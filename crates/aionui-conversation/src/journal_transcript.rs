@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::stream_persistence::CanonicalJournalEvent;
 
-const TRANSCRIPT_SCHEMA_VERSION: u32 = 1;
+const TRANSCRIPT_SCHEMA_VERSION: u32 = 2;
 const SUMMARY_CHAR_LIMIT: usize = 240;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +78,9 @@ pub(crate) struct DerivedTranscriptItem {
     pub transcript_kind: &'static str,
     pub visibility: &'static str,
     pub summary: String,
+    /// Reconstructible model-visible payload. Tool output is already
+    /// spill-governed before the event is journaled.
+    pub content: String,
     pub source_sequences: Vec<u64>,
 }
 
@@ -89,6 +92,7 @@ struct DraftItem {
     event_id: String,
     sequence: u64,
     summary: String,
+    content: String,
     source_sequences: Vec<u64>,
 }
 
@@ -113,6 +117,7 @@ pub(crate) fn derive_transcript(
             transcript_kind: item.transcript_kind,
             visibility: item.visibility.as_str(),
             summary: item.summary,
+            content: item.content,
             source_sequences: item.source_sequences,
         })
         .collect();
@@ -129,13 +134,15 @@ pub(crate) fn derive_transcript(
 
 fn classify_event(event: &CanonicalJournalEvent) -> Option<DraftItem> {
     let (visibility, transcript_kind) = classify_kind(&event.kind)?;
+    let content = extract_content(&event.kind, &event.payload);
     Some(DraftItem {
         visibility,
         transcript_kind,
         journal_kind: event.kind.clone(),
         event_id: event.event_id.clone(),
         sequence: event.sequence,
-        summary: extract_summary(&event.kind, &event.payload),
+        summary: truncate_summary(&content),
+        content,
         source_sequences: vec![event.sequence],
     })
 }
@@ -144,7 +151,7 @@ fn classify_kind(kind: &str) -> Option<(TranscriptVisibility, &'static str)> {
     match kind {
         "Text" => Some((TranscriptVisibility::Model, "assistant/message")),
         "ToolCall" | "AcpToolCall" | "ToolGroup" => Some((TranscriptVisibility::Model, "tool/call")),
-        "Ask" => Some((TranscriptVisibility::Model, "user/message")),
+        "Ask" | "UserPrompt" => Some((TranscriptVisibility::Model, "user/message")),
         "Start" => Some((TranscriptVisibility::Host, "turn/start")),
         "Finish" => Some((TranscriptVisibility::Host, "turn/end")),
         "Error" => Some((TranscriptVisibility::Host, "turn/error")),
@@ -178,7 +185,8 @@ fn merge_assistant_text(items: Vec<DraftItem>) -> Vec<DraftItem> {
             });
         if can_merge {
             let last = merged.last_mut().expect("merge target exists");
-            last.summary = join_summaries(&last.summary, &item.summary);
+            last.content = join_content(&last.content, &item.content);
+            last.summary = truncate_summary(&last.content);
             last.source_sequences.extend(item.source_sequences);
             last.event_id = item.event_id;
             last.sequence = item.sequence;
@@ -189,20 +197,22 @@ fn merge_assistant_text(items: Vec<DraftItem>) -> Vec<DraftItem> {
     merged
 }
 
-fn join_summaries(left: &str, right: &str) -> String {
+fn join_content(left: &str, right: &str) -> String {
     if left.is_empty() {
         return right.to_owned();
     }
     if right.is_empty() {
         return left.to_owned();
     }
-    truncate_summary(&format!("{left}{right}"))
+    format!("{left}{right}")
 }
 
-fn extract_summary(kind: &str, payload: &serde_json::Value) -> String {
+fn extract_content(kind: &str, payload: &serde_json::Value) -> String {
     let candidates = [
         payload.pointer("/data/content"),
         payload.pointer("/content"),
+        payload.pointer("/data/output"),
+        payload.pointer("/output"),
         payload.pointer("/data/text"),
         payload.pointer("/text"),
         payload.pointer("/data/update/title"),
@@ -216,7 +226,7 @@ fn extract_summary(kind: &str, payload: &serde_json::Value) -> String {
         if let Some(text) = candidate.and_then(serde_json::Value::as_str)
             && !text.is_empty()
         {
-            return truncate_summary(text);
+            return text.to_owned();
         }
     }
     kind.to_owned()
@@ -239,7 +249,7 @@ fn digest_model_visible(items: &[DraftItem]) -> String {
     {
         digest.update(item.transcript_kind.as_bytes());
         digest.update([0]);
-        digest.update(item.summary.as_bytes());
+        digest.update(item.content.as_bytes());
         digest.update([0]);
         for sequence in &item.source_sequences {
             digest.update(sequence.to_le_bytes());
@@ -309,6 +319,7 @@ mod tests {
         let model = derive_transcript("conv", &events, RequestedVisibility::Model);
         assert_eq!(model.items.len(), 2);
         assert_eq!(model.items[0].summary, "hello");
+        assert_eq!(model.items[0].content, "hello");
         assert_eq!(model.items[0].source_sequences, vec![1, 2]);
         assert_eq!(model.items[1].summary, "world");
         assert_eq!(model.items[1].source_sequences, vec![4]);
@@ -343,5 +354,36 @@ mod tests {
         assert!(RequestedVisibility::parse(Some("host")).is_ok());
         assert!(RequestedVisibility::parse(None).is_ok());
         assert!(RequestedVisibility::parse(Some("secret")).is_err());
+    }
+
+    #[test]
+    fn user_prompt_is_model_visible_and_keeps_full_content() {
+        let long = "x".repeat(SUMMARY_CHAR_LIMIT + 20);
+        let events = vec![event(
+            1,
+            "UserPrompt",
+            serde_json::json!({"type":"user_prompt","data":{"msg_id":"m1","content": long}}),
+        )];
+        let model = derive_transcript("conv", &events, RequestedVisibility::Model);
+        assert_eq!(model.items.len(), 1);
+        assert_eq!(model.items[0].transcript_kind, "user/message");
+        assert_eq!(model.items[0].content, long);
+        assert_eq!(model.items[0].summary.chars().count(), SUMMARY_CHAR_LIMIT + 1);
+        assert!(model.items[0].summary.ends_with('…'));
+    }
+
+    #[test]
+    fn tool_output_content_is_reconstructible_from_the_journal() {
+        let events = vec![event(
+            1,
+            "ToolCall",
+            serde_json::json!({
+                "type":"tool_call",
+                "data":{"name":"Bash","output":"exit 0\nhello world"}
+            }),
+        )];
+        let model = derive_transcript("conv", &events, RequestedVisibility::Model);
+        assert_eq!(model.items[0].summary, "exit 0\nhello world");
+        assert_eq!(model.items[0].content, "exit 0\nhello world");
     }
 }

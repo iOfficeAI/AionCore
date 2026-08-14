@@ -735,6 +735,21 @@ impl ConversationService {
         crate::stream_persistence::CanonicalEventJournal::new(self.workspace_root.join(".event-journal"))
     }
 
+    pub(crate) async fn journal_user_prompt(&self, user_id: &str, conversation_id: &str, msg_id: &str, content: &str) {
+        if let Err(error) = self
+            .canonical_event_journal()
+            .append_user_prompt(user_id, conversation_id, msg_id, content)
+            .await
+        {
+            warn!(
+                msg_id,
+                conversation_id,
+                error = %error,
+                "Failed to journal user prompt; DB row remains the fallback projection"
+            );
+        }
+    }
+
     pub async fn runtime_summary_for(&self, conversation_id: &str) -> ConversationRuntimeSummary {
         let agent = self.task_manager.get_task(conversation_id);
         let has_task = agent.is_some();
@@ -3372,6 +3387,8 @@ impl ConversationService {
         }
 
         info!(msg_id = %user_msg_id, "User message persisted");
+        self.journal_user_prompt(user_id, conversation_id, &user_msg_id, &resolved.content)
+            .await;
 
         self.broadcaster.broadcast(WebSocketMessage::new(
             "message.userCreated",
@@ -3486,18 +3503,26 @@ impl ConversationService {
             if self
                 .runtime_persistence()
                 .allows(&request.conversation_id, RuntimeWriteKind::UserMessage)
-                && let Err(e) = self.conversation_repo.insert_message(&request.user_id, &user_msg).await
             {
-                warn!(
-                    msg_id = %user_msg.id,
-                    error = %ErrorChain(&e),
-                    "Failed to insert agent turn user message"
-                );
-                let mut turn_claim = turn_claim;
-                let was_deleting = turn_claim.release();
-                self.complete_released_turn(&request.user_id, &request.conversation_id, &turn_id, was_deleting)
-                    .await;
-                return Err(e.into());
+                if let Err(e) = self.conversation_repo.insert_message(&request.user_id, &user_msg).await {
+                    warn!(
+                        msg_id = %user_msg.id,
+                        error = %ErrorChain(&e),
+                        "Failed to insert agent turn user message"
+                    );
+                    let mut turn_claim = turn_claim;
+                    let was_deleting = turn_claim.release();
+                    self.complete_released_turn(&request.user_id, &request.conversation_id, &turn_id, was_deleting)
+                        .await;
+                    return Err(e.into());
+                }
+                self.journal_user_prompt(
+                    &request.user_id,
+                    &request.conversation_id,
+                    &user_msg.id,
+                    &request.content,
+                )
+                .await;
             }
         }
         if let Some(on_started) = request.on_started.as_ref() {
