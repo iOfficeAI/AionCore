@@ -40,7 +40,7 @@ pub use acp::{
     ConfigOptionConfirmation, DetectCliRequest, DetectCliResponse, GetConfigOptionsResponse, GetModelInfoResponse,
     JournalTranscriptItem, JournalTranscriptResponse, ModelInfoEntry, ModelInfoPayload, ProbeModelRequest,
     RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest, SetModelRequest,
-    SideQuestionResponse, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse, WorkspaceBrowseQuery,
+    SideQuestionRequest, SideQuestionResponse, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
     WorkspaceEntry,
 };
 pub use acp_prompt_hook::AcpPromptHookWarningPayload;
