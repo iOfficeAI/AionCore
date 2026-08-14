@@ -60,6 +60,23 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace
 
+  # L1 cloud verification for DeepSeek Harness managed runtime install:
+  # prove the embedded npm lock installs and the ACP entrypoint is present.
+  # Does not call the DeepSeek API (no secrets). L2 (agent online + tool call)
+  # requires DEEPSEEK_API_KEY and remains a separate workflow.
+  deepseek-harness-l1:
+    name: DeepSeek Harness L1 Install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: crates/aionui-runtime/resources/deepseek-harness/package-lock.json
+      - name: Smoke managed DeepSeek Harness install
+        run: node scripts/smoke-deepseek-harness-install.mjs
+
   changes:
     name: Detect dependency changes
     runs-on: ubuntu-latest
