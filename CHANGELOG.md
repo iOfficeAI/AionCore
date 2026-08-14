@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.67](https://github.com/iOfficeAI/AionCore/compare/v0.1.66...v0.1.67) (2026-08-14)
+
+
+### Features
+
+* **session:** report a deferred mode switch as pending instead of observed ([#846](https://github.com/iOfficeAI/AionCore/issues/846)) ([9700f88](https://github.com/iOfficeAI/AionCore/commit/9700f88306aa9c2d51d257e865866253db002bd6))
+
+
+### Bug Fixes
+
+* restore direct CLI Team MCP capabilities ([#853](https://github.com/iOfficeAI/AionCore/issues/853)) ([fe99ff6](https://github.com/iOfficeAI/AionCore/commit/fe99ff6051cf5d0a766332e56ffa66e9d8c61234))
+
 ## [0.1.66](https://github.com/iOfficeAI/AionCore/compare/v0.1.65...v0.1.66) (2026-08-13)
 
 

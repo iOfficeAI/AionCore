@@ -14,6 +14,7 @@ mod claude_conn;
 mod cli_version;
 mod codex_conn;
 mod conversation_session;
+mod descriptor;
 mod orchestrator;
 mod rehydrate;
 mod suspend;
@@ -23,11 +24,17 @@ pub use acp_conn::{AcpConnection, AcpSessionBackend, acp_capabilities};
 pub use antigravity::{AntigravityConnection, AntigravitySessionBackend, antigravity_capabilities};
 pub use claude_conn::{ClaudeConnection, ClaudeSessionBackend};
 pub use cli_version::{
-    VERIFIED_CLAUDE_VERSION, VERIFIED_CODEX_VERSION, VersionDrift, VersionVerdict, classify as classify_cli_version,
-    parse_version as parse_cli_version, version_drift,
+    VERIFIED_AGY_VERSION, VERIFIED_CLAUDE_VERSION, VERIFIED_CODEX_VERSION, VersionDrift, VersionVerdict,
+    classify as classify_cli_version, parse_version as parse_cli_version, version_drift,
 };
-pub use codex_conn::{CodexConnection, CodexSessionBackend, codex_capabilities, slash_command_name};
+pub use codex_conn::{
+    CodexConnection, CodexSessionBackend, codex_capabilities, codex_shell_environment_policy_args, slash_command_name,
+};
 pub use conversation_session::{ConversationSession, MsgStatus, PendingMessage};
+pub use descriptor::{
+    BackendCapabilityDescriptor, backend_capability_descriptor, backend_capability_descriptors,
+    effective_agent_capabilities,
+};
 pub use orchestrator::Orchestrator;
 pub use rehydrate::rehydrate;
 // `suspend::{SuspendController, ProcHandle, spawn_idle_timer}` is the F-4 idle

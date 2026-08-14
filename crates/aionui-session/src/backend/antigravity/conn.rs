@@ -251,6 +251,8 @@ impl BackendConnection for AntigravityConnection {
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
+            turn_started_hooked: Arc::new(AtomicBool::new(false)),
+            deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
         });
 
@@ -305,6 +307,22 @@ pub struct AntigravitySessionBackend {
     /// True while a turn's process is alive. agy has no way to accept input
     /// mid-turn, so a Send arriving now has to wait for the next process.
     in_flight: Arc<AtomicBool>,
+    /// Whether the CURRENTLY RUNNING turn was spawned with the approval hook on disk.
+    ///
+    /// This is what decides whether a mid-turn mode switch can reach agy at all. The
+    /// permission gate lives on the host — agy calls back per tool use and
+    /// `request_external_permission` re-reads the mode each time — so a hooked turn
+    /// honours a switch immediately, in both directions. A turn spawned in FULL AUTO has
+    /// no hook, never calls back, and therefore cannot learn about a tightening until the
+    /// next process starts; `sync_permission_hook` writes the file back, but nothing
+    /// proves a running agy re-reads it.
+    ///
+    /// Recorded at spawn rather than derived from the current mode, because the current
+    /// mode is exactly what the user just changed.
+    turn_started_hooked: Arc<AtomicBool>,
+    /// A mode switch accepted while the running turn could not hear it. Confirmed at the
+    /// next spawn, where argv finally carries it.
+    deferred_mode_confirm: Arc<Mutex<Option<String>>>,
     /// Skills provisioned into this workspace, exposed as slash commands. agy
     /// has no command-list interface, so this is read off the skill files.
     slash_commands: Vec<SlashCommandInfo>,
@@ -517,6 +535,45 @@ impl AntigravitySessionBackend {
             .or_else(|| self.config.mode.clone())
     }
 
+    /// Mark the running turn as finished and release any switch it could not hear.
+    ///
+    /// The turn ending is what makes a deferred switch real: that agy process is gone, so
+    /// nothing is running under the old mode any more and the next spawn necessarily
+    /// reads the new one. Confirming here rather than at the next spawn matters because
+    /// the next spawn needs the user to send another message — until then the picker
+    /// would sit on "switching…" with no way to tell whether it had landed.
+    ///
+    /// `take()` makes this idempotent: a later turn boundary finds nothing to release.
+    async fn settle_turn_end(&self) {
+        self.in_flight.store(false, Ordering::SeqCst);
+        if let Some(mode) = self.deferred_mode_confirm.lock().await.take() {
+            let turn_gen = self.turn_gen.load(Ordering::SeqCst);
+            tracing::info!(
+                session_id = %self.session_id,
+                mode = %mode,
+                "antigravity: turn ended — releasing the held mode confirmation"
+            );
+            self.emit(
+                turn_gen,
+                SessionEvent::ConfigChanged {
+                    mode: Some(mode),
+                    model: None,
+                },
+            );
+        }
+    }
+
+    /// Whether a mode switch made RIGHT NOW would govern the turn already running.
+    ///
+    /// Between turns: yes — the next spawn reads the new mode from argv either way.
+    /// During a hooked turn: yes — agy calls back per tool use and the host gate re-reads
+    /// the mode, so the switch governs the very next tool, in both directions.
+    /// During a full-auto turn: no — that process was spawned without a hook, never calls
+    /// back, and cannot be told; only the next spawn picks it up.
+    fn switch_reaches_current_turn(&self) -> bool {
+        !self.in_flight.load(Ordering::SeqCst) || self.turn_started_hooked.load(Ordering::SeqCst)
+    }
+
     /// Whether this session currently runs without approval prompts.
     fn is_full_auto(&self) -> bool {
         self.effective_mode()
@@ -571,6 +628,18 @@ impl AntigravitySessionBackend {
             model: self.effective_model(),
             mode: self.effective_mode(),
         };
+        let mut spawn_env = self.config.spawn_env.clone();
+        if let Some(cwd) = self.config.cwd.as_deref() {
+            // agy 1.1.13 resolves its primary customization workspace from PWD,
+            // not only the process cwd/--add-dir. A stale inherited PWD made it
+            // scan the host app directory and skip this session's MCP plugin
+            // (verified: ~/.gemini/antigravity-cli/log/cli-20260814_135824.log:48,51).
+            spawn_env.retain(|entry| entry.name != "PWD");
+            spawn_env.push(aionui_common::EnvVar {
+                name: "PWD".to_owned(),
+                value: cwd.to_owned(),
+            });
+        }
         let spec = CommandSpec {
             command: self
                 .config
@@ -578,7 +647,7 @@ impl AntigravitySessionBackend {
                 .clone()
                 .unwrap_or_else(|| std::path::PathBuf::from("agy")),
             args: build_argv(&input),
-            env: self.config.spawn_env.clone(),
+            env: spawn_env,
             cwd: self.config.cwd.clone(),
         };
 
@@ -588,8 +657,11 @@ impl AntigravitySessionBackend {
             .await
             .map_err(|e| BackendError::Transport(format!("spawn agy: {e}")))?;
         *self.current.lock().await = Some(Arc::clone(&proc));
+        // Freeze whether THIS turn can hear about a later mode switch. A hooked turn
+        // calls back per tool use, so the host gate applies a switch at once; a full-auto
+        // turn never calls back and only the next spawn can pick one up.
+        self.turn_started_hooked.store(!self.is_full_auto(), Ordering::SeqCst);
         self.in_flight.store(true, Ordering::SeqCst);
-
         self.spawn_reader(Arc::clone(&proc), turn_gen);
         Ok(turn_gen)
     }
@@ -732,7 +804,7 @@ impl AntigravitySessionBackend {
                 // Session dropped; nothing left to run for.
                 return;
             };
-            backend.in_flight.store(false, Ordering::SeqCst);
+            backend.settle_turn_end().await;
             let next = backend.queued.lock().await.pop_front();
             if let Some(content) = next
                 && let Err(e) = backend.start_turn(content).await
@@ -832,10 +904,41 @@ impl SessionBackend for AntigravitySessionBackend {
                 // in-process check never runs — the user would think they had
                 // restored approval prompts while everything still ran freely.
                 self.sync_permission_hook();
+                let turn_gen = self.turn_gen.load(Ordering::SeqCst);
+                // Confirm the switch. Unlike the other backends this signal originates
+                // here rather than on the wire — agy runs one process per turn and there
+                // is nothing to reconfigure mid-flight — but it is not self-fulfilling:
+                // the permission decision is re-read per tool call (`is_full_auto` in
+                // `request_external_permission`) and the hook file has just been synced,
+                // so the host-side gate really has changed.
+                //
+                // It is also the ONLY trigger that persists `current_mode_id` (see
+                // session_agent's `persist_side_effects`); without it a task rebuild
+                // reverted the user to the stale create-time mode.
+                // Confirm ONLY when the switch really reaches the running turn.
+                //
+                // `ConfigChanged` is what clears the frontend's pending marker, so
+                // emitting it for a deferred switch would flip the picker to "in force"
+                // for precisely the case that has not taken effect — telling the user
+                // their tightening had landed while the agent kept running unattended.
+                // The deferred case confirms itself when the next turn spawns, which is
+                // when agy actually reads the mode off argv.
+                if !self.switch_reaches_current_turn() {
+                    *self.deferred_mode_confirm.lock().await = Some(mode.clone());
+                }
+                if self.switch_reaches_current_turn() {
+                    self.emit(
+                        turn_gen,
+                        SessionEvent::ConfigChanged {
+                            mode: Some(mode.clone()),
+                            model: None,
+                        },
+                    );
+                }
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
-                    turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                    turn_gen,
                 })
             }
             Command::SetModel { .. } => Ok(CommandReceipt {
@@ -870,6 +973,20 @@ impl SessionBackend for AntigravitySessionBackend {
             current_model: self.config.model.clone(),
             current_mode: self.config.mode.clone(),
             slash_commands: self.slash_commands.clone(),
+            // agy runs one process per turn and `--mode` is a spawn flag, so a turn
+            // already running keeps the mode it was spawned with; the switch reaches agy
+            // only when the next turn spawns.
+            //
+            // Reported as NextTurn even though the host-side gate does move at once (the
+            // hook bridge re-reads `is_full_auto` per tool call). That is the safe
+            // direction to be imprecise in: claiming "in force" while the tightening has
+            // not reached agy would be the dangerous lie, whereas under-promising a
+            // loosening costs the user nothing.
+            mode_switch_effect: if self.switch_reaches_current_turn() {
+                crate::capability::ModeSwitchEffect::Immediate
+            } else {
+                crate::capability::ModeSwitchEffect::NextTurn
+            },
             ..antigravity_capabilities()
         }
     }
@@ -1041,6 +1158,14 @@ mod tests {
         assert!(spec.args.contains(&"hello".to_string()));
         assert!(spec.args.contains(&"--dangerously-skip-permissions".to_string()));
         assert_eq!(spec.cwd.as_deref(), Some("/w"));
+        assert_eq!(
+            spec.env
+                .iter()
+                .filter(|entry| entry.name == "PWD")
+                .map(|entry| entry.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/w"]
+        );
     }
 
     #[tokio::test]
@@ -1102,6 +1227,8 @@ mod tests {
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
+            turn_started_hooked: Arc::new(AtomicBool::new(false)),
+            deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
@@ -1235,6 +1362,8 @@ mod tests {
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
+            turn_started_hooked: Arc::new(AtomicBool::new(false)),
+            deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
@@ -1298,6 +1427,208 @@ mod tests {
         assert!(!hook.exists(), "full auto must not leave a hook agy would call");
     }
 
+    /// A session whose turn is running WITH the approval hook installed applies a mode
+    /// switch at once, so it must not claim otherwise.
+    ///
+    /// The gate lives on the host: agy calls back per tool use and
+    /// `request_external_permission` re-reads the mode every time. So while those
+    /// callbacks are happening, a switch governs the very next tool — in both directions.
+    #[tokio::test]
+    async fn a_hooked_turn_applies_a_mode_switch_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend_with_hook_body(dir.path(), Some("default"), Some("{\"stub\":true}"));
+        b.in_flight.store(true, Ordering::SeqCst);
+        b.turn_started_hooked.store(true, Ordering::SeqCst);
+
+        assert_eq!(
+            b.capabilities().mode_switch_effect,
+            crate::capability::ModeSwitchEffect::Immediate,
+            "a hooked turn keeps calling back, so the new mode governs the next tool call"
+        );
+    }
+
+    /// The one case that genuinely has to wait: a turn that started in FULL AUTO has no
+    /// hook on disk, so agy never calls back and the host gate never runs. Tightening
+    /// cannot reach that already-spawned process; it lands when the next turn spawns.
+    ///
+    /// Claiming `Immediate` here would be the dangerous lie -- the user would be told the
+    /// permission was restored while the agent kept running unattended.
+    #[tokio::test]
+    async fn a_full_auto_turn_defers_a_tightening_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend_with_hook_body(dir.path(), Some("yolo"), Some("{\"stub\":true}"));
+        b.in_flight.store(true, Ordering::SeqCst);
+        b.turn_started_hooked.store(false, Ordering::SeqCst);
+
+        assert_eq!(
+            b.capabilities().mode_switch_effect,
+            crate::capability::ModeSwitchEffect::NextTurn,
+            "no hook was installed for this turn, so agy cannot learn about the switch"
+        );
+    }
+
+    /// Between turns there is no agy process at all, so the next spawn necessarily reads
+    /// the new mode from argv.
+    #[tokio::test]
+    async fn an_idle_session_applies_a_mode_switch_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend_with_hook_body(dir.path(), Some("yolo"), Some("{\"stub\":true}"));
+        assert_eq!(
+            b.capabilities().mode_switch_effect,
+            crate::capability::ModeSwitchEffect::Immediate
+        );
+    }
+
+    /// A deferred switch must NOT announce itself as applied.
+    ///
+    /// `ConfigChanged` is what clears the frontend's pending marker, so emitting it here
+    /// would flip the picker to "in force" for exactly the case that has not taken effect
+    /// -- the contradiction this pair of rules exists to prevent.
+    #[tokio::test]
+    async fn a_deferred_switch_emits_no_premature_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend_with_hook_body(dir.path(), Some("yolo"), Some("{\"stub\":true}"));
+        b.in_flight.store(true, Ordering::SeqCst);
+        b.turn_started_hooked.store(false, Ordering::SeqCst);
+        let mut events = b.events();
+
+        b.dispatch(Command::SetMode {
+            mode: "default".to_owned(),
+        })
+        .await
+        .unwrap();
+
+        let confirmed = tokio::time::timeout(std::time::Duration::from_millis(400), async {
+            use futures_util::StreamExt as _;
+            while let Some(env) = events.next().await {
+                if let SessionEvent::ConfigChanged { mode, .. } = env.event {
+                    return mode;
+                }
+            }
+            None
+        })
+        .await;
+        assert!(
+            confirmed.is_err() || confirmed.as_ref().unwrap().is_none(),
+            "a switch agy cannot see yet must not be confirmed, got {confirmed:?}"
+        );
+    }
+
+    /// A deferred switch confirms as soon as the turn that could not hear it ENDS.
+    ///
+    /// Waiting for the next spawn was too conservative: once that turn is over its agy
+    /// process is gone, so nothing is running under the old mode any more and the next
+    /// spawn necessarily reads the new one. Holding "switching…" until the user happens
+    /// to send another message left the picker stuck with no way to tell whether the
+    /// switch had landed — and made a second switch appear to work instantly while the
+    /// first still looked pending.
+    #[tokio::test]
+    async fn a_deferred_switch_confirms_when_the_turn_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend_with_hook_body(dir.path(), Some("yolo"), Some("{\"stub\":true}"));
+        b.in_flight.store(true, Ordering::SeqCst);
+        b.turn_started_hooked.store(false, Ordering::SeqCst);
+        let mut events = b.events();
+
+        b.dispatch(Command::SetMode {
+            mode: "default".to_owned(),
+        })
+        .await
+        .unwrap();
+
+        b.settle_turn_end().await;
+
+        let confirmed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            use futures_util::StreamExt as _;
+            while let Some(env) = events.next().await {
+                if let SessionEvent::ConfigChanged { mode, .. } = env.event {
+                    return mode;
+                }
+            }
+            None
+        })
+        .await
+        .expect("the turn ending must release the held confirmation");
+        assert_eq!(confirmed.as_deref(), Some("default"));
+    }
+
+    /// ...and only once: a second turn boundary must not re-announce it.
+    #[tokio::test]
+    async fn a_released_confirmation_is_not_repeated() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend_with_hook_body(dir.path(), Some("yolo"), Some("{\"stub\":true}"));
+        b.in_flight.store(true, Ordering::SeqCst);
+        b.turn_started_hooked.store(false, Ordering::SeqCst);
+
+        b.dispatch(Command::SetMode {
+            mode: "default".to_owned(),
+        })
+        .await
+        .unwrap();
+        b.settle_turn_end().await;
+
+        let mut events = b.events();
+        b.settle_turn_end().await;
+        let again = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            use futures_util::StreamExt as _;
+            while let Some(env) = events.next().await {
+                if let SessionEvent::ConfigChanged { .. } = env.event {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert!(
+            again.is_err() || !again.unwrap(),
+            "the held confirmation is released once, not on every turn boundary"
+        );
+    }
+
+    /// A runtime mode switch must emit `ConfigChanged`.
+    ///
+    /// Two things ride on it, and both were broken by its absence:
+    ///   - PERSISTENCE. `ConfigChanged` is the ONLY trigger that writes
+    ///     `current_mode_id` (session_agent's `persist_side_effects`), so without it
+    ///     the switch lived only in this backend instance's `mode_override` and a task
+    ///     rebuild silently reverted the user to the stale create-time mode.
+    ///   - CONFIRMATION. It is what tells the frontend the switch really landed,
+    ///     instead of the self-fulfilling `Observed` the task layer synthesizes.
+    ///
+    /// Honest for agy specifically: the permission decision is re-read per tool call
+    /// (`is_full_auto` in `request_external_permission`), so once the override is
+    /// recorded and the hook file synced, the host-side gate HAS changed — regardless
+    /// of the already-spawned process's `--mode` flag.
+    #[tokio::test]
+    async fn a_runtime_mode_switch_emits_config_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend_with_hook_body(dir.path(), Some("default"), Some("{}"));
+        let mut events = b.events();
+
+        b.dispatch(Command::SetMode {
+            mode: "yolo".to_owned(),
+        })
+        .await
+        .unwrap();
+
+        let confirmed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            use futures_util::StreamExt as _;
+            while let Some(env) = events.next().await {
+                if let SessionEvent::ConfigChanged { mode, .. } = env.event {
+                    return mode;
+                }
+            }
+            None
+        })
+        .await
+        .expect("a mode switch must emit ConfigChanged within 2s");
+        assert_eq!(
+            confirmed.as_deref(),
+            Some("yolo"),
+            "the confirmation must carry the mode that is now in force"
+        );
+    }
+
     #[test]
     fn a_runtime_switch_reaches_the_next_turns_argv() {
         // agy spawns a fresh process per turn, so the mode only takes effect if
@@ -1320,6 +1651,8 @@ mod tests {
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
+            turn_started_hooked: Arc::new(AtomicBool::new(false)),
+            deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
         };
         assert_eq!(b.effective_mode().as_deref(), Some("default"));
@@ -1393,6 +1726,8 @@ mod tests {
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
+            turn_started_hooked: Arc::new(AtomicBool::new(false)),
+            deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
         };
 
@@ -1525,6 +1860,8 @@ mod tests {
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
             in_flight: Arc::new(AtomicBool::new(false)),
+            turn_started_hooked: Arc::new(AtomicBool::new(false)),
+            deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
         }
     }

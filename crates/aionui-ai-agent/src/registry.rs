@@ -789,8 +789,14 @@ fn decode_row(
     let behavior_policy =
         decode_json_field(row.behavior_policy.as_deref(), "behavior_policy").unwrap_or_else(BehaviorPolicy::default);
 
+    let persisted_backend = row.backend.as_deref().unwrap_or("");
+    let runtime_backend = aionui_db::runtime_backend_for_agent(&row);
+    let persisted_agent_capabilities = parse_json(row.agent_capabilities.as_deref(), "agent_capabilities");
     let handshake = AgentHandshake {
-        agent_capabilities: parse_json(row.agent_capabilities.as_deref(), "agent_capabilities"),
+        agent_capabilities: crate::effective_agent_capabilities(
+            &runtime_backend,
+            persisted_agent_capabilities.as_ref(),
+        ),
         auth_methods: parse_json(row.auth_methods.as_deref(), "auth_methods"),
         config_options: parse_json(row.config_options.as_deref(), "config_options"),
         available_modes: parse_json(row.available_modes.as_deref(), "available_modes"),
@@ -798,20 +804,19 @@ fn decode_row(
         available_commands: parse_json(row.available_commands.as_deref(), "available_commands"),
     };
 
-    let backend_str = row.backend.as_deref().unwrap_or("");
     // Team MEMBERSHIP (may this agent be picked into a team) — distinct from the
-    // team TRANSPORT chosen later at provisioning time, which reads capabilities
-    // only. Whitelist first, inference second:
-    //   - `supports_team` is the known-good opt-in (migration 014). It carries
-    //     agents whose `agent_capabilities` are still NULL because they have never
-    //     handshaken on this machine (claude/codex/gemini on a fresh install), and
-    //     aionrs, whose NULL backend the inference cannot judge at all.
-    //   - otherwise infer from the advertised MCP transports / CLI eligibility.
+    // transport chosen later at provisioning time. Constructed descriptors are
+    // authoritative for direct/internal backends; ACP agents retain the persisted
+    // handshake plus conservative CLI eligibility inference.
     // There is deliberately no veto flag on this path: a stored "false" could not
     // be lifted once an agent proved itself, since builtin rows reject metadata
     // edits through the agent API.
+    let descriptor_team_capable = aionui_session::backend_capability_descriptor(&runtime_backend)
+        .map(aionui_session::BackendCapabilityDescriptor::resolved)
+        .is_some_and(|capabilities| capabilities.mcp.stdio || capabilities.cli_fallback);
     let team_capable = behavior_policy.supports_team
-        || aionui_common::constants::is_team_capable(backend_str, handshake.agent_capabilities.as_ref());
+        || descriptor_team_capable
+        || aionui_common::constants::is_team_capable(persisted_backend, handshake.agent_capabilities.as_ref());
 
     let mut meta = AgentMetadata {
         id: row.id,
@@ -1633,6 +1638,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_cli_metadata_projects_constructed_mcp_capabilities() {
+        let reg = registry().await;
+        for descriptor in aionui_session::backend_capability_descriptors()
+            .iter()
+            .filter(|descriptor| descriptor.origin == aionui_common::CapabilityOrigin::DirectDescriptor)
+        {
+            let backend = descriptor.backend_id;
+            let meta = reg.find_builtin_by_backend(backend).await.unwrap_or_else(|| {
+                panic!(
+                    "direct backend {backend} has a capability descriptor but no builtin registry entry; register both together"
+                )
+            });
+            assert_eq!(
+                meta.team_capable,
+                descriptor.mcp.stdio || descriptor.cli_fallback,
+                "direct backend {backend} Team eligibility must come from its constructed descriptor"
+            );
+            let mcp = meta
+                .handshake
+                .agent_capabilities
+                .as_ref()
+                .and_then(|caps| caps.get("mcp_capabilities"))
+                .unwrap_or_else(|| panic!("{backend} effective MCP projection"));
+            assert_eq!(mcp["stdio"], descriptor.mcp.stdio, "{backend}");
+            assert_eq!(mcp["sse"], descriptor.mcp.sse, "{backend}");
+            assert_eq!(mcp["http"], descriptor.mcp.streamable_http, "{backend}");
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_metadata_projects_constructed_mcp_capabilities_when_backend_is_null() {
+        let reg = registry().await;
+        let aionrs = reg.get("632f31d2").await.expect("seeded aionrs metadata");
+        let mcp = aionrs
+            .handshake
+            .agent_capabilities
+            .as_ref()
+            .and_then(|caps| caps.get("mcp_capabilities"))
+            .expect("aionrs effective MCP projection");
+
+        assert_eq!(mcp["stdio"], true);
+        assert_eq!(mcp["sse"], false);
+        assert_eq!(mcp["http"], false);
+    }
+
+    #[tokio::test]
     async fn hermes_builtin_does_not_advertise_a_yolo_id() {
         let reg = registry().await;
         let hermes = reg.find_builtin_by_backend("hermes").await.unwrap();
@@ -1903,11 +1954,21 @@ mod tests {
         .await
         .unwrap();
 
+        let persisted = reg.repo.get(&claude.id).await.unwrap().unwrap();
+        assert_eq!(
+            parse_json(persisted.agent_capabilities.as_deref(), "agent_capabilities"),
+            Some(serde_json::json!({"load_session": true})),
+            "persisted agent_capabilities must survive later partial writes"
+        );
         let refreshed = reg.get(&claude.id).await.unwrap();
         assert_eq!(
-            refreshed.handshake.agent_capabilities,
-            Some(serde_json::json!({"load_session": true})),
-            "agent_capabilities must survive later partial writes"
+            refreshed
+                .handshake
+                .agent_capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.get("load_session")),
+            Some(&serde_json::Value::Bool(true)),
+            "effective projection must retain persisted handshake fields"
         );
         assert!(
             refreshed.handshake.auth_methods.is_some(),
@@ -1975,10 +2036,21 @@ mod tests {
             .await
             .unwrap();
 
+        let persisted = reg.repo.get(&claude.id).await.unwrap().unwrap();
+        assert_eq!(
+            parse_json(persisted.agent_capabilities.as_deref(), "agent_capabilities"),
+            Some(serde_json::json!({"x": 1}))
+        );
         let refreshed = reg.get(&claude.id).await.unwrap();
         assert_eq!(
-            refreshed.handshake.agent_capabilities,
-            Some(serde_json::json!({"x": 1}))
+            refreshed
+                .handshake
+                .agent_capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.get("x"))
+                .and_then(serde_json::Value::as_i64),
+            Some(1),
+            "effective projection must retain the unchanged persisted field"
         );
     }
 

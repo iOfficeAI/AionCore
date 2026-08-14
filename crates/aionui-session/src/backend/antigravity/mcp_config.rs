@@ -2,12 +2,14 @@
 //!
 //! agy has no per-run flag for MCP configuration — it only reads files — and
 //! the workspace-level file is what gives each conversation its own set of
-//! servers (verified: a workspace `mcp_config.json` is honoured in headless
-//! runs). This is also how the team coordination server reaches an Antigravity
+//! servers (verified: `crates/aionui-app/tests/live_ws_http_parity_e2e.rs`,
+//! `live_antigravity_team_mcp_tools_call_and_runtime_env`, against agy 1.1.13).
+//! This is also how the team coordination server reaches an Antigravity
 //! teammate.
 //!
-//! agy supports exactly two transports, Stdio and SSE
-//! (`agy-customizations/docs/mcp_servers.md`), so an HTTP server is dropped
+//! agy supports exactly two transports, Stdio and SSE (verified:
+//! `~/.gemini/antigravity-cli/builtin/skills/agy-customizations/docs/mcp_servers.md`),
+//! so an HTTP server is dropped
 //! rather than mistranslated.
 
 use std::path::Path;
@@ -43,13 +45,14 @@ pub(crate) fn write_mcp_config(workspace: &Path, servers: &[McpServerSpec]) -> s
                 "serverUrl": url,
                 "headers": pairs_to_object(headers),
             }),
-            McpTransport::Http { url, .. } => {
+            McpTransport::Http { .. } => {
                 // Emitting this as `serverUrl` would write a config that looks
                 // valid and then never connects — SSE and streamable-HTTP are
                 // different protocols.
                 tracing::warn!(
+                    backend = "antigravity",
                     server = %server.name,
-                    url = %url,
+                    transport = "streamable_http",
                     "antigravity: skipping MCP server — agy supports stdio and SSE only"
                 );
                 continue;
@@ -82,6 +85,12 @@ mod tests {
 
     #[test]
     fn stdio_spec_maps_to_agys_command_shape() {
+        assert!(
+            crate::backend::backend_capability_descriptor("antigravity")
+                .unwrap()
+                .mcp
+                .stdio
+        );
         let dir = tempfile::tempdir().unwrap();
         let servers = vec![McpServerSpec {
             name: "aionui-team".into(),
@@ -106,6 +115,12 @@ mod tests {
 
     #[test]
     fn sse_spec_maps_to_server_url_and_headers() {
+        assert!(
+            crate::backend::backend_capability_descriptor("antigravity")
+                .unwrap()
+                .mcp
+                .sse
+        );
         let dir = tempfile::tempdir().unwrap();
         let servers = vec![McpServerSpec {
             name: "remote".into(),
@@ -123,6 +138,12 @@ mod tests {
 
     #[test]
     fn http_transport_is_skipped_rather_than_passed_off_as_sse() {
+        assert!(
+            !crate::backend::backend_capability_descriptor("antigravity")
+                .unwrap()
+                .mcp
+                .streamable_http
+        );
         // agy supports stdio and SSE only. Writing an HTTP server as
         // `serverUrl` produces a config that looks fine and then fails at
         // runtime with an opaque timeout, because the protocols differ.

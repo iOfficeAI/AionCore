@@ -429,14 +429,19 @@ pub struct ClaudeSessionBackend {
     /// into `available_models`/`slash_commands` on read. Empty until the response
     /// lands (a freshly-opened backend reads empty, like codex pre-`model/list`).
     discovered_caps: Arc<std::sync::Mutex<DiscoveredCaps>>,
-    /// G2 (in-band config switch): control_requests (`set_model` /
-    /// `set_permission_mode`) deferred because they arrived mid-turn. Writing one
-    /// while a turn is Running would reinitialize the CLI session and TRUNCATE the
-    /// in-flight turn (raw-CLI limitation), so `dispatch(SetMode/SetModel)` QUEUES
-    /// the frame here and `dispatch(Send)` drains it — in order, over the same
-    /// stdin lock, BEFORE the prompt — so a queued switch applies to the NEXT turn
-    /// and can never land after-and-truncate it. De-duped by subtype (last-write-
-    /// wins). Mirrors F1's `pending_controls`.
+    /// G2 (in-band config switch): control_requests deferred because they arrived
+    /// mid-turn. `dispatch(Send)` drains them — in order, over the same stdin lock,
+    /// BEFORE the prompt — so a queued switch applies to the NEXT turn. De-duped by
+    /// subtype (last-write-wins). Mirrors F1's `pending_controls`.
+    ///
+    /// Now holds only `set_model` / `apply_flag_settings`. `set_permission_mode` is
+    /// written straight through (see `write_or_queue_control`): a 2.1.227 probe
+    /// disproved the truncation theory this queue was built on, and because draining
+    /// only happens on the next prompt, queueing left a switch unsent — and unapplied —
+    /// for as long as the user did not send another message.
+    ///
+    /// The remaining two keep queueing only because no equivalent capture exists for
+    /// them yet, not because truncation is known to occur.
     pending_controls: Arc<Mutex<Vec<serde_json::Value>>>,
     /// Monotonic counter minting `control_request` request_ids (no uuid dep). The
     /// CLI echoes it in its success control_response (observed by the reader, not
@@ -1224,8 +1229,26 @@ impl ClaudeSessionBackend {
             "request_id": request_id,
             "request": request,
         });
-        if self.turn_in_flight.load(Ordering::SeqCst) {
-            let subtype = control_subtype(&frame);
+        let subtype = control_subtype(&frame);
+        // `set_permission_mode` is written straight through, even mid-turn.
+        //
+        // LIVE-PROBED 2.1.227 (samples/claude-cli/2.1.227/set_permission_mode/, harness
+        // scripts/probe-claude-set-permission-mode.py): switching mid-generation left the
+        // turn streaming to a normal `result{subtype:"success"}` with 18-32 assistant
+        // frames after the switch, and the new mode governed the very next tool approval
+        // in that SAME turn — proven against a no-switch control run, and symmetric
+        // (loosening skipped the approval prompt, tightening brought it back).
+        //
+        // Queueing it was worse than a delay: `drain_pending_controls` runs only at the
+        // head of `dispatch(Send)`, so a mid-turn switch sat unsent until the user
+        // happened to send another message. Observed live as a switch stuck "pending" for
+        // 3+ minutes with the agent still running under the OLD mode — a safety gap when
+        // the user was TIGHTENING permissions.
+        //
+        // Deliberately narrow: `set_model` and `apply_flag_settings` have no equivalent
+        // capture, so they keep the conservative queue until one exists.
+        let write_through = subtype.as_deref() == Some("set_permission_mode");
+        if !write_through && self.turn_in_flight.load(Ordering::SeqCst) {
             let mut q = self.pending_controls.lock().await;
             q.retain(|f| control_subtype(f) != subtype);
             q.push(frame);
@@ -2935,10 +2958,10 @@ impl SessionBackend for ClaudeSessionBackend {
             Command::Steer { .. } => Err(BackendError::CommandNotSupported { command: "steer" }),
             // G2: in-band config switch via control_request (probe-verified, mirrors
             // F1). set_permission_mode / set_model are written over the retained
-            // stdin WITHOUT restarting the process; the switch applies to the NEXT
-            // turn. Mid-turn writes would reinitialize + TRUNCATE the in-flight turn,
-            // so they QUEUE (drained before the next prompt). On a successful
-            // dispatch we emit ConfigChanged so the UI confirms immediately.
+            // stdin WITHOUT restarting the process. set_permission_mode goes out
+            // immediately, even mid-turn, and governs the very next tool approval
+            // (LIVE-PROBED 2.1.227 — see `write_or_queue_control`); set_model still
+            // queues to the next prompt for want of a capture.
             Command::SetMode { mode } => {
                 // DE-OPTIMISTIC (design §9.10.1 option A / README #10): we write the
                 // set_permission_mode request and STOP — no optimistic ConfigChanged, no
@@ -3112,6 +3135,13 @@ impl SessionBackend for ClaudeSessionBackend {
         // supply one (the snapshot's current_model is None in that case; the reader
         // fills discovered_model from the system/init frame). Read-only sync lock.
         let mut caps = self.capabilities.clone();
+        // Immediate regardless of turn state: `write_or_queue_control` writes
+        // `set_permission_mode` straight through even mid-turn (see there for the probe),
+        // and 2.1.227 shows the ack plus `system/status{permissionMode}` landing within a
+        // millisecond, with the new mode governing the very next tool approval in that
+        // same turn. Left explicit rather than inherited from the static adapter caps so
+        // this stays next to the reason.
+        caps.mode_switch_effect = crate::capability::ModeSwitchEffect::Immediate;
         if caps.current_model.is_none()
             && let Some(model) = self.discovered_model.lock().unwrap_or_else(|e| e.into_inner()).clone()
         {
@@ -3365,6 +3395,12 @@ mod tests {
     /// stdio carrying command/args/env.
     #[test]
     fn build_claude_init_args_mcp_emits_strict_and_map_json() {
+        assert!(
+            crate::backend::backend_capability_descriptor("claude")
+                .unwrap()
+                .mcp
+                .stdio
+        );
         let config = SessionConfig {
             init: SessionInit {
                 mcp_servers: vec![McpServerSpec {
@@ -3511,6 +3547,12 @@ mod tests {
     /// http/sse MCP transports map to claude's `{type,url,headers}` entry shape.
     #[test]
     fn build_claude_mcp_config_http_carries_type_and_headers() {
+        assert!(
+            crate::backend::backend_capability_descriptor("claude")
+                .unwrap()
+                .mcp
+                .streamable_http
+        );
         let json_str = build_claude_mcp_config(&[McpServerSpec {
             name: "api".into(),
             transport: McpTransport::Http {
@@ -3523,6 +3565,27 @@ mod tests {
         assert_eq!(json["mcpServers"]["api"]["type"], "http");
         assert_eq!(json["mcpServers"]["api"]["url"], "https://example.com/mcp");
         assert_eq!(json["mcpServers"]["api"]["headers"]["Authorization"], "Bearer x");
+    }
+
+    /// The official claude-code ACP adapter preserves SSE as a distinct
+    /// transport (`type: "sse"`); it must not be collapsed into HTTP.
+    /// verified: ~/.npm/_npx/ca6c9a6e3c4cc822/node_modules/
+    /// @agentclientprotocol/claude-agent-acp/dist/acp-agent.js:1872-1896
+    #[test]
+    fn build_claude_mcp_config_sse_carries_type_and_headers() {
+        assert!(crate::backend::backend_capability_descriptor("claude").unwrap().mcp.sse);
+        let json_str = build_claude_mcp_config(&[McpServerSpec {
+            name: "events".into(),
+            transport: McpTransport::Sse {
+                url: "https://example.com/events".into(),
+                headers: vec![("Authorization".into(), "Bearer x".into())],
+            },
+        }])
+        .expect("sse server -> some json");
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(json["mcpServers"]["events"]["type"], "sse");
+        assert_eq!(json["mcpServers"]["events"]["url"], "https://example.com/events");
+        assert_eq!(json["mcpServers"]["events"]["headers"]["Authorization"], "Bearer x");
     }
 
     /// SESS-INIT-17 (audit): duplicate MCP server NAMES collapse by construction.
@@ -4992,10 +5055,66 @@ mod tests {
         );
     }
 
+    /// A SetMode raised WHILE A TURN IS IN FLIGHT goes out IMMEDIATELY.
+    ///
+    /// It used to be queued until the next prompt, on the theory that a mid-turn control
+    /// write "would reinitialize the CLI session and TRUNCATE the in-flight turn". That
+    /// was the one live-behaviour claim in this file with no captured evidence, and a
+    /// 2.1.227 probe disproved it: switching mid-generation left the turn streaming to a
+    /// normal `result{success}` and took effect within that same turn, in both directions
+    /// (samples/claude-cli/2.1.227/set_permission_mode/, harness
+    /// scripts/probe-claude-set-permission-mode.py).
+    ///
+    /// Queueing was not merely a delay. `drain_pending_controls` runs only at the head of
+    /// `dispatch(Send)`, so a switch made mid-turn sat unsent until the user happened to
+    /// send another message — observed live as a permission change stuck "pending" for
+    /// 3+ minutes while the agent kept running under the OLD mode. For a TIGHTENING
+    /// switch that is a safety gap, not just a stale label.
+    ///
+    /// Scope is deliberately `set_permission_mode` only: `set_model` and
+    /// `apply_flag_settings` have no such capture, so they keep queueing (asserted by
+    /// the test below).
+    #[tokio::test]
+    async fn set_mode_mid_turn_is_written_immediately() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
+
+        // First Send → turn_in_flight = true (no terminal ever arrives here).
+        backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("first".into())],
+                metadata: CommandMeta::default(),
+            })
+            .await
+            .expect("first Send accepted");
+
+        backend
+            .dispatch(Command::SetMode { mode: "plan".into() })
+            .await
+            .expect("SetMode accepted");
+
+        let mut written = String::new();
+        for _ in 0..40 {
+            written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+            if written.contains("set_permission_mode") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            written.contains("set_permission_mode") && written.contains("\"mode\":\"plan\""),
+            "a mid-turn mode switch must reach the CLI without waiting for the next prompt, got: {written}"
+        );
+    }
+
     /// G2: a SetModel issued WHILE A TURN IS IN FLIGHT is QUEUED (not written
     /// mid-turn, which would truncate the turn) and drained over stdin BEFORE the
     /// next prompt — so the switch applies to the next turn. Proves the queue +
     /// drain ordering: the control_request bytes precede the next user prompt bytes.
+    ///
+    /// Unlike `set_permission_mode` (see above), set_model's mid-turn behaviour has NOT
+    /// been captured, so it keeps the conservative queue.
     #[tokio::test]
     async fn set_model_mid_turn_is_queued_and_drained_before_next_prompt() {
         let fake = FakeAgentIo::never_exits(Vec::new());
@@ -5939,10 +6058,14 @@ mod tests {
     /// sniff_mode: claude's AUTHORITATIVE mode signal is `permissionMode` on a
     /// `system/status` frame — emitted for BOTH a user-driven set AND an autonomous
     /// change (plan-exit). The reader adopts it (normal→default) as current_mode AND
-    /// emits ConfigChanged{mode} (design §9.10.1 option A; README #10). Wire shape from
-    /// protocols/samples/claude-cli/2.1.187/_all_autonomous_mode.jsonl (autonomous
-    /// plan-exit emitted exactly this system/status). MUTATION-PROVEN by the autonomous
-    /// scenario: without sniff_mode the autonomous mode change is silently dropped.
+    /// emits ConfigChanged{mode} (design §9.10.1 option A; README #10).
+    ///
+    /// This case uses a SYNTHETIC frame because `normal` (claude's internal name for our
+    /// `default`) is the one value the 2.1.227 capture never produced; the real-wire
+    /// counterpart is `sniff_mode_handles_real_capture_status_frames` below.
+    ///
+    /// NOTE: this doc used to cite samples/claude-cli/2.1.187/_all_autonomous_mode.jsonl,
+    /// which no longer exists on disk (only 2.1.221/226/227/228 remain).
     #[tokio::test]
     async fn sniff_mode_emits_config_changed_from_system_status() {
         // `normal` is claude's internal name for our `default` — covers the mapping too.
@@ -5970,6 +6093,64 @@ mod tests {
             backend.capabilities().current_mode.as_deref(),
             Some("default"),
             "the inbound applied mode becomes the authoritative current_mode"
+        );
+    }
+
+    /// The same path, driven by REAL captured bytes rather than a hand-written frame.
+    ///
+    /// Frames copied verbatim from
+    /// samples/claude-cli/2.1.227/set_permission_mode/s5.inbound.jsonl (a
+    /// `set_permission_mode` issued mid-generation; harness:
+    /// scripts/probe-claude-set-permission-mode.py). This matters because the real
+    /// stream interleaves a SECOND kind of `system/status` — `{"status":"requesting"}`
+    /// with NO `permissionMode` at all — which a synthetic single-frame test never
+    /// exercises. Reading such a frame as a mode change would hand the picker a bogus
+    /// value; the guard that prevents it has no other coverage.
+    ///
+    /// Also pins the two facts the capture established: a USER-DRIVEN set really does
+    /// emit `system/status{permissionMode}` (so this confirmation path is live, not
+    /// dead code), and the switch is confirmed while the turn is still streaming.
+    #[tokio::test]
+    async fn sniff_mode_handles_real_capture_status_frames() {
+        // All three `system/status` frames of that capture, in wire order. The trailing
+        // `requesting` one is the load-bearing case: it arrives AFTER the mode was
+        // confirmed, so a reader that mistook it for a mode change would drop the
+        // picker back to nothing.
+        let captured = concat!(
+            r#"{"type": "system", "subtype": "status", "status": "requesting", "uuid": "a2e3fd0c-bf39-41ac-a01f-716392d7b9b1", "session_id": "b1f38ca8-789b-4598-ba55-d96ea7e603d5"}"#,
+            "\n",
+            r#"{"type": "system", "subtype": "status", "status": null, "permissionMode": "acceptEdits", "uuid": "ebf5aac3-1de6-405f-bb23-95cbb75671af", "session_id": "b1f38ca8-789b-4598-ba55-d96ea7e603d5"}"#,
+            "\n",
+            r#"{"type": "system", "subtype": "status", "status": "requesting", "uuid": "3460b839-35bd-45e7-83b7-f79a9637ce57", "session_id": "b1f38ca8-789b-4598-ba55-d96ea7e603d5"}"#,
+            "\n",
+        );
+        let backend =
+            ClaudeSessionBackend::build_with_io("s", Box::new(FakeAgentIo::never_exits(captured.as_bytes().to_vec())))
+                .await;
+        let mut events = backend.events();
+
+        // Collect until the stream goes quiet rather than stopping at the first event:
+        // the point of the trailing frame is that it must produce NO second event, which
+        // an early return could never observe.
+        let mut confirmations: Vec<Option<String>> = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(800), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::ConfigChanged { mode, .. } = env.event {
+                    confirmations.push(mode);
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            confirmations,
+            vec![Some("acceptEdits".to_string())],
+            "exactly one confirmation, carrying the applied mode: the two `requesting` \
+             frames carry no permissionMode and must be ignored"
+        );
+        assert_eq!(
+            backend.capabilities().current_mode.as_deref(),
+            Some("acceptEdits"),
+            "a later status frame WITHOUT permissionMode must not disturb the applied mode"
         );
     }
 

@@ -60,6 +60,7 @@ pub struct AppServices {
     pub skill_paths: Arc<aionui_extension::SkillPaths>,
     /// User skill metadata and import history repository.
     pub skill_repo: Arc<dyn ISkillRepository>,
+    backend_binary_path: Arc<PathBuf>,
     runtime_helper_bin: String,
     runtime_base_url: String,
     /// Shared with the Antigravity hook endpoint so it can authenticate callbacks.
@@ -73,6 +74,10 @@ impl AppServices {
 
     pub(crate) fn runtime_base_url(&self) -> String {
         self.runtime_base_url.clone()
+    }
+
+    pub(crate) fn backend_binary_path(&self) -> Arc<PathBuf> {
+        self.backend_binary_path.clone()
     }
 
     /// Replace the worker task manager after construction.
@@ -99,6 +104,21 @@ impl AppServices {
     }
 
     pub async fn from_config(database: Database, config: &AppConfig) -> anyhow::Result<Self> {
+        let backend_binary_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("aioncore"));
+        Self::from_config_with_backend_binary_path(database, config, backend_binary_path).await
+    }
+
+    /// Construct application services with an explicitly resolved backend binary.
+    ///
+    /// Runtime entry points should use [`Self::from_config`]. This variant lets
+    /// integration tests run the real `aioncore` MCP/helper subcommands instead
+    /// of accidentally respawning the test harness returned by `current_exe()`.
+    pub async fn from_config_with_backend_binary_path(
+        database: Database,
+        config: &AppConfig,
+        backend_binary_path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let backend_binary_path = backend_binary_path.canonicalize().unwrap_or(backend_binary_path);
         let data_dir = config.data_dir.clone();
         let work_dir = config.work_dir.clone();
         let identity_mode = config.effective_identity_mode();
@@ -210,8 +230,7 @@ impl AppServices {
         // Absolute path to this process's binary. Reused as the `command` for
         // the stdio MCP bridge spawned by ACP CLIs when a team session is
         // attached to a conversation (phase1 mcp.md §4.6 single-binary model).
-        let backend_binary_path =
-            Arc::new(std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("aioncore")));
+        let backend_binary_path = Arc::new(backend_binary_path);
         let runtime_helper_bin = backend_binary_path.to_string_lossy().into_owned();
         let runtime_base_url = config.local_base_url();
         let antigravity_hook_tokens = Arc::new(aionui_ai_agent::antigravity_hook::HookTokenRegistry::new());
@@ -305,6 +324,7 @@ impl AppServices {
             app_version,
             skill_paths,
             skill_repo,
+            backend_binary_path,
             runtime_helper_bin,
             runtime_base_url,
         })
