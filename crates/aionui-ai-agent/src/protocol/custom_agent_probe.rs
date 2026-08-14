@@ -17,6 +17,8 @@ use std::time::Duration;
 
 use aionui_api_types::{AgentHandshake, TryConnectCustomAgentResponse};
 use aionui_common::{CommandSpec, EnvVar};
+
+use crate::protocol::acp_init_budget::{INIT_TIMEOUT_SECS, InitBudget};
 use aionui_runtime::{NodeRuntimeProgressReporter, ResolvedCommand, ensure_runtime_command_with_reporter};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, warn};
@@ -194,8 +196,14 @@ async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
     // Race the ACP initialize handshake against the child process exiting.
     // A misconfigured CLI (e.g. an invalid package launcher command) exits
     // almost immediately with a non-zero status; without this race the
-    // `AcpProtocol::connect` call would block on its internal 30 s
-    // timeout waiting for an `initialize` reply that will never arrive.
+    // `AcpProtocol::connect` call would block on its whole initialize budget
+    // waiting for an `initialize` reply that will never arrive.
+    //
+    // The probe passes the steady-state budget rather than deriving a
+    // cold-start one: the caller already caps this handshake at
+    // `STEP2_TIMEOUT`, so a longer inner budget could never elapse. Keeping
+    // the inner budget strictly below that cap also preserves which timeout
+    // reports the failure — the inner one, as `InitTimeout`.
     let connect = AcpProtocol::connect(
         stdin,
         stdout,
@@ -204,6 +212,10 @@ async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
         notification_tx,
         "custom-agent-probe",
         None,
+        InitBudget {
+            timeout: Duration::from_secs(INIT_TIMEOUT_SECS),
+            cold_start: false,
+        },
     );
     let protocol = tokio::select! {
         biased;

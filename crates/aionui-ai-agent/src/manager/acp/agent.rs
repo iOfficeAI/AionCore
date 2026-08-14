@@ -249,6 +249,7 @@ async fn spawn_and_connect_acp_once(
         notification_tx,
         &params.conversation_id,
         Some(std::path::PathBuf::from(&params.workspace.path)),
+        crate::protocol::acp_init_budget::init_budget(&params.command_spec),
     );
     tokio::pin!(connect_fut);
     let protocol = tokio::select! {

@@ -47,6 +47,7 @@ use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 use tracing::{debug, info, warn};
 
 use crate::protocol::acp_dialect;
+use crate::protocol::acp_init_budget::InitBudget;
 use crate::protocol::error::AcpError;
 use crate::protocol::events::{self as stream_event, AgentStreamEvent};
 
@@ -68,11 +69,9 @@ fn build_legacy_set_model_params(session_id: &str, model_id: &str) -> serde_json
     serde_json::json!({ "sessionId": session_id, "modelId": model_id })
 }
 
-/// Timeout for the ACP initialize handshake (seconds).
-const INIT_TIMEOUT_SECS: u64 = 30;
-
 /// Timeout for the short config/mode/model RPCs (seconds). Intentionally
-/// shorter than INIT_TIMEOUT_SECS; a dropped/absent response self-heals via retry.
+/// shorter than every `initialize` budget in [`acp_init_budget`]; a
+/// dropped/absent response self-heals via retry.
 const CONFIG_RPC_TIMEOUT_SECS: u64 = 10;
 
 /// Client identity reported in the ACP `initialize` handshake (`clientInfo`).
@@ -170,6 +169,11 @@ impl AcpProtocol {
     /// Takes ownership of the child's stdin/stdout (from [`CliAgentProcess::take_stdio`]).
     /// Spawns the SDK background task for JSON-RPC message routing.
     /// Returns after the initialize handshake completes successfully.
+    ///
+    /// `init_budget` bounds the handshake. It is passed in rather than read
+    /// here because only the caller knows whether this launch still has to
+    /// install its package — see [`crate::protocol::acp_init_budget`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect(
         stdin: ChildStdin,
         stdout: ChildStdout,
@@ -178,12 +182,13 @@ impl AcpProtocol {
         notification_tx: mpsc::Sender<SessionNotification>,
         terminal_label: &str,
         terminal_cwd: Option<std::path::PathBuf>,
+        init_budget: InitBudget,
     ) -> Result<Self, AcpError> {
         let alive = Arc::new(AtomicBool::new(true));
         let replay_suppression = Arc::new(AtomicBool::new(false));
         let terminal_registry = Arc::new(crate::terminal::TerminalRegistry::new(terminal_label, terminal_cwd));
         let started_at = std::time::Instant::now();
-        log_acp_initialize_start();
+        log_acp_initialize_start(init_budget);
 
         // Signals from the background task:
         // - `init_tx`: initialize handshake result (with possible SDK error)
@@ -211,8 +216,7 @@ impl AcpProtocol {
         ));
 
         // Wait for init to complete with timeout.
-        let init_response = match tokio::time::timeout(std::time::Duration::from_secs(INIT_TIMEOUT_SECS), init_rx).await
-        {
+        let init_response = match tokio::time::timeout(init_budget.timeout, init_rx).await {
             Ok(Ok(Ok(response))) => {
                 log_acp_initialize_success(started_at.elapsed().as_millis() as u64);
                 response
@@ -232,7 +236,7 @@ impl AcpProtocol {
             Err(_) => {
                 log_acp_initialize_failed("timeout", started_at.elapsed().as_millis() as u64);
                 return Err(AcpError::InitTimeout {
-                    timeout_secs: INIT_TIMEOUT_SECS,
+                    timeout_secs: init_budget.timeout.as_secs(),
                 });
             }
         };
@@ -1067,11 +1071,12 @@ fn string_pointer(value: &serde_json::Value, pointers: &[&str]) -> Option<String
         .map(str::to_owned)
 }
 
-fn log_acp_initialize_start() {
+fn log_acp_initialize_start(init_budget: InitBudget) {
     info!(
         target: "aionui_feedback_diagnostics",
         diagnostic_event = "feedback.runtime.acp_initialize_start",
-        timeout_secs = INIT_TIMEOUT_SECS,
+        timeout_secs = init_budget.timeout.as_secs(),
+        cold_start = init_budget.cold_start,
         "feedback.runtime.acp_initialize_start"
     );
 }
@@ -1415,7 +1420,7 @@ mod tests {
         use tracing::Level;
 
         let captured = capture_logs(Level::INFO, || {
-            super::log_acp_initialize_start();
+            super::log_acp_initialize_start(steady_state_budget());
             super::log_acp_initialize_success(123);
             super::log_acp_initialize_failed("timeout", 456);
         });
@@ -1431,8 +1436,34 @@ mod tests {
             "{captured}"
         );
         assert!(captured.contains("timeout_secs=30"), "{captured}");
+        assert!(captured.contains("cold_start=false"), "{captured}");
         assert!(captured.contains("failure_class=timeout"), "{captured}");
         assert!(captured.contains("elapsed_ms=456"), "{captured}");
+    }
+
+    fn steady_state_budget() -> crate::protocol::acp_init_budget::InitBudget {
+        crate::protocol::acp_init_budget::InitBudget {
+            timeout: std::time::Duration::from_secs(30),
+            cold_start: false,
+        }
+    }
+
+    /// A cold start must be visible in the diagnostic log: a 300s wait that
+    /// reads as an ordinary 30s one leaves "the agent hung" indistinguishable
+    /// from "the package is still downloading".
+    #[test]
+    fn acp_initialize_start_log_reports_the_cold_start_budget_it_actually_used() {
+        use tracing::Level;
+
+        let captured = capture_logs(Level::INFO, || {
+            super::log_acp_initialize_start(crate::protocol::acp_init_budget::InitBudget {
+                timeout: std::time::Duration::from_secs(300),
+                cold_start: true,
+            });
+        });
+
+        assert!(captured.contains("timeout_secs=300"), "{captured}");
+        assert!(captured.contains("cold_start=true"), "{captured}");
     }
 
     #[test]

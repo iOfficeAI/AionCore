@@ -41,7 +41,7 @@ fn computed_existing_npx_cache_entry(command_spec: &CommandSpec) -> Option<PathB
     Some(npx_cache_entry)
 }
 
-fn computed_npx_cache_entry(command_spec: &CommandSpec) -> Option<PathBuf> {
+pub(crate) fn computed_npx_cache_entry(command_spec: &CommandSpec) -> Option<PathBuf> {
     let npm_cache = command_spec_env(command_spec, "npm_config_cache")?;
     let packages = npx_package_specs(command_spec)?;
     let hash = npm_npx_cache_hash(&packages);
