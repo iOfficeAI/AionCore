@@ -2023,15 +2023,26 @@ impl ConversationService {
         } else {
             false
         };
+        let row_agent_type = parse_agent_type_from_row(&row);
         let mut response = row_to_response_with_extra(row, extra, &self.workspace_root)?;
         self.attach_assistant_identity(user_id, &mut response).await?;
         response.runtime = Some(self.runtime_summary_for(id).await);
         // Fork + prompt capabilities: detail-path-only post-fill (list stays
         // N+1-free). Best-effort — a lookup failure just hides the fork entry
-        // point / media hint.
-        if let Ok(Some(acp_row)) = self.acp_session_repo.get_for_user(user_id, id).await
+        // point / media hint. acp_session-backed agents resolve via their
+        // acp_session row; the builtin aionrs agent has no such row, so its
+        // identity comes from the assistant snapshot (same fallback fork()
+        // uses).
+        let capability_agent_id = match self.acp_session_repo.get_for_user(user_id, id).await {
+            Ok(Some(acp_row)) => Some(acp_row.agent_id),
+            Ok(None) if row_agent_type == Some(AgentType::Aionrs) => {
+                self.aionrs_capability_agent_id(user_id, id).await.ok()
+            }
+            _ => None,
+        };
+        if let Some(agent_id) = capability_agent_id
             && let Ok(capabilities) = self
-                .agent_capabilities_for_agent(user_id, &acp_row.agent_id, &response.extra.to_string())
+                .agent_capabilities_for_agent(user_id, &agent_id, &response.extra.to_string())
                 .await
         {
             response.fork_capability = capabilities.as_ref().and_then(fork_capability_view);
@@ -2530,9 +2541,12 @@ impl ConversationService {
     /// backend session id into `extra.fork`, creates the new row (same
     /// workspace — claude keys on-disk sessions by cwd), copies the visible
     /// history, and returns. The BACKEND session materializes lazily on the
-    /// fork's first open (`SessionSpec::Fork` / ACP `session/fork`); the
-    /// frontend calls `POST {new_id}/runtime/ensure` right after to surface
-    /// fork failures eagerly.
+    /// fork's first open (`SessionSpec::Fork` / ACP `session/fork` / for the
+    /// builtin aionrs agent, `SessionManager::fork_from` in the aionrs
+    /// factory — its session store is keyed by conversation id, so the parent
+    /// conversation id is the session anchor and no acp_session row exists);
+    /// the frontend calls `POST {new_id}/runtime/ensure` right after to
+    /// surface fork failures eagerly.
     ///
     /// Error contract (stable `reason` prefixes the frontend maps to i18n):
     /// 403 team / 404 conversation or message / 409 `FORK_TURN_IN_FLIGHT`,
@@ -2564,25 +2578,41 @@ impl ConversationService {
             });
         }
 
-        // Capability gate + parent session anchor, both from the acp_session
-        // row (claude/codex/ACP all share it; other agent types have none).
+        // Capability gate + parent session anchor. acp_session-backed agents
+        // (claude/codex/ACP) carry both on their acp_session row. The builtin
+        // aionrs agent owns no acp_session row: its session store is keyed by
+        // conversation id (the aionrs factory loads
+        // `SessionManager::load(<conversation_id>)`), so the parent
+        // conversation id IS the session anchor, and the agent identity comes
+        // from the assistant snapshot.
         let acp_row = self
             .acp_session_repo
             .get_for_user(user_id, id)
             .await
-            .map_err(|e| ConversationError::internal(format!("acp_session lookup: {e}")))?
-            .ok_or_else(|| ConversationError::Unprocessable {
-                reason: "FORK_UNSUPPORTED: this conversation type cannot be forked".into(),
-            })?;
+            .map_err(|e| ConversationError::internal(format!("acp_session lookup: {e}")))?;
+        let (capability_agent_id, parent_session_id) = match &acp_row {
+            Some(acp_row) => {
+                let session_id = acp_row.session_id.clone().ok_or_else(|| ConversationError::Busy {
+                    reason: "FORK_PARENT_UNBOUND: the conversation has no backend session to fork yet".into(),
+                })?;
+                (acp_row.agent_id.clone(), session_id)
+            }
+            None if parse_agent_type_from_row(&parent) == Some(AgentType::Aionrs) => {
+                let agent_id = self.aionrs_capability_agent_id(user_id, id).await?;
+                (agent_id, id.to_owned())
+            }
+            None => {
+                return Err(ConversationError::Unprocessable {
+                    reason: "FORK_UNSUPPORTED: this conversation type cannot be forked".into(),
+                });
+            }
+        };
         let fork_capability = self
-            .fork_capability_for_agent(user_id, &acp_row.agent_id, &parent.extra)
+            .fork_capability_for_agent(user_id, &capability_agent_id, &parent.extra)
             .await?
             .ok_or_else(|| ConversationError::Unprocessable {
                 reason: "FORK_UNSUPPORTED: this agent does not support session forking".into(),
             })?;
-        let parent_session_id = acp_row.session_id.clone().ok_or_else(|| ConversationError::Busy {
-            reason: "FORK_PARENT_UNBOUND: the conversation has no backend session to fork yet".into(),
-        })?;
 
         // Fork point: must be a message of the PARENT conversation. Cursor is
         // the display sort key (created_at, id), endpoint inclusive.
@@ -2725,31 +2755,34 @@ impl ConversationService {
         // acp_session row: same agent identity, session_id NULL ("fork
         // pending" — the first open materializes it); mode/model seeded from
         // the parent's live runtime state so the fork opens with the same
-        // selections.
-        let params = CreateAcpSessionParams {
-            user_id,
-            conversation_id: &new_id,
-            agent_source: &acp_row.agent_source,
-            agent_id: &acp_row.agent_id,
-        };
-        self.acp_session_repo
-            .create(&params)
-            .await
-            .map_err(|e| ConversationError::internal(format!("Failed to create acp_session row: {e}")))?;
-        if let Ok(Some(state)) = self.acp_session_repo.load_runtime_state_for_user(user_id, id).await {
-            let seed = SaveRuntimeStateParams {
-                current_mode_id: state.current_mode_id.as_deref().map(Some),
-                current_model_id: state.current_model_id.as_deref().map(Some),
-                config_selections_json: None,
-                context_usage_json: None,
+        // selections. aionrs conversations own no acp_session row (parity
+        // with create()): their fork materializes from `extra.fork` alone.
+        if let Some(acp_row) = &acp_row {
+            let params = CreateAcpSessionParams {
+                user_id,
+                conversation_id: &new_id,
+                agent_source: &acp_row.agent_source,
+                agent_id: &acp_row.agent_id,
             };
-            if (seed.current_mode_id.is_some() || seed.current_model_id.is_some())
-                && let Err(err) = self
-                    .acp_session_repo
-                    .save_runtime_state_for_user(user_id, &new_id, &seed)
-                    .await
-            {
-                warn!(error = %ErrorChain(&err), "fork: failed to seed runtime state (non-fatal)");
+            self.acp_session_repo
+                .create(&params)
+                .await
+                .map_err(|e| ConversationError::internal(format!("Failed to create acp_session row: {e}")))?;
+            if let Ok(Some(state)) = self.acp_session_repo.load_runtime_state_for_user(user_id, id).await {
+                let seed = SaveRuntimeStateParams {
+                    current_mode_id: state.current_mode_id.as_deref().map(Some),
+                    current_model_id: state.current_model_id.as_deref().map(Some),
+                    config_selections_json: None,
+                    context_usage_json: None,
+                };
+                if (seed.current_mode_id.is_some() || seed.current_model_id.is_some())
+                    && let Err(err) = self
+                        .acp_session_repo
+                        .save_runtime_state_for_user(user_id, &new_id, &seed)
+                        .await
+                {
+                    warn!(error = %ErrorChain(&err), "fork: failed to seed runtime state (non-fatal)");
+                }
             }
         }
 
@@ -2770,6 +2803,31 @@ impl ConversationService {
         response.fork_capability = Some(fork_capability);
         self.broadcast_list_changed(user_id, &new_id, "created", response.source.as_ref());
         Ok(response)
+    }
+
+    /// Agent identity owning capability metadata for an aionrs conversation
+    /// (which has no acp_session row): the assistant snapshot's agent binding
+    /// when present, else the builtin Aion CLI row resolved through the
+    /// standard id/backend/agent_type binding ladder (aionrs's backend column
+    /// is NULL, so it resolves by agent_type).
+    async fn aionrs_capability_agent_id(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<String, ConversationError> {
+        if let Some(snapshot) = self
+            .conversation_repo
+            .get_assistant_snapshot(user_id, conversation_id)
+            .await?
+            && !snapshot.agent_id.trim().is_empty()
+        {
+            return Ok(snapshot.agent_id);
+        }
+        Ok(self
+            .resolve_assistant_agent_binding(user_id, "aionrs")
+            .await?
+            .map(|binding| binding.agent_id)
+            .unwrap_or_default())
     }
 
     /// Resolve the fork capability for an agent from

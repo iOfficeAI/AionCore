@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.66](https://github.com/iOfficeAI/AionCore/compare/v0.1.65...v0.1.66) (2026-08-13)
+
+
+### Features
+
+* **conversation:** support forking aionrs conversations ([6e04e74](https://github.com/iOfficeAI/AionCore/commit/6e04e741c42425072a8296fdacd95e5d1261d4d7))
+* **conversation:** support forking aionrs conversations ([4b09341](https://github.com/iOfficeAI/AionCore/commit/4b0934145b46f208d75f63e14dfb190dd4fb06b8))
+
+
+### Bug Fixes
+
+* **session:** retry claude session-title generation with timeout and observability ([#843](https://github.com/iOfficeAI/AionCore/issues/843)) ([c59e937](https://github.com/iOfficeAI/AionCore/commit/c59e937a0cc49327a6756c32fb77213e1abe2224))
+
 ## [0.1.65](https://github.com/iOfficeAI/AionCore/compare/v0.1.64...v0.1.65) (2026-08-12)
 
 
