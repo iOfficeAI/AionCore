@@ -62,8 +62,7 @@ jobs:
 
   # L1 cloud verification for DeepSeek Harness managed runtime install:
   # prove the embedded npm lock installs and the ACP entrypoint is present.
-  # Does not call the DeepSeek API (no secrets). L2 (agent online + tool call)
-  # requires DEEPSEEK_API_KEY and remains a separate workflow.
+  # Does not call the DeepSeek API (no secrets).
   deepseek-harness-l1:
     name: DeepSeek Harness L1 Install
     runs-on: ubuntu-latest
@@ -76,6 +75,21 @@ jobs:
           cache-dependency-path: crates/aionui-runtime/resources/deepseek-harness/package-lock.json
       - name: Smoke managed DeepSeek Harness install
         run: node scripts/smoke-deepseek-harness-install.mjs
+
+  # Host-side harness protocol helpers. No DeepSeek API key; this is
+  # permission/tool-event contract coverage, not a live model call.
+  deepseek-harness-helpers:
+    name: DeepSeek Harness Protocol Helpers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check protocol helpers
+        run: node --test scripts/smoke-deepseek-harness-l2.test.mjs
+      - name: Self-check
+        run: node scripts/smoke-deepseek-harness-l2.mjs
 
   changes:
     name: Detect dependency changes
