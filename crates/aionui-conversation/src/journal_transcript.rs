@@ -216,10 +216,8 @@ fn compact_old_tool_results(items: &mut [DraftItem]) {
     let prune_end = tool_indexes.len().saturating_sub(KEEP_RECENT_TOOL_RESULTS);
     for &index in &tool_indexes[..prune_end] {
         let item = &mut items[index];
-        if item.content != item.summary {
-            item.content = item.summary.clone();
-            item.compacted = true;
-        }
+        item.content = item.summary.clone();
+        item.compacted = true;
     }
 }
 
@@ -418,12 +416,13 @@ mod tests {
     fn older_tool_results_compact_to_summary_and_recent_ones_stay_full() {
         let events: Vec<_> = (1..=4)
             .map(|sequence| {
+                let output = format!("{}-{sequence}", "x".repeat(SUMMARY_CHAR_LIMIT + 8));
                 event(
                     sequence,
                     "ToolCall",
                     serde_json::json!({
                         "type": "tool_call",
-                        "data": { "name": format!("tool-{sequence}"), "output": format!("full output {sequence}") }
+                        "data": { "name": format!("tool-{sequence}"), "output": output }
                     }),
                 )
             })
@@ -432,10 +431,11 @@ mod tests {
         assert_eq!(model.items.len(), 4);
         assert!(model.items[0].compacted);
         assert_eq!(model.items[0].content, model.items[0].summary);
-        assert_eq!(model.items[0].summary, "full output 1");
+        assert!(model.items[0].summary.ends_with('…'));
+        assert!(model.items[0].summary.chars().count() < SUMMARY_CHAR_LIMIT + 8);
         for item in &model.items[1..] {
             assert!(!item.compacted);
-            assert!(item.content.starts_with("full output "));
+            assert!(item.content.len() > SUMMARY_CHAR_LIMIT);
         }
     }
 
