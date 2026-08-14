@@ -391,7 +391,7 @@ impl TeamStdioServer {
 
     #[tool(
         name = "team_clear_agent_context",
-        description = "Clear a team member's backend conversation context while preserving team membership, settings, and visible chat history. Lead only."
+        description = "Start a fresh backend context for a teammate while preserving team membership, settings, visible chat history, tasks, files, and unread mailbox messages. Lead only."
     )]
     async fn clear_agent_context(&self, Parameters(params): Parameters<ClearAgentContextParams>) -> CallToolResult {
         self.forward_to_tcp(

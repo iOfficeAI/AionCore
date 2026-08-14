@@ -1272,15 +1272,18 @@ async fn exec_clear_agent_context(
         .team_owner_user_id(team_id)
         .await
         .map_err(|error| ToolCallError::from_message(error.to_string()))?;
-    service
+    let outcome = service
         .clear_agent_context_in_session(&user_id, team_id, &target_slot_id)
         .await
         .map_err(|error| ToolCallError::from_message(error.to_string()))?;
 
     json_text(&json!({
         "status": "ok",
-        "action": "agent_context_cleared",
+        "action": "agent_context_reset",
         "target_slot_id": target_slot_id,
+        "reset_status": outcome.reset_status,
+        "runtime_status": outcome.runtime_status,
+        "preserved_unread_count": outcome.preserved_unread_count,
     }))
 }
 
