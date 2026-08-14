@@ -28,7 +28,7 @@ use crate::runtime_status::conversation_runtime_reporter;
 /// talks: the frontend renders every non-aionrs agent through the ACP chat
 /// surface, so the backend label is the only thing that says which runtime a
 /// row really needs.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackendRoute {
     /// claude/codex — direct-CLI via `build_session_instance`.
     DirectCli,
@@ -38,12 +38,25 @@ pub(crate) enum BackendRoute {
     AcpManager,
 }
 
+const CONFIGURED_NON_ACP_ROUTES: &[(&str, BackendRoute)] = &[
+    ("antigravity", BackendRoute::Antigravity),
+    ("claude", BackendRoute::DirectCli),
+    ("codex", BackendRoute::DirectCli),
+];
+
+fn configured_non_acp_routes() -> &'static [(&'static str, BackendRoute)] {
+    CONFIGURED_NON_ACP_ROUTES
+}
+
 pub(crate) fn route_for_backend(backend: Option<&str>) -> BackendRoute {
-    match backend {
-        Some("antigravity") => BackendRoute::Antigravity,
-        Some("claude" | "codex") => BackendRoute::DirectCli,
-        _ => BackendRoute::AcpManager,
-    }
+    backend
+        .and_then(|backend| {
+            configured_non_acp_routes()
+                .iter()
+                .find(|(registered, _)| *registered == backend)
+                .map(|(_, route)| *route)
+        })
+        .unwrap_or(BackendRoute::AcpManager)
 }
 
 pub(super) async fn build(
@@ -1213,6 +1226,37 @@ mod tests {
     fn claude_and_codex_keep_the_direct_cli_route() {
         assert_eq!(route_for_backend(Some("claude")), BackendRoute::DirectCli);
         assert_eq!(route_for_backend(Some("codex")), BackendRoute::DirectCli);
+    }
+
+    #[test]
+    fn every_registered_direct_descriptor_has_a_non_acp_factory_route() {
+        for descriptor in aionui_session::backend_capability_descriptors()
+            .iter()
+            .filter(|descriptor| descriptor.origin == aionui_common::CapabilityOrigin::DirectDescriptor)
+        {
+            assert_ne!(
+                route_for_backend(Some(descriptor.backend_id)),
+                BackendRoute::AcpManager,
+                "direct backend {} has a capability descriptor but no direct factory route; register its runtime before declaring the descriptor",
+                descriptor.backend_id
+            );
+        }
+    }
+
+    #[test]
+    fn every_non_acp_factory_route_has_a_direct_descriptor() {
+        for (backend, _) in configured_non_acp_routes() {
+            let descriptor = aionui_session::backend_capability_descriptor(backend).unwrap_or_else(|| {
+                panic!(
+                    "direct factory backend {backend} has no capability descriptor; register its verified capabilities before routing it outside ACP"
+                )
+            });
+            assert_eq!(
+                descriptor.origin,
+                aionui_common::CapabilityOrigin::DirectDescriptor,
+                "non-ACP factory backend {backend} must use a direct capability descriptor"
+            );
+        }
     }
 
     #[test]

@@ -31,7 +31,10 @@ pub use codex_conn::{
     CodexConnection, CodexSessionBackend, codex_capabilities, codex_shell_environment_policy_args, slash_command_name,
 };
 pub use conversation_session::{ConversationSession, MsgStatus, PendingMessage};
-pub use descriptor::{BackendCapabilityDescriptor, backend_capability_descriptor, effective_agent_capabilities};
+pub use descriptor::{
+    BackendCapabilityDescriptor, backend_capability_descriptor, backend_capability_descriptors,
+    effective_agent_capabilities,
+};
 pub use orchestrator::Orchestrator;
 pub use rehydrate::rehydrate;
 // `suspend::{SuspendController, ProcHandle, spawn_idle_timer}` is the F-4 idle

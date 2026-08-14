@@ -40,75 +40,86 @@ impl BackendCapabilityDescriptor {
     }
 }
 
+const BACKEND_CAPABILITY_DESCRIPTORS: &[BackendCapabilityDescriptor] = &[
+    // verified: ~/.npm/_npx/ca6c9a6e3c4cc822/node_modules/
+    // @agentclientprotocol/claude-agent-acp/dist/acp-agent.js:1872-1898
+    BackendCapabilityDescriptor {
+        backend_id: "claude",
+        mcp: McpTransportCapabilities {
+            stdio: true,
+            sse: true,
+            streamable_http: true,
+        },
+        cli_fallback: true,
+        verified_version: VERIFIED_CLAUDE_VERSION,
+        origin: CapabilityOrigin::DirectDescriptor,
+        prompt: Some(PromptCapabilities {
+            image: true,
+            audio: false,
+        }),
+        fork: Some(ForkCapabilities { at_turn: false }),
+    },
+    // verified: `codex mcp add --help` declares command-based stdio and
+    // `--url` streamable HTTP, and does not declare SSE.
+    BackendCapabilityDescriptor {
+        backend_id: "codex",
+        mcp: McpTransportCapabilities {
+            stdio: true,
+            sse: false,
+            streamable_http: true,
+        },
+        cli_fallback: true,
+        verified_version: VERIFIED_CODEX_VERSION,
+        origin: CapabilityOrigin::DirectDescriptor,
+        prompt: Some(PromptCapabilities {
+            image: true,
+            audio: false,
+        }),
+        fork: Some(ForkCapabilities { at_turn: true }),
+    },
+    // verified: ~/.gemini/antigravity-cli/builtin/skills/
+    // agy-customizations/docs/mcp_servers.md
+    BackendCapabilityDescriptor {
+        backend_id: "antigravity",
+        mcp: McpTransportCapabilities {
+            stdio: true,
+            sse: true,
+            streamable_http: false,
+        },
+        cli_fallback: true,
+        verified_version: VERIFIED_AGY_VERSION,
+        origin: CapabilityOrigin::DirectDescriptor,
+        prompt: None,
+        fork: None,
+    },
+    BackendCapabilityDescriptor {
+        backend_id: "aionrs",
+        mcp: McpTransportCapabilities {
+            stdio: true,
+            sse: false,
+            streamable_http: false,
+        },
+        cli_fallback: false,
+        verified_version: env!("CARGO_PKG_VERSION"),
+        origin: CapabilityOrigin::InternalDescriptor,
+        prompt: None,
+        fork: Some(ForkCapabilities { at_turn: true }),
+    },
+];
+
+/// Enumerate every backend whose capabilities are constructed in-process.
+/// Contract tests consume this registry so a new entry automatically exercises
+/// lookup, projection, and Team resolver behavior.
+pub fn backend_capability_descriptors() -> &'static [BackendCapabilityDescriptor] {
+    BACKEND_CAPABILITY_DESCRIPTORS
+}
+
 /// Return a descriptor only when the backend has constructed capability data.
 pub fn backend_capability_descriptor(backend: &str) -> Option<BackendCapabilityDescriptor> {
-    match backend {
-        // verified: ~/.npm/_npx/ca6c9a6e3c4cc822/node_modules/
-        // @agentclientprotocol/claude-agent-acp/dist/acp-agent.js:1872-1898
-        "claude" => Some(BackendCapabilityDescriptor {
-            backend_id: "claude",
-            mcp: McpTransportCapabilities {
-                stdio: true,
-                sse: true,
-                streamable_http: true,
-            },
-            cli_fallback: true,
-            verified_version: VERIFIED_CLAUDE_VERSION,
-            origin: CapabilityOrigin::DirectDescriptor,
-            prompt: Some(PromptCapabilities {
-                image: true,
-                audio: false,
-            }),
-            fork: Some(ForkCapabilities { at_turn: false }),
-        }),
-        // verified: `codex mcp add --help` declares command-based stdio and
-        // `--url` streamable HTTP, and does not declare SSE.
-        "codex" => Some(BackendCapabilityDescriptor {
-            backend_id: "codex",
-            mcp: McpTransportCapabilities {
-                stdio: true,
-                sse: false,
-                streamable_http: true,
-            },
-            cli_fallback: true,
-            verified_version: VERIFIED_CODEX_VERSION,
-            origin: CapabilityOrigin::DirectDescriptor,
-            prompt: Some(PromptCapabilities {
-                image: true,
-                audio: false,
-            }),
-            fork: Some(ForkCapabilities { at_turn: true }),
-        }),
-        // verified: ~/.gemini/antigravity-cli/builtin/skills/
-        // agy-customizations/docs/mcp_servers.md
-        "antigravity" => Some(BackendCapabilityDescriptor {
-            backend_id: "antigravity",
-            mcp: McpTransportCapabilities {
-                stdio: true,
-                sse: true,
-                streamable_http: false,
-            },
-            cli_fallback: true,
-            verified_version: VERIFIED_AGY_VERSION,
-            origin: CapabilityOrigin::DirectDescriptor,
-            prompt: None,
-            fork: None,
-        }),
-        "aionrs" => Some(BackendCapabilityDescriptor {
-            backend_id: "aionrs",
-            mcp: McpTransportCapabilities {
-                stdio: true,
-                sse: false,
-                streamable_http: false,
-            },
-            cli_fallback: false,
-            verified_version: env!("CARGO_PKG_VERSION"),
-            origin: CapabilityOrigin::InternalDescriptor,
-            prompt: None,
-            fork: Some(ForkCapabilities { at_turn: true }),
-        }),
-        _ => None,
-    }
+    BACKEND_CAPABILITY_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.backend_id == backend)
+        .copied()
 }
 
 /// Overlay constructed fields onto persisted discovery data. Constructed false
@@ -170,7 +181,55 @@ pub fn effective_agent_capabilities(backend: &str, persisted: Option<&serde_json
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
+
+    #[test]
+    fn constructed_descriptor_registry_is_unique_and_drives_lookup() {
+        let descriptors = backend_capability_descriptors();
+        assert!(
+            !descriptors.is_empty(),
+            "constructed backend descriptor registry must not be empty"
+        );
+
+        let mut ids = HashSet::new();
+        for descriptor in descriptors {
+            assert!(
+                !descriptor.backend_id.trim().is_empty(),
+                "constructed backend descriptors require a stable backend id"
+            );
+            assert!(
+                !descriptor.verified_version.trim().is_empty(),
+                "constructed backend {} must record the version its contract was verified against",
+                descriptor.backend_id
+            );
+            assert!(
+                ids.insert(descriptor.backend_id),
+                "duplicate constructed backend descriptor for {}; keep one registry entry per backend",
+                descriptor.backend_id
+            );
+            assert_eq!(
+                backend_capability_descriptor(descriptor.backend_id),
+                Some(*descriptor),
+                "registered backend {} is not discoverable through the capability lookup",
+                descriptor.backend_id
+            );
+
+            let projected = effective_agent_capabilities(descriptor.backend_id, None).unwrap_or_else(|| {
+                panic!(
+                    "registered backend {} has no effective projection",
+                    descriptor.backend_id
+                )
+            });
+            assert_eq!(projected["mcp_capabilities"]["stdio"], descriptor.mcp.stdio);
+            assert_eq!(projected["mcp_capabilities"]["sse"], descriptor.mcp.sse);
+            assert_eq!(
+                projected["mcp_capabilities"]["streamable_http"],
+                descriptor.mcp.streamable_http
+            );
+        }
+    }
 
     #[test]
     fn direct_descriptor_matrix_matches_verified_adapter_contracts() {

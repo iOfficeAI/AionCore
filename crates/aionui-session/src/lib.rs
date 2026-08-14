@@ -60,8 +60,9 @@ pub use backend::{
     QuestionAnswer, SessionBackend, SessionConfig, SessionEnvelope, SessionInfoKind, SessionInit, SessionSpec,
     StateSnapshot, Tier2Checkpoint, TransitionReason, VERIFIED_AGY_VERSION, VERIFIED_CLAUDE_VERSION,
     VERIFIED_CODEX_VERSION, VersionDrift, VersionVerdict, acp_capabilities, antigravity_capabilities,
-    backend_capability_descriptor, classify_cli_version, codex_capabilities, codex_shell_environment_policy_args,
-    command_name, effective_agent_capabilities, parse_cli_version, rehydrate, slash_command_name, version_drift,
+    backend_capability_descriptor, backend_capability_descriptors, classify_cli_version, codex_capabilities,
+    codex_shell_environment_policy_args, command_name, effective_agent_capabilities, parse_cli_version, rehydrate,
+    slash_command_name, version_drift,
 };
 pub use capability::{
     BlockSet, Capabilities, CapabilityTier, CommandSet, ModeInfo, ModelInfo, PromptAcceptedSource, SignalSet,

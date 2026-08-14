@@ -141,8 +141,26 @@ mod tests {
         }
         let resolver = TeamCapabilityResolver::new(Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone())));
         let mut resolved = Vec::new();
-        for backend in ["claude", "codex", "antigravity"] {
-            resolved.push(resolver.resolve("system_default_user", backend, None).await.unwrap());
+        for descriptor in aionui_session::backend_capability_descriptors()
+            .iter()
+            .filter(|descriptor| descriptor.origin == CapabilityOrigin::DirectDescriptor)
+        {
+            let capabilities = resolver
+                .resolve("system_default_user", descriptor.backend_id, None)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "registered direct backend {} did not resolve its constructed capabilities: {error}",
+                        descriptor.backend_id
+                    )
+                });
+            assert_eq!(
+                capabilities,
+                descriptor.resolved(),
+                "registered direct backend {} bypassed its constructed descriptor",
+                descriptor.backend_id
+            );
+            resolved.push(capabilities);
         }
         resolved
     }
@@ -156,9 +174,9 @@ mod tests {
         assert_eq!(fresh, historical_true);
         assert_eq!(fresh, historical_false);
         assert!(
-            fresh.iter().all(|caps| {
-                caps.origin == CapabilityOrigin::DirectDescriptor && caps.mcp.stdio && caps.cli_fallback
-            })
+            fresh
+                .iter()
+                .all(|caps| caps.origin == CapabilityOrigin::DirectDescriptor)
         );
     }
 

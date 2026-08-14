@@ -1640,22 +1640,30 @@ mod tests {
     #[tokio::test]
     async fn direct_cli_metadata_projects_constructed_mcp_capabilities() {
         let reg = registry().await;
-        for (backend, sse, http) in [
-            ("claude", true, true),
-            ("codex", false, true),
-            ("antigravity", true, false),
-        ] {
-            let meta = reg.find_builtin_by_backend(backend).await.unwrap();
-            assert!(meta.team_capable, "{backend} descriptor makes it Team-selectable");
+        for descriptor in aionui_session::backend_capability_descriptors()
+            .iter()
+            .filter(|descriptor| descriptor.origin == aionui_common::CapabilityOrigin::DirectDescriptor)
+        {
+            let backend = descriptor.backend_id;
+            let meta = reg.find_builtin_by_backend(backend).await.unwrap_or_else(|| {
+                panic!(
+                    "direct backend {backend} has a capability descriptor but no builtin registry entry; register both together"
+                )
+            });
+            assert_eq!(
+                meta.team_capable,
+                descriptor.mcp.stdio || descriptor.cli_fallback,
+                "direct backend {backend} Team eligibility must come from its constructed descriptor"
+            );
             let mcp = meta
                 .handshake
                 .agent_capabilities
                 .as_ref()
                 .and_then(|caps| caps.get("mcp_capabilities"))
                 .unwrap_or_else(|| panic!("{backend} effective MCP projection"));
-            assert_eq!(mcp["stdio"], true, "{backend}");
-            assert_eq!(mcp["sse"], sse, "{backend}");
-            assert_eq!(mcp["http"], http, "{backend}");
+            assert_eq!(mcp["stdio"], descriptor.mcp.stdio, "{backend}");
+            assert_eq!(mcp["sse"], descriptor.mcp.sse, "{backend}");
+            assert_eq!(mcp["http"], descriptor.mcp.streamable_http, "{backend}");
         }
     }
 
