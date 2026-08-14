@@ -66,6 +66,13 @@ pub(crate) fn build_argv(input: &ArgvInput) -> Vec<String> {
     if let Some(id) = non_blank(&input.resume_conversation_id) {
         a.push("--conversation".into());
         a.push(id.to_owned());
+    } else {
+        // A fresh print invocation otherwise reuses agy's globally active
+        // project, so workspace plugins can be scanned from an unrelated cwd.
+        // `agy --help` 1.1.13 defines this flag as creating a project for the
+        // current CLI session; a real probe bound the primary workspace to cwd
+        // (verified: ~/.gemini/antigravity-cli/log/cli-20260814_144215.log:52,54,66).
+        a.push("--new-project".into());
     }
     if let Some(w) = non_blank(&input.workspace) {
         a.push("--add-dir".into());
@@ -116,6 +123,10 @@ mod tests {
         assert!(a.contains(&"hello".to_string()));
         assert_eq!(flag_value(&a, "--output-format"), Some("stream-json"));
         assert!(!a.contains(&"--conversation".to_string()));
+        assert!(
+            a.contains(&"--new-project".to_string()),
+            "a fresh agy turn must bind its primary customization workspace to the session cwd"
+        );
     }
 
     #[test]
@@ -196,6 +207,7 @@ mod tests {
         i.resume_conversation_id = Some("conv-9".into());
         let a = build_argv(&i);
         assert_eq!(flag_value(&a, "--conversation"), Some("conv-9"));
+        assert!(!a.contains(&"--new-project".to_string()));
     }
 
     #[test]

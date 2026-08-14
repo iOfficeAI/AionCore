@@ -45,11 +45,21 @@ async fn start_live_app() -> LiveApp {
 /// exists in the shared database and `setup_and_login` panics trying to create
 /// it again.
 async fn start_live_app_on(db: aionui_db::Database, create_user: bool) -> LiveApp {
-    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
-    let mut router = create_router(&services).await.expect("build router");
-
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let config = AppConfig {
+        port: addr.port(),
+        ..AppConfig::default()
+    };
+    let services = AppServices::from_config_with_backend_binary_path(
+        db,
+        &config,
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_aioncore")),
+    )
+    .await
+    .unwrap();
+    let mut router = create_router(&services).await.expect("build router");
+
     let serve_router = router.clone();
     tokio::spawn(async move {
         axum::serve(listener, serve_router).await.unwrap();
@@ -995,6 +1005,175 @@ async fn run_backend_mcp_provisioning(backend: &str) {
     record_frame_types(backend, &frames.lock().unwrap().clone());
 }
 
+/// Release-gate probe for direct CLI Team MCP plus tool-shell environment.
+///
+/// This deliberately requires a real `tools/call`, not merely MCP startup, and
+/// requires a real command-execution child to read the sentinel. A final text
+/// answer by itself is insufficient: the streamed tool cards must also name the
+/// Team MCP tool and a shell tool.
+async fn run_direct_backend_team_mcp_and_runtime_env(backend: &str, agent_id: &str) {
+    const SENTINEL: &str = "AIONUI_DIRECT_CLI_E2E_42";
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "aionui_app=info,aionui_ai_agent=info,aionui_session=info,aionui_team=info",
+        ))
+        .with_test_writer()
+        .try_init();
+    assert_eq!(
+        std::env::var("AIONUI_E2E_SENTINEL").as_deref(),
+        Ok(SENTINEL),
+        "run this ignored release gate with AIONUI_E2E_SENTINEL={SENTINEL}"
+    );
+
+    let app = start_live_app().await;
+    let suffix = aionui_common::now_ms();
+    let assistant_id = format!("live-team-{backend}-{suffix}");
+    let assistant = http_json(
+        &app,
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": assistant_id,
+            "name": format!("Live Team {backend}"),
+            "agent_id": agent_id,
+        }),
+    )
+    .await;
+    assert_eq!(
+        assistant["success"], true,
+        "[{backend}] assistant create failed: {assistant}"
+    );
+
+    let workspace = std::env::temp_dir().join(format!("live-team-{backend}-{suffix}"));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let created = http_json(
+        &app,
+        "POST",
+        "/api/teams",
+        json!({
+            "name": format!("Live {backend} Team"),
+            "workspace": workspace,
+            "agents": [{
+                "name": "Lead",
+                "role": "lead",
+                "model": "",
+                "assistant_id": assistant_id,
+            }]
+        }),
+    )
+    .await;
+    let team = &created["data"];
+    let team_id = team["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("[{backend}] team create failed: {created}"));
+    let conversation_id = team["assistants"][0]["conversation_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("[{backend}] team lead has no conversation: {created}"));
+
+    let ensured = http_json(&app, "POST", &format!("/api/teams/{team_id}/session"), json!({})).await;
+    assert_eq!(
+        ensured["success"], true,
+        "[{backend}] Team session ensure failed: {ensured}"
+    );
+
+    let messages_uri = format!("/api/teams/{team_id}/messages");
+    // Exercise the CLI fallback first. Besides proving the tool-child runtime
+    // environment on a fresh session, this establishes the vendor conversation
+    // anchor before the independent MCP assertion below.
+    let shell_frames = drive_and_collect_from_uri(
+        &app,
+        conversation_id,
+        &messages_uri,
+        "Now use your real shell/command-execution tool to run exactly: \
+         printf '{}\\n' | \"$AIONUI_HELPER_BIN\" team members >/dev/null && \
+         test \"$AIONUI_E2E_SENTINEL\" = \"AIONUI_DIRECT_CLI_E2E_42\" && echo AIONUI_ENV_OK. \
+         Only after the Team CLI fallback helper and sentinel check both succeed, reply with exactly: AIONUI_ENV_OK",
+        300,
+    )
+    .await;
+    let is_tool_frame = |frame: &&Value| {
+        matches!(
+            frame["data"]["type"].as_str(),
+            Some("tool_call") | Some("acp_tool_call")
+        )
+    };
+    let mcp_prompt = "Call the team_members MCP tool from the aionui-team MCP server now. \
+         Do not use AIONUI_HELPER_BIN or any CLI fallback for that call. \
+         Only after the MCP tool succeeds, reply with exactly: TEAM_MCP_OK";
+    let mut mcp_frames = Vec::new();
+    for _attempt in 0..3 {
+        mcp_frames.extend(drive_and_collect_from_uri(&app, conversation_id, &messages_uri, mcp_prompt, 300).await);
+        let evidence = serde_json::to_string(&mcp_frames.iter().filter(is_tool_frame).collect::<Vec<_>>()).unwrap();
+        if evidence.contains("team_members") {
+            break;
+        }
+    }
+
+    let mcp_tool_frames = mcp_frames.iter().filter(is_tool_frame).collect::<Vec<_>>();
+    let shell_tool_frames = shell_frames.iter().filter(is_tool_frame).collect::<Vec<_>>();
+    let tool_frames = mcp_tool_frames
+        .iter()
+        .chain(shell_tool_frames.iter())
+        .copied()
+        .collect::<Vec<_>>();
+    let mcp_tool_evidence = serde_json::to_string(&mcp_tool_frames).unwrap();
+    let shell_tool_evidence = serde_json::to_string(&shell_tool_frames).unwrap();
+    let tool_names = tool_frames
+        .iter()
+        .filter_map(|frame| {
+            frame["data"]["data"]["name"]
+                .as_str()
+                .or_else(|| frame["data"]["data"]["update"]["name"].as_str())
+        })
+        .collect::<BTreeSet<_>>();
+    assert!(
+        mcp_tool_evidence.contains("team_members"),
+        "[{backend}] no streamed Team MCP tools/call evidence; tool names={tool_names:?}"
+    );
+    assert!(
+        shell_tool_evidence.contains("AIONUI_HELPER_BIN")
+            && (shell_tool_evidence.contains("AIONUI_E2E_SENTINEL") || shell_tool_evidence.contains("AIONUI_ENV_OK")),
+        "[{backend}] no streamed shell/command-execution evidence for the Team CLI fallback and sentinel check; \
+         tool names={tool_names:?}"
+    );
+    let tool_call_ids = tool_frames
+        .iter()
+        .filter_map(|frame| {
+            frame["data"]["data"]["call_id"]
+                .as_str()
+                .or_else(|| frame["data"]["data"]["tool_call_id"].as_str())
+                .or_else(|| frame["data"]["data"]["update"]["tool_call_id"].as_str())
+        })
+        .collect::<BTreeSet<_>>();
+    assert!(
+        tool_call_ids.len() >= 2,
+        "[{backend}] expected distinct Team MCP and shell tool calls, got {tool_call_ids:?}; \
+         tool names={tool_names:?}"
+    );
+    let mcp_reply = mcp_frames
+        .iter()
+        .filter_map(|frame| match frame["data"]["type"].as_str() {
+            Some("text" | "content") => frame["data"]["data"]["content"].as_str(),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(
+        mcp_reply.contains("TEAM_MCP_OK"),
+        "[{backend}] MCP call failed; reply={mcp_reply:?}"
+    );
+    let shell_reply = shell_frames
+        .iter()
+        .filter_map(|frame| match frame["data"]["type"].as_str() {
+            Some("text" | "content") => frame["data"]["data"]["content"].as_str(),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(
+        shell_reply.contains("AIONUI_ENV_OK"),
+        "[{backend}] Team CLI fallback or tool-shell sentinel failed; reply={shell_reply:?}"
+    );
+}
+
 /// The approval card, actually raised and actually answered.
 ///
 /// The full-access test asserts a permission frame does NOT appear; nothing
@@ -1135,16 +1314,32 @@ fn record_frame_types(label: &str, frames: &[Value]) {
 }
 
 async fn drive_and_collect(app: &LiveApp, conv_id: &str, prompt: &str, timeout_s: u64) -> Vec<Value> {
-    let frames = connect_ws_recorder(app.addr, &app.token).await;
-    http_json(
+    drive_and_collect_from_uri(
         app,
-        "POST",
+        conv_id,
         &format!("/api/conversations/{conv_id}/messages"),
-        json!({ "content": prompt }),
+        prompt,
+        timeout_s,
     )
-    .await;
+    .await
+}
+
+async fn drive_and_collect_from_uri(
+    app: &LiveApp,
+    conv_id: &str,
+    uri: &str,
+    prompt: &str,
+    timeout_s: u64,
+) -> Vec<Value> {
+    let frames = connect_ws_recorder(app.addr, &app.token).await;
+    let sent = http_json(app, "POST", uri, json!({ "content": prompt })).await;
+    assert_eq!(
+        sent["success"], true,
+        "message send was rejected before the live CLI turn started: {sent}"
+    );
 
     let started = Instant::now();
+    let mut terminal = false;
     while started.elapsed() < Duration::from_secs(timeout_s) {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let snapshot = frames.lock().unwrap().clone();
@@ -1152,8 +1347,35 @@ async fn drive_and_collect(app: &LiveApp, conv_id: &str, prompt: &str, timeout_s
             .iter()
             .any(|f| matches!(f["data"]["type"].as_str(), Some("finish") | Some("error")))
         {
+            terminal = true;
             break;
         }
+    }
+    if !terminal {
+        let snapshot = frames.lock().unwrap().clone();
+        let collected: Vec<Value> = stream_frames_for(&snapshot, conv_id).into_iter().cloned().collect();
+        record_frame_types(conv_id, &collected);
+        let tool_summary = collected
+            .iter()
+            .filter_map(|frame| {
+                let frame_type = frame["data"]["type"].as_str()?;
+                if !matches!(frame_type, "tool_call" | "acp_tool_call") {
+                    return None;
+                }
+                Some(format!(
+                    "{}:{}",
+                    frame_type,
+                    frame["data"]["data"]["name"]
+                        .as_str()
+                        .or_else(|| frame["data"]["data"]["update"]["name"].as_str())
+                        .unwrap_or("unknown")
+                ))
+            })
+            .collect::<Vec<_>>();
+        panic!(
+            "live CLI turn for conversation {conv_id} did not emit finish/error within {timeout_s}s; \
+             tool frames={tool_summary:?}"
+        );
     }
     // A short grace period: trailing frames (usage, late tool settles) land
     // just after the terminal and are part of what the UI renders.
@@ -1562,6 +1784,24 @@ async fn live_codex_survives_a_broken_mcp_server() {
 #[ignore = "spawns the real agy CLI; needs credentials"]
 async fn live_antigravity_survives_a_broken_mcp_server() {
     run_backend_mcp_provisioning("antigravity").await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the real claude CLI; needs credentials"]
+async fn live_claude_team_mcp_tools_call_and_runtime_env() {
+    run_direct_backend_team_mcp_and_runtime_env("claude", "2d23ff1c").await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the real codex CLI; needs credentials"]
+async fn live_codex_team_mcp_tools_call_and_runtime_env() {
+    run_direct_backend_team_mcp_and_runtime_env("codex", "8e1acf31").await;
+}
+
+#[tokio::test]
+#[ignore = "spawns the real agy CLI; needs credentials"]
+async fn live_antigravity_team_mcp_tools_call_and_runtime_env() {
+    run_direct_backend_team_mcp_and_runtime_env("antigravity", "a9f3c21e").await;
 }
 
 // Resume across an app restart, for every backend.

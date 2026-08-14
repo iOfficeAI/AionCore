@@ -49,6 +49,7 @@ use aionui_team::{
 };
 
 use crate::config::{IdentityMode, derive_encryption_key};
+use crate::router::team_capability_resolver::TeamCapabilityResolver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
 
@@ -262,12 +263,7 @@ pub async fn build_module_states(
     .await;
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: channel state built");
 
-    let backend_binary_path = Arc::new(
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.canonicalize().ok())
-            .unwrap_or_else(|| std::path::PathBuf::from("aioncore")),
-    );
+    let backend_binary_path = services.backend_binary_path();
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: backend binary path resolved"
@@ -679,9 +675,9 @@ pub async fn build_channel_state(
 
 /// Build the default `TeamRouterState` from application services.
 ///
-/// `backend_binary_path` is resolved once in `build_module_states` via
-/// `std::env::current_exe()` and cloned into each builder that needs it,
-/// per `docs/teams/phase1/interface-contracts.md` §10.
+/// `backend_binary_path` is resolved once while constructing `AppServices` and
+/// cloned into each builder that needs it, per
+/// `docs/teams/phase1/interface-contracts.md` §10.
 pub fn build_team_state(
     services: &AppServices,
     _cron_service: Option<Arc<aionui_cron::service::CronService>>,
@@ -742,6 +738,9 @@ pub fn build_team_state(
     let turn_port: Arc<dyn AgentTurnExecutionPort> = adapters.clone();
     let slash_command_port: Arc<dyn NativeSlashCommandPort> = adapters.clone();
     let cancellation_port: Arc<dyn AgentTurnCancellationPort> = adapters;
+    let capability_port: Arc<dyn aionui_team::TeamToolCapabilityPort> = Arc::new(TeamCapabilityResolver::new(
+        Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
+    ));
     let service = TeamSessionService::new_with_prompt_dump(
         team_repo,
         Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
@@ -758,6 +757,7 @@ pub fn build_team_state(
         turn_port,
         cancellation_port,
         slash_command_port,
+        capability_port,
         backend_binary_path,
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );

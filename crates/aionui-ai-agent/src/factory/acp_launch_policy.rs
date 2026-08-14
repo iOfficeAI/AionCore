@@ -4,9 +4,6 @@ use crate::shared_kernel::PersistedSessionState;
 use aionui_api_types::{AcpBuildExtra, AgentMetadata};
 use aionui_common::CommandSpec;
 
-const CODEX_CONFIG_FLAG: &str = "-c";
-const CODEX_ENV_POLICY_INHERIT_ALL: &str = "shell_environment_policy.inherit=all";
-const CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY: &str = "shell_environment_policy.include_only=[]";
 const CODEX_WINDOWS_UNELEVATED_SANDBOX: &str = "windows.sandbox=\"unelevated\"";
 
 pub(super) struct AcpLaunchPolicyInput<'a> {
@@ -81,8 +78,9 @@ fn apply_codex_runtime_config_args(
         return;
     }
 
-    push_codex_config_arg(command_spec, CODEX_ENV_POLICY_INHERIT_ALL);
-    push_codex_config_arg(command_spec, CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY);
+    command_spec
+        .args
+        .extend(aionui_session::codex_shell_environment_policy_args().map(str::to_owned));
 
     let sandbox_mode = codex_sandbox_mode_for_requested_mode(initial_mode);
     push_codex_config_arg(command_spec, &format!("sandbox_mode=\"{sandbox_mode}\""));
@@ -92,7 +90,7 @@ fn apply_codex_runtime_config_args(
 }
 
 fn push_codex_config_arg(command_spec: &mut CommandSpec, value: &str) {
-    command_spec.args.push(CODEX_CONFIG_FLAG.to_owned());
+    command_spec.args.push("-c".to_owned());
     command_spec.args.push(value.to_owned());
 }
 

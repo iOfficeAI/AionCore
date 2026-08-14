@@ -41,7 +41,7 @@ use crate::member_runtime::{
 use crate::message_projection::TeamProjectionMessageStore;
 use crate::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, NoopNativeSlashCommandPort,
-    TeamAssistantCatalogPort,
+    TeamAssistantCatalogPort, TeamToolCapabilityPort, UnknownTeamToolCapabilityPort,
 };
 use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
@@ -127,6 +127,7 @@ pub struct TeamSessionService {
     task_manager: Arc<dyn IWorkerTaskManager>,
     turn_port: Arc<dyn AgentTurnExecutionPort>,
     cancellation_port: Arc<dyn AgentTurnCancellationPort>,
+    capability_port: Arc<dyn TeamToolCapabilityPort>,
     /// Native slash-command recognizer injected into each `TeamSession`
     /// (ELECTRON-3RN). No-op by default (see `NoopNativeSlashCommandPort`).
     slash_command_port: Arc<dyn NativeSlashCommandPort>,
@@ -182,6 +183,46 @@ impl TeamSessionService {
             turn_port,
             cancellation_port,
             Arc::new(NoopNativeSlashCommandPort),
+            Arc::new(UnknownTeamToolCapabilityPort),
+            backend_binary_path,
+            TeamPromptDumpConfig::disabled(),
+        )
+    }
+
+    /// Construct with an explicit backend-capability resolver while keeping
+    /// the default no-op slash catalog and disabled prompt dump.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_capability_port(
+        repo: Arc<dyn ITeamRepository>,
+        agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+        assistant_catalog: Arc<dyn TeamAssistantCatalogPort>,
+        assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
+        assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
+        provider_repo: Arc<dyn IProviderRepository>,
+        conversation_port: Arc<dyn TeamConversationProvisioningPort>,
+        projection_store: Arc<dyn TeamProjectionMessageStore>,
+        broadcaster: Arc<dyn EventBroadcaster>,
+        task_manager: Arc<dyn IWorkerTaskManager>,
+        turn_port: Arc<dyn AgentTurnExecutionPort>,
+        cancellation_port: Arc<dyn AgentTurnCancellationPort>,
+        capability_port: Arc<dyn TeamToolCapabilityPort>,
+        backend_binary_path: Arc<PathBuf>,
+    ) -> Arc<Self> {
+        Self::new_with_prompt_dump(
+            repo,
+            agent_metadata_repo,
+            assistant_catalog,
+            assistant_definition_repo,
+            assistant_overlay_repo,
+            provider_repo,
+            conversation_port,
+            projection_store,
+            broadcaster,
+            task_manager,
+            turn_port,
+            cancellation_port,
+            Arc::new(NoopNativeSlashCommandPort),
+            capability_port,
             backend_binary_path,
             TeamPromptDumpConfig::disabled(),
         )
@@ -202,6 +243,7 @@ impl TeamSessionService {
         turn_port: Arc<dyn AgentTurnExecutionPort>,
         cancellation_port: Arc<dyn AgentTurnCancellationPort>,
         slash_command_port: Arc<dyn NativeSlashCommandPort>,
+        capability_port: Arc<dyn TeamToolCapabilityPort>,
         backend_binary_path: Arc<PathBuf>,
         prompt_dump: TeamPromptDumpConfig,
     ) -> Arc<Self> {
@@ -219,6 +261,7 @@ impl TeamSessionService {
             turn_port,
             cancellation_port,
             slash_command_port,
+            capability_port,
             backend_binary_path,
             prompt_dump,
             sessions: Arc::new(DashMap::new()),
@@ -236,6 +279,7 @@ impl TeamSessionService {
             self.assistant_catalog.clone(),
             self.provider_repo.clone(),
             self.conversation_port.clone(),
+            self.capability_port.clone(),
         )
     }
 

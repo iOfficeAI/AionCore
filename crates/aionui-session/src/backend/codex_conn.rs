@@ -41,6 +41,48 @@ use crate::capability::{BlockSet, Capabilities, CapabilityTier, CommandSet, Prom
 use crate::event::{CancelReason, ProvisioningPhase, SessionEvent, StopReason, SubagentStatus, TurnOutcome};
 use futures_util::stream::{BoxStream, StreamExt};
 
+const CODEX_CONFIG_FLAG: &str = "-c";
+const CODEX_ENV_POLICY_INHERIT_ALL: &str = "shell_environment_policy.inherit=all";
+const CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY: &str = "shell_environment_policy.include_only=[]";
+
+/// Config overrides that make Codex command-execution children inherit the
+/// runtime environment injected into the app-server process.
+pub fn codex_shell_environment_policy_args() -> [&'static str; 4] {
+    [
+        CODEX_CONFIG_FLAG,
+        CODEX_ENV_POLICY_INHERIT_ALL,
+        CODEX_CONFIG_FLAG,
+        CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY,
+    ]
+}
+
+/// Build the process-level app-server argv shared by initial open and idle
+/// wake. `codex app-server --help` documents the config override and uses
+/// `shell_environment_policy.inherit=all` as its example.
+fn codex_app_server_args(extra_args: &[String]) -> Vec<String> {
+    let mut args = vec!["app-server".to_owned()];
+    args.extend(extra_args.iter().cloned());
+    // Append the compatibility policy after user/configured extras, matching
+    // the former ACP launch policy and making these final overrides authoritative.
+    args.extend(codex_shell_environment_policy_args().map(str::to_owned));
+    args
+}
+
+fn log_codex_runtime_policy(spawn_env: &[aionui_common::EnvVar]) {
+    let mut runtime_env_keys = spawn_env
+        .iter()
+        .filter_map(|entry| entry.name.starts_with("AIONUI_").then_some(entry.name.as_str()))
+        .collect::<Vec<_>>();
+    runtime_env_keys.sort_unstable();
+    runtime_env_keys.dedup();
+    tracing::info!(
+        backend = "codex",
+        shell_env_policy_explicit = true,
+        ?runtime_env_keys,
+        "starting Codex app-server with explicit tool-shell environment policy"
+    );
+}
+
 /// Connection-level factory for codex. Holds the injected `Spawner`. Unlike
 /// claude (1:1), codex's app-server CAN multiplex threads on one process — but
 /// P1 opens one process per logical session (multiplexing is a later refinement;
@@ -73,8 +115,8 @@ impl BackendConnection for CodexConnection {
             SessionSpec::Resume { session_id, .. } => session_id.clone(),
             SessionSpec::Fork { session_id, .. } => session_id.clone(),
         };
-        let mut args = vec!["app-server".to_string()];
-        args.extend(config.extra_args.iter().cloned());
+        let args = codex_app_server_args(&config.extra_args);
+        log_codex_runtime_policy(&config.spawn_env);
         let cmd = aionui_common::CommandSpec {
             // Orchestration-resolved bundled CLI (packaged app) or bare "codex"
             // (dev → PATH). See SessionConfig.cli_program.
@@ -536,8 +578,15 @@ fn build_codex_mcp_servers(servers: &[crate::backend::McpServerSpec]) -> Value {
             // neutral spec carries headers; codex takes a bearer_token_env_var, so we
             // pass the url and let codex's own auth/oauth path handle credentials
             // (inline arbitrary headers are not a codex config field).
-            McpTransport::Http { url, .. } | McpTransport::Sse { url, .. } => {
-                json!({ "url": url })
+            McpTransport::Http { url, .. } => json!({ "url": url }),
+            McpTransport::Sse { .. } => {
+                tracing::warn!(
+                    backend = "codex",
+                    server = %s.name,
+                    transport = "sse",
+                    "skipping unsupported MCP transport"
+                );
+                continue;
             }
         };
         map.insert(s.name.clone(), entry);
@@ -1303,8 +1352,8 @@ impl CodexSessionBackend {
             .spawner
             .as_ref()
             .ok_or_else(|| BackendError::Transport("codex wake: no spawner (suspension not enabled)".into()))?;
-        let mut args = vec!["app-server".to_string()];
-        args.extend(self.wake.config.extra_args.iter().cloned());
+        let args = codex_app_server_args(&self.wake.config.extra_args);
+        log_codex_runtime_policy(&self.wake.config.spawn_env);
         let cmd = aionui_common::CommandSpec {
             // Same bundled-CLI resolution + spawn env as the initial spawn
             // (R16 continuity).
@@ -7316,6 +7365,10 @@ mod tests {
     #[test]
     fn thread_start_injects_codex_mcp_map_and_preset() {
         use crate::backend::{McpServerSpec, McpTransport, SessionInit};
+        let descriptor = crate::backend::backend_capability_descriptor("codex").unwrap();
+        assert!(descriptor.mcp.stdio);
+        assert!(descriptor.mcp.streamable_http);
+        assert!(!descriptor.mcp.sse);
         let frame = thread_start_params(&SessionConfig {
             cwd: Some("/work".into()),
             init: SessionInit {
@@ -7335,6 +7388,13 @@ mod tests {
                             headers: vec![],
                         },
                     },
+                    McpServerSpec {
+                        name: "unsupported-sse".into(),
+                        transport: McpTransport::Sse {
+                            url: "https://mcp.example/sse".into(),
+                            headers: vec![],
+                        },
+                    },
                 ],
                 preset_context: Some("You are a helpful assistant.".into()),
                 ..Default::default()
@@ -7349,6 +7409,10 @@ mod tests {
         // codex env is a MAP {KEY:VAL}, NOT acp's array of {name,value}.
         assert_eq!(mcp["fs"]["env"]["TOKEN"], "x");
         assert_eq!(mcp["remote"]["url"], "https://mcp.example/api");
+        assert!(
+            mcp.get("unsupported-sse").is_none(),
+            "Codex does not declare an SSE MCP transport; the adapter must filter it instead of serializing it as HTTP"
+        );
         // preset → baseInstructions.
         assert_eq!(frame["params"]["baseInstructions"], "You are a helpful assistant.");
     }
@@ -7436,13 +7500,16 @@ mod tests {
         let spec = spawner.last_command().await.expect("a CommandSpec was recorded");
         assert_eq!(spec.command.to_str(), Some("codex"), "spawns the codex binary");
         assert_eq!(
-            spec.args.first().map(String::as_str),
-            Some("app-server"),
-            "first arg is app-server"
-        );
-        assert!(
-            spec.args.iter().any(|a| a == "--flag"),
-            "extra_args threaded into the spawn"
+            spec.args,
+            [
+                "app-server",
+                "--flag",
+                "-c",
+                "shell_environment_policy.inherit=all",
+                "-c",
+                "shell_environment_policy.include_only=[]",
+            ],
+            "every app-server spawn must explicitly propagate the parent environment to commandExecution shells"
         );
         assert_eq!(spec.cwd.as_deref(), Some("/tmp/work"), "cwd threaded (workspace)");
         // #103 parity with claude_conn: the orchestration-filled spawn env
@@ -8645,10 +8712,16 @@ mod tests {
         assert_eq!(spawner.call_count(), 1, "wake routed through the injected spawner once");
         let spec = spawner.last_command().await.expect("a spawn was recorded");
         assert_eq!(spec.command.to_str(), Some("codex"), "wake re-spawns the codex binary");
-        assert!(
-            spec.args.iter().any(|a| a == "app-server"),
-            "wake re-spawns `codex app-server`, got {:?}",
-            spec.args
+        assert_eq!(
+            spec.args,
+            [
+                "app-server",
+                "-c",
+                "shell_environment_policy.inherit=all",
+                "-c",
+                "shell_environment_policy.include_only=[]",
+            ],
+            "wake must restore the same explicit commandExecution environment policy as the initial spawn"
         );
         drop(backend);
     }

@@ -2843,10 +2843,18 @@ impl ConversationService {
                 _ => None,
             }
         };
-        let Some(capabilities_json) = metadata_row.and_then(|row| row.agent_capabilities) else {
+        let Some(metadata_row) = metadata_row else {
             return Ok(None);
         };
-        Ok(serde_json::from_str(&capabilities_json).ok())
+        let backend = aionui_db::runtime_backend_for_agent(&metadata_row);
+        let persisted = metadata_row
+            .agent_capabilities
+            .as_deref()
+            .and_then(|capabilities| serde_json::from_str::<serde_json::Value>(capabilities).ok());
+        Ok(aionui_ai_agent::effective_agent_capabilities(
+            &backend,
+            persisted.as_ref(),
+        ))
     }
 
     /// Reset a conversation: clear messages and set status back to pending.
@@ -4728,11 +4736,18 @@ async fn resolve_acp_mcp_support_policy(
         None => None,
     };
 
-    let capabilities = row
+    let persisted = row
         .as_ref()
         .and_then(|row| row.agent_capabilities.as_deref())
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-        .map(|value| parse_acp_mcp_capabilities(&value))
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
+    let effective_backend = row
+        .as_ref()
+        .map(aionui_db::runtime_backend_for_agent)
+        .or_else(|| backend.map(str::to_owned))
+        .unwrap_or_default();
+    let capabilities = aionui_ai_agent::effective_agent_capabilities(&effective_backend, persisted.as_ref())
+        .as_ref()
+        .map(parse_acp_mcp_capabilities)
         .unwrap_or_default();
 
     Ok(McpSupportPolicy::from_acp_capabilities(capabilities))
@@ -4960,7 +4975,7 @@ fn legacy_cron_trigger_to_artifact(row: MessageRow) -> Result<ConversationArtifa
 
 /// Merge `patch` into `base` (top-level key overwrite).
 /// Project `session_capabilities.fork` out of a parsed
-/// `agent_metadata.agent_capabilities` value. `None` = fork hidden.
+/// effective agent capability value. `None` = fork hidden.
 fn fork_capability_view(capabilities: &serde_json::Value) -> Option<ForkCapabilityView> {
     let fork = capabilities.get("session_capabilities")?.get("fork")?;
     if fork.is_null() {
@@ -4972,7 +4987,7 @@ fn fork_capability_view(capabilities: &serde_json::Value) -> Option<ForkCapabili
 }
 
 /// Project `prompt_capabilities` out of a parsed
-/// `agent_metadata.agent_capabilities` value. `None` = unknown (UI treats
+/// effective agent capability value. `None` = unknown (UI treats
 /// media attachments as path-delivered).
 fn prompt_capability_view(capabilities: &serde_json::Value) -> Option<PromptCapabilityView> {
     let prompt = capabilities.get("prompt_capabilities")?;
@@ -5346,5 +5361,25 @@ mod tests {
         );
 
         assert_eq!(status.status, ConversationMcpStatusKind::Failed);
+    }
+
+    #[tokio::test]
+    async fn direct_cli_mcp_policy_uses_effective_descriptor_on_a_fresh_database() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAgentMetadataRepository> =
+            Arc::new(aionui_db::SqliteAgentMetadataRepository::new(db.pool().clone()));
+
+        let policy = resolve_acp_mcp_support_policy(
+            &repo,
+            "system_default_user",
+            &json!({"backend": "codex", "agent_source": "builtin"}),
+        )
+        .await
+        .unwrap();
+
+        assert!(policy.stdio);
+        assert!(policy.http);
+        assert!(policy.streamable_http);
+        assert!(!policy.sse);
     }
 }

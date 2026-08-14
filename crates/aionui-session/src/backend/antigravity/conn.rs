@@ -571,6 +571,18 @@ impl AntigravitySessionBackend {
             model: self.effective_model(),
             mode: self.effective_mode(),
         };
+        let mut spawn_env = self.config.spawn_env.clone();
+        if let Some(cwd) = self.config.cwd.as_deref() {
+            // agy 1.1.13 resolves its primary customization workspace from PWD,
+            // not only the process cwd/--add-dir. A stale inherited PWD made it
+            // scan the host app directory and skip this session's MCP plugin
+            // (verified: ~/.gemini/antigravity-cli/log/cli-20260814_135824.log:48,51).
+            spawn_env.retain(|entry| entry.name != "PWD");
+            spawn_env.push(aionui_common::EnvVar {
+                name: "PWD".to_owned(),
+                value: cwd.to_owned(),
+            });
+        }
         let spec = CommandSpec {
             command: self
                 .config
@@ -578,7 +590,7 @@ impl AntigravitySessionBackend {
                 .clone()
                 .unwrap_or_else(|| std::path::PathBuf::from("agy")),
             args: build_argv(&input),
-            env: self.config.spawn_env.clone(),
+            env: spawn_env,
             cwd: self.config.cwd.clone(),
         };
 
@@ -1041,6 +1053,14 @@ mod tests {
         assert!(spec.args.contains(&"hello".to_string()));
         assert!(spec.args.contains(&"--dangerously-skip-permissions".to_string()));
         assert_eq!(spec.cwd.as_deref(), Some("/w"));
+        assert_eq!(
+            spec.env
+                .iter()
+                .filter(|entry| entry.name == "PWD")
+                .map(|entry| entry.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/w"]
+        );
     }
 
     #[tokio::test]

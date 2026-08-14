@@ -81,8 +81,8 @@ pub struct ForkConversationRequest {
 }
 
 /// Prompt media capability projection for one conversation, sourced from
-/// `agent_metadata.agent_capabilities.prompt_capabilities` (ACP agents:
-/// handshake-persisted; claude/codex: migration-constructed, 037). `None` =
+/// the effective `prompt_capabilities` projection (ACP handshake or constructed
+/// backend descriptor). `None` =
 /// unknown/unsupported — the UI then hints that media attachments are sent
 /// as file paths. Filled only on the single-conversation detail path (list
 /// responses omit it — no N+1).
@@ -97,8 +97,8 @@ pub struct PromptCapabilityView {
 }
 
 /// Session-fork capability projection for one conversation, sourced from
-/// `agent_metadata.agent_capabilities.session_capabilities.fork` (ACP agents:
-/// handshake-persisted; claude/codex: migration-constructed). `Some` = the fork
+/// the effective `session_capabilities.fork` projection (ACP handshake or
+/// constructed backend descriptor). `Some` = the fork
 /// entry point may be shown; `None` = hidden. Filled only on the single-
 /// conversation detail path (list responses omit it — no N+1).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

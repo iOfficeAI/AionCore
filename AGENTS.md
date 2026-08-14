@@ -169,6 +169,22 @@ Supports the same arguments as `git push` (e.g. `just push -u origin feat/branch
 2. Emit via `event_bus.broadcast()` in service
 3. Naming: `domain.camelCaseAction`
 
+### Add a Direct CLI Backend
+
+Before a direct CLI backend is considered complete:
+
+1. Implement the session/backend connection contract.
+2. Register a constructed backend capability descriptor.
+3. Declare only MCP transports verified by an approved source; leave unverified transports disabled.
+4. Implement and contract-test serialization for every declared MCP transport.
+5. Implement the vendor-specific policy that propagates runtime environment into tool subprocesses.
+6. Cite CLI self-description, official adapter/documentation, or captured real traffic for every capability claim.
+7. Add descriptor-to-serializer consistency tests.
+8. Add a real ignored/live E2E that observes an MCP `tools/call`.
+9. Add a real ignored/live E2E that reads a sentinel from a CLI fallback tool subprocess.
+
+Team transport selection must consume the unified capability resolver. Do not add backend-name branches to the Team domain.
+
 ## Test Organization
 
 | Location                                 | What goes there                        |

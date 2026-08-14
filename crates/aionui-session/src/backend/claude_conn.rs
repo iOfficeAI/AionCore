@@ -3365,6 +3365,12 @@ mod tests {
     /// stdio carrying command/args/env.
     #[test]
     fn build_claude_init_args_mcp_emits_strict_and_map_json() {
+        assert!(
+            crate::backend::backend_capability_descriptor("claude")
+                .unwrap()
+                .mcp
+                .stdio
+        );
         let config = SessionConfig {
             init: SessionInit {
                 mcp_servers: vec![McpServerSpec {
@@ -3511,6 +3517,12 @@ mod tests {
     /// http/sse MCP transports map to claude's `{type,url,headers}` entry shape.
     #[test]
     fn build_claude_mcp_config_http_carries_type_and_headers() {
+        assert!(
+            crate::backend::backend_capability_descriptor("claude")
+                .unwrap()
+                .mcp
+                .streamable_http
+        );
         let json_str = build_claude_mcp_config(&[McpServerSpec {
             name: "api".into(),
             transport: McpTransport::Http {
@@ -3523,6 +3535,27 @@ mod tests {
         assert_eq!(json["mcpServers"]["api"]["type"], "http");
         assert_eq!(json["mcpServers"]["api"]["url"], "https://example.com/mcp");
         assert_eq!(json["mcpServers"]["api"]["headers"]["Authorization"], "Bearer x");
+    }
+
+    /// The official claude-code ACP adapter preserves SSE as a distinct
+    /// transport (`type: "sse"`); it must not be collapsed into HTTP.
+    /// verified: ~/.npm/_npx/ca6c9a6e3c4cc822/node_modules/
+    /// @agentclientprotocol/claude-agent-acp/dist/acp-agent.js:1872-1896
+    #[test]
+    fn build_claude_mcp_config_sse_carries_type_and_headers() {
+        assert!(crate::backend::backend_capability_descriptor("claude").unwrap().mcp.sse);
+        let json_str = build_claude_mcp_config(&[McpServerSpec {
+            name: "events".into(),
+            transport: McpTransport::Sse {
+                url: "https://example.com/events".into(),
+                headers: vec![("Authorization".into(), "Bearer x".into())],
+            },
+        }])
+        .expect("sse server -> some json");
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(json["mcpServers"]["events"]["type"], "sse");
+        assert_eq!(json["mcpServers"]["events"]["url"], "https://example.com/events");
+        assert_eq!(json["mcpServers"]["events"]["headers"]["Authorization"], "Bearer x");
     }
 
     /// SESS-INIT-17 (audit): duplicate MCP server NAMES collapse by construction.

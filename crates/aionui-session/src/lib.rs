@@ -53,14 +53,15 @@ pub use adapter::{AgentIo, ManagedProcessIo, is_valid_claude_permission_mode};
 // `command`/`session` modules that forced the `BackendCommand`/`BackendSessionSpec`
 // aliases, so these are now exported under their plain names.
 pub use backend::{
-    AcpConnection, AcpSessionBackend, Admission, AntigravityConnection, AntigravitySessionBackend, BackendConnection,
-    BackendError, CancelTarget, ClaudeConnection, ClaudeSessionBackend, CodexConnection, CodexSessionBackend, Command,
-    CommandMeta, CommandReceipt, ContentBlock, ConversationSession, McpServerSpec, McpTransport, MsgStatus,
-    Orchestrator, PendingMessage, PendingPermissionView, PermissionDecision, QuestionAnswer, SessionBackend,
-    SessionConfig, SessionEnvelope, SessionInfoKind, SessionInit, SessionSpec, StateSnapshot, Tier2Checkpoint,
-    TransitionReason, VERIFIED_CLAUDE_VERSION, VERIFIED_CODEX_VERSION, VersionDrift, VersionVerdict, acp_capabilities,
-    antigravity_capabilities, classify_cli_version, codex_capabilities, command_name, parse_cli_version, rehydrate,
-    slash_command_name, version_drift,
+    AcpConnection, AcpSessionBackend, Admission, AntigravityConnection, AntigravitySessionBackend,
+    BackendCapabilityDescriptor, BackendConnection, BackendError, CancelTarget, ClaudeConnection, ClaudeSessionBackend,
+    CodexConnection, CodexSessionBackend, Command, CommandMeta, CommandReceipt, ContentBlock, ConversationSession,
+    McpServerSpec, McpTransport, MsgStatus, Orchestrator, PendingMessage, PendingPermissionView, PermissionDecision,
+    QuestionAnswer, SessionBackend, SessionConfig, SessionEnvelope, SessionInfoKind, SessionInit, SessionSpec,
+    StateSnapshot, Tier2Checkpoint, TransitionReason, VERIFIED_AGY_VERSION, VERIFIED_CLAUDE_VERSION,
+    VERIFIED_CODEX_VERSION, VersionDrift, VersionVerdict, acp_capabilities, antigravity_capabilities,
+    backend_capability_descriptor, classify_cli_version, codex_capabilities, codex_shell_environment_policy_args,
+    command_name, effective_agent_capabilities, parse_cli_version, rehydrate, slash_command_name, version_drift,
 };
 pub use capability::{
     BlockSet, Capabilities, CapabilityTier, CommandSet, ModeInfo, ModelInfo, PromptAcceptedSource, SignalSet,
