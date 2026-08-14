@@ -2,9 +2,9 @@
 
 use crate::state::ConversationRouterState;
 use aionui_api_types::{
-    ApiResponse, CanonicalReplayProjectionResponse, RetainedOutputResponse, SetConfigOptionRequest,
-    SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery,
-    WorkspaceEntry,
+    ApiResponse, CanonicalReplayProjectionResponse, JournalTranscriptResponse, RetainedOutputResponse,
+    SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
+    WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -21,6 +21,7 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/slash-commands", get(get_slash_commands))
         .route("/api/conversations/{id}/usage", get(get_usage))
         .route("/api/conversations/{id}/event-replay", get(replay_event_projection))
+        .route("/api/conversations/{id}/transcript", get(get_event_transcript))
         .route("/api/conversations/{id}/outputs/{reference}", get(get_retained_output))
         .route(
             "/api/conversations/{id}/config-options/{option_id}",
@@ -35,6 +36,11 @@ struct EventReplayQuery {
     expected_sha256: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct TranscriptQuery {
+    visibility: Option<String>,
+}
+
 async fn replay_event_projection(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -45,6 +51,21 @@ async fn replay_event_projection(
         state
             .service
             .replay_event_projection(&user.id, &id, query.expected_sha256.as_deref())
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn get_event_transcript(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Query(query): Query<TranscriptQuery>,
+) -> Result<Json<ApiResponse<JournalTranscriptResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .derive_event_transcript(&user.id, &id, query.visibility.as_deref())
             .await
             .map_err(ApiError::from)?,
     )))

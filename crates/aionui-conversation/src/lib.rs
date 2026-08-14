@@ -6,6 +6,7 @@ mod agent_health_policy;
 mod background_stream;
 mod convert;
 pub mod error;
+mod journal_transcript;
 pub(crate) mod message_cursor;
 mod message_persistence;
 pub mod response_middleware;

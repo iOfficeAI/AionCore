@@ -134,6 +134,35 @@ pub struct CanonicalReplayProjectionResponse {
     pub journal_sha256: String,
 }
 
+/// One derived transcript item. Consecutive assistant text chunks are merged
+/// into a single `assistant/message` with `source_sequences` recording the
+/// original journal sequence numbers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JournalTranscriptItem {
+    pub sequence: u64,
+    pub event_id: String,
+    pub journal_kind: String,
+    pub transcript_kind: String,
+    pub visibility: String,
+    pub summary: String,
+    pub source_sequences: Vec<u64>,
+}
+
+/// Host transcript projected from the canonical event journal.
+///
+/// `visibility=model` is the DeepSeek Harness `deriveMessages()` equivalent:
+/// only model-visible items. `visibility=host` also includes UI-only notices.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JournalTranscriptResponse {
+    pub schema_version: u32,
+    pub conversation_id: String,
+    pub visibility: String,
+    pub items: Vec<JournalTranscriptItem>,
+    pub model_visible_count: u64,
+    pub model_visible_sha256: String,
+    pub journal_sha256: String,
+}
+
 /// Inner model info payload matching the frontend's `AcpModelInfo` type.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelInfoPayload {

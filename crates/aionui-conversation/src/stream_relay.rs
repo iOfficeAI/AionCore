@@ -481,6 +481,8 @@ impl StreamRelay {
                         warn!(error = %error, "Failed to retain large tool output; forwarding bounded in-memory event");
                         bound_large_tool_output(&mut event);
                     }
+                    // Journal first: model/host-visible history must be reconstructible
+                    // from this log (see journal_transcript::derive_transcript).
                     if let Some(journal) = &self.event_journal {
                         journal_event_index = journal_event_index.saturating_add(1);
                         let payload = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
