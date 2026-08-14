@@ -12,8 +12,9 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
-    ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionRequest, SetConfigOptionResponse,
-    SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
+    ConfigOptionConfirmation, GetConfigOptionsResponse, RetainedOutputResponse, SetConfigOptionRequest,
+    SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery,
+    WorkspaceEntry,
 };
 use aionui_common::{AgentKillReason, ErrorChain};
 use aionui_db::SaveRuntimeStateParams;
@@ -25,6 +26,34 @@ use crate::service::{AssistantRuntimePreferenceUpdate, ConversationService};
 const MAX_DIR_DEPTH: usize = 10;
 
 impl ConversationService {
+    pub async fn read_retained_output(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        reference: &str,
+    ) -> Result<RetainedOutputResponse, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        let (sha256, content) = self
+            .output_retention_policy()
+            .read(user_id, conversation_id, reference)
+            .await
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => ConversationError::NotFound {
+                    id: reference.to_owned(),
+                },
+                std::io::ErrorKind::PermissionDenied => ConversationError::BadRequest {
+                    reason: "invalid retained output reference".to_owned(),
+                },
+                _ => ConversationError::internal(format!("Failed to read retained output: {error}")),
+            })?;
+        Ok(RetainedOutputResponse {
+            reference: reference.to_owned(),
+            sha256,
+            size: content.len() as u64,
+            content,
+        })
+    }
+
     // ── Config Options ──────────────────────────────────────────────
 
     pub async fn get_config_options(

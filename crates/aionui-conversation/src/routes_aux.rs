@@ -2,8 +2,8 @@
 
 use crate::state::ConversationRouterState;
 use aionui_api_types::{
-    ApiResponse, SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse,
-    SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
+    ApiResponse, RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest,
+    SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -19,12 +19,27 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/side-question", post(side_question))
         .route("/api/conversations/{id}/slash-commands", get(get_slash_commands))
         .route("/api/conversations/{id}/usage", get(get_usage))
+        .route("/api/conversations/{id}/outputs/{reference}", get(get_retained_output))
         .route(
             "/api/conversations/{id}/config-options/{option_id}",
             put(set_config_option),
         )
         .route("/api/conversations/{id}/workspace", get(browse_workspace))
         .with_state(state)
+}
+
+async fn get_retained_output(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, reference)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<RetainedOutputResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .read_retained_output(&user.id, &id, &reference)
+            .await
+            .map_err(ApiError::from)?,
+    )))
 }
 
 // ── Route handlers ─────────────────────────────────────────────────

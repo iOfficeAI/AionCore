@@ -38,8 +38,8 @@ mod websocket;
 pub use acp::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AcpEnvResponse, AgentModeResponse, ConfigOptionConfirmation,
     DetectCliRequest, DetectCliResponse, GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry,
-    ModelInfoPayload, ProbeModelRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
-    SetModelRequest, SideQuestionRequest, SideQuestionResponse, TryConnectCustomAgentRequest,
+    ModelInfoPayload, ProbeModelRequest, RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse,
+    SetModeRequest, SetModelRequest, SideQuestionRequest, SideQuestionResponse, TryConnectCustomAgentRequest,
     TryConnectCustomAgentResponse, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 pub use acp_prompt_hook::AcpPromptHookWarningPayload;

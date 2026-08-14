@@ -115,6 +115,14 @@ pub struct SetConfigOptionResponse {
     pub config_options: Option<Vec<AcpConfigOptionDto>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetainedOutputResponse {
+    pub reference: String,
+    pub sha256: String,
+    pub size: u64,
+    pub content: String,
+}
+
 /// Inner model info payload matching the frontend's `AcpModelInfo` type.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelInfoPayload {

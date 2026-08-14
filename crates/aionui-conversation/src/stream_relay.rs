@@ -12,7 +12,7 @@ use crate::runtime_persistence::RuntimePersistenceCoordinator;
 use crate::runtime_state::ConversationRuntimeStateService;
 use crate::service::ConversationService;
 use crate::stream_persistence::{
-    PersistedTextSegment, StreamPersistenceAdapter, TextSegmentState, ThinkingSegmentState,
+    OutputRetentionPolicy, PersistedTextSegment, StreamPersistenceAdapter, TextSegmentState, ThinkingSegmentState,
 };
 use aionui_db::IConversationRepository;
 use aionui_realtime::EventBroadcaster;
@@ -80,6 +80,123 @@ fn humanize_ms(ms: i64) -> String {
         (0, 0, s) => format!("{s}s"),
         (0, m, s) => format!("{m}m{s:02}s"),
         (h, m, _) => format!("{h}h{m:02}m"),
+    }
+}
+
+async fn retain_large_tool_output(
+    policy: &OutputRetentionPolicy,
+    user_id: &str,
+    conversation_id: &str,
+    event: &mut AgentStreamEvent,
+) -> Result<(), std::io::Error> {
+    async fn governed(
+        policy: &OutputRetentionPolicy,
+        user_id: &str,
+        conversation_id: &str,
+        value: &str,
+    ) -> Result<Option<String>, std::io::Error> {
+        Ok(policy.retain(user_id, conversation_id, value).await?.map(|retained| {
+            json!({
+                "preview": retained.preview,
+                "size": retained.size,
+                "sha256": retained.sha256,
+                "reference": retained.reference,
+            })
+            .to_string()
+        }))
+    }
+
+    match event {
+        AgentStreamEvent::ToolCall(data) => {
+            if let Some(output) = data.output.as_mut()
+                && let Some(replacement) = governed(policy, user_id, conversation_id, output).await?
+            {
+                *output = replacement;
+            }
+        }
+        AgentStreamEvent::AcpToolCall(data) => {
+            if let Some(raw_output) = data.update.raw_output.as_mut() {
+                let serialized = serde_json::to_string(raw_output).unwrap_or_default();
+                if let Some(replacement) = governed(policy, user_id, conversation_id, &serialized).await? {
+                    *raw_output = serde_json::from_str(&replacement).unwrap_or(serde_json::Value::Null);
+                }
+            }
+            if let Some(content) = data.update.content.as_mut() {
+                for item in content {
+                    match item {
+                        aionui_ai_agent::protocol::events::tool_call::AcpToolCallContentItem::Content { content } => {
+                            if let Some(replacement) = governed(policy, user_id, conversation_id, &content.text).await?
+                            {
+                                content.text = replacement;
+                            }
+                        }
+                        aionui_ai_agent::protocol::events::tool_call::AcpToolCallContentItem::Diff {
+                            old_text,
+                            new_text,
+                            ..
+                        } => {
+                            if let Some(value) = old_text.as_mut()
+                                && let Some(replacement) = governed(policy, user_id, conversation_id, value).await?
+                            {
+                                *value = replacement;
+                            }
+                            if let Some(replacement) = governed(policy, user_id, conversation_id, new_text).await? {
+                                *new_text = replacement;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn bound_large_tool_output(event: &mut AgentStreamEvent) {
+    fn preview(value: &str) -> String {
+        const MAX: usize = 64 * 1024;
+        if value.len() <= MAX {
+            return value.to_owned();
+        }
+        let end = value.floor_char_boundary(MAX);
+        format!("{}\n[output truncated: spill unavailable]", &value[..end])
+    }
+
+    match event {
+        AgentStreamEvent::ToolCall(data) => {
+            if let Some(output) = data.output.as_mut() {
+                *output = preview(output);
+            }
+        }
+        AgentStreamEvent::AcpToolCall(data) => {
+            if let Some(raw_output) = data.update.raw_output.as_mut() {
+                let serialized = serde_json::to_string(raw_output).unwrap_or_default();
+                if serialized.len() > 64 * 1024 {
+                    *raw_output = json!({ "preview": preview(&serialized), "spill_error": true });
+                }
+            }
+            if let Some(content) = data.update.content.as_mut() {
+                for item in content {
+                    match item {
+                        aionui_ai_agent::protocol::events::tool_call::AcpToolCallContentItem::Content { content } => {
+                            content.text = preview(&content.text);
+                        }
+                        aionui_ai_agent::protocol::events::tool_call::AcpToolCallContentItem::Diff {
+                            old_text,
+                            new_text,
+                            ..
+                        } => {
+                            if let Some(value) = old_text.as_mut() {
+                                *value = preview(value);
+                            }
+                            *new_text = preview(new_text);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -172,6 +289,7 @@ pub struct StreamRelay {
     complete_turn: bool,
     defer_clean_terminal_errors: bool,
     superseding_tips: SupersedingTipTotals,
+    output_retention: Option<OutputRetentionPolicy>,
 }
 
 impl StreamRelay {
@@ -199,6 +317,7 @@ impl StreamRelay {
             complete_turn: true,
             defer_clean_terminal_errors: false,
             superseding_tips: SupersedingTipTotals::default(),
+            output_retention: None,
         }
     }
 
@@ -238,6 +357,11 @@ impl StreamRelay {
 
     pub fn with_defer_clean_terminal_errors(mut self, enabled: bool) -> Self {
         self.defer_clean_terminal_errors = enabled;
+        self
+    }
+
+    pub(crate) fn with_output_retention(mut self, policy: OutputRetentionPolicy) -> Self {
+        self.output_retention = Some(policy);
         self
     }
 
@@ -340,7 +464,14 @@ impl StreamRelay {
             };
 
             match recv_result {
-                Ok(event) => {
+                Ok(mut event) => {
+                    if let Some(policy) = &self.output_retention
+                        && let Err(error) =
+                            retain_large_tool_output(policy, &self.user_id, &self.conversation_id, &mut event).await
+                    {
+                        warn!(error = %error, "Failed to retain large tool output; forwarding bounded in-memory event");
+                        bound_large_tool_output(&mut event);
+                    }
                     let deleting = self.is_deleting();
                     if deleting && !matches!(event, AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_)) {
                         debug!(

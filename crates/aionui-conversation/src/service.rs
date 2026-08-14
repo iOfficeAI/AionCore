@@ -727,6 +727,10 @@ impl ConversationService {
         &self.task_manager
     }
 
+    pub(crate) fn output_retention_policy(&self) -> crate::stream_persistence::OutputRetentionPolicy {
+        crate::stream_persistence::OutputRetentionPolicy::new(self.workspace_root.join(".retained-output"))
+    }
+
     pub async fn runtime_summary_for(&self, conversation_id: &str) -> ConversationRuntimeSummary {
         let agent = self.task_manager.get_task(conversation_id);
         let has_task = agent.is_some();
