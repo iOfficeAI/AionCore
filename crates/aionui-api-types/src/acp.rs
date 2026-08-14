@@ -148,6 +148,9 @@ pub struct JournalTranscriptItem {
     /// Reconstructible model-visible payload. Absent on older AionCore builds.
     #[serde(default)]
     pub content: String,
+    /// True when an older tool result was collapsed to its summary.
+    #[serde(default)]
+    pub compacted: bool,
     pub source_sequences: Vec<u64>,
 }
 

@@ -12,8 +12,11 @@ use sha2::{Digest, Sha256};
 
 use crate::stream_persistence::CanonicalJournalEvent;
 
-const TRANSCRIPT_SCHEMA_VERSION: u32 = 2;
+const TRANSCRIPT_SCHEMA_VERSION: u32 = 3;
 const SUMMARY_CHAR_LIMIT: usize = 240;
+/// Host equivalent of DeepSeek Harness `dsh-compaction-tool-result-pruner`:
+/// keep the newest tool results reconstructible; older ones collapse to summary.
+const KEEP_RECENT_TOOL_RESULTS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TranscriptVisibility {
@@ -79,8 +82,10 @@ pub(crate) struct DerivedTranscriptItem {
     pub visibility: &'static str,
     pub summary: String,
     /// Reconstructible model-visible payload. Tool output is already
-    /// spill-governed before the event is journaled.
+    /// spill-governed before the event is journaled. Compacted tool
+    /// results copy `summary` here so the projection stays bounded.
     pub content: String,
+    pub compacted: bool,
     pub source_sequences: Vec<u64>,
 }
 
@@ -93,6 +98,7 @@ struct DraftItem {
     sequence: u64,
     summary: String,
     content: String,
+    compacted: bool,
     source_sequences: Vec<u64>,
 }
 
@@ -101,7 +107,8 @@ pub(crate) fn derive_transcript(
     events: &[CanonicalJournalEvent],
     requested: RequestedVisibility,
 ) -> DerivedTranscript {
-    let drafts = merge_assistant_text(events.iter().filter_map(classify_event).collect());
+    let mut drafts = merge_assistant_text(events.iter().filter_map(classify_event).collect());
+    compact_old_tool_results(&mut drafts);
     let model_visible_count = drafts
         .iter()
         .filter(|item| item.visibility == TranscriptVisibility::Model)
@@ -118,6 +125,7 @@ pub(crate) fn derive_transcript(
             visibility: item.visibility.as_str(),
             summary: item.summary,
             content: item.content,
+            compacted: item.compacted,
             source_sequences: item.source_sequences,
         })
         .collect();
@@ -143,6 +151,7 @@ fn classify_event(event: &CanonicalJournalEvent) -> Option<DraftItem> {
         sequence: event.sequence,
         summary: truncate_summary(&content),
         content,
+        compacted: false,
         source_sequences: vec![event.sequence],
     })
 }
@@ -195,6 +204,23 @@ fn merge_assistant_text(items: Vec<DraftItem>) -> Vec<DraftItem> {
         }
     }
     merged
+}
+
+fn compact_old_tool_results(items: &mut [DraftItem]) {
+    let tool_indexes: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.transcript_kind == "tool/call" && item.visibility == TranscriptVisibility::Model)
+        .map(|(index, _)| index)
+        .collect();
+    let prune_end = tool_indexes.len().saturating_sub(KEEP_RECENT_TOOL_RESULTS);
+    for &index in &tool_indexes[..prune_end] {
+        let item = &mut items[index];
+        if item.content != item.summary {
+            item.content = item.summary.clone();
+            item.compacted = true;
+        }
+    }
 }
 
 fn join_content(left: &str, right: &str) -> String {
@@ -385,5 +411,72 @@ mod tests {
         let model = derive_transcript("conv", &events, RequestedVisibility::Model);
         assert_eq!(model.items[0].summary, "exit 0\nhello world");
         assert_eq!(model.items[0].content, "exit 0\nhello world");
+        assert!(!model.items[0].compacted);
+    }
+
+    #[test]
+    fn older_tool_results_compact_to_summary_and_recent_ones_stay_full() {
+        let events: Vec<_> = (1..=4)
+            .map(|sequence| {
+                event(
+                    sequence,
+                    "ToolCall",
+                    serde_json::json!({
+                        "type": "tool_call",
+                        "data": { "name": format!("tool-{sequence}"), "output": format!("full output {sequence}") }
+                    }),
+                )
+            })
+            .collect();
+        let model = derive_transcript("conv", &events, RequestedVisibility::Model);
+        assert_eq!(model.items.len(), 4);
+        assert!(model.items[0].compacted);
+        assert_eq!(model.items[0].content, model.items[0].summary);
+        assert_eq!(model.items[0].summary, "full output 1");
+        for item in &model.items[1..] {
+            assert!(!item.compacted);
+            assert!(item.content.starts_with("full output "));
+        }
+    }
+
+    #[test]
+    fn user_and_assistant_messages_are_not_compacted() {
+        let events = vec![
+            event(
+                1,
+                "UserPrompt",
+                serde_json::json!({"data":{"content":"please keep this user prompt"}}),
+            ),
+            event(2, "Text", serde_json::json!({"content":"assistant stays whole"})),
+            event(
+                3,
+                "ToolCall",
+                serde_json::json!({"data":{"name":"Bash","output":"old tool body"}}),
+            ),
+            event(
+                4,
+                "ToolCall",
+                serde_json::json!({"data":{"name":"Bash","output":"newer tool body"}}),
+            ),
+            event(
+                5,
+                "ToolCall",
+                serde_json::json!({"data":{"name":"Bash","output":"newest tool body"}}),
+            ),
+            event(
+                6,
+                "ToolCall",
+                serde_json::json!({"data":{"name":"Bash","output":"latest tool body"}}),
+            ),
+        ];
+        let model = derive_transcript("conv", &events, RequestedVisibility::Model);
+        assert_eq!(model.items[0].content, "please keep this user prompt");
+        assert!(!model.items[0].compacted);
+        assert_eq!(model.items[1].content, "assistant stays whole");
+        assert!(!model.items[1].compacted);
+        assert!(model.items[2].compacted);
+        assert!(!model.items[3].compacted);
+        assert!(!model.items[4].compacted);
+        assert!(!model.items[5].compacted);
     }
 }

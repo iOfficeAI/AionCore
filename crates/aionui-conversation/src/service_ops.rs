@@ -98,6 +98,7 @@ impl ConversationService {
                     visibility: item.visibility.to_owned(),
                     summary: item.summary,
                     content: item.content,
+                    compacted: item.compacted,
                     source_sequences: item.source_sequences,
                 })
                 .collect(),
