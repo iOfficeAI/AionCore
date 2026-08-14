@@ -19,7 +19,6 @@ const SUMMARY_CHAR_LIMIT: usize = 240;
 pub(crate) enum TranscriptVisibility {
     Model,
     Host,
-    Internal,
 }
 
 impl TranscriptVisibility {
@@ -27,7 +26,6 @@ impl TranscriptVisibility {
         match self {
             Self::Model => "model",
             Self::Host => "host",
-            Self::Internal => "internal",
         }
     }
 
@@ -235,7 +233,10 @@ fn truncate_summary(value: &str) -> String {
 
 fn digest_model_visible(items: &[DraftItem]) -> String {
     let mut digest = Sha256::new();
-    for item in items.iter().filter(|item| item.visibility == TranscriptVisibility::Model) {
+    for item in items
+        .iter()
+        .filter(|item| item.visibility == TranscriptVisibility::Model)
+    {
         digest.update(item.transcript_kind.as_bytes());
         digest.update([0]);
         digest.update(item.summary.as_bytes());

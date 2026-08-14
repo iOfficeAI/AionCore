@@ -13,9 +13,8 @@ use std::sync::Arc;
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
     CanonicalReplayProjectionResponse, ConfigOptionConfirmation, GetConfigOptionsResponse, JournalTranscriptResponse,
-    RetainedOutputResponse,
-    SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
-    WorkspaceBrowseQuery, WorkspaceEntry,
+    RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse,
+    SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_common::{AgentKillReason, ErrorChain};
 use aionui_db::SaveRuntimeStateParams;
