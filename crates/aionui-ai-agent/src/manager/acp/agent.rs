@@ -146,10 +146,8 @@ impl AcpStartupConnectError {
     }
 }
 
-fn should_retry_initialize(backend: Option<&str>, retries: u8, error: &AgentError) -> bool {
-    backend == Some("deepseek-harness")
-        && retries == 0
-        && matches!(error, AgentError::Acp(AcpError::InitTimeout { .. }))
+fn should_retry_initialize(managed_runtime: bool, retries: u8, error: &AgentError) -> bool {
+    managed_runtime && retries == 0 && matches!(error, AgentError::Acp(AcpError::InitTimeout { .. }))
 }
 
 async fn spawn_and_connect_acp(
@@ -188,12 +186,16 @@ async fn spawn_and_connect_acp(
                 }));
             }
             Err(AcpStartupConnectError::Agent(error))
-                if should_retry_initialize(params.metadata.backend.as_deref(), initialize_retries, &error) =>
+                if should_retry_initialize(
+                    params.metadata.agent_source_info.managed_runtime.is_some(),
+                    initialize_retries,
+                    &error,
+                ) =>
             {
                 initialize_retries += 1;
                 warn!(
                     conversation_id = %params.conversation_id,
-                    backend = "deepseek-harness",
+                    backend = params.metadata.backend.as_deref().unwrap_or("-"),
                     phase = "initialize",
                     attempt = initialize_retries + 1,
                     "Retrying side-effect-free ACP initialize once"
@@ -1211,6 +1213,12 @@ impl AcpAgentManager {
         self.params.metadata.backend.as_deref()
     }
 
+    /// Declared session lifetime. Connection-scoped agents cannot be resumed
+    /// or auto-replayed after the process exits.
+    pub fn session_lifetime(&self) -> aionui_api_types::SessionLifetime {
+        self.params.metadata.behavior_policy.session_lifetime
+    }
+
     /// Agent metadata id this session was spawned from.
     pub fn agent_id(&self) -> &str {
         &self.params.metadata.id
@@ -1760,15 +1768,15 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn initialize_retry_is_bounded_and_dsh_specific() {
+    fn initialize_retry_is_bounded_to_managed_runtimes() {
         let timeout = AgentError::Acp(AcpError::InitTimeout { timeout_secs: 30 });
-        assert!(should_retry_initialize(Some("deepseek-harness"), 0, &timeout));
-        assert!(!should_retry_initialize(Some("deepseek-harness"), 1, &timeout));
-        assert!(!should_retry_initialize(Some("other-acp"), 0, &timeout));
+        assert!(should_retry_initialize(true, 0, &timeout));
+        assert!(!should_retry_initialize(true, 1, &timeout));
+        assert!(!should_retry_initialize(false, 0, &timeout));
         assert!(!should_retry_initialize(
-            Some("deepseek-harness"),
+            true,
             0,
-            &AgentError::Acp(AcpError::NotConnected),
+            &AgentError::Acp(AcpError::NotConnected)
         ));
     }
 

@@ -24,8 +24,8 @@ use crate::protocol::send_error::AgentSendError;
 use crate::types::{PromptMediaCaps, SendMessageData};
 
 use aionui_api_types::{
-    GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, SetConfigOptionResponse,
-    SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
+    GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, SessionLifetime,
+    SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
 };
 
 #[cfg(any(test, feature = "test-support"))]
@@ -197,6 +197,17 @@ impl AgentInstance {
             Self::Session(_) => None,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(_) => None,
+        }
+    }
+
+    /// Declared session lifetime from the agent catalog. Connection-scoped
+    /// sessions cannot be resumed or auto-replayed after the process exits.
+    pub fn session_lifetime(&self) -> SessionLifetime {
+        match self {
+            Self::Acp(manager) => manager.session_lifetime(),
+            Self::Aionrs(_) | Self::Session(_) => SessionLifetime::Persistent,
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(_) => SessionLifetime::Persistent,
         }
     }
 
