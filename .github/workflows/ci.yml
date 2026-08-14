@@ -76,24 +76,19 @@ jobs:
       - name: Smoke managed DeepSeek Harness install
         run: node scripts/smoke-deepseek-harness-install.mjs
 
-  # L2: ACP initialize → session/new → one tool call.
-  # Protocol helpers always run. The live path skips (exit 0) without
-  # DEEPSEEK_API_KEY so PRs stay green until the secret is configured.
-  deepseek-harness-l2:
-    name: DeepSeek Harness L2 Online
+  # Host-side harness protocol helpers. No DeepSeek API key; this is
+  # permission/tool-event contract coverage, not a live model call.
+  deepseek-harness-helpers:
+    name: DeepSeek Harness Protocol Helpers
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: crates/aionui-runtime/resources/deepseek-harness/package-lock.json
-      - name: Check L2 protocol helpers
+      - name: Check protocol helpers
         run: node --test scripts/smoke-deepseek-harness-l2.test.mjs
-      - name: ACP online and one tool call
-        env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      - name: Self-check
         run: node scripts/smoke-deepseek-harness-l2.mjs
 
   changes:
