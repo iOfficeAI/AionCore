@@ -429,14 +429,19 @@ pub struct ClaudeSessionBackend {
     /// into `available_models`/`slash_commands` on read. Empty until the response
     /// lands (a freshly-opened backend reads empty, like codex pre-`model/list`).
     discovered_caps: Arc<std::sync::Mutex<DiscoveredCaps>>,
-    /// G2 (in-band config switch): control_requests (`set_model` /
-    /// `set_permission_mode`) deferred because they arrived mid-turn. Writing one
-    /// while a turn is Running would reinitialize the CLI session and TRUNCATE the
-    /// in-flight turn (raw-CLI limitation), so `dispatch(SetMode/SetModel)` QUEUES
-    /// the frame here and `dispatch(Send)` drains it — in order, over the same
-    /// stdin lock, BEFORE the prompt — so a queued switch applies to the NEXT turn
-    /// and can never land after-and-truncate it. De-duped by subtype (last-write-
-    /// wins). Mirrors F1's `pending_controls`.
+    /// G2 (in-band config switch): control_requests deferred because they arrived
+    /// mid-turn. `dispatch(Send)` drains them — in order, over the same stdin lock,
+    /// BEFORE the prompt — so a queued switch applies to the NEXT turn. De-duped by
+    /// subtype (last-write-wins). Mirrors F1's `pending_controls`.
+    ///
+    /// Now holds only `set_model` / `apply_flag_settings`. `set_permission_mode` is
+    /// written straight through (see `write_or_queue_control`): a 2.1.227 probe
+    /// disproved the truncation theory this queue was built on, and because draining
+    /// only happens on the next prompt, queueing left a switch unsent — and unapplied —
+    /// for as long as the user did not send another message.
+    ///
+    /// The remaining two keep queueing only because no equivalent capture exists for
+    /// them yet, not because truncation is known to occur.
     pending_controls: Arc<Mutex<Vec<serde_json::Value>>>,
     /// Monotonic counter minting `control_request` request_ids (no uuid dep). The
     /// CLI echoes it in its success control_response (observed by the reader, not
@@ -1224,8 +1229,26 @@ impl ClaudeSessionBackend {
             "request_id": request_id,
             "request": request,
         });
-        if self.turn_in_flight.load(Ordering::SeqCst) {
-            let subtype = control_subtype(&frame);
+        let subtype = control_subtype(&frame);
+        // `set_permission_mode` is written straight through, even mid-turn.
+        //
+        // LIVE-PROBED 2.1.227 (samples/claude-cli/2.1.227/set_permission_mode/, harness
+        // scripts/probe-claude-set-permission-mode.py): switching mid-generation left the
+        // turn streaming to a normal `result{subtype:"success"}` with 18-32 assistant
+        // frames after the switch, and the new mode governed the very next tool approval
+        // in that SAME turn — proven against a no-switch control run, and symmetric
+        // (loosening skipped the approval prompt, tightening brought it back).
+        //
+        // Queueing it was worse than a delay: `drain_pending_controls` runs only at the
+        // head of `dispatch(Send)`, so a mid-turn switch sat unsent until the user
+        // happened to send another message. Observed live as a switch stuck "pending" for
+        // 3+ minutes with the agent still running under the OLD mode — a safety gap when
+        // the user was TIGHTENING permissions.
+        //
+        // Deliberately narrow: `set_model` and `apply_flag_settings` have no equivalent
+        // capture, so they keep the conservative queue until one exists.
+        let write_through = subtype.as_deref() == Some("set_permission_mode");
+        if !write_through && self.turn_in_flight.load(Ordering::SeqCst) {
             let mut q = self.pending_controls.lock().await;
             q.retain(|f| control_subtype(f) != subtype);
             q.push(frame);
@@ -2935,10 +2958,10 @@ impl SessionBackend for ClaudeSessionBackend {
             Command::Steer { .. } => Err(BackendError::CommandNotSupported { command: "steer" }),
             // G2: in-band config switch via control_request (probe-verified, mirrors
             // F1). set_permission_mode / set_model are written over the retained
-            // stdin WITHOUT restarting the process; the switch applies to the NEXT
-            // turn. Mid-turn writes would reinitialize + TRUNCATE the in-flight turn,
-            // so they QUEUE (drained before the next prompt). On a successful
-            // dispatch we emit ConfigChanged so the UI confirms immediately.
+            // stdin WITHOUT restarting the process. set_permission_mode goes out
+            // immediately, even mid-turn, and governs the very next tool approval
+            // (LIVE-PROBED 2.1.227 — see `write_or_queue_control`); set_model still
+            // queues to the next prompt for want of a capture.
             Command::SetMode { mode } => {
                 // DE-OPTIMISTIC (design §9.10.1 option A / README #10): we write the
                 // set_permission_mode request and STOP — no optimistic ConfigChanged, no
@@ -3112,19 +3135,13 @@ impl SessionBackend for ClaudeSessionBackend {
         // supply one (the snapshot's current_model is None in that case; the reader
         // fills discovered_model from the system/init frame). Read-only sync lock.
         let mut caps = self.capabilities.clone();
-        // A mode switch raised WHILE A TURN IS RUNNING does not reach the CLI now:
-        // `write_or_queue_control` parks it in `pending_controls` and `dispatch(Send)`
-        // drains it before the next prompt. Idle, the same write goes straight out and
-        // takes effect at once (verified: samples/claude-cli/2.1.227/set_permission_mode/
-        // — the ack and `system/status{permissionMode}` both land within a millisecond,
-        // and the switch governs the very next tool approval in that same turn).
-        //
-        // So the honest answer depends on right now, and only this live handle knows it.
-        caps.mode_switch_effect = if self.turn_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
-            crate::capability::ModeSwitchEffect::NextTurn
-        } else {
-            crate::capability::ModeSwitchEffect::Immediate
-        };
+        // Immediate regardless of turn state: `write_or_queue_control` writes
+        // `set_permission_mode` straight through even mid-turn (see there for the probe),
+        // and 2.1.227 shows the ack plus `system/status{permissionMode}` landing within a
+        // millisecond, with the new mode governing the very next tool approval in that
+        // same turn. Left explicit rather than inherited from the static adapter caps so
+        // this stays next to the reason.
+        caps.mode_switch_effect = crate::capability::ModeSwitchEffect::Immediate;
         if caps.current_model.is_none()
             && let Some(model) = self.discovered_model.lock().unwrap_or_else(|e| e.into_inner()).clone()
         {
@@ -5005,10 +5022,66 @@ mod tests {
         );
     }
 
+    /// A SetMode raised WHILE A TURN IS IN FLIGHT goes out IMMEDIATELY.
+    ///
+    /// It used to be queued until the next prompt, on the theory that a mid-turn control
+    /// write "would reinitialize the CLI session and TRUNCATE the in-flight turn". That
+    /// was the one live-behaviour claim in this file with no captured evidence, and a
+    /// 2.1.227 probe disproved it: switching mid-generation left the turn streaming to a
+    /// normal `result{success}` and took effect within that same turn, in both directions
+    /// (samples/claude-cli/2.1.227/set_permission_mode/, harness
+    /// scripts/probe-claude-set-permission-mode.py).
+    ///
+    /// Queueing was not merely a delay. `drain_pending_controls` runs only at the head of
+    /// `dispatch(Send)`, so a switch made mid-turn sat unsent until the user happened to
+    /// send another message — observed live as a permission change stuck "pending" for
+    /// 3+ minutes while the agent kept running under the OLD mode. For a TIGHTENING
+    /// switch that is a safety gap, not just a stale label.
+    ///
+    /// Scope is deliberately `set_permission_mode` only: `set_model` and
+    /// `apply_flag_settings` have no such capture, so they keep queueing (asserted by
+    /// the test below).
+    #[tokio::test]
+    async fn set_mode_mid_turn_is_written_immediately() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
+
+        // First Send → turn_in_flight = true (no terminal ever arrives here).
+        backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("first".into())],
+                metadata: CommandMeta::default(),
+            })
+            .await
+            .expect("first Send accepted");
+
+        backend
+            .dispatch(Command::SetMode { mode: "plan".into() })
+            .await
+            .expect("SetMode accepted");
+
+        let mut written = String::new();
+        for _ in 0..40 {
+            written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+            if written.contains("set_permission_mode") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            written.contains("set_permission_mode") && written.contains("\"mode\":\"plan\""),
+            "a mid-turn mode switch must reach the CLI without waiting for the next prompt, got: {written}"
+        );
+    }
+
     /// G2: a SetModel issued WHILE A TURN IS IN FLIGHT is QUEUED (not written
     /// mid-turn, which would truncate the turn) and drained over stdin BEFORE the
     /// next prompt — so the switch applies to the next turn. Proves the queue +
     /// drain ordering: the control_request bytes precede the next user prompt bytes.
+    ///
+    /// Unlike `set_permission_mode` (see above), set_model's mid-turn behaviour has NOT
+    /// been captured, so it keeps the conservative queue.
     #[tokio::test]
     async fn set_model_mid_turn_is_queued_and_drained_before_next_prompt() {
         let fake = FakeAgentIo::never_exits(Vec::new());
