@@ -41,7 +41,7 @@ pub use acp::{
     JournalTranscriptItem, JournalTranscriptResponse, ModelInfoEntry, ModelInfoPayload, ProbeModelRequest,
     RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest, SetModelRequest,
     SideQuestionRequest, SideQuestionResponse, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
-    WorkspaceEntry,
+    WorkspaceBrowseQuery, WorkspaceEntry,
 };
 pub use acp_prompt_hook::AcpPromptHookWarningPayload;
 pub use agent_build_extra::{
