@@ -154,6 +154,20 @@ pub struct JournalTranscriptItem {
     pub source_sequences: Vec<u64>,
 }
 
+/// Replay token snapshot for the current model-visible surface.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct JournalTranscriptTokens {
+    pub log_revision: u64,
+    pub surface_tokens: u64,
+    pub nodes: Vec<JournalTranscriptTokenNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JournalTranscriptTokenNode {
+    pub sequence: u64,
+    pub tokens: u64,
+}
+
 /// Host transcript projected from the canonical event journal.
 ///
 /// `visibility=model` is the DeepSeek Harness `deriveMessages()` equivalent:
@@ -167,6 +181,14 @@ pub struct JournalTranscriptResponse {
     pub model_visible_count: u64,
     pub model_visible_sha256: String,
     pub journal_sha256: String,
+    /// `none` / `open` / `closed`. An unpaired start means compaction crashed.
+    #[serde(default)]
+    pub compaction_lock: String,
+    #[serde(default)]
+    pub tokens: JournalTranscriptTokens,
+    /// False when a tool call is still open on the current journal surface.
+    #[serde(default)]
+    pub tool_pairing_balanced: bool,
 }
 
 /// Inner model info payload matching the frontend's `AcpModelInfo` type.

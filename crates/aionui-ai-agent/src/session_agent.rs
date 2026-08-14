@@ -637,7 +637,8 @@ impl SessionAgentTask {
         Ok(())
     }
 
-    /// `always_allow` (legacy flag) forces AllowAlways regardless.
+    /// `always_allow` (legacy flag) forces AllowAlways after a grant.
+    /// Missing, unknown, or unattended answers fail closed (`Denied`).
     pub fn confirm(
         &self,
         _msg_id: &str,
@@ -645,20 +646,11 @@ impl SessionAgentTask {
         data: serde_json::Value,
         always_allow: bool,
     ) -> Result<(), AgentError> {
-        use aionui_session::PermissionDecision;
+        use crate::shared_kernel::{ApprovalPolicy, resolve_approval_outcome};
         let picked = confirm_option_id(&data);
-        let (decision, selected) = if always_allow {
-            (PermissionDecision::AllowAlways, None)
-        } else {
-            match picked.as_deref() {
-                Some(PERM_REJECT) => (PermissionDecision::Denied, None),
-                Some(PERM_ALLOW_ALWAYS) => (PermissionDecision::AllowAlways, None),
-                Some(PERM_ALLOW) | None => (PermissionDecision::Approved, None),
-                // A question answer label (AskUserQuestion): approve and forward the
-                // label so claude records it as the chosen answer.
-                Some(label) => (PermissionDecision::Approved, Some(label.to_owned())),
-            }
-        };
+        let ask_kind = pending_ask_kind(&self.backend.pending_permission_requests(), call_id);
+        let outcome = resolve_approval_outcome(ApprovalPolicy::Ask, picked.as_deref(), always_allow, ask_kind);
+        let (decision, selected) = permission_decision_from_outcome(outcome, picked.as_deref(), always_allow);
         let backend = self.backend.clone();
         let request_id = call_id.to_string();
         let conv_id = self.conversation_id.clone();
@@ -3394,6 +3386,76 @@ async fn persist_context_usage(
         .await
     {
         tracing::warn!(conversation_id, error = %err, "session-sync: save context_usage failed");
+    }
+}
+
+fn pending_ask_kind(
+    pending: &[aionui_session::PendingPermissionView],
+    call_id: &str,
+) -> crate::shared_kernel::ApprovalAskKind {
+    use crate::shared_kernel::ApprovalAskKind;
+    match pending.iter().find(|request| request.request_id == call_id) {
+        None => ApprovalAskKind::Missing,
+        Some(request) if request.tool_name == "AskUserQuestion" => ApprovalAskKind::AskUserQuestion,
+        Some(_) => ApprovalAskKind::Permission,
+    }
+}
+
+fn permission_decision_from_outcome(
+    outcome: crate::shared_kernel::ApprovalOutcome,
+    picked: Option<&str>,
+    always_allow: bool,
+) -> (aionui_session::PermissionDecision, Option<String>) {
+    use aionui_session::PermissionDecision;
+    if !outcome.grants() {
+        return (PermissionDecision::Denied, None);
+    }
+    if always_allow || picked == Some(PERM_ALLOW_ALWAYS) {
+        return (PermissionDecision::AllowAlways, None);
+    }
+    if picked == Some(PERM_ALLOW) || picked == Some(PERM_REJECT) {
+        return (PermissionDecision::Approved, None);
+    }
+    (PermissionDecision::Approved, picked.map(ToOwned::to_owned))
+}
+
+#[cfg(test)]
+mod approval_fail_closed_tests {
+    use super::{PERM_ALLOW, PERM_ALLOW_ALWAYS, permission_decision_from_outcome};
+    use crate::shared_kernel::{ApprovalAskKind, ApprovalPolicy, resolve_approval_outcome};
+    use aionui_session::PermissionDecision;
+
+    #[test]
+    fn missing_pick_denies_instead_of_approving() {
+        let outcome = resolve_approval_outcome(ApprovalPolicy::Ask, None, false, ApprovalAskKind::Permission);
+        let (decision, selected) = permission_decision_from_outcome(outcome, None, false);
+        assert_eq!(decision, PermissionDecision::Denied);
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn explicit_allow_still_approves() {
+        let outcome = resolve_approval_outcome(
+            ApprovalPolicy::Ask,
+            Some(PERM_ALLOW),
+            false,
+            ApprovalAskKind::Permission,
+        );
+        let (decision, selected) = permission_decision_from_outcome(outcome, Some(PERM_ALLOW), false);
+        assert_eq!(decision, PermissionDecision::Approved);
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn allow_always_stays_a_host_overlay_after_a_grant() {
+        let outcome = resolve_approval_outcome(
+            ApprovalPolicy::Ask,
+            Some(PERM_ALLOW_ALWAYS),
+            false,
+            ApprovalAskKind::Permission,
+        );
+        let (decision, _) = permission_decision_from_outcome(outcome, Some(PERM_ALLOW_ALWAYS), false);
+        assert_eq!(decision, PermissionDecision::AllowAlways);
     }
 }
 

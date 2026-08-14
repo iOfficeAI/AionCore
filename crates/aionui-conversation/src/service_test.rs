@@ -6743,6 +6743,107 @@ async fn confirm_removes_confirmation_and_broadcasts() {
     assert_eq!(events[0].name, "confirmation.remove");
     assert_eq!(events[0].data["conversation_id"], conv.id);
     assert_eq!(events[0].data["id"], "c1");
+
+    let journal = svc.canonical_event_journal();
+    let events = journal.replay("user_1", &conv.id).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "ApprovalDecided" && event.payload["data"]["outcome"] == "allowed-once"),
+        "granted confirmations must leave an approval/decided audit event"
+    );
+}
+
+#[tokio::test]
+async fn confirm_without_a_pick_fail_closes_and_still_clears_the_card() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = AgentInstance::Mock(Arc::new(MockAgent::with_confirmations(
+        &conv.id,
+        make_test_confirmations(),
+    )));
+    task_mgr.insert_agent(&conv.id, agent);
+
+    let req = aionui_api_types::ConfirmRequest {
+        msg_id: "msg-1".into(),
+        data: json!({ "label": "Allow" }),
+        always_allow: false,
+    };
+    svc.confirm(
+        "user_1",
+        &conv.id,
+        "call-1",
+        req,
+        &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+    )
+    .await
+    .unwrap();
+
+    let remaining = task_mgr.get_task(&conv.id).unwrap().get_confirmations();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].call_id, "call-2");
+
+    let events = svc.canonical_event_journal().replay("user_1", &conv.id).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "ApprovalDecided" && event.payload["data"]["outcome"] == "unavailable"),
+        "missing option ids must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn never_approval_policy_rejects_an_explicit_allow() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    crate::approval_audit::append_approval_policy(
+        &svc.canonical_event_journal(),
+        "user_1",
+        &conv.id,
+        aionui_ai_agent::shared_kernel::ApprovalPolicy::Never,
+    )
+    .await
+    .unwrap();
+
+    let agent = AgentInstance::Mock(Arc::new(MockAgent::with_confirmations(
+        &conv.id,
+        make_test_confirmations(),
+    )));
+    task_mgr.insert_agent(&conv.id, agent);
+
+    let req = aionui_api_types::ConfirmRequest {
+        msg_id: "msg-1".into(),
+        data: json!({ "value": "allow" }),
+        always_allow: true,
+    };
+    svc.confirm(
+        "user_1",
+        &conv.id,
+        "call-1",
+        req,
+        &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+    )
+    .await
+    .unwrap();
+
+    let remaining = task_mgr.get_task(&conv.id).unwrap().get_confirmations();
+    assert_eq!(remaining.len(), 1);
+    assert!(
+        !task_mgr
+            .get_task(&conv.id)
+            .unwrap()
+            .check_approval("edit_file", Some("bash")),
+        "never policy must not record an always-allow grant"
+    );
+    let events = svc.canonical_event_journal().replay("user_1", &conv.id).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| { event.kind == "ApprovalDecided" && event.payload["data"]["outcome"] == "rejected" })
+    );
 }
 
 #[tokio::test]

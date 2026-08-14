@@ -82,6 +82,13 @@ impl ConversationService {
             .replay_projection(user_id, conversation_id)
             .await
             .map_err(|error| ConversationError::internal(format!("Failed to project canonical events: {error}")))?;
+        if let Err(violation) = crate::model_visible::check_model_surface_reconstructible(&events) {
+            warn!(
+                conversation_id,
+                error = %violation,
+                "Model-visible invariant violated while deriving transcript"
+            );
+        }
         let transcript = derive_transcript(conversation_id, &events, requested);
         Ok(JournalTranscriptResponse {
             schema_version: transcript.schema_version,
@@ -105,6 +112,21 @@ impl ConversationService {
             model_visible_count: transcript.model_visible_count,
             model_visible_sha256: transcript.model_visible_sha256,
             journal_sha256: projection.journal_sha256,
+            compaction_lock: transcript.compaction_lock.as_str().to_owned(),
+            tokens: aionui_api_types::JournalTranscriptTokens {
+                log_revision: transcript.tokens.log_revision,
+                surface_tokens: transcript.tokens.surface_tokens,
+                nodes: transcript
+                    .tokens
+                    .nodes
+                    .into_iter()
+                    .map(|node| aionui_api_types::JournalTranscriptTokenNode {
+                        sequence: node.sequence,
+                        tokens: node.tokens,
+                    })
+                    .collect(),
+            },
+            tool_pairing_balanced: transcript.tool_pairing_balanced,
         })
     }
 

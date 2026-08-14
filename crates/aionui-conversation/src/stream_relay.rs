@@ -23,6 +23,8 @@ use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, info, warn};
 
+type PermissionAutoReject = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Number of text chunks to accumulate before flushing to the database.
 const FLUSH_INTERVAL: u32 = 20;
 
@@ -176,6 +178,7 @@ pub struct StreamRelay {
     superseding_tips: SupersedingTipTotals,
     output_retention: Option<OutputRetentionPolicy>,
     event_journal: Option<CanonicalEventJournal>,
+    permission_auto_reject: Option<PermissionAutoReject>,
 }
 
 impl StreamRelay {
@@ -205,6 +208,7 @@ impl StreamRelay {
             superseding_tips: SupersedingTipTotals::default(),
             output_retention: None,
             event_journal: None,
+            permission_auto_reject: None,
         }
     }
 
@@ -254,6 +258,11 @@ impl StreamRelay {
 
     pub(crate) fn with_event_journal(mut self, journal: CanonicalEventJournal) -> Self {
         self.event_journal = Some(journal);
+        self
+    }
+
+    pub(crate) fn with_permission_auto_reject(mut self, hook: PermissionAutoReject) -> Self {
+        self.permission_auto_reject = Some(hook);
         self
     }
 
@@ -379,13 +388,14 @@ impl StreamRelay {
                         let payload = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
                         let seed = format!("{}:{}:{}", self.turn_id, self.msg_id, journal_event_index);
                         let event_id = canonical_event_id(&seed, &payload);
+                        let kind = Self::event_kind(&event);
                         if let Err(error) = journal
                             .append(
                                 &self.user_id,
                                 &self.conversation_id,
                                 event_id,
-                                Self::event_kind(&event).to_owned(),
-                                payload,
+                                kind.to_owned(),
+                                payload.clone(),
                             )
                             .await
                         {
@@ -399,6 +409,8 @@ impl StreamRelay {
                             if !terminal {
                                 continue;
                             }
+                        } else {
+                            self.record_permission_audit(journal, kind, &payload).await;
                         }
                     }
                     let deleting = self.is_deleting();
@@ -785,6 +797,60 @@ impl StreamRelay {
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(lagged = n, "Stream relay lagged, some events dropped");
                 }
+            }
+        }
+    }
+
+    async fn record_permission_audit(&self, journal: &CanonicalEventJournal, kind: &str, payload: &serde_json::Value) {
+        let Some(call_id) = crate::approval_audit::extract_permission_call_id(kind, payload) else {
+            return;
+        };
+        let request_id = format!("approval:{}:{call_id}", self.conversation_id);
+        if let Err(error) = crate::approval_audit::append_approval_asked(
+            journal,
+            &self.user_id,
+            &self.conversation_id,
+            &request_id,
+            &call_id,
+            payload
+                .pointer("/title")
+                .or_else(|| payload.pointer("/data/title"))
+                .and_then(serde_json::Value::as_str),
+        )
+        .await
+        {
+            warn!(
+                conversation_id = %self.conversation_id,
+                call_id,
+                error = %error,
+                "Failed to journal approval/asked audit event"
+            );
+        }
+        let events = journal
+            .replay(&self.user_id, &self.conversation_id)
+            .await
+            .unwrap_or_default();
+        if crate::approval_audit::fold_approval_policy(&events) == aionui_ai_agent::shared_kernel::ApprovalPolicy::Never
+        {
+            if let Some(hook) = &self.permission_auto_reject {
+                hook(&call_id);
+            }
+            if let Err(error) = crate::approval_audit::append_approval_decided(
+                journal,
+                &self.user_id,
+                &self.conversation_id,
+                &request_id,
+                &call_id,
+                aionui_ai_agent::shared_kernel::ApprovalOutcome::Rejected,
+            )
+            .await
+            {
+                warn!(
+                    conversation_id = %self.conversation_id,
+                    call_id,
+                    error = %error,
+                    "Failed to journal never-policy approval rejection"
+                );
             }
         }
     }

@@ -736,8 +736,8 @@ impl ConversationService {
     }
 
     pub(crate) async fn journal_user_prompt(&self, user_id: &str, conversation_id: &str, msg_id: &str, content: &str) {
-        if let Err(error) = self
-            .canonical_event_journal()
+        let journal = self.canonical_event_journal();
+        if let Err(error) = journal
             .append_user_prompt(user_id, conversation_id, msg_id, content)
             .await
         {
@@ -747,6 +747,32 @@ impl ConversationService {
                 error = %error,
                 "Failed to journal user prompt; DB row remains the fallback projection"
             );
+            return;
+        }
+        match journal.replay(user_id, conversation_id).await {
+            Ok(events) => {
+                if let Err(violation) = crate::model_visible::check_claimed_inputs_recorded(
+                    conversation_id,
+                    &events,
+                    &[crate::model_visible::ClaimedModelInput {
+                        transcript_kind: "user/message",
+                        content: content.to_owned(),
+                    }],
+                ) {
+                    error!(
+                        msg_id,
+                        conversation_id,
+                        error = %violation,
+                        "Model-visible invariant violated: claimed user prompt is not reconstructible from the journal"
+                    );
+                }
+            }
+            Err(error) => warn!(
+                msg_id,
+                conversation_id,
+                error = %error,
+                "Failed to replay journal after recording a user prompt"
+            ),
         }
     }
 
@@ -3203,12 +3229,50 @@ impl ConversationService {
             })?;
 
         let confirmations = agent.get_confirmations();
-        let conf_id = confirmations
-            .iter()
-            .find(|c| c.call_id == call_id)
-            .map(|c| c.id.clone());
+        let pending = confirmations.iter().find(|c| c.call_id == call_id);
+        let conf_id = pending.map(|c| c.id.clone());
+        let journal = self.canonical_event_journal();
+        let events = journal.replay(user_id, conversation_id).await.unwrap_or_default();
+        let policy = crate::approval_audit::fold_approval_policy(&events);
+        let ask_kind = match pending {
+            None => aionui_ai_agent::shared_kernel::ApprovalAskKind::Missing,
+            Some(item) if item.questions.is_some() || item.title.as_deref() == Some("AskUserQuestion") => {
+                aionui_ai_agent::shared_kernel::ApprovalAskKind::AskUserQuestion
+            }
+            Some(_) => aionui_ai_agent::shared_kernel::ApprovalAskKind::Permission,
+        };
+        let picked = crate::approval_audit::picked_option_id(&req.data);
+        let outcome = aionui_ai_agent::shared_kernel::resolve_approval_outcome(
+            policy,
+            picked.as_deref(),
+            req.always_allow,
+            ask_kind,
+        );
+        let (data, always_allow) = if outcome.grants() {
+            (req.data, req.always_allow)
+        } else {
+            (serde_json::json!("reject"), false)
+        };
 
-        agent.confirm(&req.msg_id, call_id, req.data, req.always_allow)?;
+        agent.confirm(&req.msg_id, call_id, data, always_allow)?;
+        if let Err(error) = crate::approval_audit::append_approval_decided(
+            &journal,
+            user_id,
+            conversation_id,
+            &format!("approval:{conversation_id}:{call_id}"),
+            call_id,
+            outcome,
+        )
+        .await
+        {
+            warn!(
+                conversation_id,
+                call_id,
+                outcome = outcome.as_str(),
+                error = %error,
+                "Failed to journal approval decision"
+            );
+        }
 
         if let Some(conf_id) = conf_id {
             let payload = serde_json::json!({
