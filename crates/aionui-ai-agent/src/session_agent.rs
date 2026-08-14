@@ -866,6 +866,15 @@ impl SessionAgentTask {
             model: current_model.clone(),
             effort: self.backend.capabilities().current_effort,
         });
+        // Same reason, for the catalog itself: a later confirmation has to re-project the
+        // WHOLE snapshot, and the pump can only do that from a catalog it was handed.
+        // `CatalogUpdated` is not a reliable supply — agy emits none at all (its modes are
+        // static), so gating on it left agy's picker stuck on "switching…" with no signal
+        // that could ever clear it. This path always runs first: the frontend reads
+        // config-options on mount, before any switch is possible.
+        if !modes.is_empty() || !models.is_empty() {
+            self.runtime.set_last_catalog(modes.clone(), models.clone());
+        }
         let mut config_options = Vec::new();
         if !modes.is_empty() {
             config_options.push(aionui_api_types::AcpConfigOptionDto {
@@ -8731,6 +8740,86 @@ mod pump_tests {
                 ..StaticCapsBackend.capabilities()
             }
         }
+    }
+
+    /// A backend that never announces a catalog, like agy: its modes are static, so it
+    /// has nothing to push and only ever exposes them through `capabilities()`.
+    pub(super) struct NoCatalogEventBackend;
+
+    #[async_trait::async_trait]
+    impl SessionBackend for NoCatalogEventBackend {
+        async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+            Ok(CommandReceipt {
+                accepted: true,
+                admission: Admission::NoTurn,
+                turn_gen: 0,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::empty().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            StaticCapsBackend.capabilities()
+        }
+    }
+
+    /// A confirmation must reach the frontend even when the backend never emits
+    /// `CatalogUpdated`.
+    ///
+    /// The pump re-projects the option snapshot from the last catalog it saw, but agy
+    /// emits none at all (its modes are static — zero `CatalogUpdated` in that backend).
+    /// Gating the confirmation on that catalog meant agy's frame was never sent, so the
+    /// picker sat on "switching…" forever with no signal that could ever clear it — the
+    /// user could not tell when, or whether, the switch had landed.
+    ///
+    /// REST is the missing supply: `get_config_options` holds the backend handle and the
+    /// full catalog, and the frontend always reads it before switching.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_backend_without_catalog_events_still_confirms() {
+        let backend: Arc<dyn SessionBackend> = Arc::new(NoCatalogEventBackend);
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        // What the frontend does on mount — and the only place this backend's catalog
+        // is ever visible.
+        let _ = task.get_config_options().await.unwrap();
+
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        let runtime = task.runtime_for_test();
+        runtime.set_mode_override("plan".to_string());
+        let Some((modes, models)) = runtime.last_catalog() else {
+            panic!("reading config options must leave the pump a catalog to re-project");
+        };
+        emit_config_options_snapshot(&modes, &models, runtime);
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Ok(ev) = rx.recv().await {
+                if let AgentStreamEvent::AcpConfigOption(v) = ev {
+                    return Some(v);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+        .expect("a confirmation frame must be emitted");
+
+        let mode = frame
+            .get("config_options")
+            .and_then(|v| v.as_array())
+            .and_then(|a| {
+                a.iter()
+                    .find(|o| o.get("category").and_then(|c| c.as_str()) == Some("mode"))
+            })
+            .expect("the mode axis must ride the frame");
+        assert_eq!(mode.get("current_value").and_then(|v| v.as_str()), Some("plan"));
     }
 
     /// A confirmation frame must not blank out the OTHER axes it re-sends.
