@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
-    ConfigOptionConfirmation, GetConfigOptionsResponse, RetainedOutputResponse, SetConfigOptionRequest,
-    SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery,
-    WorkspaceEntry,
+    CanonicalReplayProjectionResponse, ConfigOptionConfirmation, GetConfigOptionsResponse, RetainedOutputResponse,
+    SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
+    WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_common::{AgentKillReason, ErrorChain};
 use aionui_db::SaveRuntimeStateParams;
@@ -26,6 +26,43 @@ use crate::service::{AssistantRuntimePreferenceUpdate, ConversationService};
 const MAX_DIR_DEPTH: usize = 10;
 
 impl ConversationService {
+    pub async fn replay_event_projection(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<CanonicalReplayProjectionResponse, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        if let Some(expected) = expected_sha256
+            && (expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(ConversationError::BadRequest {
+                reason: "expected_sha256 must be a 64-character hexadecimal digest".to_owned(),
+            });
+        }
+
+        let projection = self
+            .canonical_event_journal()
+            .replay_projection(user_id, conversation_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to replay canonical events: {error}")))?;
+        if expected_sha256.is_some_and(|expected| !projection.journal_sha256.eq_ignore_ascii_case(expected)) {
+            return Err(ConversationError::Busy {
+                reason: "canonical event projection does not match the expected digest".to_owned(),
+            });
+        }
+
+        Ok(CanonicalReplayProjectionResponse {
+            schema_version: projection.schema_version,
+            conversation_id: projection.conversation_id,
+            event_count: projection.event_count,
+            last_sequence: projection.last_sequence,
+            last_event_id: projection.last_event_id,
+            kind_counts: projection.kind_counts,
+            journal_sha256: projection.journal_sha256,
+        })
+    }
+
     pub async fn read_retained_output(
         &self,
         user_id: &str,

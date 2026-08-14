@@ -12,7 +12,8 @@ use crate::runtime_persistence::RuntimePersistenceCoordinator;
 use crate::runtime_state::ConversationRuntimeStateService;
 use crate::service::ConversationService;
 use crate::stream_persistence::{
-    OutputRetentionPolicy, PersistedTextSegment, StreamPersistenceAdapter, TextSegmentState, ThinkingSegmentState,
+    CanonicalEventJournal, OutputRetentionPolicy, PersistedTextSegment, StreamPersistenceAdapter, TextSegmentState,
+    ThinkingSegmentState, canonical_event_id,
 };
 use aionui_db::IConversationRepository;
 use aionui_realtime::EventBroadcaster;
@@ -290,6 +291,7 @@ pub struct StreamRelay {
     defer_clean_terminal_errors: bool,
     superseding_tips: SupersedingTipTotals,
     output_retention: Option<OutputRetentionPolicy>,
+    event_journal: Option<CanonicalEventJournal>,
 }
 
 impl StreamRelay {
@@ -318,6 +320,7 @@ impl StreamRelay {
             defer_clean_terminal_errors: false,
             superseding_tips: SupersedingTipTotals::default(),
             output_retention: None,
+            event_journal: None,
         }
     }
 
@@ -362,6 +365,11 @@ impl StreamRelay {
 
     pub(crate) fn with_output_retention(mut self, policy: OutputRetentionPolicy) -> Self {
         self.output_retention = Some(policy);
+        self
+    }
+
+    pub(crate) fn with_event_journal(mut self, journal: CanonicalEventJournal) -> Self {
+        self.event_journal = Some(journal);
         self
     }
 
@@ -421,6 +429,7 @@ impl StreamRelay {
         let mut send_error_done = send_error_rx.is_none();
         let mut pending_send_error: Option<AgentSendError> = None;
         let mut attempt = TurnAttemptSummary::default();
+        let mut journal_event_index = 0_u64;
 
         loop {
             let recv_result = if send_error_done {
@@ -471,6 +480,33 @@ impl StreamRelay {
                     {
                         warn!(error = %error, "Failed to retain large tool output; forwarding bounded in-memory event");
                         bound_large_tool_output(&mut event);
+                    }
+                    if let Some(journal) = &self.event_journal {
+                        journal_event_index = journal_event_index.saturating_add(1);
+                        let payload = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
+                        let seed = format!("{}:{}:{}", self.turn_id, self.msg_id, journal_event_index);
+                        let event_id = canonical_event_id(&seed, &payload);
+                        if let Err(error) = journal
+                            .append(
+                                &self.user_id,
+                                &self.conversation_id,
+                                event_id,
+                                Self::event_kind(&event).to_owned(),
+                                payload,
+                            )
+                            .await
+                        {
+                            let terminal = matches!(event, AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_));
+                            warn!(
+                                error = %error,
+                                event_type = Self::event_kind(&event),
+                                terminal,
+                                "Failed to append canonical event before projection"
+                            );
+                            if !terminal {
+                                continue;
+                            }
+                        }
                     }
                     let deleting = self.is_deleting();
                     if deleting && !matches!(event, AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_)) {
@@ -1436,6 +1472,33 @@ mod tests {
             "needs-auth empty turn is a benign finish"
         );
         assert!(outcome.attempt.needs_auth, "needs-auth tip must set the summary flag");
+    }
+
+    #[tokio::test]
+    async fn journal_write_failure_does_not_swallow_terminal_event() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let temp = tempfile::tempdir().unwrap();
+        let invalid_root = temp.path().join("journal-root-is-a-file");
+        tokio::fs::write(&invalid_root, b"not a directory").await.unwrap();
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo,
+            bus,
+        )
+        .with_event_journal(CanonicalEventJournal::new(invalid_root));
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), relay.consume(rx))
+            .await
+            .expect("journal failure must not leave the relay waiting forever");
+
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
     }
 
     #[tokio::test]

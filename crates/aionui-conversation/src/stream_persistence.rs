@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use aionui_ai_agent::protocol::events::{
     ErrorEventData, TipType, TipsEventData,
@@ -13,6 +14,7 @@ use aionui_db::{ConversationRowUpdate, DbError, IConversationRepository, Message
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, warn};
 
 use crate::runtime_completion::RuntimeCompletionPublisher;
@@ -21,37 +23,6 @@ use crate::service::ConversationService;
 
 fn is_not_found(err: &DbError) -> bool {
     matches!(err, DbError::NotFound(_))
-}
-
-#[cfg(test)]
-mod output_retention_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn spills_large_output_and_reads_it_only_in_the_same_scope() {
-        let root = tempfile::tempdir().unwrap();
-        let policy = OutputRetentionPolicy::with_preview_bytes(root.path().to_path_buf(), 4);
-        let retained = policy.retain("user-a", "conv-a", "hello world").await.unwrap().unwrap();
-        assert_eq!(retained.preview, "hell");
-        assert_eq!(retained.size, 11);
-        let (_, full) = policy.read("user-a", "conv-a", &retained.reference).await.unwrap();
-        assert_eq!(full, "hello world");
-        assert_eq!(
-            policy
-                .read("user-b", "conv-a", &retained.reference)
-                .await
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-    }
-
-    #[tokio::test]
-    async fn keeps_small_output_inline() {
-        let root = tempfile::tempdir().unwrap();
-        let policy = OutputRetentionPolicy::with_preview_bytes(root.path().to_path_buf(), 64);
-        assert!(policy.retain("user", "conv", "small").await.unwrap().is_none());
-    }
 }
 
 const DEFAULT_RETAINED_OUTPUT_PREVIEW_BYTES: usize = 64 * 1024;
@@ -169,6 +140,14 @@ fn stable_scope(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
 
+pub(crate) fn canonical_event_id(seed: &str, payload: &serde_json::Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(seed.as_bytes());
+    hasher.update([0]);
+    hasher.update(serde_json::to_vec(payload).unwrap_or_default());
+    hex::encode(hasher.finalize())
+}
+
 fn ensure_contained(root: &Path, target: &Path) -> Result<(), std::io::Error> {
     if target == root || !target.starts_with(root) {
         return Err(std::io::Error::new(
@@ -177,6 +156,221 @@ fn ensure_contained(root: &Path, target: &Path) -> Result<(), std::io::Error> {
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub(crate) struct CanonicalJournalEvent {
+    pub schema_version: u32,
+    pub event_id: String,
+    pub conversation_id: String,
+    pub sequence: u64,
+    pub timestamp: i64,
+    pub kind: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct CanonicalReplayProjection {
+    pub schema_version: u32,
+    pub conversation_id: String,
+    pub event_count: u64,
+    pub last_sequence: u64,
+    pub last_event_id: Option<String>,
+    pub kind_counts: BTreeMap<String, u64>,
+    pub journal_sha256: String,
+}
+
+impl CanonicalReplayProjection {
+    fn from_empty(conversation_id: &str, events: &[CanonicalJournalEvent]) -> Result<Self, std::io::Error> {
+        let mut kind_counts = BTreeMap::new();
+        let mut digest = Sha256::new();
+        for (index, event) in events.iter().enumerate() {
+            if event.conversation_id != conversation_id || event.sequence != index as u64 + 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "canonical replay event does not match its projection scope",
+                ));
+            }
+            *kind_counts.entry(event.kind.clone()).or_insert(0) += 1;
+            digest.update(
+                serde_json::to_vec(event)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+            );
+            digest.update([b'\n']);
+        }
+        Ok(Self {
+            schema_version: 1,
+            conversation_id: conversation_id.to_owned(),
+            event_count: events.len() as u64,
+            last_sequence: events.last().map_or(0, |event| event.sequence),
+            last_event_id: events.last().map(|event| event.event_id.clone()),
+            kind_counts,
+            journal_sha256: hex::encode(digest.finalize()),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CanonicalEventJournal {
+    root: PathBuf,
+}
+
+static JOURNAL_APPEND_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+impl CanonicalEventJournal {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    pub async fn append(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        event_id: String,
+        kind: String,
+        payload: serde_json::Value,
+    ) -> Result<CanonicalJournalEvent, std::io::Error> {
+        let _guard = JOURNAL_APPEND_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let path = self.path(user_id, conversation_id)?;
+        self.repair_incomplete_tail(&path).await?;
+        let events = self.replay_unlocked(&path).await?;
+        if let Some(existing) = events.iter().find(|event| event.event_id == event_id) {
+            return Ok(existing.clone());
+        }
+        let event = CanonicalJournalEvent {
+            schema_version: 1,
+            event_id,
+            conversation_id: conversation_id.to_owned(),
+            sequence: events.last().map_or(1, |event| event.sequence.saturating_add(1)),
+            timestamp: now_ms(),
+            kind,
+            payload,
+        };
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        let mut encoded =
+            serde_json::to_vec(&event).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        encoded.push(b'\n');
+        file.write_all(&encoded).await?;
+        file.flush().await?;
+        file.sync_data().await?;
+        Ok(event)
+    }
+
+    pub async fn replay(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<CanonicalJournalEvent>, std::io::Error> {
+        let path = self.path(user_id, conversation_id)?;
+        self.replay_unlocked(&path).await
+    }
+
+    pub async fn replay_projection(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<CanonicalReplayProjection, std::io::Error> {
+        let events = self.replay(user_id, conversation_id).await?;
+        CanonicalReplayProjection::from_empty(conversation_id, &events)
+    }
+
+    #[cfg(test)]
+    pub async fn replay_and_compare(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        expected: &CanonicalReplayProjection,
+    ) -> Result<CanonicalReplayProjection, std::io::Error> {
+        let actual = self.replay_projection(user_id, conversation_id).await?;
+        if &actual != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "canonical replay projection mismatch: expected count/digest {}/{}, actual {}/{}",
+                    expected.event_count, expected.journal_sha256, actual.event_count, actual.journal_sha256
+                ),
+            ));
+        }
+        Ok(actual)
+    }
+
+    fn path(&self, user_id: &str, conversation_id: &str) -> Result<PathBuf, std::io::Error> {
+        let path = self
+            .root
+            .join(stable_scope(user_id))
+            .join(format!("{}.ndjson", stable_scope(conversation_id)));
+        ensure_contained(&self.root, &path)?;
+        Ok(path)
+    }
+
+    async fn replay_unlocked(&self, path: &Path) -> Result<Vec<CanonicalJournalEvent>, std::io::Error> {
+        let bytes = match tokio::fs::read(path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let committed_len = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let raw = std::str::from_utf8(&bytes[..committed_len])
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let mut events = Vec::new();
+        for (index, line) in raw.lines().filter(|line| !line.trim().is_empty()).enumerate() {
+            let event: CanonicalJournalEvent = serde_json::from_str(line)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            if event.schema_version != 1 || event.sequence != index as u64 + 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "canonical event journal sequence is invalid",
+                ));
+            }
+            if events
+                .iter()
+                .any(|seen: &CanonicalJournalEvent| seen.event_id == event.event_id)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "canonical event journal contains a duplicate event id",
+                ));
+            }
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    async fn repair_incomplete_tail(&self, path: &Path) -> Result<(), std::io::Error> {
+        let bytes = match tokio::fs::read(path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+            return Ok(());
+        }
+        let committed_len = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
+        file.set_len(committed_len as u64).await?;
+        file.sync_data().await?;
+        warn!(
+            discarded_bytes = bytes.len() - committed_len,
+            "Recovered incomplete canonical journal tail"
+        );
+        Ok(())
+    }
 }
 
 fn is_foreign_key_constraint(err: &DbError) -> bool {
@@ -770,5 +964,117 @@ impl StreamPersistenceAdapter {
                 error!(error = %ErrorChain(&e), "Failed to persist tool_group message");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod output_retention_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn spills_large_output_and_reads_it_only_in_the_same_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let policy = OutputRetentionPolicy::with_preview_bytes(root.path().to_path_buf(), 4);
+        let retained = policy.retain("user-a", "conv-a", "hello world").await.unwrap().unwrap();
+        assert_eq!(retained.preview, "hell");
+        assert_eq!(retained.size, 11);
+        let (_, full) = policy.read("user-a", "conv-a", &retained.reference).await.unwrap();
+        assert_eq!(full, "hello world");
+        assert_eq!(
+            policy
+                .read("user-b", "conv-a", &retained.reference)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_small_output_inline() {
+        let root = tempfile::tempdir().unwrap();
+        let policy = OutputRetentionPolicy::with_preview_bytes(root.path().to_path_buf(), 64);
+        assert!(policy.retain("user", "conv", "small").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn canonical_journal_is_ordered_and_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = CanonicalEventJournal::new(root.path().to_path_buf());
+        let payload = serde_json::json!({"content":"hello"});
+        let first = journal
+            .append("user", "conv", "event-1".into(), "Text".into(), payload.clone())
+            .await
+            .unwrap();
+        let duplicate = journal
+            .append("user", "conv", "event-1".into(), "Text".into(), payload)
+            .await
+            .unwrap();
+        let second = journal
+            .append("user", "conv", "event-2".into(), "Finish".into(), serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(first, duplicate);
+        assert_eq!(second.sequence, 2);
+        assert_eq!(journal.replay("user", "conv").await.unwrap().len(), 2);
+        assert!(journal.replay("other-user", "conv").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn canonical_replay_projection_compares_from_an_empty_projection() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = CanonicalEventJournal::new(root.path().to_path_buf());
+        journal
+            .append(
+                "user",
+                "conv",
+                "event-1".into(),
+                "Text".into(),
+                serde_json::json!({"text":"a"}),
+            )
+            .await
+            .unwrap();
+        journal
+            .append("user", "conv", "event-2".into(), "Finish".into(), serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let expected = journal.replay_projection("user", "conv").await.unwrap();
+        assert_eq!(expected.event_count, 2);
+        assert_eq!(expected.kind_counts.get("Text"), Some(&1));
+        assert!(journal.replay_and_compare("user", "conv", &expected).await.is_ok());
+
+        let mut wrong = expected;
+        wrong.event_count = 3;
+        assert_eq!(
+            journal
+                .replay_and_compare("user", "conv", &wrong)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_journal_discards_an_incomplete_crash_tail_before_append() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = CanonicalEventJournal::new(root.path().to_path_buf());
+        journal
+            .append("user", "conv", "event-1".into(), "Text".into(), serde_json::json!({}))
+            .await
+            .unwrap();
+        let path = journal.path("user", "conv").unwrap();
+        let mut file = tokio::fs::OpenOptions::new().append(true).open(&path).await.unwrap();
+        file.write_all(br#"{"schema_version":1"#).await.unwrap();
+        file.flush().await.unwrap();
+
+        journal
+            .append("user", "conv", "event-2".into(), "Finish".into(), serde_json::json!({}))
+            .await
+            .unwrap();
+        let events = journal.replay("user", "conv").await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].sequence, 2);
     }
 }

@@ -1324,6 +1324,15 @@ mod tests {
     use tokio::sync::{RwLock, broadcast};
     use tokio::time::timeout;
 
+    static TEST_ROOT_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn unique_test_root(name: &str) -> std::path::PathBuf {
+        let sequence = TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("{name}-{}-{sequence}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
     fn ensure_named_workspace_path(name: &str) -> String {
         let workspace = std::env::temp_dir().join(name);
         std::fs::create_dir_all(&workspace).unwrap();
@@ -2638,8 +2647,9 @@ mod tests {
         let stub_repo: Arc<dyn IConversationRepository> = Arc::new(StubConvRepo);
         let agent_metadata_repo: Arc<dyn aionui_db::IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo);
         let acp_session_repo: Arc<dyn aionui_db::IAcpSessionRepository> = Arc::new(StubAcpSessionRepo);
+        let test_root = unique_test_root("aionui-cron-busy-executor");
         let conv_service = Arc::new(ConversationService::new(
-            std::env::temp_dir(),
+            test_root.clone(),
             stub_broadcaster,
             Arc::new(StubSkillResolver),
             Arc::new(StubTaskManager),
@@ -2654,8 +2664,8 @@ mod tests {
             Arc::new(StubTaskManager),
             stub_repo,
             conv_service,
-            std::env::temp_dir(),
-            std::env::temp_dir(),
+            test_root.clone(),
+            test_root,
             Arc::new(StubBroadcaster),
             agent_registry,
         )
@@ -3396,8 +3406,9 @@ mod tests {
 
         let agent_metadata_repo: Arc<dyn aionui_db::IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo);
         let acp_session_repo: Arc<dyn aionui_db::IAcpSessionRepository> = Arc::new(StubAcpSessionRepo);
+        let test_root = unique_test_root("aionui-cron-executor");
         let conversation_service = Arc::new(ConversationService::new(
-            std::env::temp_dir(),
+            test_root.clone(),
             Arc::clone(&broadcaster),
             Arc::new(StubSkillResolver),
             Arc::clone(&task_manager),
@@ -3412,8 +3423,8 @@ mod tests {
             task_manager,
             repo,
             conversation_service,
-            std::env::temp_dir(),
-            std::env::temp_dir(),
+            test_root.clone(),
+            test_root,
             broadcaster,
             agent_registry,
         )
