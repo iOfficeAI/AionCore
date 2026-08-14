@@ -535,6 +535,34 @@ impl AntigravitySessionBackend {
             .or_else(|| self.config.mode.clone())
     }
 
+    /// Mark the running turn as finished and release any switch it could not hear.
+    ///
+    /// The turn ending is what makes a deferred switch real: that agy process is gone, so
+    /// nothing is running under the old mode any more and the next spawn necessarily
+    /// reads the new one. Confirming here rather than at the next spawn matters because
+    /// the next spawn needs the user to send another message — until then the picker
+    /// would sit on "switching…" with no way to tell whether it had landed.
+    ///
+    /// `take()` makes this idempotent: a later turn boundary finds nothing to release.
+    async fn settle_turn_end(&self) {
+        self.in_flight.store(false, Ordering::SeqCst);
+        if let Some(mode) = self.deferred_mode_confirm.lock().await.take() {
+            let turn_gen = self.turn_gen.load(Ordering::SeqCst);
+            tracing::info!(
+                session_id = %self.session_id,
+                mode = %mode,
+                "antigravity: turn ended — releasing the held mode confirmation"
+            );
+            self.emit(
+                turn_gen,
+                SessionEvent::ConfigChanged {
+                    mode: Some(mode),
+                    model: None,
+                },
+            );
+        }
+    }
+
     /// Whether a mode switch made RIGHT NOW would govern the turn already running.
     ///
     /// Between turns: yes — the next spawn reads the new mode from argv either way.
@@ -622,20 +650,6 @@ impl AntigravitySessionBackend {
         // turn never calls back and only the next spawn can pick one up.
         self.turn_started_hooked.store(!self.is_full_auto(), Ordering::SeqCst);
         self.in_flight.store(true, Ordering::SeqCst);
-        // A switch deferred during the previous turn becomes real exactly here: this argv
-        // carries it. Confirm it now, which both clears the frontend's pending marker and
-        // persists `current_mode_id` (ConfigChanged is the only trigger for that).
-        if let Some(mode) = self.deferred_mode_confirm.lock().await.take() {
-            let turn_gen = self.turn_gen.load(Ordering::SeqCst);
-            self.emit(
-                turn_gen,
-                SessionEvent::ConfigChanged {
-                    mode: Some(mode),
-                    model: None,
-                },
-            );
-        }
-
         self.spawn_reader(Arc::clone(&proc), turn_gen);
         Ok(turn_gen)
     }
@@ -778,7 +792,7 @@ impl AntigravitySessionBackend {
                 // Session dropped; nothing left to run for.
                 return;
             };
-            backend.in_flight.store(false, Ordering::SeqCst);
+            backend.settle_turn_end().await;
             let next = backend.queued.lock().await.pop_front();
             if let Some(content) = next
                 && let Err(e) = backend.start_turn(content).await
@@ -1477,6 +1491,77 @@ mod tests {
         assert!(
             confirmed.is_err() || confirmed.as_ref().unwrap().is_none(),
             "a switch agy cannot see yet must not be confirmed, got {confirmed:?}"
+        );
+    }
+
+    /// A deferred switch confirms as soon as the turn that could not hear it ENDS.
+    ///
+    /// Waiting for the next spawn was too conservative: once that turn is over its agy
+    /// process is gone, so nothing is running under the old mode any more and the next
+    /// spawn necessarily reads the new one. Holding "switching…" until the user happens
+    /// to send another message left the picker stuck with no way to tell whether the
+    /// switch had landed — and made a second switch appear to work instantly while the
+    /// first still looked pending.
+    #[tokio::test]
+    async fn a_deferred_switch_confirms_when_the_turn_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend_with_hook_body(dir.path(), Some("yolo"), Some("{\"stub\":true}"));
+        b.in_flight.store(true, Ordering::SeqCst);
+        b.turn_started_hooked.store(false, Ordering::SeqCst);
+        let mut events = b.events();
+
+        b.dispatch(Command::SetMode {
+            mode: "default".to_owned(),
+        })
+        .await
+        .unwrap();
+
+        b.settle_turn_end().await;
+
+        let confirmed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            use futures_util::StreamExt as _;
+            while let Some(env) = events.next().await {
+                if let SessionEvent::ConfigChanged { mode, .. } = env.event {
+                    return mode;
+                }
+            }
+            None
+        })
+        .await
+        .expect("the turn ending must release the held confirmation");
+        assert_eq!(confirmed.as_deref(), Some("default"));
+    }
+
+    /// ...and only once: a second turn boundary must not re-announce it.
+    #[tokio::test]
+    async fn a_released_confirmation_is_not_repeated() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend_with_hook_body(dir.path(), Some("yolo"), Some("{\"stub\":true}"));
+        b.in_flight.store(true, Ordering::SeqCst);
+        b.turn_started_hooked.store(false, Ordering::SeqCst);
+
+        b.dispatch(Command::SetMode {
+            mode: "default".to_owned(),
+        })
+        .await
+        .unwrap();
+        b.settle_turn_end().await;
+
+        let mut events = b.events();
+        b.settle_turn_end().await;
+        let again = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            use futures_util::StreamExt as _;
+            while let Some(env) = events.next().await {
+                if let SessionEvent::ConfigChanged { .. } = env.event {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert!(
+            again.is_err() || !again.unwrap(),
+            "the held confirmation is released once, not on every turn boundary"
         );
     }
 
