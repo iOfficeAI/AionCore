@@ -1526,6 +1526,51 @@ async fn run_backend_tool_card(backend: &str) {
     let conv_id = conversation_for(&app, backend, "toolcard").await;
     let ws_dir = std::env::temp_dir();
 
+    // agy only: run this one without approval prompts.
+    //
+    // The test is about whether a tool card RENDERS. In its default mode agy
+    // routes every tool through the PreToolUse hook and waits for a human, which
+    // no test provides; the backend then denies at its 20s deadline ("denied a
+    // tool because agy was about to stop waiting for approval"), no tool runs,
+    // and the assertion below reports "no tool frame at all" as though the
+    // translation were broken. Observed 2026-08-15 against agy 1.1.13: three
+    // `acp_permission` frames raised, three auto-denials, zero `tool_call`.
+    //
+    // claude and codex reach a tool here without this, so they are left alone —
+    // and the mode VOCABULARY is per-backend anyway: agy's full-auto sentinel is
+    // `yolo`, codex's is `agent-full-access`. A first attempt sent
+    // `agent-full-access` for every backend and turned claude's passing test red
+    // with `mode 'agent-full-access' is not one of the available modes`.
+    //
+    // Selected before the first turn: agy resolves its mode at spawn, so
+    // switching later would exercise a different path.
+    if backend == "antigravity" {
+        let ensured = http_json(
+            &app,
+            "POST",
+            &format!("/api/conversations/{conv_id}/runtime/ensure"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            ensured["success"],
+            json!(true),
+            "[{backend}] runtime must come up before selecting a mode: {ensured}"
+        );
+        let mode_resp = http_json(
+            &app,
+            "PUT",
+            &format!("/api/conversations/{conv_id}/config-options/mode"),
+            json!({"value": "yolo"}),
+        )
+        .await;
+        assert_eq!(
+            mode_resp["success"],
+            json!(true),
+            "[{backend}] full auto must actually apply, or a denied tool looks like a missing frame: {mode_resp}"
+        );
+    }
+
     let frames = drive_and_collect(
         &app,
         &conv_id,
