@@ -4,9 +4,41 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aionui_api_types::{ConversationRuntimeSummary, TeamRunTargetRole};
+use aionui_common::ResolvedBackendCapabilities;
 use async_trait::async_trait;
 
 use crate::error::TeamError;
+
+/// Resolves Team tool capability without exposing backend-specific descriptors
+/// or persisted handshake shapes to the Team domain.
+#[async_trait]
+pub trait TeamToolCapabilityPort: Send + Sync {
+    async fn resolve(
+        &self,
+        user_id: &str,
+        backend: &str,
+        agent_id: Option<&str>,
+    ) -> Result<ResolvedBackendCapabilities, TeamError>;
+}
+
+/// Safe default for test-only/service construction that does not inject the
+/// composition resolver: unknown backends retain the CLI fallback.
+pub struct UnknownTeamToolCapabilityPort;
+
+#[async_trait]
+impl TeamToolCapabilityPort for UnknownTeamToolCapabilityPort {
+    async fn resolve(
+        &self,
+        _user_id: &str,
+        _backend: &str,
+        _agent_id: Option<&str>,
+    ) -> Result<ResolvedBackendCapabilities, TeamError> {
+        Ok(ResolvedBackendCapabilities {
+            cli_fallback: true,
+            ..Default::default()
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TeamConversationBindingLookup {

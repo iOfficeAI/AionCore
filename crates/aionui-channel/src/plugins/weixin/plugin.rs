@@ -626,6 +626,7 @@ mod tests {
                 client_secret: None,
                 account_id: account_id.map(String::from),
                 bot_token: bot_token.map(String::from),
+                app_token: None,
                 extra: HashMap::new(),
             },
             config: None,

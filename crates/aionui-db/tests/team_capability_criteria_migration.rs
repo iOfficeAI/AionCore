@@ -148,8 +148,9 @@ async fn probed_registry_agents_carry_seeded_mcp_capabilities() {
         ("kilo", Some((true, true))),
         ("mimo-code", Some((true, true))),
         ("nova", Some((true, true))),
-        ("omp", Some((true, true))),
         ("sigit", Some((false, false))),
+        // direct CLI launch (031 seeded it on npx; 039 moved it off the bridge)
+        ("omp", Some((true, true))),
         // binary distributions (025)
         ("amp-acp", Some((true, true))),
         ("cortex-code", None),

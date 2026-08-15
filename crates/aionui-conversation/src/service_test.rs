@@ -4441,6 +4441,86 @@ async fn command_ack_does_not_persist_assistant_preference_in_core_service() {
     assert!(refreshed.extra.get("current_model_id").is_none());
 }
 
+/// A deferred switch is still the user's choice and must be remembered.
+///
+/// `PendingNextTurn` says "the agent applies this from the next turn", not "the request
+/// was refused" -- unlike `CommandAck`, which says nothing landed either way. Gating the
+/// preference write-back on `Observed` alone would silently strip preference memory from
+/// every codex conversation, since codex reports a mode switch as next-turn
+/// unconditionally (its schema documents `permissions` as being "for subsequent turns").
+#[tokio::test]
+async fn pending_next_turn_still_persists_the_users_choice() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo, definition_repo, overlay_repo, preference_repo) =
+        make_service_with_mock_task_manager_and_assistant_support(task_mgr.clone()).await;
+
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "asstdef_acp_auto",
+        "assistant-acp-auto",
+        "codex",
+        "auto",
+        "auto",
+    )
+    .await;
+    overlay_repo
+        .upsert(&UpsertAssistantOverlayParams {
+            assistant_definition_id: "asstdef_acp_auto",
+            enabled: true,
+            sort_order: 0,
+            agent_id_override: None,
+            last_used_at: None,
+        })
+        .await
+        .unwrap();
+
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-auto").await;
+    let agent = Arc::new(
+        MockAgent::new(&conv.id).with_set_config_option_response(SetConfigOptionResponse {
+            confirmation: ConfigOptionConfirmation::PendingNextTurn,
+            config_options: Some(vec![AcpConfigOptionDto {
+                id: "mode".to_owned(),
+                name: None,
+                label: None,
+                description: None,
+                category: Some("mode".to_owned()),
+                option_type: "select".to_owned(),
+                // Deliberately still the OLD mode: a deferred switch reports what is in
+                // force, not what was requested.
+                current_value: Some("default".to_owned()),
+                options: vec![],
+            }]),
+        }),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
+
+    let result = svc
+        .set_config_option(
+            "user_1",
+            &conv.id,
+            "mode",
+            SetConfigOptionRequest {
+                value: "plan".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.confirmation, ConfigOptionConfirmation::PendingNextTurn);
+
+    let pref = preference_repo
+        .get_for_user("user_1", "asstdef_acp_auto")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pref.last_permission_value.as_deref(),
+        Some("plan"),
+        "a deferred switch is still the user's settled choice and must be remembered"
+    );
+    let snapshot = repo.get_assistant_snapshot("user_1", &conv.id).await.unwrap().unwrap();
+    assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("plan"));
+}
+
 #[tokio::test]
 async fn set_config_option_persists_runtime_model_into_assistant_preference_when_observed() {
     let task_mgr = Arc::new(MockTaskManager::new());
@@ -8507,6 +8587,41 @@ async fn cancel_during_the_build_is_recorded_instead_of_dropped() {
         "it must NOT reuse the ordinary cancelling flag: that one is also set when the \
          agent was handed the cancel directly, and the orchestrator would then abort turns \
          whose cancel is already being handled"
+    );
+}
+
+/// Remembering the cancel is only half of it — the client has to be told.
+///
+/// The turn ends on the server, but every terminal frame on the send path comes
+/// from the `StreamRelay`, which the deferred-cancel branch returns before
+/// building. So the server settled and the UI kept spinning until the 15s
+/// watchdog. Live symptom (agy 1.1.12, 2026-08-12): the conversation produced no
+/// stream frames at all, not even `start`, and the live cancel test failed 4/4;
+/// with the frame it settles in ~200ms.
+///
+/// The sibling test above asserts only that the request is recorded, which is
+/// why it stayed green through all of that.
+#[tokio::test]
+async fn a_turn_cancelled_before_its_agent_exists_tells_the_client_it_ended() {
+    let (svc, broadcaster, _repo, _task_mgr) = make_service();
+
+    svc.broadcast_turn_settled_without_relay("user_1", "conv_1", "turn_1", "msg_1");
+
+    let events = broadcaster.take_events();
+    let finish = events
+        .iter()
+        .find(|e| e.name == "message.stream" && e.data["type"] == "finish")
+        .expect("a turn that ends before its relay exists must still emit a terminal frame");
+
+    assert_eq!(finish.data["conversation_id"], "conv_1");
+    assert_eq!(finish.data["turn_id"], "turn_1");
+    assert_eq!(
+        finish.data["msg_id"], "msg_1",
+        "the frame has to name the message the client is spinning on"
+    );
+    assert_eq!(
+        finish.data["hidden"], false,
+        "a hidden terminal would settle nothing the user can see"
     );
 }
 

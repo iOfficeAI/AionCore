@@ -22,7 +22,7 @@ setup:
 _cargo *ARGS:
     @{{cargo_script}} {{ARGS}}
 
-# Build in release mode and install to cargo bin
+# Build in release mode (does not install; run `just install` for that)
 # Use `just build --force` to skip cache check
 build *FLAGS: lint-fix fmt
     @{{build_script}} release {{FLAGS}}
@@ -32,7 +32,8 @@ build *FLAGS: lint-fix fmt
 build-debug *FLAGS:
     @{{build_script}} debug {{FLAGS}}
 
-install:
+# Build (if needed) then install the release binary to cargo bin
+install: build
     @{{install_script}} release
 
 # Run all tests

@@ -1171,6 +1171,12 @@ impl BackendAdapter for ClaudeAdapter {
         // CLI-static (filled by ClaudeConnection).
         Capabilities {
             tier: CapabilityTier::Parsed,
+            // Static default only. The live backend OVERRIDES this per call, because
+            // claude's answer depends on what it is doing: a `set_permission_mode` written
+            // while idle takes effect at once (verified:
+            // samples/claude-cli/2.1.227/set_permission_mode/), but one raised mid-turn is
+            // queued by `write_or_queue_control` and drained before the NEXT prompt.
+            mode_switch_effect: crate::capability::ModeSwitchEffect::Immediate,
             emits: SignalSet {
                 heartbeat: true,
                 tool_lifecycle: true,

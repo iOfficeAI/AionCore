@@ -18,7 +18,9 @@ use aionui_api_types::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AgentModeResponse, ConfigOptionConfirmation,
     GetConfigOptionsResponse, SetConfigOptionResponse, SlashCommandItem,
 };
-use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, ErrorChain, TimestampMs, now_ms};
+use aionui_common::{
+    AgentKillReason, AgentType, Confirmation, ConversationStatus, ErrorChain, TimestampMs, generate_short_id, now_ms,
+};
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, broadcast};
 use tokio::time::timeout;
@@ -404,7 +406,22 @@ impl IAgentTask for AionrsAgentManager {
             "Built structured Aionrs content blocks"
         );
 
+        // One anchor for both history stores: the conversation-layer turn id
+        // is stamped onto this turn's DB message rows (BackendTurnBound →
+        // stream persistence, mirroring the codex reader) AND onto the
+        // engine's session messages, so an at-turn fork can cut both at the
+        // same point.
+        let turn_anchor = data
+            .turn_id
+            .clone()
+            .unwrap_or_else(|| format!("turn_{}", generate_short_id()));
+        let _ = self
+            .runtime
+            .event_sender()
+            .send(AgentStreamEvent::BackendTurnBound(turn_anchor.clone()));
+
         let mut engine = self.engine.lock().await;
+        engine.set_next_turn_id(Some(turn_anchor));
 
         let result = tokio::select! {
             res = engine.run_with_blocks(content_blocks, &data.msg_id) => Some(res),

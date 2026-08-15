@@ -728,6 +728,7 @@ fn build_test_config(req: &TestPluginRequest) -> PluginConfig {
         client_secret: None,
         account_id: None,
         bot_token: None,
+        app_token: None,
         extra: HashMap::new(),
     };
 
@@ -813,6 +814,7 @@ fn build_extension_config(
         client_secret: None,
         account_id: None,
         bot_token: None,
+        app_token: None,
         extra: HashMap::new(),
     };
     let mut config_extra = HashMap::new();

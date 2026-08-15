@@ -9,6 +9,8 @@ telegram = ["dep:reqwest"]
 lark = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:prost", "dep:rustls", "dep:rustls-native-certs"]
 dingtalk = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-native-certs"]
 weixin = ["dep:reqwest", "dep:futures-util", "dep:base64", "dep:uuid"]
+slack = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-native-certs"]
+discord = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-native-certs"]
 
 [dependencies]
 aionui-common.workspace = true

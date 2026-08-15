@@ -4,6 +4,7 @@
 pub mod constants;
 pub mod user_paths;
 
+mod backend_capabilities;
 mod branding;
 mod case_convert;
 mod crypto;
@@ -16,6 +17,7 @@ mod pagination;
 mod timestamp;
 mod types;
 
+pub use backend_capabilities::{CapabilityOrigin, McpTransportCapabilities, ResolvedBackendCapabilities};
 pub use branding::normalize_product_brand_text;
 pub use case_convert::{camel_to_snake, normalize_keys_to_snake_case};
 pub use crypto::{CryptoError, decrypt_string, encrypt_string};

@@ -9,6 +9,21 @@
 * **agent:** drive lifecycle from declared handshake behavior policy
 * **conversation:** compact older tool results and replay surface tokens
 * **conversation:** fail-closed approval audit and model-visible journal invariant
+* **conversation:** support forking aionrs conversations
+* **session:** report a deferred mode switch as pending instead of observed
+* **channel:** add Slack Socket Mode and Discord Gateway plugins
+* **db:** dedicated startup stage for a database created by a newer app
+* **sidebar:** add user_order ordering base and sidebar grouping API
+
+### Bug Fixes
+
+* restore direct CLI Team MCP capabilities
+* **session:** retry claude session-title generation with timeout and observability
+* **antigravity:** parse TSV output from `agy models`
+* **conversation:** tell the client when a turn is cancelled before its agent exists
+* **cli-version:** deliver the version-drift notice, and stop it reading as an error
+* **agent:** stop the idle scanner from killing agents with live background tasks
+* **runtime:** bump verified ACP registry pins and CLI versions
 
 ## [0.1.69](https://github.com/suoak/AionCore/compare/v0.1.68...v0.1.69) (2026-08-14)
 

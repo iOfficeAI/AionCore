@@ -316,6 +316,26 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
                     return None;
                 }
 
+                // A live background container (workflow / background bash /
+                // background subagent) outlives its turn with status=Finished
+                // and emits no mid-flight frames, so idle_ms alone misreads a
+                // busy agent as idle. Killing it orphans the work and drops the
+                // CLI's completion report. Protection is logged at info: this
+                // fires at most once per scan per agent and is exactly what a
+                // production "background task vanished" report needs.
+                let live_background_tasks = agent.live_background_tasks();
+                if live_background_tasks > 0 {
+                    info!(
+                        conversation_id = %entry.key(),
+                        ?status,
+                        idle_ms,
+                        live_background_tasks,
+                        reason = %"LiveBackgroundTask",
+                        "Idle scan: live background task protects idle agent"
+                    );
+                    return None;
+                }
+
                 if let Some(expires_at) = self.active_leases.active_until(entry.key()) {
                     debug!(
                         conversation_id = %entry.key(),
@@ -387,6 +407,7 @@ mod tests {
         workspace: String,
         status: Option<ConversationStatus>,
         last_activity: AtomicI64,
+        live_background_tasks: usize,
         killed: Arc<std::sync::atomic::AtomicUsize>,
         event_tx: broadcast::Sender<AgentStreamEvent>,
     }
@@ -400,6 +421,7 @@ mod tests {
                 workspace: "/tmp/test".to_owned(),
                 status,
                 last_activity: AtomicI64::new(now_ms()),
+                live_background_tasks: 0,
                 killed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 event_tx,
             }
@@ -417,6 +439,11 @@ mod tests {
 
         fn with_last_activity(mut self, ts: TimestampMs) -> Self {
             self.last_activity = AtomicI64::new(ts);
+            self
+        }
+
+        fn with_live_background_tasks(mut self, count: usize) -> Self {
+            self.live_background_tasks = count;
             self
         }
     }
@@ -437,6 +464,9 @@ mod tests {
         }
         fn last_activity_at(&self) -> TimestampMs {
             self.last_activity.load(Ordering::Relaxed)
+        }
+        fn live_background_tasks(&self) -> usize {
+            self.live_background_tasks
         }
         fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
             self.event_tx.subscribe()
@@ -947,6 +977,37 @@ mod tests {
 
         assert!(captured.contains("reason=ActiveLease"));
         assert!(captured.contains("lease_expires_in_ms="));
+    }
+
+    // A background task (workflow / background bash / background subagent)
+    // legitimately outlives its turn with status=Finished and no frames, so
+    // idle_ms alone misreads a busy agent as idle. Live-verified misfire:
+    // five IdleTimeout kills over 2026-08-08..10 each cut down a 10-45 min
+    // `just push` gate running as a claude background bash.
+    #[test]
+    fn collect_idle_skips_tasks_with_live_background_tasks() {
+        let factory: AgentFactory = Arc::new(|_| async { unreachable!() }.boxed());
+        let mgr = WorkerTaskManagerImpl::new(factory);
+
+        let cell: OnceCell<ManagedAgentTask> = OnceCell::new();
+        cell.set(managed_instance(mock_instance(
+            MockAgent::new("conv-bg", Some(ConversationStatus::Finished))
+                .with_last_activity(now_ms() - 600_000)
+                .with_live_background_tasks(1),
+        )))
+        .ok();
+        mgr.tasks.insert("conv-bg".into(), Arc::new(cell));
+
+        let captured = capture_logs(tracing::Level::INFO, || {
+            let idle = mgr.collect_idle(300_000);
+            assert!(
+                idle.is_empty(),
+                "live background task must protect the agent, got {idle:?}"
+            );
+        });
+
+        assert!(captured.contains("reason=LiveBackgroundTask"));
+        assert!(captured.contains("live_background_tasks=1"));
     }
 
     #[test]
