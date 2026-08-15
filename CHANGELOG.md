@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.71](https://github.com/suoak/AionCore/compare/v0.1.70...v0.1.71) (2026-08-15)
+
+### Features
+
+* **aionrs:** update the branded runtime dependency to v0.2.14
+* **conversation:** support forking aionrs conversations
+* **session:** report a deferred mode switch as pending instead of observed
+* **channel:** add Slack Socket Mode and Discord Gateway plugins
+* **db:** dedicated startup stage for a database created by a newer app
+* **sidebar:** add user_order ordering base and sidebar grouping API
+
+### Bug Fixes
+
+* restore direct CLI Team MCP capabilities
+* **session:** retry claude session-title generation with timeout and observability
+* **antigravity:** parse TSV output from `agy models`
+* **conversation:** tell the client when a turn is cancelled before its agent exists
+* **cli-version:** deliver the version-drift notice, and stop it reading as an error
+* **agent:** stop the idle scanner from killing agents with live background tasks
+* **runtime:** bump verified ACP registry pins and CLI versions
+
 ## [0.1.70](https://github.com/suoak/AionCore/compare/v0.1.69...v0.1.70) (2026-08-15)
 
 ### Features
