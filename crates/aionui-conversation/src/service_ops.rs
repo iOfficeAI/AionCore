@@ -339,6 +339,25 @@ impl ConversationService {
 
     // ── Usage / Slash commands ──────────────────────────────────────
 
+    pub async fn list_usage_events(
+        &self,
+        user_id: &str,
+        since: Option<i64>,
+        limit: Option<i64>,
+    ) -> Result<aionui_api_types::UsageListResponse, ConversationError> {
+        let Some(repo) = self.usage_event_repo() else {
+            return Ok(aionui_api_types::UsageListResponse { events: Vec::new() });
+        };
+        crate::usage_ledger::list_usage_events(repo.as_ref(), user_id, since, limit).await
+    }
+
+    pub async fn clear_usage_events(&self, user_id: &str) -> Result<u64, ConversationError> {
+        let Some(repo) = self.usage_event_repo() else {
+            return Ok(0);
+        };
+        crate::usage_ledger::clear_usage_events(repo.as_ref(), user_id).await
+    }
+
     pub async fn get_usage(
         &self,
         user_id: &str,

@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, WorkflowProgressData};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case};
-use aionui_db::IConversationRepository;
+use aionui_db::{IConversationRepository, IUsageEventRepository};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -55,6 +55,7 @@ pub(crate) struct BackgroundStreamWatcher {
     /// session titles and leave every other frame to the existing ACP
     /// delivery paths (orphan turns / card refreshes are Session semantics).
     pub title_only: bool,
+    pub usage_event_repo: Option<Arc<dyn IUsageEventRepository>>,
 }
 
 impl BackgroundStreamWatcher {
@@ -300,7 +301,8 @@ impl BackgroundStreamWatcher {
             self.broadcaster.clone(),
         )
         .with_runtime_state(Arc::clone(&self.runtime_state))
-        .with_persistence(self.persistence.clone());
+        .with_persistence(self.persistence.clone())
+        .with_usage_event_repo(self.usage_event_repo.clone());
 
         let (feed_tx, feed_rx) = broadcast::channel::<AgentStreamEvent>(256);
         let mut relay_task = tokio::spawn(relay.consume(feed_rx));
@@ -445,6 +447,7 @@ mod tests {
             persistence: RuntimePersistenceCoordinator::new(Arc::clone(&runtime_state)),
             runtime_state: Arc::clone(&runtime_state),
             title_only,
+            usage_event_repo: None,
         };
         let handle = tokio::spawn(watcher.run(tx.subscribe()));
         Rig {

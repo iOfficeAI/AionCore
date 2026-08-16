@@ -473,6 +473,10 @@ impl StreamPersistenceAdapter {
         }
     }
 
+    pub(crate) fn conversation_repo(&self) -> &Arc<dyn IConversationRepository> {
+        &self.repo
+    }
+
     /// Record the backend's turn id for the in-flight turn (relay-only).
     pub(crate) fn set_backend_turn_id(&self, backend_turn_id: String) {
         *self.backend_turn_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(backend_turn_id);

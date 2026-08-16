@@ -34,9 +34,9 @@ use aionui_db::models::{AssistantDefinitionRow, ConversationAssistantSnapshotRow
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, MessagePageCursor,
-    MessagePageDirection, MessagePageParams, SaveRuntimeStateParams, UpsertConversationAssistantSnapshotParams,
-    resolve_agent_binding_from_rows,
+    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, IUsageEventRepository,
+    MessagePageCursor, MessagePageDirection, MessagePageParams, SaveRuntimeStateParams,
+    UpsertConversationAssistantSnapshotParams, resolve_agent_binding_from_rows,
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -341,6 +341,7 @@ pub struct ConversationService {
     conversation_repo: Arc<dyn IConversationRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
+    usage_event_repo: Arc<RwLock<Option<Arc<dyn IUsageEventRepository>>>>,
 }
 
 #[derive(Clone)]
@@ -415,6 +416,7 @@ impl ConversationService {
             conversation_repo,
             agent_metadata_repo,
             acp_session_repo,
+            usage_event_repo: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -445,6 +447,16 @@ impl ConversationService {
         if let Ok(mut guard) = self.mcp_server_repo.write() {
             *guard = Some(repo);
         }
+    }
+
+    pub fn with_usage_event_repo(&self, repo: Arc<dyn IUsageEventRepository>) {
+        if let Ok(mut guard) = self.usage_event_repo.write() {
+            *guard = Some(repo);
+        }
+    }
+
+    pub(crate) fn usage_event_repo(&self) -> Option<Arc<dyn IUsageEventRepository>> {
+        crate::usage_ledger::maybe_usage_repo(&self.usage_event_repo)
     }
 
     /// Inject the project-bind service (project-bind side branch). When unset,
@@ -630,6 +642,7 @@ impl ConversationService {
             persistence: self.runtime_persistence(),
             runtime_state: Arc::clone(&self.runtime_state),
             title_only,
+            usage_event_repo: self.usage_event_repo(),
         };
         let rx = agent.subscribe();
         let join = tokio::spawn(watcher.run(rx));

@@ -796,6 +796,9 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     conv_service.with_mcp_server_repo(Arc::new(aionui_db::SqliteMcpServerRepository::new(
         services.database.pool().clone(),
     )));
+    conv_service.with_usage_event_repo(Arc::new(aionui_db::SqliteUsageEventRepository::new(
+        services.database.pool().clone(),
+    )));
     conv_service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(
         services.database.pool().clone(),
     )));

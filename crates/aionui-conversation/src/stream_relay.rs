@@ -16,7 +16,7 @@ use crate::stream_persistence::{
     ThinkingSegmentState, canonical_event_id,
 };
 use crate::tool_event_pipeline::{ToolEventPipeline, ToolPreExecuteDisposition};
-use aionui_db::IConversationRepository;
+use aionui_db::{IConversationRepository, IUsageEventRepository};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::broadcast::error::TryRecvError;
@@ -179,6 +179,8 @@ pub struct StreamRelay {
     output_retention: Option<OutputRetentionPolicy>,
     event_journal: Option<CanonicalEventJournal>,
     permission_auto_reject: Option<PermissionAutoReject>,
+    usage_event_repo: Option<Arc<dyn IUsageEventRepository>>,
+    last_model_id: Option<String>,
 }
 
 impl StreamRelay {
@@ -209,6 +211,8 @@ impl StreamRelay {
             output_retention: None,
             event_journal: None,
             permission_auto_reject: None,
+            usage_event_repo: None,
+            last_model_id: None,
         }
     }
 
@@ -266,6 +270,11 @@ impl StreamRelay {
         self
     }
 
+    pub(crate) fn with_usage_event_repo(mut self, repo: Option<Arc<dyn IUsageEventRepository>>) -> Self {
+        self.usage_event_repo = repo;
+        self
+    }
+
     /// Run the relay loop. Consumes `self` and runs until the agent stream ends.
     #[tracing::instrument(
         skip_all,
@@ -298,7 +307,7 @@ impl StreamRelay {
     }
 
     async fn consume_inner(
-        self,
+        mut self,
         mut rx: broadcast::Receiver<AgentStreamEvent>,
         mut send_error_rx: Option<oneshot::Receiver<AgentSendError>>,
     ) -> RelayOutcome {
@@ -421,6 +430,8 @@ impl StreamRelay {
                         );
                         continue;
                     }
+
+                    self.maybe_record_usage(&event).await;
 
                     if !first_agent_event_logged {
                         first_agent_event_logged = true;
@@ -852,6 +863,47 @@ impl StreamRelay {
                     "Failed to journal never-policy approval rejection"
                 );
             }
+        }
+    }
+
+    async fn maybe_record_usage(&mut self, event: &AgentStreamEvent) {
+        match event {
+            AgentStreamEvent::RequestTrace(payload) => {
+                if let Some(model_id) = payload
+                    .get("model_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty() && *value != "unknown")
+                {
+                    self.last_model_id = Some(model_id.to_owned());
+                }
+            }
+            AgentStreamEvent::AcpContextUsage(payload) => {
+                let Some(repo) = self.usage_event_repo.clone() else {
+                    return;
+                };
+                let Some(spend) = crate::usage_ledger::spend_from_context_usage(payload) else {
+                    return;
+                };
+                if let Err(error) = crate::usage_ledger::record_context_usage_spend(
+                    repo.as_ref(),
+                    self.adapter.conversation_repo().as_ref(),
+                    &self.user_id,
+                    &self.conversation_id,
+                    Some(self.turn_id.as_str()),
+                    self.last_model_id.as_deref(),
+                    &spend,
+                )
+                .await
+                {
+                    warn!(
+                        conversation_id = %self.conversation_id,
+                        error = %error,
+                        "Failed to record turn usage spend"
+                    );
+                }
+            }
+            _ => {}
         }
     }
 

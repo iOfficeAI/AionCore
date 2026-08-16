@@ -32,6 +32,7 @@ mod tool_event_pipeline;
 mod turn_continuation_policy;
 mod turn_orchestrator;
 mod turn_recovery_policy;
+mod usage_ledger;
 
 pub use error::ConversationError;
 pub use response_middleware::{MessageMiddleware, MiddlewareResult, strip_think_tags};

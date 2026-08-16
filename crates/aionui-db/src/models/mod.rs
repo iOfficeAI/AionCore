@@ -15,6 +15,7 @@ mod remote_agent;
 mod skill;
 mod system_settings;
 mod team;
+mod usage_event;
 mod user;
 
 pub use acp_session::AcpSessionRow;
@@ -40,4 +41,5 @@ pub use remote_agent::RemoteAgentRow;
 pub use skill::{SkillImportRecordRow, SkillRegistryInstallRow, SkillRow};
 pub use system_settings::SystemSettings;
 pub use team::{MailboxMessageRow, TeamRow, TeamTaskRow};
+pub use usage_event::UsageEventRow;
 pub use user::{ExternalUserProjection, User, UserStatus, UserType};

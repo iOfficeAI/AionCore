@@ -128,11 +128,31 @@ impl OutputSink for BackendOutputSink {
         &self,
         _msg_id: &str,
         _turns: usize,
-        _input_tokens: u64,
-        _output_tokens: u64,
-        _cache_creation_tokens: u64,
-        _cache_read_tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
     ) {
+        let used = input_tokens.saturating_add(output_tokens);
+        if used > 0 {
+            let mut meta = serde_json::json!({
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            });
+            if cache_read_tokens > 0 {
+                meta["cached_read_tokens"] = serde_json::json!(cache_read_tokens);
+            }
+            if cache_creation_tokens > 0 {
+                meta["cached_write_tokens"] = serde_json::json!(cache_creation_tokens);
+            }
+            let _ = self.event_tx.send(AgentStreamEvent::AcpContextUsage(serde_json::json!({
+                "used": used,
+                "size": 0,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "_meta": meta,
+            })));
+        }
         let _ = self
             .event_tx
             .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }));
@@ -284,8 +304,15 @@ mod tests {
     fn emit_stream_end_sends_finish_event() {
         let (sink, mut rx) = make_sink();
         sink.emit_stream_end("msg-1", 3, 1000, 500, 100, 200);
-        let event = rx.try_recv().unwrap();
-        match event {
+        match rx.try_recv().unwrap() {
+            AgentStreamEvent::AcpContextUsage(payload) => {
+                assert_eq!(payload["used"], 1500);
+                assert_eq!(payload["_meta"]["input_tokens"], 1000);
+                assert_eq!(payload["_meta"]["output_tokens"], 500);
+            }
+            other => panic!("Expected AcpContextUsage, got {:?}", other),
+        }
+        match rx.try_recv().unwrap() {
             AgentStreamEvent::Finish(_) => {}
             other => panic!("Expected Finish, got {:?}", other),
         }

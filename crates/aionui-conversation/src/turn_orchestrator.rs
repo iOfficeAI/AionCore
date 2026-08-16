@@ -284,6 +284,7 @@ impl ConversationTurnOrchestrator {
             .with_defer_clean_terminal_errors(defer_clean_terminal_errors)
             .with_output_retention(self.service.output_retention_policy())
             .with_event_journal(self.service.canonical_event_journal())
+            .with_usage_event_repo(self.service.usage_event_repo())
             .with_permission_auto_reject({
                 let agent = agent.clone();
                 Arc::new(move |call_id: &str| {
