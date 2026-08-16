@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.72](https://github.com/suoak/AionCore/compare/v0.1.71...v0.1.72) (2026-08-16)
+
+### Bug Fixes
+
+* **cli:** bump verified claude to 2.1.233
+
 ## [0.1.71](https://github.com/suoak/AionCore/compare/v0.1.70...v0.1.71) (2026-08-15)
 
 ### Features
