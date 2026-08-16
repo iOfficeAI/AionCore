@@ -1,4 +1,4 @@
--- Migration 038: track conversation name origin for agent auto-naming.
+-- Migration 043: track conversation name origin for agent auto-naming.
 --
 -- NULL    = default/placeholder name — an agent-generated title may replace
 --           it. Placeholders are (a) the frontend's create-flow name, which

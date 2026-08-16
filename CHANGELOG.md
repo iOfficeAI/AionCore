@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.73](https://github.com/suoak/AionCore/compare/v0.1.72...v0.1.73) (2026-08-16)
+
+### Bug Fixes
+
+* **db:** renumber merged upstream migrations 038/039 so they no longer collide with branded history
+
 ## [0.1.72](https://github.com/suoak/AionCore/compare/v0.1.71...v0.1.72) (2026-08-16)
 
 ### Bug Fixes
