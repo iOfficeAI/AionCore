@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.74](https://github.com/suoak/AionCore/compare/v0.1.73...v0.1.74) (2026-08-16)
+
+### Bug Fixes
+
+* **db:** remap branded 038/039 collisions so 0.1.70 databases can open
+
 ## [0.1.73](https://github.com/suoak/AionCore/compare/v0.1.72...v0.1.73) (2026-08-16)
 
 ### Bug Fixes
