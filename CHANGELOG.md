@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.75](https://github.com/suoak/AionCore/compare/v0.1.74...v0.1.75) (2026-08-17)
+
+### Features
+
+* **usage:** persist completed-turn spend across desktop, team, cron, and messaging channels
+
 ## [0.1.74](https://github.com/suoak/AionCore/compare/v0.1.73...v0.1.74) (2026-08-16)
 
 ### Bug Fixes
