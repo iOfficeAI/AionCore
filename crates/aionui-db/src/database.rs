@@ -405,6 +405,14 @@ async fn run_migrations_staged(pool: &SqlitePool) -> Result<(), DatabaseInitErro
         .await
         .map_err(|e| DatabaseInitError::new("database.migration", e))?;
 
+    // 0.1.73 reused versions 038/039 for branded files after those numbers had
+    // already shipped as upstream `conversation_name_source` / `omp_direct_cli_launch`.
+    // Existing DBs (CSBU WorkMate 2.1.62 / AionCore 0.1.70) then fail with
+    // VersionMismatch: "migration 38 was previously applied but has been modified".
+    remap_branded_migration_collisions(&mut conn)
+        .await
+        .map_err(|e| DatabaseInitError::new("database.migration", e))?;
+
     let result = run_migrations_with_retry(&mut conn).await.map_err(|e| {
         if let Some(db_version) = e.missing_migration_version() {
             // Downgrade: the DB holds a migration this binary doesn't ship.
@@ -464,6 +472,113 @@ async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<
         }
         Err(e) => Err(DbError::Migration(e)),
     }
+}
+
+/// One branded-history collision: an upstream migration was shipped under a
+/// version the fork later reused, then renumbered. Relocate the applied row
+/// onto the new version so the reused number can apply.
+struct BrandedCollisionRemap {
+    old_version: i64,
+    new_version: i64,
+    old_description: &'static str,
+}
+
+/// 0.1.70 shipped 038 as conversation-name-source and 0.1.71/0.1.72 briefly
+/// shipped a duplicate 039 as omp-direct-cli. 0.1.73 kept the branded files
+/// at 038/039 and moved those upstream files to 043/044.
+const BRANDED_COLLISION_REMAPS: &[BrandedCollisionRemap] = &[
+    BrandedCollisionRemap {
+        old_version: 38,
+        new_version: 43,
+        old_description: "conversation name source",
+    },
+    BrandedCollisionRemap {
+        old_version: 39,
+        new_version: 44,
+        old_description: "omp direct cli launch",
+    },
+];
+
+/// Relocate applied collision rows onto their post-0.1.73 version numbers.
+///
+/// Only matches by the *old* description. A database that already applied
+/// 038 as `aionrs fork capability` is left alone. If the target version is
+/// already recorded, we also leave the row alone rather than invent a merge.
+async fn remap_branded_migration_collisions(conn: &mut sqlx::SqliteConnection) -> Result<(), DbError> {
+    let has_table: bool =
+        sqlx::query_scalar("SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(DbError::Query)?;
+    if !has_table {
+        return Ok(());
+    }
+
+    for remap in BRANDED_COLLISION_REMAPS {
+        remap_one_branded_collision(conn, remap).await?;
+    }
+    Ok(())
+}
+
+async fn remap_one_branded_collision(
+    conn: &mut sqlx::SqliteConnection,
+    remap: &BrandedCollisionRemap,
+) -> Result<(), DbError> {
+    let applied_description: Option<String> =
+        sqlx::query_scalar("SELECT description FROM _sqlx_migrations WHERE version = ? AND success = 1")
+            .bind(remap.old_version)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(DbError::Query)?;
+    let Some(description) = applied_description else {
+        return Ok(());
+    };
+    if description != remap.old_description {
+        return Ok(());
+    }
+
+    let target_exists: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM _sqlx_migrations WHERE version = ?")
+        .bind(remap.new_version)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(DbError::Query)?;
+    if target_exists {
+        warn!(
+            old_version = remap.old_version,
+            new_version = remap.new_version,
+            description = remap.old_description,
+            "Branded-history collision row found but the remapped version is already recorded; leaving it in place"
+        );
+        return Ok(());
+    }
+
+    let Some(migration) = DB_MIGRATOR
+        .iter()
+        .find(|migration| migration.version == remap.new_version)
+    else {
+        return Ok(());
+    };
+
+    let updated = sqlx::query(
+        "UPDATE _sqlx_migrations SET version = ?, description = ?, checksum = ? WHERE version = ? AND success = 1",
+    )
+    .bind(remap.new_version)
+    .bind(&*migration.description)
+    .bind(&*migration.checksum)
+    .bind(remap.old_version)
+    .execute(&mut *conn)
+    .await
+    .map_err(DbError::Query)?;
+
+    if updated.rows_affected() > 0 {
+        info!(
+            old_version = remap.old_version,
+            new_version = remap.new_version,
+            description = remap.old_description,
+            "Remapped branded-history collision so the reused migration version can apply"
+        );
+    }
+    Ok(())
 }
 
 /// Detect the specific "another process inserted this version first" error.
