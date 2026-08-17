@@ -246,7 +246,10 @@ impl ChannelMessageService {
             // web UI; an IM transcript has no card to update, and streaming one
             // message per refresh would spam the channel.
             | AgentStreamEvent::WorkflowProgress(_)
-            | AgentStreamEvent::AcpDialectSignal(_) => None,
+            | AgentStreamEvent::AcpDialectSignal(_)
+            // Internal-only correlation frame for mid-turn interjection; never
+            // user-facing (consumed by the conversation layer's watcher).
+            | AgentStreamEvent::MessageLifecycle(_) => None,
         }
     }
 

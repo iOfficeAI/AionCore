@@ -657,6 +657,12 @@ impl StreamRelay {
                             attempt.saw_tool_or_side_effect = true;
                             self.forward_to_websocket(&event);
                         }
+                        AgentStreamEvent::MessageLifecycle(_) => {
+                            // Internal-only correlation frame (mid-turn interjection
+                            // Task 3): consumed by the BackgroundStreamWatcher between
+                            // turns; inside a turn it is pure bookkeeping. Never
+                            // forwarded to the WebSocket.
+                        }
                         // NOTE: AcpSessionInfo (agent session titles) is deliberately
                         // NOT consumed here. Titles arrive at session-open and at the
                         // turn's final instant (pi/omp race the relay's exit by ~1ms;
@@ -769,6 +775,7 @@ impl StreamRelay {
             AgentStreamEvent::BackendTurnBound(_) => "BackendTurnBound",
             AgentStreamEvent::WorkflowProgress(_) => "WorkflowProgress",
             AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
+            AgentStreamEvent::MessageLifecycle(_) => "MessageLifecycle",
         }
     }
 

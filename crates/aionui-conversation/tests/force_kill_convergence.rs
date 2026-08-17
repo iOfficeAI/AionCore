@@ -106,7 +106,7 @@ async fn user_cancel_kill_converges_session_turn_to_idle() {
     let runtime = Arc::new(ConversationRuntimeStateService::default());
     let mut claim = runtime.try_claim_turn("conv-1", "turn-1").expect("turn claim");
     runtime.mark_cancelling("conv-1");
-    let before = runtime.summary_from_parts("conv-1", IAgentTask::status(task.as_ref()), true, 0);
+    let before = runtime.summary_from_parts("conv-1", IAgentTask::status(task.as_ref()), true, 0, false);
     assert_eq!(
         before.state,
         ConversationRuntimeStateKind::Cancelling,
@@ -144,7 +144,7 @@ async fn user_cancel_kill_converges_session_turn_to_idle() {
 
     assert!(!runtime.is_claimed("conv-1"), "turn claim released");
     assert!(!runtime.is_cancelling("conv-1"), "cancelling cleared on release");
-    let after = runtime.summary_from_parts("conv-1", IAgentTask::status(task.as_ref()), false, 0);
+    let after = runtime.summary_from_parts("conv-1", IAgentTask::status(task.as_ref()), false, 0, false);
     assert_eq!(
         after.state,
         ConversationRuntimeStateKind::Idle,

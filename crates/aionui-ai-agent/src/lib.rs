@@ -41,6 +41,10 @@ pub use agent_runtime::AgentRuntime;
 pub use agent_task::IMockAgent;
 pub use agent_task::{AgentInstance, IAgentTask};
 pub use aionui_api_types::{AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, SlashCommandItem};
+// Backend-static capability table (session layer's single source of truth) —
+// re-exported so the conversation layer can read the mid-turn bit for a
+// conversation whose agent task is not currently live.
+pub use aionui_session::backend_supports_midturn_delivery;
 pub use aionui_session::effective_agent_capabilities;
 pub use capability::skill_manager::{
     AcpSkillManager, SkillDefinition, SkillIndex, build_skills_index_text, build_system_instructions,

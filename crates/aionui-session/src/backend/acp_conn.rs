@@ -290,6 +290,7 @@ pub fn acp_capabilities() -> Capabilities {
         // 009 R2: ACP is one session/prompt at a time — no proactive next-turn
         // input path from the conv layer. can_queue degrades to false (= can_send).
         accepts_proactive_input: false,
+        supports_midturn_delivery: false,
         // #101: static default empty; filled from the `available_commands_update`
         // session/update (capabilities() merges the discovered set on read).
         slash_commands: Vec::new(),
@@ -2604,6 +2605,14 @@ mod tests {
     use super::*;
     use crate::backend::{McpServerSpec, McpTransport};
     use crate::testing::FakeAgentIo;
+
+    /// Verified backend matrix (task-1 brief): ACP MUST NOT advertise
+    /// `supports_midturn_delivery` — one `session/prompt` at a time, no
+    /// proactive mid-turn input path.
+    #[test]
+    fn capabilities_do_not_advertise_midturn_delivery() {
+        assert!(!acp_capabilities().supports_midturn_delivery);
+    }
 
     /// PROPERTY (§F.3 input field-value boundary for the acp `map_update` entry,
     /// sibling of codex `prop_map_item_*` and claude `prop_parse_assistant_*`): for

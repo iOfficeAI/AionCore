@@ -2955,7 +2955,49 @@ impl SessionBackend for ClaudeSessionBackend {
                 })
             }
             Command::AnswerAuth { .. } => Err(BackendError::CommandNotSupported { command: "answer_auth" }),
-            Command::Steer { .. } => Err(BackendError::CommandNotSupported { command: "steer" }),
+            // B5 mid-turn delivery: a Steer is a DIRECT stdin user-frame write.
+            // claude's persistent stdin accepts writes at any time; the CLI's own
+            // kernel queue decides consumption (next tool_result boundary folds it
+            // into the current turn; a pure-text turn opens a follow-up turn after
+            // its `result` — design spec §6.1/§6甲.2, live 2.1.226). Deliberately
+            // NOT dispatch(Send): no drain_pending_controls (draining is a
+            // next-prompt concern and a Steer opens no prompt), no
+            // turn_in_flight change and NO turn_gen bump — the message folds into
+            // the live turn, and the session pump's per-turn suppression state
+            // must not reset mid-turn (see session_agent's gen-advance reset).
+            // `client_msg_id` is stamped as the user frame's `uuid`, which claude
+            // echoes in `command_lifecycle` (the three-state receipt).
+            Command::Steer { content, client_msg_id } => {
+                let blocks = self.capabilities().prompt_blocks;
+                if let Some(bad) = content.iter().find(|b| !blocks.allows(b)) {
+                    return Err(BackendError::CommandNotSupported {
+                        command: crate::capability::block_kind_name(bad),
+                    });
+                }
+                self.suspend
+                    .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
+                    .await?;
+                {
+                    let mut guard = self.stdin.lock().await;
+                    let stdin = guard
+                        .as_mut()
+                        .ok_or_else(|| BackendError::Transport("steer: stdin unavailable".into()))?;
+                    self.adapter
+                        .deliver_prompt(stdin, &content, client_msg_id.as_deref())
+                        .await
+                        .map_err(|e| BackendError::Transport(format!("steer deliver_prompt: {e}")))?;
+                } // stdin lock released (microsecond frame-write lock, §5.4)
+                tracing::info!(
+                    conversation_id = %self.session_id,
+                    block_count = content.len(),
+                    "claude dispatch(Steer): mid-turn user frame written to stdin"
+                );
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::NoTurn,
+                    turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                })
+            }
             // G2: in-band config switch via control_request (probe-verified, mirrors
             // F1). set_permission_mode / set_model are written over the retained
             // stdin WITHOUT restarting the process. set_permission_mode goes out
@@ -4150,6 +4192,58 @@ mod tests {
         );
     }
 
+    /// B5 mid-turn delivery: dispatch(Steer) writes a uuid-stamped user frame
+    /// straight to stdin and does NOT bump turn_gen (the message folds into the
+    /// live turn — a bump would reset the session pump's per-turn suppression
+    /// state mid-turn and misattribute the turn's remaining frames).
+    #[tokio::test]
+    async fn dispatch_steer_writes_midturn_user_frame_without_turn_gen_bump() {
+        let io = FakeAgentIo::never_exits(Vec::new());
+        let captured = io.captured_stdin();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(io)).await;
+        // Open a turn the normal way so turn_gen has a live value.
+        let send_receipt = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("start the turn".into())],
+                metadata: CommandMeta::default(),
+            })
+            .await
+            .expect("send accepted");
+        let steer_receipt = backend
+            .dispatch(Command::Steer {
+                content: vec![ContentBlock::Text("mid-turn interjection".into())],
+                client_msg_id: Some("cmsg-42".into()),
+            })
+            .await
+            .expect("steer accepted");
+        assert_eq!(
+            steer_receipt.admission,
+            Admission::NoTurn,
+            "steer folds into the live turn"
+        );
+        assert_eq!(
+            steer_receipt.turn_gen, send_receipt.turn_gen,
+            "steer must NOT bump turn_gen"
+        );
+        // The stdin→capture copy is a background task; poll briefly.
+        let mut written = String::new();
+        for _ in 0..40 {
+            written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+            if written.contains("mid-turn interjection") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            written.contains("mid-turn interjection"),
+            "steer text written to stdin, got: {written}"
+        );
+        assert!(
+            written.contains(r#""uuid":"cmsg-42""#),
+            "correlation id stamped as the user frame uuid (claude echoes it via command_lifecycle), got: {written}"
+        );
+    }
+
     #[tokio::test]
     async fn unsupported_commands_are_rejected_by_capability() {
         // Reject matrix: every cap=false command MUST return the EXACT
@@ -4163,7 +4257,9 @@ mod tests {
         assert!(!caps.supported_commands.rewind);
         assert!(!caps.supported_commands.list_checkpoints);
         assert!(!caps.supported_commands.answer_auth);
-        assert!(!caps.supported_commands.steer);
+        // B5: steer is now advertised TRUE (mid-turn stdin write wired); its
+        // accept path is covered by dispatch_steer_writes_midturn_user_frame.
+        assert!(caps.supported_commands.steer);
         // G2: set_mode/set_model are now advertised TRUE (wired in-band).
         assert!(caps.supported_commands.set_mode);
         assert!(caps.supported_commands.set_model);
@@ -4194,10 +4290,6 @@ mod tests {
                 })
                 .await,
             Err(BackendError::CommandNotSupported { command: "answer_auth" })
-        ));
-        assert!(matches!(
-            backend.dispatch(Command::Steer { content: Vec::new() }).await,
-            Err(BackendError::CommandNotSupported { command: "steer" })
         ));
         assert!(matches!(
             backend

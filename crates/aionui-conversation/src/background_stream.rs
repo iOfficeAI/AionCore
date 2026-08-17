@@ -25,6 +25,7 @@
 
 use std::sync::Arc;
 
+use aionui_ai_agent::protocol::events::MessageLifecyclePhase;
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, WorkflowProgressData};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case};
 use aionui_db::IConversationRepository;
@@ -44,6 +45,21 @@ use crate::stream_relay::StreamRelay;
 /// with what it has, so the watcher can never be wedged forever.
 const ORPHAN_TURN_IDLE_MS: u64 = 180_000;
 
+/// How long a `MessageLifecycle{Started}` echo stays armed as "the next
+/// agent-started turn serves a user message" before it is presumed lost.
+///
+/// The design spec's measured data (docs/superpowers/specs/
+/// 2026-08-12-midturn-interjection-design.md §6.1, real claude 2.1.226 run)
+/// shows `started` firing at the boundary where the message is consumed into a
+/// turn, with that turn's content following within seconds (12.24s started →
+/// 16.74s assistant text); the pure-text follow-up turn opens immediately after
+/// the current turn's `result` (§五 table). 30s is an order of magnitude of
+/// headroom over that, while staying far below the minutes a detached exec can
+/// run — so a Started whose terminal `completed`/`cancelled` echo was lost
+/// (broadcast lag, CLI crash between phases) cannot claim an unrelated
+/// background continuation and lock the input box (#758's design intent).
+pub(crate) const PENDING_STARTED_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub(crate) struct BackgroundStreamWatcher {
     pub conversation_id: String,
     pub user_id: String,
@@ -55,6 +71,9 @@ pub(crate) struct BackgroundStreamWatcher {
     /// session titles and leave every other frame to the existing ACP
     /// delivery paths (orphan turns / card refreshes are Session semantics).
     pub title_only: bool,
+    /// Expiry for a pending `MessageLifecycle{Started}` (see
+    /// [`PENDING_STARTED_TTL`]); injectable so tests can use a short bound.
+    pub pending_started_ttl: std::time::Duration,
 }
 
 impl BackgroundStreamWatcher {
@@ -87,6 +106,13 @@ impl BackgroundStreamWatcher {
             conversation_id = %self.conversation_id,
             "background stream watcher started"
         );
+        // Mid-turn interjection (Task 3): the client_msg_id of the user message
+        // the NEXT agent-started turn serves, taken from the most recent
+        // `MessageLifecycle{Started}` echo and consumed by exactly one orphan
+        // turn (or cleared by the message's Completed/Cancelled echo). The
+        // arming instant bounds its lifetime: a Started whose terminal echo was
+        // lost must not claim an unrelated later turn (see PENDING_STARTED_TTL).
+        let mut pending_user_msg: Option<(String, std::time::Instant)> = None;
         loop {
             let ev = match rx.recv().await {
                 Ok(ev) => ev,
@@ -142,6 +168,61 @@ impl BackgroundStreamWatcher {
                 }
                 continue;
             }
+            // Lifecycle echoes are pure bookkeeping, handled BEFORE the
+            // active-turn gate: `Started` can race the previous turn claim's
+            // release by a frame, and missing it would leave claude's
+            // follow-up turn unclaimed. Only Session instances emit these.
+            if let AgentStreamEvent::MessageLifecycle(data) = &ev {
+                // B5 receipt badge (Task 4): any consumption/terminal echo means
+                // the agent TOOK the message — flip its persisted status from
+                // "pending" (待接收) to "finish" (已接收) and broadcast
+                // message.statusChanged. Guarded to rows currently "pending", so
+                // an echo can never touch an ordinary message. Cancelled also
+                // counts: claude only cancels an echo it had already started
+                // (still-queued messages are unaffected by an interrupt and
+                // self-start later — spec §6甲.7).
+                if !matches!(data.phase, MessageLifecyclePhase::Queued) {
+                    crate::service::apply_message_receipt(
+                        &self.repo,
+                        &self.broadcaster,
+                        &self.user_id,
+                        &self.conversation_id,
+                        &data.client_msg_id,
+                        crate::service::MIDTURN_STATUS_RECEIVED,
+                        true,
+                    )
+                    .await;
+                }
+                match data.phase {
+                    MessageLifecyclePhase::Started => {
+                        if let Some((prev, _)) = pending_user_msg.as_ref()
+                            && prev != &data.client_msg_id
+                        {
+                            // A Started should be terminated by its own
+                            // Completed/Cancelled before the next one arrives;
+                            // an overwrite means that echo was lost or reordered.
+                            warn!(
+                                conversation_id = %self.conversation_id,
+                                prev_client_msg_id = %prev,
+                                client_msg_id = %data.client_msg_id,
+                                "background stream: pending Started overwritten without a terminal echo"
+                            );
+                        }
+                        pending_user_msg = Some((data.client_msg_id.clone(), std::time::Instant::now()));
+                    }
+                    MessageLifecyclePhase::Completed | MessageLifecyclePhase::Cancelled => {
+                        if pending_user_msg
+                            .as_ref()
+                            .is_some_and(|(id, _)| id == &data.client_msg_id)
+                        {
+                            pending_user_msg = None;
+                        }
+                    }
+                    // Not yet consumed into a turn — nothing to correlate.
+                    MessageLifecyclePhase::Queued => {}
+                }
+                continue;
+            }
             // Title-only watchers (ACP manager instances) stop here: orphan
             // turns and card refreshes are Session-instance semantics.
             if self.title_only {
@@ -162,7 +243,24 @@ impl BackgroundStreamWatcher {
                     self.forward_out_of_turn_frame(&ev)
                 }
                 ev_ref if Self::is_orphan_turn_content(ev_ref) => {
-                    self.run_orphan_turn(ev.clone(), &mut rx).await;
+                    // A serving turn's first frame follows its Started within
+                    // seconds (spec §6.1); anything armed longer than the TTL
+                    // is a leftover from a lost terminal echo and must not
+                    // claim this (unrelated) turn.
+                    let serving_client_msg_id = pending_user_msg.take().and_then(|(id, armed_at)| {
+                        if armed_at.elapsed() <= self.pending_started_ttl {
+                            Some(id)
+                        } else {
+                            warn!(
+                                conversation_id = %self.conversation_id,
+                                client_msg_id = %id,
+                                armed_for_ms = armed_at.elapsed().as_millis() as u64,
+                                "background stream: stale pending Started discarded (terminal echo lost)"
+                            );
+                            None
+                        }
+                    });
+                    self.run_orphan_turn(ev.clone(), &mut rx, serving_client_msg_id).await;
                 }
                 // Start/Finish strays, usage (the pump broadcasts usage itself),
                 // internal signals — nothing to deliver.
@@ -282,13 +380,31 @@ impl BackgroundStreamWatcher {
     /// Run a CLI-initiated turn through a REGULAR relay so it gets everything a
     /// user turn gets: WS forwarding, text segments, persistence, and the
     /// `turn.completed` bookkeeping (the relay's default `complete_turn`).
-    async fn run_orphan_turn(&self, first: AgentStreamEvent, rx: &mut broadcast::Receiver<AgentStreamEvent>) {
+    async fn run_orphan_turn(
+        &self,
+        first: AgentStreamEvent,
+        rx: &mut broadcast::Receiver<AgentStreamEvent>,
+        serving_client_msg_id: Option<String>,
+    ) {
         let msg_id = ConversationService::mint_msg_id();
         let turn_id = ConversationService::mint_turn_id();
+        // Claim ONLY when this agent-started turn serves a user message (claude
+        // opens a follow-up turn for a mid-turn message it could not fold into the
+        // running one — design spec §6甲.2). A pure background continuation (a
+        // detached exec still streaming) must NOT be claimed: #758's whole point is
+        // that the user keeps working while it runs.
+        //
+        // Bind by name — `let _ = …` would drop the claim immediately.
+        let _agent_claim = serving_client_msg_id
+            .is_some()
+            .then(|| self.runtime_state.claim_for_agent_turn(&self.conversation_id, &turn_id))
+            .flatten();
         info!(
             conversation_id = %self.conversation_id,
             turn_id = %turn_id,
             first_frame = frame_kind(&first),
+            serving_client_msg_id = serving_client_msg_id.as_deref(),
+            claimed = _agent_claim.is_some(),
             "background stream: CLI-initiated turn started"
         );
         let relay = StreamRelay::new(
@@ -314,10 +430,12 @@ impl BackgroundStreamWatcher {
                     Ok(Ok(ev)) => {
                         // A user turn starting mid-orphan-turn takes the stream
                         // over; stop feeding so two relays never double-process.
+                        // Our OWN claim (an agent turn serving a user message)
+                        // must not trip this — only a FOREIGN turn id counts.
                         if self
                             .runtime_state
                             .active_turn_id_for(&self.conversation_id)
-                            .is_some()
+                            .is_some_and(|active| active != turn_id)
                         {
                             warn!(
                                 conversation_id = %self.conversation_id,
@@ -388,7 +506,7 @@ mod tests {
     use aionui_ai_agent::protocol::events::tool_call::{
         ToolCallEventData, ToolCallStatus, ToolGroupEntry, ToolGroupStatus,
     };
-    use aionui_ai_agent::protocol::events::{FinishEventData, TextEventData};
+    use aionui_ai_agent::protocol::events::{FinishEventData, MessageLifecycleData, TextEventData};
     use aionui_common::now_ms;
     use aionui_db::models::ConversationRow;
     use aionui_db::{
@@ -406,10 +524,14 @@ mod tests {
     }
 
     async fn rig() -> Rig {
-        rig_with(false).await
+        rig_with_opts(false, PENDING_STARTED_TTL).await
     }
 
     async fn rig_with(title_only: bool) -> Rig {
+        rig_with_opts(title_only, PENDING_STARTED_TTL).await
+    }
+
+    async fn rig_with_opts(title_only: bool, pending_started_ttl: std::time::Duration) -> Rig {
         let db = init_database_memory().await.unwrap();
         let user_repo = SqliteUserRepository::new(db.pool().clone());
         let user = user_repo.create_user("user-1", "hash").await.unwrap();
@@ -445,6 +567,7 @@ mod tests {
             persistence: RuntimePersistenceCoordinator::new(Arc::clone(&runtime_state)),
             runtime_state: Arc::clone(&runtime_state),
             title_only,
+            pending_started_ttl,
         };
         let handle = tokio::spawn(watcher.run(tx.subscribe()));
         Rig {
@@ -681,6 +804,240 @@ mod tests {
             !ghost_forwarded,
             "a settle-only frame for an unknown row must not reach the UI"
         );
+    }
+
+    /// Mid-turn interjection (Task 3): claude opens a follow-up turn for a
+    /// queued user message and announces it with `MessageLifecycle{Started}`.
+    /// That turn SERVES a user message, so the watcher must claim it — the UI
+    /// keeps showing `running` instead of flashing idle while the answer
+    /// streams — and release the claim when the turn finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_turn_serving_a_user_message_is_claimed() {
+        let rig = rig().await;
+        rig.tx
+            .send(AgentStreamEvent::MessageLifecycle(MessageLifecycleData {
+                client_msg_id: "cmsg-1".into(),
+                phase: MessageLifecyclePhase::Started,
+            }))
+            .unwrap();
+        rig.tx
+            .send(AgentStreamEvent::Text(TextEventData {
+                content: "answer to the interjected message".into(),
+            }))
+            .unwrap();
+
+        // The orphan turn must hold the conversation claim while it streams.
+        let turn = eventually(async || rig.runtime_state.active_turn_id_for("conv-1"))
+            .await
+            .expect("agent-started turn serving a user message must be claimed");
+        assert!(!turn.is_empty());
+
+        // …and release it once the turn ends.
+        rig.tx
+            .send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+        eventually(async || (!rig.runtime_state.is_claimed("conv-1")).then_some(()))
+            .await
+            .expect("the claim must be released after the turn finished");
+    }
+
+    /// B5 receipt badge (Task 4): a `MessageLifecycle{Started}` echo for a
+    /// mid-turn user message flips its persisted status "pending" → "finish"
+    /// and broadcasts `message.statusChanged`, so the 待接收 badge resolves.
+    /// A second echo (Completed) or an echo for an unknown/ordinary message
+    /// must not produce further updates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifecycle_started_flips_pending_user_message_and_broadcasts() {
+        let rig = rig().await;
+        // Seed the mid-turn user row exactly as deliver_midturn_message writes it.
+        rig.repo
+            .insert_message(
+                &rig.user_id,
+                &aionui_db::models::MessageRow {
+                    id: "um-1".into(),
+                    conversation_id: "conv-1".into(),
+                    msg_id: Some("um-1".into()),
+                    r#type: "text".into(),
+                    content: serde_json::json!({"content": "mid-turn interjection"}).to_string(),
+                    position: Some("right".into()),
+                    status: Some("pending".into()),
+                    hidden: false,
+                    created_at: now_ms(),
+                    backend_turn_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        // An ordinary (finish) user row an echo must never touch.
+        rig.repo
+            .insert_message(
+                &rig.user_id,
+                &aionui_db::models::MessageRow {
+                    id: "um-2".into(),
+                    conversation_id: "conv-1".into(),
+                    msg_id: Some("um-2".into()),
+                    r#type: "text".into(),
+                    content: serde_json::json!({"content": "ordinary"}).to_string(),
+                    position: Some("right".into()),
+                    status: Some("finish".into()),
+                    hidden: false,
+                    created_at: now_ms(),
+                    backend_turn_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut ws = rig.bus.subscribe();
+        rig.tx
+            .send(AgentStreamEvent::MessageLifecycle(MessageLifecycleData {
+                client_msg_id: "um-1".into(),
+                phase: MessageLifecyclePhase::Started,
+            }))
+            .unwrap();
+
+        let row = eventually(async || {
+            rows_of_type(&rig, "text")
+                .await
+                .into_iter()
+                .find(|m| m.id == "um-1" && m.status.as_deref() == Some("finish"))
+        })
+        .await
+        .expect("Started echo must flip the pending user row to finish");
+        assert_eq!(row.status.as_deref(), Some("finish"));
+
+        let mut saw_status_changed = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && !saw_status_changed {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), ws.recv()).await {
+                Ok(Ok(evt)) => {
+                    if evt.name == "message.statusChanged" {
+                        assert_eq!(evt.data["conversation_id"], "conv-1");
+                        assert_eq!(evt.data["msg_id"], "um-1");
+                        assert_eq!(evt.data["status"], "finish");
+                        saw_status_changed = true;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(saw_status_changed, "message.statusChanged must be broadcast");
+
+        // An echo for an already-finish row is a no-op (guarded flip).
+        rig.tx
+            .send(AgentStreamEvent::MessageLifecycle(MessageLifecycleData {
+                client_msg_id: "um-2".into(),
+                phase: MessageLifecyclePhase::Completed,
+            }))
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let mut extra = 0;
+        while let Ok(evt) = ws.try_recv() {
+            if evt.name == "message.statusChanged" {
+                extra += 1;
+            }
+        }
+        assert_eq!(extra, 0, "an echo for an ordinary message must not broadcast");
+    }
+
+    /// #758 design intent: a pure background continuation (a detached exec
+    /// still streaming, with NO client_msg_id association) must stay UNCLAIMED
+    /// so the user keeps working — claiming it would lock the input box.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pure_background_continuation_is_not_claimed() {
+        let rig = rig().await;
+        rig.tx
+            .send(AgentStreamEvent::Text(TextEventData {
+                content: "BG_DONE — the sleep finished.".into(),
+            }))
+            .unwrap();
+        // Assert WHILE the turn is still open — a wrongly taken claim would
+        // already be released again after Finish, hiding the bug.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !rig.runtime_state.is_claimed("conv-1"),
+            "a pure background continuation must not be claimed"
+        );
+        rig.tx
+            .send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+        // And the turn is still delivered (persisted) as before.
+        eventually(async || rows_of_type(&rig, "text").await.into_iter().next())
+            .await
+            .expect("background turn content must still be delivered");
+    }
+
+    /// Review fix (Task 3): a `Started` whose terminal echo was LOST (broadcast
+    /// lag dropping frames, a CLI crash between phases) must not stay armed
+    /// forever — a LATER background continuation is not the turn that Started
+    /// announced (a serving turn's first frame follows Started within seconds)
+    /// and must NOT be claimed, or the input box locks for the whole detached
+    /// exec (#758's regression).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_started_without_terminal_echo_does_not_claim_a_later_turn() {
+        let rig = rig_with_opts(false, std::time::Duration::from_millis(50)).await;
+        rig.tx
+            .send(AgentStreamEvent::MessageLifecycle(MessageLifecycleData {
+                client_msg_id: "cmsg-lost".into(),
+                phase: MessageLifecyclePhase::Started,
+            }))
+            .unwrap();
+        // No Completed/Cancelled ever arrives; wait past the pending TTL.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        rig.tx
+            .send(AgentStreamEvent::Text(TextEventData {
+                content: "much later background report".into(),
+            }))
+            .unwrap();
+        // Assert WHILE the turn is still open (a wrongly taken claim would be
+        // released again after Finish, hiding the bug).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !rig.runtime_state.is_claimed("conv-1"),
+            "a stale Started must not claim a later background continuation"
+        );
+        rig.tx
+            .send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+        eventually(async || rows_of_type(&rig, "text").await.into_iter().next())
+            .await
+            .expect("background turn content must still be delivered");
+    }
+
+    /// A `Completed`/`Cancelled` lifecycle echo consumes the pending Started:
+    /// a LATER agent-started turn with no fresh association is a pure
+    /// background continuation again and must not inherit a stale claim.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_lifecycle_clears_the_pending_user_message() {
+        let rig = rig().await;
+        rig.tx
+            .send(AgentStreamEvent::MessageLifecycle(MessageLifecycleData {
+                client_msg_id: "cmsg-1".into(),
+                phase: MessageLifecyclePhase::Started,
+            }))
+            .unwrap();
+        rig.tx
+            .send(AgentStreamEvent::MessageLifecycle(MessageLifecycleData {
+                client_msg_id: "cmsg-1".into(),
+                phase: MessageLifecyclePhase::Completed,
+            }))
+            .unwrap();
+        rig.tx
+            .send(AgentStreamEvent::Text(TextEventData {
+                content: "later unrelated background report".into(),
+            }))
+            .unwrap();
+        // Assert WHILE the turn is still open (see the test above).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !rig.runtime_state.is_claimed("conv-1"),
+            "a consumed lifecycle must not leave a stale claim behind"
+        );
+        rig.tx
+            .send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+        eventually(async || rows_of_type(&rig, "text").await.into_iter().next())
+            .await
+            .expect("background turn content must still be delivered");
     }
 
     /// While a USER turn is active, its own relay owns every frame — the watcher

@@ -313,6 +313,10 @@ impl ClaudeAdapter {
             // message_stop) carries no FSM signal — the regular `assistant`/`user`
             // frames already deliver the content — so they stay opaque.
             "stream_event" => self.parse_stream_event(v),
+            // Task 2 (mid-turn interjection observability): claude echoes back the
+            // uuid WE minted on the user frame, reporting where it landed in the
+            // turn lifecycle (verified 2.1.226, design spec §6.1).
+            "command_lifecycle" => self.parse_command_lifecycle(v),
             // unknown top-level type → opaque catch-all (I8/I13, never panic).
             other => vec![SessionEvent::AdapterSpecific {
                 tag: other.to_string(),
@@ -965,6 +969,28 @@ impl ClaudeAdapter {
             }],
         }
     }
+
+    /// A `command_lifecycle` frame: claude echoing back the `uuid` WE minted on
+    /// a user frame, reporting where it landed (§6.1). `command_uuid` is that
+    /// SAME correlation key; missing it degrades to no event (never guess an id).
+    fn parse_command_lifecycle(&self, v: &Value) -> Vec<SessionEvent> {
+        let Some(id) = v.get("command_uuid").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        // An unrecognised phase degrades to NO event rather than a guess: this
+        // frame is additive and claude may grow states we have not probed.
+        let phase = match v.get("state").and_then(Value::as_str) {
+            Some("queued") => crate::event::MessageLifecyclePhase::Queued,
+            Some("started") => crate::event::MessageLifecyclePhase::Started,
+            Some("completed") => crate::event::MessageLifecyclePhase::Completed,
+            Some("cancelled") | Some("canceled") => crate::event::MessageLifecyclePhase::Cancelled,
+            _ => return Vec::new(),
+        };
+        vec![SessionEvent::MessageLifecycle {
+            client_msg_id: id.to_string(),
+            phase,
+        }]
+    }
 }
 
 #[async_trait::async_trait]
@@ -1183,7 +1209,12 @@ impl BackendAdapter for ClaudeAdapter {
                 terminal_result: true,
             },
             supported_commands: crate::capability::CommandSet {
-                steer: false,
+                // B5: mid-turn delivery routes Command::Steer to a direct stdin
+                // user-frame write (claude's persistent stdin accepts writes any
+                // time; the CLI queues and consumes them itself — command_lifecycle
+                // echoes our uuid, design spec §6.1/§6甲.2). No turn_gen bump, no
+                // FSM involvement (NoTurn admission).
+                steer: true,
                 cancel_tool: false,
                 answer_permission: true,
                 answer_auth: false,
@@ -1238,9 +1269,13 @@ impl BackendAdapter for ClaudeAdapter {
             auth_methods: Vec::new(), // no mid-session re-auth on local path
             // 009 R2: claude's persistent stdin is a FIFO — a write while a turn
             // is in flight is buffered and consumed as the next turn, so the conv
-            // layer CAN proactively queue. This (NOT supported_commands.steer,
-            // which is false here anyway) is what can_queue gates on.
+            // layer CAN proactively queue. This (NOT supported_commands.steer)
+            // is what can_queue gates on.
             accepts_proactive_input: true,
+            // Verified backend matrix (see `Capabilities::supports_midturn_delivery`):
+            // claude is a direct-CLI backend that can deliver a mid-turn message to
+            // the agent without waiting for the current turn to end.
+            supports_midturn_delivery: true,
             // #101: static default empty; the clean-slate ClaudeConnection fills it
             // from the control_request{initialize} response (the legacy adapter has
             // no discovery wire). capabilities() merges the discovered set on read.
@@ -1468,6 +1503,50 @@ mod tests {
     }
 
     /// 009 R8: a STRING tool_result content → one Text part (e.g. Bash stdout).
+    /// Verified backend matrix (task-1 brief): claude MUST advertise
+    /// `supports_midturn_delivery` so mid-turn UI can gate on it.
+    #[test]
+    fn capabilities_advertise_midturn_delivery() {
+        let a = ClaudeAdapter::new();
+        assert!(a.capabilities().supports_midturn_delivery);
+        // Lock the backend-static table against the real constructor (claude
+        // has no pub capability constructor, so the lock lives here).
+        assert_eq!(
+            crate::capability::backend_supports_midturn_delivery("claude"),
+            a.capabilities().supports_midturn_delivery,
+        );
+    }
+
+    /// Task 2: claude echoes back the uuid WE minted on a user frame via a
+    /// `command_lifecycle` frame (verified 2.1.226, design spec §6.1) — the
+    /// adapter must normalize it into `SessionEvent::MessageLifecycle`.
+    #[test]
+    fn parses_command_lifecycle_into_message_lifecycle_events() {
+        let a = ClaudeAdapter::new();
+        let frame = r#"{"type":"command_lifecycle","command_uuid":"u-1","state":"queued"}"#;
+        let v: serde_json::Value = serde_json::from_str(frame).unwrap();
+        match a.parse_command_lifecycle(&v).as_slice() {
+            [SessionEvent::MessageLifecycle { client_msg_id, phase }] => {
+                assert_eq!(client_msg_id, "u-1");
+                assert_eq!(*phase, crate::event::MessageLifecyclePhase::Queued);
+            }
+            other => panic!("expected one MessageLifecycle, got {other:?}"),
+        }
+    }
+
+    /// An unrecognised `state` degrades to NO event rather than a guess — this
+    /// frame is additive and claude may grow states we have not probed.
+    #[test]
+    fn unknown_command_lifecycle_state_is_ignored_not_panicked() {
+        let a = ClaudeAdapter::new();
+        let frame = r#"{"type":"command_lifecycle","command_uuid":"u-1","state":"future_state"}"#;
+        let v: serde_json::Value = serde_json::from_str(frame).unwrap();
+        assert!(
+            a.parse_command_lifecycle(&v).is_empty(),
+            "an unknown phase must degrade to no event"
+        );
+    }
+
     #[test]
     fn parse_user_tool_result_string_content_to_text() {
         let a = ClaudeAdapter::new();

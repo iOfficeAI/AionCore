@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.68](https://github.com/iOfficeAI/AionCore/compare/v0.1.67...v0.1.68) (2026-08-17)
+
+
+### Features
+
+* **codex:** auto-name sessions and label command steps ([#868](https://github.com/iOfficeAI/AionCore/issues/868)) ([7aedbbd](https://github.com/iOfficeAI/AionCore/commit/7aedbbdcaf2835f8675db8cea87381aed4a91f10))
+* **conversation:** mid-turn interjection — deliver messages while a turn is in flight ([#836](https://github.com/iOfficeAI/AionCore/issues/836)) ([484327d](https://github.com/iOfficeAI/AionCore/commit/484327dbbcd44ca8752c133dfe2fe04c901bafbb))
+
+
+### Bug Fixes
+
+* **acp:** give a first-run npx agent room to install before initialize times out ([#854](https://github.com/iOfficeAI/AionCore/issues/854)) ([f6131a4](https://github.com/iOfficeAI/AionCore/commit/f6131a4ace14c90946de009ec8315f1c37f44e0f))
+* **acp:** stop collapsing agent failures into an opaque -32603 ([#869](https://github.com/iOfficeAI/AionCore/issues/869)) ([27fc006](https://github.com/iOfficeAI/AionCore/commit/27fc006a9811bdb55153741cfb549ad1b42c3751))
+* **agents:** launch omp through its local CLI instead of the npx bridge ([#855](https://github.com/iOfficeAI/AionCore/issues/855)) ([13b5dd4](https://github.com/iOfficeAI/AionCore/commit/13b5dd42f941e9dd8a9f3ff06498a3df4449452f))
+* **antigravity:** read the HTTP status before parsing the hook decision ([#867](https://github.com/iOfficeAI/AionCore/issues/867)) ([60bab79](https://github.com/iOfficeAI/AionCore/commit/60bab79d4a10844fb2dc4397cd89c2da09a6548d))
+* **auth:** stop CSRF rejecting agy's PreToolUse callback ([#860](https://github.com/iOfficeAI/AionCore/issues/860)) ([1d91312](https://github.com/iOfficeAI/AionCore/commit/1d913129d71b2a253f42d9c644d844c3c3213fe7))
+* **runtime:** find agent CLIs installed by bun and by vendor installers ([#856](https://github.com/iOfficeAI/AionCore/issues/856)) ([8881980](https://github.com/iOfficeAI/AionCore/commit/8881980401da402eaa6ecf73e884c104635b34ff))
+
 ## [0.1.67](https://github.com/iOfficeAI/AionCore/compare/v0.1.66...v0.1.67) (2026-08-14)
 
 

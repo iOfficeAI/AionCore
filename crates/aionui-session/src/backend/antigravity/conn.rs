@@ -147,6 +147,11 @@ pub fn antigravity_capabilities() -> Capabilities {
         // take input mid-turn, but its next turn is a fresh process anyway, so
         // the input box can stay usable instead of locking until the turn ends.
         accepts_proactive_input: true,
+        // agy runs ONE PROCESS PER TURN and ignores stdin mid-turn (see the
+        // `capabilities_allow_queueing_but_not_steering` test), so a message sent
+        // during a turn cannot reach it — it waits for the next process. agy MUST
+        // therefore behave exactly like ACP in the UI.
+        supports_midturn_delivery: false,
         ..Default::default()
     }
 }
@@ -1202,6 +1207,7 @@ mod tests {
         let err = backend
             .dispatch(Command::Steer {
                 content: vec![ContentBlock::Text("stop".into())],
+                client_msg_id: None,
             })
             .await
             .expect_err("steer must not be silently accepted");
@@ -1816,6 +1822,14 @@ mod tests {
         assert!(!c.supported_commands.steer);
         // ...but queueing for the next turn is natural for a per-turn process.
         assert!(c.accepts_proactive_input);
+    }
+
+    /// Verified backend matrix (task-1 brief): agy MUST NOT advertise
+    /// `supports_midturn_delivery` — it is one-process-per-turn and ignores
+    /// stdin mid-turn, so it must behave like ACP in the UI.
+    #[test]
+    fn capabilities_do_not_advertise_midturn_delivery() {
+        assert!(!antigravity_capabilities().supports_midturn_delivery);
     }
 
     #[test]
