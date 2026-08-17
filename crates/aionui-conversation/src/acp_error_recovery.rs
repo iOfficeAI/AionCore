@@ -210,7 +210,11 @@ impl ConversationService {
         }
     }
 
-    /// Drop the persisted ACP session id once the agent process has been killed.
+    /// Drop the persisted ACP session id once the agent has disowned it.
+    ///
+    /// Called from BOTH failure paths: terminal-error eviction and agent task
+    /// BUILD failure. The build path is the one that actually mattered for the
+    /// reported loop — warmup fails there, so the eviction path never runs.
     ///
     /// The session lives INSIDE that process, so killing it destroys the session
     /// while the id stayed on disk. Every later turn then replayed the dead id at
@@ -227,7 +231,7 @@ impl ConversationService {
     /// carries the session id forward so the replay resumes the same session
     /// instead of losing the conversation's context (see
     /// `auto_replay_rebuild_keeps_existing_acp_session_id_in_build_options`).
-    async fn clear_persisted_acp_session_after_eviction(
+    pub(crate) async fn clear_persisted_acp_session_after_disown(
         &self,
         user_id: &str,
         conversation_id: &str,
@@ -291,7 +295,7 @@ impl ConversationService {
         task_manager
             .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
             .await;
-        self.clear_persisted_acp_session_after_eviction(user_id, conversation_id, error_code)
+        self.clear_persisted_acp_session_after_disown(user_id, conversation_id, error_code)
             .await;
         self.clear_persisted_acp_model_after_model_not_found(user_id, conversation_id, error_code)
             .await;

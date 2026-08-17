@@ -138,6 +138,20 @@ impl ConversationTurnOrchestrator {
                     "Agent task build failed"
                 );
                 let failure_message = send_error_display_message(&send_error);
+                // A build that failed because the agent disowned our session id
+                // must not leave that id behind: warmup replays it on every later
+                // turn and fails the same way BEFORE the prompt is sent, so the
+                // real cause is never reachable again. Verified live (conversation
+                // 161c458a): the agent was killed after a first error, its
+                // in-process session died with it, and the id then produced
+                // `Session not found` on every turn until the row was cleared.
+                //
+                // This is the build path — the terminal-error eviction in
+                // `evict_acp_task_after_terminal_error` never runs here, which is
+                // why clearing there alone did not fix it.
+                self.service
+                    .clear_persisted_acp_session_after_disown(&input.user_id, &input.conv_id, send_error.code())
+                    .await;
                 record_agent_session_failure(
                     &self.service,
                     &input.user_id,

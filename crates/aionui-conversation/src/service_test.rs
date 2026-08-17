@@ -8926,3 +8926,49 @@ async fn a_clean_finish_leaves_the_session_id_alone() {
         "a live session must survive a clean turn"
     );
 }
+
+/// The BUILD path is where the reported loop actually lived: warmup fails, so the
+/// terminal-error eviction never runs. This calls the shared helper directly with
+/// the code that path reports, pinning that a disowned id is dropped there too.
+#[tokio::test]
+async fn session_not_found_during_task_build_clears_the_persisted_session_id() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("deb7c49d-dead"));
+    let (svc, _b, _r, _task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(RecordingSkillResolver {
+            names: Vec::new(),
+            links: Arc::new(Mutex::new(Vec::new())),
+        }),
+        acp_repo.clone(),
+    );
+
+    svc.clear_persisted_acp_session_after_disown("user-1", "conv-1", Some(AgentErrorCode::UserAgentSessionNotFound))
+        .await;
+
+    assert!(
+        acp_repo.session_id.lock().unwrap().is_none(),
+        "a build failure that disowns the session must clear the id"
+    );
+}
+
+/// A build failure for any other reason keeps the id — the session may still be
+/// resumable and dropping it would lose the conversation's context.
+#[tokio::test]
+async fn other_build_failures_keep_the_persisted_session_id() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-live"));
+    let (svc, _b, _r, _task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(RecordingSkillResolver {
+            names: Vec::new(),
+            links: Arc::new(Mutex::new(Vec::new())),
+        }),
+        acp_repo.clone(),
+    );
+
+    svc.clear_persisted_acp_session_after_disown("user-1", "conv-1", Some(AgentErrorCode::UnknownUpstreamError))
+        .await;
+
+    assert_eq!(
+        acp_repo.session_id.lock().unwrap().as_deref(),
+        Some("sess-live"),
+        "an unrelated build failure must not drop a resumable session"
+    );
+}
