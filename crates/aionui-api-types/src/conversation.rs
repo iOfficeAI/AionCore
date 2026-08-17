@@ -174,6 +174,12 @@ pub struct SendMessageRequest {
 pub struct SendMessageResponse {
     pub msg_id: String,
     pub turn_id: String,
+    /// B5 mid-turn interjection: `true` when the message was delivered INTO the
+    /// already-running turn (`turn_id` is then the ACTIVE turn's id, no new
+    /// turn was opened, and the HTTP status is 200 instead of the normal 202).
+    /// Absent/false for an ordinary send that opened a new turn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delivered_midturn: bool,
     pub runtime: ConversationRuntimeSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_id: Option<String>,
@@ -335,6 +341,12 @@ pub struct ConversationRuntimeSummary {
     pub is_processing: bool,
     pub pending_confirmations: usize,
     pub turn_id: Option<String>,
+    /// Whether a message sent right now reaches the agent without waiting for the
+    /// current turn to end. The ONLY capability bit the frontend may gate mid-turn
+    /// UI on — see `Capabilities::supports_midturn_delivery` for why
+    /// `accepts_proactive_input` must never be exposed.
+    #[serde(default)]
+    pub supports_midturn_delivery: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -521,6 +533,21 @@ pub type ConversationArtifactListResponse = Vec<ConversationArtifactResponse>;
 pub struct ConversationNameUpdatedPayload {
     pub conversation_id: String,
     pub name: String,
+}
+
+/// Payload of the `message.statusChanged` websocket event (B5 mid-turn
+/// interjection): a persisted message's `status` field changed outside the
+/// normal stream flow. Today it carries the mid-turn user-message receipt
+/// transition — `"pending"` (delivered to the CLI, not yet consumed) →
+/// `"finish"` (the agent took it: claude `command_lifecycle` echo / codex
+/// steer ack). The frontend flips the 待接收/已接收 badge on it, keyed by
+/// `msg_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageStatusChangedPayload {
+    pub user_id: String,
+    pub conversation_id: String,
+    pub msg_id: String,
+    pub status: String,
 }
 
 /// A single item from cross-conversation message search.

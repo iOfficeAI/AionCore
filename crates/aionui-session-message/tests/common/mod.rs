@@ -139,6 +139,9 @@ impl IAgentTask for FakeAgent {
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.event_tx.subscribe()
     }
+    fn supports_midturn_delivery(&self) -> bool {
+        self.supports_midturn
+    }
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.sent.lock().unwrap().push(data);
         // Finish so the relay of a newly-opened turn completes and the claim is
@@ -159,6 +162,10 @@ impl IAgentTask for FakeAgent {
 impl IMockAgent for FakeAgent {
     fn get_confirmations(&self) -> Vec<Confirmation> {
         self.confirmations.lock().unwrap().clone()
+    }
+    async fn deliver_midturn(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        self.delivered_midturn.lock().unwrap().push(data);
+        Ok(())
     }
 }
 

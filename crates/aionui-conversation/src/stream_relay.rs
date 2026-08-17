@@ -789,6 +789,12 @@ impl StreamRelay {
                             // Journal-only diagnostic. The trajectory change notification
                             // above tells the client to fetch the compact semantic record.
                         }
+                        AgentStreamEvent::MessageLifecycle(_) => {
+                            // Internal-only correlation frame (mid-turn interjection
+                            // Task 3): consumed by the BackgroundStreamWatcher between
+                            // turns; inside a turn it is pure bookkeeping. Never
+                            // forwarded to the WebSocket.
+                        }
                         // Agent session titles. The BackgroundStreamWatcher is the
                         // between-turns consumer, but while it lends its receiver to
                         // an orphan-turn relay THIS relay is the only consumer — live
@@ -1134,6 +1140,7 @@ impl StreamRelay {
             AgentStreamEvent::BackendTurnBound(_) => "BackendTurnBound",
             AgentStreamEvent::WorkflowProgress(_) => "WorkflowProgress",
             AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
+            AgentStreamEvent::MessageLifecycle(_) => "MessageLifecycle",
         }
     }
 

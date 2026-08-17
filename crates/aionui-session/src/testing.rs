@@ -554,7 +554,7 @@ pub mod invariants {
                 "steer",
                 Command::Steer {
                     content: Vec::new(),
-                    client_user_message_id: None,
+                    client_msg_id: None,
                 },
                 |c| c.supported_commands.steer,
             ),

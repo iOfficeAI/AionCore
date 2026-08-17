@@ -33,10 +33,14 @@ pub enum Command {
     Cancel { target: CancelTarget },
     /// Inject content into the in-flight turn (adapter-private gated steering;
     /// the b-side FSM never sees Steer). Gated by `supported_commands.steer`.
+    ///
+    /// `client_msg_id` is the mid-turn correlation id (B5): claude stamps it as
+    /// the user frame's `uuid` (echoed back via `command_lifecycle`), codex
+    /// sends it as `turn/steer.clientUserMessageId` (official schema field,
+    /// design spec §6甲.10). `None` = no correlation (legacy callers / host steer).
     Steer {
         content: Vec<ContentBlock>,
-        /// Stable host input id forwarded to backends that support request correlation.
-        client_user_message_id: Option<String>,
+        client_msg_id: Option<String>,
     },
     /// Answer a `Permission{request_id}` the backend raised. `decision` is the
     /// coarse allow/deny (sound for every generic tool approval).

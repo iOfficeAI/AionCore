@@ -244,17 +244,18 @@ pub fn can_send_message(state: &SessionState) -> bool {
 ///       flight, not blocked on a permission/auth the user must answer first).
 ///       `Starting`/`Error`/`Idle` never queue (Idle is `can_send`, not queue).
 ///   (b) capability half — the backend `accepts_proactive_input` (claude's stdin
-///       FIFO). ⚠️ NOT `caps.supported_commands.steer`: codex advertises steer but
-///       the conv layer doesn't route it, so keying off steer would surface a dead
-///       queue affordance (MX-QUEUE-3). ACP/aionrs lack the path → degrade to false.
+///       FIFO; codex since B5 wired mid-turn Steer routing). ⚠️ NOT
+///       `caps.supported_commands.steer`: a backend could advertise steer without
+///       the conv layer routing it, surfacing a dead queue affordance
+///       (MX-QUEUE-3). ACP/aionrs lack the path → degrade to false.
 ///
 /// Orthogonal to `can_send` (Idle): `can_send || can_queue` is the input-box gate.
 /// Truth table (× backend `accepts_proactive_input`):
-/// | state                              | claude(true) | codex/acp/aionrs(false) |
-/// |------------------------------------|--------------|-------------------------|
-/// | Idle / Starting / Error            | false        | false                   |
-/// | Running { requires_action empty }  | true         | false                   |
-/// | Running { requires_action count>0 }| false        | false                   |
+/// | state                              | claude/codex(true) | acp/aionrs(false) |
+/// |------------------------------------|--------------------|-------------------|
+/// | Idle / Starting / Error            | false              | false             |
+/// | Running { requires_action empty }  | true               | false             |
+/// | Running { requires_action count>0 }| false              | false             |
 pub fn can_queue_message(state: &SessionState, accepts_proactive_input: bool) -> bool {
     accepts_proactive_input && matches!(state, SessionState::Running { .. }) && !is_requires_action(state)
 }
@@ -459,10 +460,10 @@ mod tests {
             ),
             "Error cannot queue"
         );
-        // codex/acp/aionrs (accepts_proactive_input=false): degrades to false in
-        // EVERY state — including Running no-RA where claude would queue. This is
-        // the MX-QUEUE-3 dead-button guard: the gate is the proactive-input bit,
-        // NOT supported_commands.steer (which codex sets true).
+        // acp/aionrs (accepts_proactive_input=false): degrades to false in
+        // EVERY state — including Running no-RA where claude/codex would queue.
+        // This is the MX-QUEUE-3 dead-button guard: the gate is the
+        // proactive-input bit, NOT supported_commands.steer.
         assert!(
             !can_queue_message(&ra(0), false),
             "no proactive-input path → never queue"

@@ -526,6 +526,120 @@ impl SessionAgentTask {
         self.command_seq.fetch_add(1, Ordering::Relaxed) as u64
     }
 
+    /// Build the multimodal `ContentBlock` vector for a prompt: partition
+    /// attachments by the backend's declared prompt blocks — capable media
+    /// becomes native Image/Audio blocks; everything else keeps the
+    /// pre-multimodal form (path in the [[AION_FILES]] text + resource link).
+    /// A read failure degrades that attachment back to a resource link — the
+    /// path also remains in the original text because partition already ran,
+    /// which the adapters tolerate (they resolve links independently of the
+    /// text). Shared by `send_message` and `deliver_midturn`.
+    async fn build_prompt_blocks(
+        &self,
+        data: &SendMessageData,
+    ) -> (Vec<ContentBlock>, Vec<aionui_api_types::PromptAttachmentV1>) {
+        // Partition attachments by the backend's declared prompt blocks:
+        // capable media becomes native Image/Audio blocks PAIRED with a
+        // ResourceLink to the same file; everything else keeps the
+        // pre-multimodal form (path in the [[AION_FILES]] text + resource
+        // link). The pair is how the disk path reaches an agent: a native
+        // image/audio block has no uri field, and partition already stripped
+        // that path out of the text. Shared by `send_message` and `deliver_midturn`.
+        let mut partition =
+            crate::media::partition_media(&data.content, &data.files, &data.attachments, self.prompt_media_caps())
+                .await;
+        let link_media_paths = self.backend.capabilities().prompt_blocks.resource;
+        let mut content: Vec<ContentBlock> = Vec::new();
+        if !partition.content.is_empty() {
+            content.push(ContentBlock::Text(partition.content));
+        }
+        for path in partition.path_files {
+            content.push(ContentBlock::ResourceLink {
+                uri: path,
+                mime_type: None,
+            });
+        }
+        let mut media_links = 0usize;
+        for attachment in &partition.media {
+            match crate::media::read_media_bytes(attachment).await {
+                Some(bytes) => {
+                    content.push(match attachment.kind {
+                        crate::media::MediaKind::Image => ContentBlock::Image {
+                            data: bytes,
+                            media_type: attachment.mime.clone(),
+                        },
+                        crate::media::MediaKind::Audio => ContentBlock::Audio {
+                            data: bytes,
+                            media_type: attachment.mime.clone(),
+                        },
+                    });
+                    if link_media_paths {
+                        content.push(ContentBlock::ResourceLink {
+                            uri: attachment.path.clone(),
+                            mime_type: Some(attachment.mime.clone()),
+                        });
+                        media_links += 1;
+                    }
+                }
+                None => {
+                    if let Some(delivery) = partition.deliveries.get_mut(attachment.attachment_index) {
+                        delivery.delivery = aionui_api_types::PromptAttachmentDelivery::PathFallback;
+                        delivery.reason = Some("native_read_failed".to_owned());
+                    }
+                    content.push(ContentBlock::ResourceLink {
+                        uri: attachment.path.clone(),
+                        mime_type: Some(attachment.mime.clone()),
+                    });
+                }
+            }
+        }
+        let deliveries = std::mem::take(&mut partition.deliveries);
+        if !partition.media.is_empty() {
+            let (images, audios) = content.iter().fold((0usize, 0usize), |(i, a), b| match b {
+                ContentBlock::Image { .. } => (i + 1, a),
+                ContentBlock::Audio { .. } => (i, a + 1),
+                _ => (i, a),
+            });
+            tracing::info!(
+                conversation_id = %self.conversation_id,
+                msg_id = %data.msg_id,
+                images,
+                audios,
+                media_links,
+                "session prompt carries native media content blocks"
+            );
+        }
+        (content, deliveries)
+    }
+
+    /// B5 mid-turn delivery: hand a message to the RUNNING turn instead of
+    /// opening a new one. Dispatches `Command::Steer` (codex `turn/steer`;
+    /// claude direct stdin user-frame write) with `data.msg_id` as the
+    /// correlation id both CLIs round-trip (claude user-frame `uuid` echoed via
+    /// `command_lifecycle`; codex `clientUserMessageId`).
+    ///
+    /// Deliberately NOT `send_message`: no `AgentStreamEvent::Start` emit and
+    /// no status flip — the message folds into the ACTIVE turn, whose relay and
+    /// status are already live (a stray Start would open a phantom turn
+    /// boundary mid-stream).
+    pub async fn deliver_midturn(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        self.runtime.touch();
+        let (content, _) = self.build_prompt_blocks(&data).await;
+        self.dump_session_cli_final_input(&content, Some(data.msg_id.as_str()));
+        let cmd = Command::Steer {
+            content,
+            client_msg_id: Some(data.msg_id),
+        };
+        self.backend
+            .dispatch(cmd)
+            .await
+            .map(|_| ())
+            // Preserve the backend's message text: the conversation layer
+            // classifies codex's "no active turn to steer" rejection to fall
+            // back to the normal new-turn path.
+            .map_err(|e| AgentSendError::from_agent_error(AgentError::bad_gateway(e.to_string())))
+    }
+
     /// DEV (`--dump-prompts`): dump this turn's final input blocks as a
     /// `session-cli-final-input` JSON, symmetric with the ACP path's
     /// `acp-final-input`. Best-effort: a failure only warns and never affects
@@ -1179,12 +1293,16 @@ impl SessionAgentTask {
         self.backend
             .dispatch(Command::Steer {
                 content: vec![ContentBlock::Text(content)],
-                client_user_message_id: Some(input_id),
+                client_msg_id: Some(input_id),
             })
             .await
             .map(|_| ())
             .map_err(|error| match &error {
-                BackendError::Transport(code) if code == "too_late" => AgentError::bad_request("too_late"),
+                BackendError::Transport(code)
+                    if code == "too_late" || code.contains("no active turn to steer") =>
+                {
+                    AgentError::bad_request("too_late")
+                }
                 _ => AgentError::bad_gateway(error.to_string()),
             })
     }
@@ -1220,6 +1338,10 @@ impl IAgentTask for SessionAgentTask {
         self.runtime.tx.subscribe()
     }
 
+    fn supports_midturn_delivery(&self) -> bool {
+        self.backend.capabilities().supports_midturn_delivery
+    }
+
     fn prompt_media_caps(&self) -> PromptMediaCaps {
         let blocks = self.backend.capabilities().prompt_blocks;
         PromptMediaCaps {
@@ -1230,93 +1352,7 @@ impl IAgentTask for SessionAgentTask {
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.runtime.touch();
-        // Partition attachments by the backend's declared prompt blocks:
-        // capable media becomes native Image/Audio blocks PAIRED with a
-        // ResourceLink to the same file; everything else keeps the
-        // pre-multimodal form (path in the [[AION_FILES]] text + resource
-        // link). The pair is how the disk path reaches an agent: a native
-        // image/audio block has no uri field, and partition already stripped
-        // that path out of the text. Adapters render a link as
-        // `[Attached file: <uri>]` (see `adapter/claude.rs` /
-        // `backend/codex_conn.rs`), which is how every non-media attachment
-        // already travels and how images travelled before the multimodal
-        // split. Without the pair, an agent that can both see and read files
-        // gets pixels it cannot open. The pair is gated on the backend
-        // advertising `resource`: an un-advertised block is rejected at
-        // dispatch and would kill the whole Send (`BlockSet::allows`).
-        //
-        // A read failure degrades that attachment back to a resource link
-        // alone — the path also remains in the original text because
-        // partition already ran, which the adapters tolerate (they resolve
-        // links independently of the text).
-        let mut partition =
-            crate::media::partition_media(&data.content, &data.files, &data.attachments, self.prompt_media_caps())
-                .await;
-        let link_media_paths = self.backend.capabilities().prompt_blocks.resource;
-        let mut content: Vec<ContentBlock> = Vec::new();
-        if !partition.content.is_empty() {
-            content.push(ContentBlock::Text(partition.content));
-        }
-        for path in partition.path_files {
-            // File paths ride as resource links; the claude/codex adapters resolve
-            // them (Read tool / base64) at dispatch time.
-            content.push(ContentBlock::ResourceLink {
-                uri: path,
-                mime_type: None,
-            });
-        }
-        let mut media_links = 0usize;
-        for attachment in &partition.media {
-            match crate::media::read_media_bytes(attachment).await {
-                Some(bytes) => {
-                    content.push(match attachment.kind {
-                        crate::media::MediaKind::Image => ContentBlock::Image {
-                            data: bytes,
-                            media_type: attachment.mime.clone(),
-                        },
-                        crate::media::MediaKind::Audio => ContentBlock::Audio {
-                            data: bytes,
-                            media_type: attachment.mime.clone(),
-                        },
-                    });
-                    // Pair the bytes with the path (see the fn doc): the block
-                    // itself has no uri field and the text no longer lists it.
-                    if link_media_paths {
-                        content.push(ContentBlock::ResourceLink {
-                            uri: attachment.path.clone(),
-                            mime_type: Some(attachment.mime.clone()),
-                        });
-                        media_links += 1;
-                    }
-                }
-                None => {
-                    if let Some(delivery) = partition.deliveries.get_mut(attachment.attachment_index) {
-                        delivery.delivery = aionui_api_types::PromptAttachmentDelivery::PathFallback;
-                        delivery.reason = Some("native_read_failed".to_owned());
-                    }
-                    content.push(ContentBlock::ResourceLink {
-                        uri: attachment.path.clone(),
-                        mime_type: Some(attachment.mime.clone()),
-                    });
-                }
-            }
-        }
-        let deliveries = std::mem::take(&mut partition.deliveries);
-        if !partition.media.is_empty() {
-            let (images, audios) = content.iter().fold((0usize, 0usize), |(i, a), b| match b {
-                ContentBlock::Image { .. } => (i + 1, a),
-                ContentBlock::Audio { .. } => (i, a + 1),
-                _ => (i, a),
-            });
-            tracing::info!(
-                conversation_id = %self.conversation_id,
-                msg_id = %data.msg_id,
-                images,
-                audios,
-                media_links,
-                "session prompt carries native media content blocks"
-            );
-        }
+        let (content, deliveries) = self.build_prompt_blocks(&data).await;
         // DEV (`--dump-prompts`): borrow the final blocks BEFORE they move into
         // Command::Send. No-op / best-effort — never affects the dispatch.
         self.dump_session_cli_final_input(&content, Some(data.msg_id.as_str()));
@@ -4615,6 +4651,17 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
         // identically (translate.rs emits the same frame for real ACP agents).
         SessionEvent::SessionTitle { title } => {
             vec![AgentStreamEvent::AcpSessionInfo(serde_json::json!({ "title": title }))]
+        }
+        // Mid-turn interjection (Task 3): lower the claude command_lifecycle echo
+        // to an internal-only stream frame so the conversation layer's
+        // BackgroundStreamWatcher can tell an agent-started turn that SERVES a
+        // user message (claim it) from a pure background continuation (leave it
+        // unclaimed). Consumed inside the relay/watcher, never forwarded to the
+        // WebSocket.
+        SessionEvent::MessageLifecycle { client_msg_id, phase } => {
+            vec![AgentStreamEvent::MessageLifecycle(
+                crate::protocol::events::MessageLifecycleData { client_msg_id, phase },
+            )]
         }
         // Events with no origin-side counterpart (or purely internal) are dropped.
         // Cancel folds into the Finish emitted by the resulting terminal; Heartbeat,
@@ -10291,6 +10338,52 @@ mod force_kill_tests {
         }
         async fn terminate(&self) {
             self.terminate_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Task-1 brief: `SessionAgentTask::supports_midturn_delivery` must read
+    /// straight through to the backend's declared capability bit — no
+    /// reinterpretation, no default override.
+    struct MidturnCapableBackend {
+        supports_midturn_delivery: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for MidturnCapableBackend {
+        async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+            Ok(CommandReceipt {
+                accepted: true,
+                admission: Admission::NoTurn,
+                turn_gen: 1,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::empty().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_midturn_delivery: self.supports_midturn_delivery,
+                ..Capabilities::default()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn supports_midturn_delivery_reads_through_backend_capabilities() {
+        for expected in [true, false] {
+            let backend: Arc<dyn SessionBackend> = Arc::new(MidturnCapableBackend {
+                supports_midturn_delivery: expected,
+            });
+            let task = SessionAgentTask::new(
+                AgentType::Acp,
+                "conv-1".into(),
+                "user-1".into(),
+                "/w".into(),
+                backend,
+                None,
+            );
+            assert_eq!(IAgentTask::supports_midturn_delivery(task.as_ref()), expected);
         }
     }
 
