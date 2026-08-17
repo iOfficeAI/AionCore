@@ -30,6 +30,9 @@ use aionui_process::Spawner;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast, oneshot};
 
+#[cfg(any(test, feature = "test-support"))]
+use super::codex_title::NoTitleIo;
+use super::codex_title::{SpawnedTitleIo, TitleGen};
 use super::suspend::{ProcHandle, SuspendController, spawn_idle_timer};
 use super::types::{
     Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, PendingPermissionView,
@@ -131,6 +134,7 @@ impl BackendConnection for CodexConnection {
             env: config.spawn_env.clone(),
             cwd: config.cwd.clone(),
         };
+        let title_cmd = cmd.clone();
         let proc = self
             .spawner
             .spawn(cmd, &[], "aionui-session")
@@ -145,7 +149,17 @@ impl BackendConnection for CodexConnection {
             spawner: Some(self.spawner.clone()),
             config: config.clone(),
         };
-        let mut backend = CodexSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms).await;
+        // First-turn title latch: armed only for a Fresh open (a brand-new
+        // conversation). Its runs go to a THROWAWAY process built from the same
+        // CommandSpec — same codex install, env and cwd, hence the same
+        // credentials — but never onto this session's connection.
+        let title_gen = Arc::new(TitleGen::new(
+            matches!(&spec, SessionSpec::Fresh { .. }),
+            Arc::new(SpawnedTitleIo::new(self.spawner.clone(), title_cmd)),
+        ));
+        title_gen.set_model(config.model.clone());
+        let mut backend =
+            CodexSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms, title_gen).await;
         // Report a codex whose version differs from the release AionUi verified.
         // codex runs from the user's own install (nothing is bundled), the same
         // situation agy has always been in. Placed here rather than at the two
@@ -932,6 +946,10 @@ struct CodexReaderState {
     /// terminal (TurnResult / Detached). The idle timer reads it so a streaming turn
     /// is never suspended mid-flight.
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// First-turn session-title latch. Fired by the reader on a successful turn
+    /// terminal; runs on its OWN process (see `codex_title`), so nothing here
+    /// touches `thread_binding` / `turn_in_flight` / the R8 `terminated` flag.
+    title_gen: Arc<TitleGen>,
 }
 
 /// Spawn a codex JSON-RPC reader over `stdout`/`io` using the shared state. Used
@@ -963,6 +981,7 @@ fn start_codex_reader(
             state.discovered,
             state.stdin,
             state.turn_in_flight,
+            state.title_gen,
         )
         .await;
     })
@@ -1031,6 +1050,18 @@ impl CodexSessionBackend {
         Self::spawn(session_id.into(), io).await
     }
 
+    /// Test-support seam: build over an injected `AgentIo` WITH a caller-supplied
+    /// title latch, so the first-turn title wiring (reader terminal → fire) can be
+    /// driven without spawning a real codex.
+    #[cfg(test)]
+    pub(crate) async fn build_with_io_titled(
+        session_id: impl Into<String>,
+        io: Box<dyn AgentIo>,
+        title_gen: Arc<TitleGen>,
+    ) -> Self {
+        Self::spawn_with_wake(session_id.into(), io, CodexWakeRecipe::inert(), None, title_gen).await
+    }
+
     /// Test-support seam: build a SUSPENDABLE backend with a caller-supplied
     /// `Spawner` (to observe the wake re-spawn) + an `idle_ttl_ms`. Lets a test
     /// drive the suspend→wake path: the idle slot suspends, and the next dispatch
@@ -1046,7 +1077,14 @@ impl CodexSessionBackend {
             spawner: Some(spawner),
             config: SessionConfig::default(),
         };
-        Self::spawn_with_wake(session_id.into(), io, wake, Some(idle_ttl_ms)).await
+        Self::spawn_with_wake(
+            session_id.into(),
+            io,
+            wake,
+            Some(idle_ttl_ms),
+            Arc::new(TitleGen::new(false, Arc::new(NoTitleIo))),
+        )
+        .await
     }
 
     /// Test-support seam: pre-bind the backend threadId (the resume anchor the
@@ -1109,7 +1147,14 @@ impl CodexSessionBackend {
     /// wake recipe; only the `build_with_io` test seam uses this.
     #[cfg(any(test, feature = "test-support"))]
     async fn spawn(session_id: String, io: Box<dyn AgentIo>) -> Self {
-        Self::spawn_with_wake(session_id, io, CodexWakeRecipe::inert(), None).await
+        Self::spawn_with_wake(
+            session_id,
+            io,
+            CodexWakeRecipe::inert(),
+            None,
+            Arc::new(TitleGen::new(false, Arc::new(NoTitleIo))),
+        )
+        .await
     }
 
     /// Spawn + (optionally) enable F-4 idle self-suspend. `wake` carries what a
@@ -1120,6 +1165,7 @@ impl CodexSessionBackend {
         io: Box<dyn AgentIo>,
         wake: CodexWakeRecipe,
         idle_ttl_ms: Option<i64>,
+        title_gen: Arc<TitleGen>,
     ) -> Self {
         let io: Arc<dyn AgentIo> = Arc::from(io);
         let turn_gen = Arc::new(AtomicU64::new(0));
@@ -1163,6 +1209,7 @@ impl CodexSessionBackend {
             discovered: discovered.clone(),
             stdin: stdin.clone(),
             turn_in_flight: turn_in_flight.clone(),
+            title_gen: title_gen.clone(),
         };
         let reader = start_codex_reader(&reader_state, stdout, io.clone());
 
@@ -1456,6 +1503,7 @@ async fn reader_task(
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    title_gen: Arc<TitleGen>,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1639,6 +1687,18 @@ async fn reader_task(
                                 // F-4: turn terminal → clear the turn-active flag so the
                                 // idle timer may suspend the now-idle process.
                                 turn_in_flight.store(false, Ordering::SeqCst);
+                                // First-turn title: every SUCCESSFUL turn fires
+                                // while the latch is armed (an error turn keeps it
+                                // armed for the next one). Detached onto its own
+                                // process — see `codex_title`.
+                                if let SessionEvent::TurnResult {
+                                    is_error: false,
+                                    result_text,
+                                    ..
+                                } = &ev
+                                {
+                                    title_gen.fire(&session_id, result_text, &event_tx, cur);
+                                }
                                 emit(&event_tx, &session_id, cur, ev);
                             } else if system_error_pending && !was_pending {
                                 // systemError was just deferred: arm the bounded grace
@@ -2937,6 +2997,60 @@ fn map_collab_status(s: &str) -> SubagentStatus {
     }
 }
 
+/// Turn codex's protocol-level `commandExecution` item into a compact,
+/// user-facing step label. The raw item is still carried as `ToolCall.input`,
+/// so this changes presentation only and does not discard command details.
+///
+/// `commandActions` is the semantic summary emitted by codex itself (for
+/// example `read`, `search`, or `listFiles`). Prefer it over reparsing the shell
+/// command; fall back to the command text for actions codex classifies as
+/// `unknown`.
+fn command_execution_display_name(item: &Value) -> String {
+    const MAX_DETAIL_CHARS: usize = 96;
+
+    fn bounded(value: &str) -> String {
+        let value = value.trim().replace(['\n', '\r'], " ");
+        let mut chars = value.chars();
+        let head: String = chars.by_ref().take(MAX_DETAIL_CHARS).collect();
+        if chars.next().is_some() {
+            format!("{head}…")
+        } else {
+            head
+        }
+    }
+
+    let actions = item.get("commandActions").and_then(Value::as_array);
+    let action = actions.and_then(|items| items.first());
+    let action_count = actions.map_or(0, Vec::len);
+
+    let (verb, detail) = match action.and_then(|a| a.get("type")).and_then(Value::as_str) {
+        Some("read") => (
+            "Read",
+            action
+                .and_then(|a| a.get("name").or_else(|| a.get("path")))
+                .and_then(Value::as_str),
+        ),
+        Some("search") => ("Search", action.and_then(|a| a.get("query")).and_then(Value::as_str)),
+        Some("listFiles") => ("List files", action.and_then(|a| a.get("path")).and_then(Value::as_str)),
+        Some("unknown") | Some(_) | None => (
+            "Run",
+            action
+                .and_then(|a| a.get("command"))
+                .and_then(Value::as_str)
+                .or_else(|| item.get("command").and_then(Value::as_str)),
+        ),
+    };
+
+    let mut label = match detail.map(bounded).filter(|s| !s.is_empty()) {
+        Some(detail) => format!("{verb} {detail}"),
+        None => format!("{verb} command"),
+    };
+    if action_count > 1 {
+        label.push_str(&format!(" · {action_count} actions"));
+    }
+    label
+}
+
 /// A1 CORE: match the item's `type` STRING with a fallthrough. The closed codex
 /// ThreadItem enum is NEVER constructed in our code, so an unknown future `type`
 /// becomes `AdapterSpecific` instead of a deserialization panic.
@@ -3079,7 +3193,11 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
             } else {
                 out.push(SessionEvent::ToolCall {
                     tool_use_id: id.clone(),
-                    name: item_type.to_string(),
+                    name: if item_type == "commandExecution" {
+                        command_execution_display_name(item)
+                    } else {
+                        item_type.to_string()
+                    },
                     subagent: crate::event::SubagentKind::Inline,
                     // Gap #4 / H2: carry the codex tool ARGUMENTS. On the started
                     // (non-completed) item the invocation fields (command/cwd/
@@ -3689,6 +3807,20 @@ impl SessionBackend for CodexSessionBackend {
                         command: crate::capability::block_kind_name(bad),
                     });
                 }
+                // While the first-turn title latch is armed, record the first
+                // prompt's text as the generation description (bounded inside;
+                // prompt content is never logged).
+                if self.reader_state.title_gen.is_armed() {
+                    let text = content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.reader_state.title_gen.record_first_prompt(&text);
+                }
                 // Bridge-parity slash routing (ELECTRON-3PX): the 6 advertised
                 // commands (builtin_slash_commands) translate to native ops the way
                 // the codex-acp bridge did in-process (v0.14.0 thread.rs:3252
@@ -3985,6 +4117,10 @@ impl SessionBackend for CodexSessionBackend {
                 // Track it so a subsequent SetMode can build collaborationMode (M1).
                 let tid = self.bound_thread().await?;
                 *self.current_model.lock().await = Some(model.clone());
+                // Keep the title latch on the model the user is actually talking
+                // to — a title run started after a switch must not use the stale
+                // open-time model.
+                self.reader_state.title_gen.set_model(Some(model.clone()));
                 let id = self.next_rpc_id();
                 // Register the rpc id so the reader claims the response: a JSON-RPC
                 // error (codex rejected the model) surfaces as a Notice instead of
@@ -5604,8 +5740,8 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("a ToolCall content event for c1, got {started:?}"));
         assert_eq!(
-            tool_call.0, "commandExecution",
-            "#1: ToolCall.name pinned (was unpinned)"
+            tool_call.0, "Run echo hi",
+            "#1: ToolCall.name is a readable command summary"
         );
         assert_eq!(
             tool_call.1.get("command").and_then(serde_json::Value::as_str),
@@ -5629,6 +5765,56 @@ mod tests {
                 .any(|e| matches!(e, SessionEvent::ToolResult { tool_use_id, .. } if tool_use_id == "c1")),
             "and the ToolResult content event, got {completed:?}"
         );
+    }
+
+    #[test]
+    fn command_execution_uses_codex_semantic_action_as_its_label() {
+        let read = serde_json::json!({
+            "type": "commandExecution",
+            "command": "/bin/zsh -lc 'sed -n 1,20p src/lib.rs'",
+            "commandActions": [{
+                "type": "read",
+                "command": "sed -n 1,20p src/lib.rs",
+                "name": "lib.rs",
+                "path": "/workspace/src/lib.rs"
+            }]
+        });
+        assert_eq!(command_execution_display_name(&read), "Read lib.rs");
+
+        let search = serde_json::json!({
+            "type": "commandExecution",
+            "commandActions": [
+                { "type": "search", "query": "SessionTitle", "path": "crates" },
+                { "type": "search", "query": "apply_agent_title", "path": "crates" }
+            ]
+        });
+        assert_eq!(
+            command_execution_display_name(&search),
+            "Search SessionTitle · 2 actions"
+        );
+
+        let list = serde_json::json!({
+            "type": "commandExecution",
+            "commandActions": [{ "type": "listFiles", "path": "crates/aionui-session" }]
+        });
+        assert_eq!(
+            command_execution_display_name(&list),
+            "List files crates/aionui-session"
+        );
+    }
+
+    #[test]
+    fn command_execution_falls_back_to_a_bounded_command_summary() {
+        let command = "x".repeat(120);
+        let item = serde_json::json!({
+            "type": "commandExecution",
+            "command": command,
+            "commandActions": [{ "type": "unknown", "command": command }]
+        });
+        let label = command_execution_display_name(&item);
+        assert!(label.starts_with("Run "));
+        assert!(label.ends_with('…'));
+        assert!(label.chars().count() <= 101, "label was not bounded: {label}");
     }
 
     #[tokio::test]
