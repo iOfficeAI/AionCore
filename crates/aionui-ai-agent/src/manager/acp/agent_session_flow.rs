@@ -666,23 +666,27 @@ fn end_turn_usage_frame(usage: &Usage) -> Value {
 /// 1. the SDK's unstable `usage` field (`unstable_end_turn_token_usage`);
 /// 2. the gemini-cli dialect: `_meta.quota.token_count`
 ///    (`{input_tokens, output_tokens}` — input is the full context sent this
-///    turn, so input+output approximates current context occupancy).
+///    turn, so input+output approximates current context occupancy);
+/// 3. Grok `_meta.usage` (full-prompt camelCase billing; official
+///    `14-headless-mode.md` + captured `turn_completed` objects).
 fn end_turn_usage_frame_from_response(response: &PromptResponse) -> Option<Value> {
     if let Some(usage) = response.usage.as_ref().filter(|u| u.total_tokens > 0) {
         return Some(end_turn_usage_frame(usage));
     }
-    let counts = response.meta.as_ref()?.get("quota")?.get("token_count")?;
-    let input = counts.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-    let output = counts.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
-    let used = input + output;
-    if used == 0 {
-        return None;
+    let meta = response.meta.as_ref()?;
+    if let Some(counts) = meta.get("quota").and_then(|quota| quota.get("token_count")) {
+        let input = counts.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+        let output = counts.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+        let used = input + output;
+        if used > 0 {
+            return Some(serde_json::json!({
+                "used": used,
+                "size": 0,
+                "_meta": { "input_tokens": input, "output_tokens": output },
+            }));
+        }
     }
-    Some(serde_json::json!({
-        "used": used,
-        "size": 0,
-        "_meta": { "input_tokens": input, "output_tokens": output },
-    }))
+    crate::protocol::acp_grok_usage::frame_from_prompt_meta(meta)
 }
 
 /// Carry previously-reported fields the end-of-turn write doesn't know —
@@ -942,6 +946,27 @@ mod tests {
         });
         let zero = PromptResponse::new(StopReason::EndTurn).meta(empty_counts.as_object().cloned().unwrap());
         assert!(end_turn_usage_frame_from_response(&zero).is_none());
+    }
+
+    #[test]
+    fn end_turn_usage_falls_back_to_grok_prompt_meta() {
+        let meta = serde_json::json!({
+            "totalTokens": 15044,
+            "usage": {
+                "inputTokens": 14883,
+                "outputTokens": 40,
+                "reasoningTokens": 28,
+                "cachedReadTokens": 11648,
+                "costUsdTicks": 21307800
+            }
+        });
+        let response = PromptResponse::new(StopReason::EndTurn).meta(meta.as_object().cloned().expect("meta object"));
+
+        let frame = end_turn_usage_frame_from_response(&response).expect("grok dialect must produce a frame");
+        assert_eq!(frame["_meta"]["input_tokens"], 14883);
+        assert_eq!(frame["_meta"]["output_tokens"], 40);
+        assert_eq!(frame["_meta"]["thought_tokens"], 28);
+        assert_eq!(frame["_meta"]["cached_read_tokens"], 11648);
     }
 
     /// OpenCode regression: a mid-turn UsageUpdate notification stores the

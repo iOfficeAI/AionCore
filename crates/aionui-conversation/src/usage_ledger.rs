@@ -31,20 +31,25 @@ fn non_negative_int(value: Option<&Value>) -> i64 {
         .unwrap_or(0)
 }
 
+fn spend_counter(payload: &Value, meta: Option<&Value>, snake: &str, camel: &str) -> i64 {
+    let nested = meta.and_then(|m| m.get("usage"));
+    non_negative_int(
+        meta.and_then(|m| m.get(snake))
+            .or_else(|| nested.and_then(|u| u.get(camel)))
+            .or_else(|| nested.and_then(|u| u.get(snake)))
+            .or_else(|| payload.get(snake))
+            .or_else(|| payload.get(camel)),
+    )
+}
+
 /// Occupancy-only frames have `used`/`size` and no per-turn spend. Those are ignored.
 pub fn spend_from_context_usage(payload: &Value) -> Option<ContextUsageSpend> {
     let meta = payload.get("_meta");
-    let input_tokens = non_negative_int(
-        meta.and_then(|m| m.get("input_tokens"))
-            .or_else(|| payload.get("input_tokens")),
-    );
-    let output_tokens = non_negative_int(
-        meta.and_then(|m| m.get("output_tokens"))
-            .or_else(|| payload.get("output_tokens")),
-    );
-    let thought_tokens = non_negative_int(meta.and_then(|m| m.get("thought_tokens")));
-    let cached_read_tokens = non_negative_int(meta.and_then(|m| m.get("cached_read_tokens")));
-    let cached_write_tokens = non_negative_int(meta.and_then(|m| m.get("cached_write_tokens")));
+    let input_tokens = spend_counter(payload, meta, "input_tokens", "inputTokens");
+    let output_tokens = spend_counter(payload, meta, "output_tokens", "outputTokens");
+    let thought_tokens = spend_counter(payload, meta, "thought_tokens", "reasoningTokens");
+    let cached_read_tokens = spend_counter(payload, meta, "cached_read_tokens", "cachedReadTokens");
+    let cached_write_tokens = spend_counter(payload, meta, "cached_write_tokens", "cacheCreationTokens");
     let cost = payload.get("cost");
     let session_cost_amount = cost
         .and_then(|c| c.get("amount"))
@@ -302,5 +307,26 @@ mod tests {
         .expect("spend");
         assert_eq!(spend.input_tokens, 900);
         assert_eq!(spend.output_tokens, 80);
+    }
+
+    #[test]
+    fn grok_nested_usage_is_spend() {
+        let spend = spend_from_context_usage(&json!({
+            "used": 14_794,
+            "size": 0,
+            "_meta": {
+                "usage": {
+                    "inputTokens": 14675,
+                    "outputTokens": 119,
+                    "reasoningTokens": 77,
+                    "cachedReadTokens": 11648
+                }
+            }
+        }))
+        .expect("spend");
+        assert_eq!(spend.input_tokens, 14675);
+        assert_eq!(spend.output_tokens, 119);
+        assert_eq!(spend.thought_tokens, 77);
+        assert_eq!(spend.cached_read_tokens, 11648);
     }
 }

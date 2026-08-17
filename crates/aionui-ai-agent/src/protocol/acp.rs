@@ -636,19 +636,28 @@ async fn run_sdk_background(
             let dialect_event_tx = dialect_event_tx.clone();
             async move {
                 match line {
-                    Ok(line) => match acp_dialect::classify_incoming_line(&line) {
-                        acp_dialect::LineDisposition::Forward(line) => Some(Ok(line)),
-                        acp_dialect::LineDisposition::Absorb(kind) => {
-                            log_acp_dialect_absorbed(kind, &line);
-                            // `broadcast::send` is synchronous and non-blocking; a
-                            // send error only means no active subscriber for this
-                            // turn (nothing to correlate against), which is fine.
-                            let _ = dialect_event_tx.send(AgentStreamEvent::AcpDialectSignal(
-                                stream_event::AcpDialectSignalData { kind },
-                            ));
-                            None
+                    Ok(line) => {
+                        // Grok spend is `_x.ai/session/update` turn_completed.usage,
+                        // not ACP UsageUpdate. Emit the ledger frame and still
+                        // forward the line so the SDK can ignore the extension.
+                        if let Some(frame) = super::acp_grok_usage::frame_from_jsonrpc_line(&line) {
+                            log_grok_turn_usage(&line);
+                            let _ = dialect_event_tx.send(AgentStreamEvent::AcpContextUsage(frame));
                         }
-                    },
+                        match acp_dialect::classify_incoming_line(&line) {
+                            acp_dialect::LineDisposition::Forward(line) => Some(Ok(line)),
+                            acp_dialect::LineDisposition::Absorb(kind) => {
+                                log_acp_dialect_absorbed(kind, &line);
+                                // `broadcast::send` is synchronous and non-blocking; a
+                                // send error only means no active subscriber for this
+                                // turn (nothing to correlate against), which is fine.
+                                let _ = dialect_event_tx.send(AgentStreamEvent::AcpDialectSignal(
+                                    stream_event::AcpDialectSignalData { kind },
+                                ));
+                                None
+                            }
+                        }
+                    }
                     Err(err) => Some(Err(err)),
                 }
             }
@@ -1207,6 +1216,22 @@ fn log_acp_dialect_absorbed(kind: stream_event::AcpDialectSignalKind, line: &str
         session_id = session_id.as_deref().unwrap_or("none"),
         marker = marker.as_deref().unwrap_or("none"),
         "[ACP] absorbed CodeBuddy dialect notification (tolerant layer); not forwarded to SDK"
+    );
+}
+
+/// Grok turn spend arrived on `_x.ai/session/update`. Counts stay off the log.
+fn log_grok_turn_usage(line: &str) {
+    let session_id = serde_json::from_str::<serde_json::Value>(line).ok().and_then(|value| {
+        value
+            .pointer("/params/sessionId")
+            .and_then(|id| id.as_str())
+            .map(str::to_owned)
+    });
+    info!(
+        direction = "agent_notify",
+        method = "_x.ai/session/update",
+        session_id = session_id.as_deref().unwrap_or("none"),
+        "[ACP] forwarded Grok turn_completed usage as AcpContextUsage"
     );
 }
 
