@@ -420,7 +420,31 @@ fn classify_acp_error(err: &AcpError) -> AgentSendError {
                     let detail = acp_agent_internal_detail_for_classification(*code, classification, text);
                     classification.into_send_error(detail)
                 }
-                None => unknown_upstream_error(default_detail),
+                // Failing to CLASSIFY does not make the text worthless — the
+                // classifiers only recognise failure shapes we have already seen,
+                // so an unrecognised one is exactly where the agent's own
+                // explanation matters most. Dropping it left the user (and
+                // triage) with a bare "Agent internal error (code -32603)" while
+                // the answer sat in the JSON-RPC `data` we had already parsed
+                // (AIONUI-DESKTOP-9D: "No API key found. Set the Z_AI_API_KEY
+                // environment variable, or run `glm-acp-agent --setup`").
+                //
+                // Safe by the same rule the classified branch relies on:
+                // `AgentSendError::new` runs `sanitize_error_detail` on whatever
+                // detail it is handed, redacting secret VALUES (bearer/sk-/
+                // token=/api_key=, auth headers, URL queries) while keeping prose
+                // such as the variable NAME the user has to set.
+                //
+                // Do NOT sanitize here as well: that pass emits `<redacted
+                // header>`, which the second pass's `strip_markup` then deletes as
+                // if it were an HTML tag, silently blanking the whole detail.
+                None => match acp_agent_internal_texts(message, data.as_ref())
+                    .into_iter()
+                    .find(|text| !text.trim().is_empty())
+                {
+                    Some(text) => unknown_upstream_error(format!("{default_detail}: {text}")),
+                    None => unknown_upstream_error(default_detail),
+                },
             }
         }
         _ => AgentSendError::from_acp_non_internal(err, err.to_string()),
@@ -1283,6 +1307,95 @@ mod tests {
         assert_eq!(err.ownership(), Some(AgentErrorOwnership::UnknownUpstream));
         assert_eq!(err.stream_error().feedback_recommended, Some(false));
         assert!(err.stream_error().resolution.is_none());
+    }
+
+    /// Verbatim payload from AIONUI-DESKTOP-9D. `glm-acp-agent` answers
+    /// `session/prompt` with a bare -32603 whose only actionable content is in
+    /// `data`. No classifier recognises it, but the text must still reach the
+    /// user instead of being replaced by the code alone.
+    #[test]
+    fn unclassified_agent_internal_keeps_the_agent_supplied_detail() {
+        let err = AgentSendError::from_agent_error(AgentError::Acp(AcpError::AgentInternal {
+            message: "Internal error".into(),
+            code: -32603,
+            data: Some(serde_json::json!({
+                "details": "No API key found. Set the Z_AI_API_KEY environment variable, or run `glm-acp-agent --setup` to store one."
+            })),
+        }));
+
+        assert_eq!(err.code(), Some(AgentErrorCode::UnknownUpstreamError));
+        let detail = err.stream_error().detail.clone().expect("detail must be present");
+        assert!(
+            detail.contains("Agent internal error (code -32603)"),
+            "the diagnostic code must be kept; got {detail}"
+        );
+        assert!(
+            detail.contains("Z_AI_API_KEY") && detail.contains("glm-acp-agent --setup"),
+            "the agent's own actionable text must survive; got {detail}"
+        );
+    }
+
+    /// The passthrough must not become a secret leak — a bearer token in the
+    /// agent's own text never reaches the user.
+    ///
+    /// NOTE the second assertion documents a PRE-EXISTING over-redaction bug
+    /// this change did not introduce and deliberately does not fix:
+    /// `redact_url_queries` rebuilds its input with `split_whitespace()`, which
+    /// collapses newlines, so the line-oriented `redact_lines` that follows sees
+    /// ONE line. A single `authorization:` anywhere therefore replaces the whole
+    /// detail with `<redacted header>`, discarding unrelated diagnostics. It
+    /// already affects the classified branch; fixing it changes redaction for
+    /// every error detail and belongs in its own change.
+    #[test]
+    fn unclassified_agent_internal_detail_is_sanitized() {
+        let err = AgentSendError::from_agent_error(AgentError::Acp(AcpError::AgentInternal {
+            message: "Internal error".into(),
+            code: -32603,
+            data: Some(serde_json::json!({
+                "details": "upstream rejected the call\nauthorization: Bearer eyJhbGciOiJIUzI1NiJ9.secret\nretry later"
+            })),
+        }));
+
+        let detail = err.stream_error().detail.clone().expect("detail must be present");
+        assert!(
+            !detail.contains("eyJhbGciOiJIUzI1NiJ9.secret"),
+            "the bearer token must never reach the user; got {detail}"
+        );
+        assert!(
+            detail.contains("<redacted header>"),
+            "current (over-broad) redaction collapses the whole detail; got {detail}"
+        );
+    }
+
+    /// Single-line details — the common shape — keep their prose intact, so the
+    /// passthrough is genuinely useful and not always swallowed by redaction.
+    #[test]
+    fn unclassified_agent_internal_keeps_prose_when_no_secret_present() {
+        let err = AgentSendError::from_agent_error(AgentError::Acp(AcpError::AgentInternal {
+            message: "Internal error".into(),
+            code: -32603,
+            data: Some(serde_json::json!({ "details": "workspace is read-only, retry later" })),
+        }));
+
+        let detail = err.stream_error().detail.clone().expect("detail must be present");
+        assert!(
+            detail.contains("workspace is read-only, retry later"),
+            "prose with no secret must survive verbatim; got {detail}"
+        );
+    }
+
+    /// No `data` and a placeholder `message` → nothing to add, keep the old
+    /// code-only detail rather than emitting a dangling separator.
+    #[test]
+    fn agent_internal_without_usable_text_keeps_the_code_only_detail() {
+        let err = AgentSendError::from_agent_error(AgentError::Acp(AcpError::AgentInternal {
+            message: String::new(),
+            code: -32603,
+            data: None,
+        }));
+
+        let detail = err.stream_error().detail.clone().expect("detail must be present");
+        assert_eq!(detail, "Agent internal error (code -32603)");
     }
 
     #[test]
