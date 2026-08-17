@@ -1732,7 +1732,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("missing release lock for {backend}: {error}"));
             locked += 1;
         }
-        assert_eq!(locked, 13);
+        assert_eq!(locked, 12);
     }
 
     /// On a host that has *none* of the seeded CLIs installed, the

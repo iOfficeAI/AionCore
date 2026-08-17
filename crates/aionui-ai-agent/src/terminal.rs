@@ -383,12 +383,12 @@ mod tests {
     /// taken the instant after exit can legitimately still be empty. Poll for
     /// the expected text instead of racing it; the bounded wait keeps a real
     /// regression (output never delivered) failing.
-    async fn output_contains(reg: &TerminalRegistry, id: &str, needle: &str) -> String {
+    async fn wait_for_output_contains(reg: &TerminalRegistry, id: &str, needle: &str) -> TerminalOutputSnapshot {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut last = String::new();
+        let mut last = reg.output(id).await.expect("terminal should remain registered");
         while tokio::time::Instant::now() < deadline {
-            last = reg.output(id).await.map(|s| s.output).unwrap_or_default();
-            if last.contains(needle) {
+            last = reg.output(id).await.expect("terminal should remain registered");
+            if last.output.contains(needle) {
                 return last;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -403,7 +403,7 @@ mod tests {
         let exit = reg.wait_for_exit(&id).await.unwrap();
         assert_eq!(exit.exit_code, Some(0));
         assert!(!exit.signaled);
-        let snap = reg.output(&id).await.unwrap();
+        let snap = wait_for_output_contains(&reg, &id, "hello_term").await;
         assert!(snap.output.contains("hello_term"));
         assert!(!snap.truncated);
         assert!(snap.exit.is_some());
@@ -416,7 +416,7 @@ mod tests {
         p.output_byte_limit = Some(4);
         let id = reg.create(p).await.unwrap();
         reg.wait_for_exit(&id).await.unwrap();
-        let snap = reg.output(&id).await.unwrap();
+        let snap = wait_for_output_contains(&reg, &id, "BBBB").await;
         assert_eq!(snap.output, "BBBB");
         assert!(snap.truncated);
     }
@@ -462,8 +462,8 @@ mod tests {
         let id = reg.create(p).await.unwrap();
         let exit = reg.wait_for_exit(&id).await.unwrap();
         assert_eq!(exit.exit_code, Some(0));
-        let output = output_contains(&reg, &id, "shell_interpreted").await;
-        assert!(output.contains("shell_interpreted"), "got: {output}");
+        let snap = wait_for_output_contains(&reg, &id, "shell_interpreted").await;
+        assert!(snap.output.contains("shell_interpreted"), "got: {}", snap.output);
     }
 
     #[tokio::test]
@@ -481,8 +481,8 @@ mod tests {
             .expect("exit must be reported once the direct child exits, not when the pipe closes")
             .unwrap();
         assert_eq!(exit.exit_code, Some(0));
-        let output = output_contains(&reg, &id, "parent_done").await;
-        assert!(output.contains("parent_done"), "got: {output}");
+        let snap = wait_for_output_contains(&reg, &id, "parent_done").await;
+        assert!(snap.output.contains("parent_done"), "got: {}", snap.output);
     }
 
     #[tokio::test]
@@ -494,14 +494,15 @@ mod tests {
         let reg = TerminalRegistry::new("conv-t", Some(dir.path().to_path_buf()));
         let id = reg.create(params("pwd", &[])).await.unwrap();
         reg.wait_for_exit(&id).await.unwrap();
-        let snap = reg.output(&id).await.unwrap();
         // `pwd` prints the resolved path (on macOS temp_dir lives under
         // /var -> /private/var), so compare against the canonicalized full path
         // rather than only the trailing directory name.
         let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let expected = canonical.to_str().unwrap();
+        let snap = wait_for_output_contains(&reg, &id, expected).await;
         assert_eq!(
             snap.output.trim(),
-            canonical.to_str().unwrap(),
+            expected,
             "pwd should report the default cwd; output: {}",
             snap.output
         );

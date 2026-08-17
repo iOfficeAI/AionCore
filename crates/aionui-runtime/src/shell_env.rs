@@ -99,11 +99,16 @@ fn platform_extra_bins_at(home: Option<&Path>) -> Vec<PathBuf> {
     };
 
     if let Some(h) = home {
+        // Package-manager global bins.
         push_if_dir(h.join(".cargo").join("bin"));
         push_if_dir(h.join("go").join("bin"));
         push_if_dir(h.join(".deno").join("bin"));
+        push_if_dir(h.join(".bun").join("bin"));
         push_if_dir(h.join(".local").join("bin"));
         push_if_dir(h.join(".volta").join("bin"));
+        // Agent CLIs whose vendor installer uses a private directory rather
+        // than one of the above (MiMo Code: `INSTALL_DIR=$HOME/.mimocode/bin`).
+        push_if_dir(h.join(".mimocode").join("bin"));
         for nvm_bin in nvm_version_bins(h) {
             push_if_dir(nvm_bin);
         }
@@ -121,6 +126,12 @@ fn platform_extra_bins_at(home: Option<&Path>) -> Vec<PathBuf> {
             push_if_dir(PathBuf::from(&local).join("Microsoft").join("WinGet").join("Links"));
             // Yarn classic global bin.
             push_if_dir(PathBuf::from(&local).join("Yarn").join("bin"));
+            // omp's Windows installer writes `omp.exe` straight into this
+            // directory (`install.ps1`: `$InstallDir = "$env:LOCALAPPDATA\omp"`).
+            // It matters more here than the Unix vendor dirs do, because there
+            // is no login-shell probe on Windows — this list plus the inherited
+            // PATH is the whole search space.
+            push_if_dir(PathBuf::from(&local).join("omp"));
         }
         if let Ok(pf) = std::env::var("ProgramFiles") {
             push_if_dir(PathBuf::from(&pf).join("Git").join("cmd"));
@@ -323,6 +334,44 @@ mod tests {
         // 没创建的目录不应出现
         assert!(!bins.iter().any(|p| p.ends_with("go/bin")));
         assert!(!bins.iter().any(|p| p.ends_with(".deno/bin")));
+    }
+
+    /// bun sits alongside cargo/deno/volta as a package manager whose global
+    /// installs land in a home-relative bin, and `.mimocode/bin` is where the
+    /// MiMo Code installer puts its CLI. Both were missing from the fallback
+    /// list, so an agent installed either way was only findable when the
+    /// login-shell probe happened to succeed.
+    #[test]
+    fn platform_extra_bins_at_includes_bun_and_vendor_install_dirs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path();
+
+        std::fs::create_dir_all(home.join(".bun/bin")).unwrap();
+        std::fs::create_dir_all(home.join(".mimocode/bin")).unwrap();
+
+        let bins = platform_extra_bins_at(Some(home));
+
+        assert!(
+            bins.iter().any(|p| p.ends_with(".bun/bin")),
+            "expected ~/.bun/bin in result: {bins:?}"
+        );
+        assert!(
+            bins.iter().any(|p| p.ends_with(".mimocode/bin")),
+            "expected ~/.mimocode/bin in result: {bins:?}"
+        );
+    }
+
+    /// The list is a fallback, not a guess: a directory that does not exist
+    /// must not be pushed onto PATH just because a vendor might use it.
+    #[test]
+    fn platform_extra_bins_at_omits_bun_and_vendor_dirs_that_do_not_exist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path();
+
+        let bins = platform_extra_bins_at(Some(home));
+
+        assert!(!bins.iter().any(|p| p.ends_with(".bun/bin")), "{bins:?}");
+        assert!(!bins.iter().any(|p| p.ends_with(".mimocode/bin")), "{bins:?}");
     }
 
     #[test]
