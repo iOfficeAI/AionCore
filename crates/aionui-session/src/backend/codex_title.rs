@@ -246,8 +246,10 @@ impl TitleIoSource for SpawnedTitleIo {
 /// A source that can never open anything — used wherever a backend is built
 /// without a spawner (hermetic `build_with_io`, wake recipes with no spawner),
 /// so the latch is present but inert.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct NoTitleIo;
 
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait::async_trait]
 impl TitleIoSource for NoTitleIo {
     async fn open(&self) -> Option<Box<dyn AgentIo>> {

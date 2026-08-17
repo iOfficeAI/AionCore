@@ -30,7 +30,9 @@ use aionui_process::Spawner;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 
-use super::codex_title::{NoTitleIo, SpawnedTitleIo, TitleGen};
+#[cfg(any(test, feature = "test-support"))]
+use super::codex_title::NoTitleIo;
+use super::codex_title::{SpawnedTitleIo, TitleGen};
 use super::suspend::{ProcHandle, SuspendController, spawn_idle_timer};
 use super::types::{
     Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, PendingPermissionView,
@@ -2940,6 +2942,60 @@ fn map_collab_status(s: &str) -> SubagentStatus {
     }
 }
 
+/// Turn codex's protocol-level `commandExecution` item into a compact,
+/// user-facing step label. The raw item is still carried as `ToolCall.input`,
+/// so this changes presentation only and does not discard command details.
+///
+/// `commandActions` is the semantic summary emitted by codex itself (for
+/// example `read`, `search`, or `listFiles`). Prefer it over reparsing the shell
+/// command; fall back to the command text for actions codex classifies as
+/// `unknown`.
+fn command_execution_display_name(item: &Value) -> String {
+    const MAX_DETAIL_CHARS: usize = 96;
+
+    fn bounded(value: &str) -> String {
+        let value = value.trim().replace(['\n', '\r'], " ");
+        let mut chars = value.chars();
+        let head: String = chars.by_ref().take(MAX_DETAIL_CHARS).collect();
+        if chars.next().is_some() {
+            format!("{head}…")
+        } else {
+            head
+        }
+    }
+
+    let actions = item.get("commandActions").and_then(Value::as_array);
+    let action = actions.and_then(|items| items.first());
+    let action_count = actions.map_or(0, Vec::len);
+
+    let (verb, detail) = match action.and_then(|a| a.get("type")).and_then(Value::as_str) {
+        Some("read") => (
+            "Read",
+            action
+                .and_then(|a| a.get("name").or_else(|| a.get("path")))
+                .and_then(Value::as_str),
+        ),
+        Some("search") => ("Search", action.and_then(|a| a.get("query")).and_then(Value::as_str)),
+        Some("listFiles") => ("List files", action.and_then(|a| a.get("path")).and_then(Value::as_str)),
+        Some("unknown") | Some(_) | None => (
+            "Run",
+            action
+                .and_then(|a| a.get("command"))
+                .and_then(Value::as_str)
+                .or_else(|| item.get("command").and_then(Value::as_str)),
+        ),
+    };
+
+    let mut label = match detail.map(bounded).filter(|s| !s.is_empty()) {
+        Some(detail) => format!("{verb} {detail}"),
+        None => format!("{verb} command"),
+    };
+    if action_count > 1 {
+        label.push_str(&format!(" · {action_count} actions"));
+    }
+    label
+}
+
 /// A1 CORE: match the item's `type` STRING with a fallthrough. The closed codex
 /// ThreadItem enum is NEVER constructed in our code, so an unknown future `type`
 /// becomes `AdapterSpecific` instead of a deserialization panic.
@@ -3082,7 +3138,11 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
             } else {
                 out.push(SessionEvent::ToolCall {
                     tool_use_id: id.clone(),
-                    name: item_type.to_string(),
+                    name: if item_type == "commandExecution" {
+                        command_execution_display_name(item)
+                    } else {
+                        item_type.to_string()
+                    },
                     subagent: crate::event::SubagentKind::Inline,
                     // Gap #4 / H2: carry the codex tool ARGUMENTS. On the started
                     // (non-completed) item the invocation fields (command/cwd/
@@ -5574,8 +5634,8 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("a ToolCall content event for c1, got {started:?}"));
         assert_eq!(
-            tool_call.0, "commandExecution",
-            "#1: ToolCall.name pinned (was unpinned)"
+            tool_call.0, "Run echo hi",
+            "#1: ToolCall.name is a readable command summary"
         );
         assert_eq!(
             tool_call.1.get("command").and_then(serde_json::Value::as_str),
@@ -5599,6 +5659,56 @@ mod tests {
                 .any(|e| matches!(e, SessionEvent::ToolResult { tool_use_id, .. } if tool_use_id == "c1")),
             "and the ToolResult content event, got {completed:?}"
         );
+    }
+
+    #[test]
+    fn command_execution_uses_codex_semantic_action_as_its_label() {
+        let read = serde_json::json!({
+            "type": "commandExecution",
+            "command": "/bin/zsh -lc 'sed -n 1,20p src/lib.rs'",
+            "commandActions": [{
+                "type": "read",
+                "command": "sed -n 1,20p src/lib.rs",
+                "name": "lib.rs",
+                "path": "/workspace/src/lib.rs"
+            }]
+        });
+        assert_eq!(command_execution_display_name(&read), "Read lib.rs");
+
+        let search = serde_json::json!({
+            "type": "commandExecution",
+            "commandActions": [
+                { "type": "search", "query": "SessionTitle", "path": "crates" },
+                { "type": "search", "query": "apply_agent_title", "path": "crates" }
+            ]
+        });
+        assert_eq!(
+            command_execution_display_name(&search),
+            "Search SessionTitle · 2 actions"
+        );
+
+        let list = serde_json::json!({
+            "type": "commandExecution",
+            "commandActions": [{ "type": "listFiles", "path": "crates/aionui-session" }]
+        });
+        assert_eq!(
+            command_execution_display_name(&list),
+            "List files crates/aionui-session"
+        );
+    }
+
+    #[test]
+    fn command_execution_falls_back_to_a_bounded_command_summary() {
+        let command = "x".repeat(120);
+        let item = serde_json::json!({
+            "type": "commandExecution",
+            "command": command,
+            "commandActions": [{ "type": "unknown", "command": command }]
+        });
+        let label = command_execution_display_name(&item);
+        assert!(label.starts_with("Run "));
+        assert!(label.ends_with('…'));
+        assert!(label.chars().count() <= 101, "label was not bounded: {label}");
     }
 
     #[tokio::test]
