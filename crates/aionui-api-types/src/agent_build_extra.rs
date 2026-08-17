@@ -128,6 +128,14 @@ pub struct AionrsBuildExtra {
     pub backend: Option<String>,
     #[serde(default)]
     pub user_id: Option<String>,
+    /// Present only on a forked conversation (see [`ForkSpec`]). Consumed by
+    /// the aionrs factory on first open when no session exists for this
+    /// conversation yet: the parent's session (keyed by
+    /// `parent_session_id` = parent conversation id) is copied into this
+    /// conversation's session id, cut at `last_turn_id` when the fork was
+    /// taken mid-history (`None` = fork at HEAD).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<ForkSpec>,
 }
 
 /// ACP model information returned by the ACP backend.

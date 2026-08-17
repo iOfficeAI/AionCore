@@ -1,12 +1,13 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
-use aion_agent::session::SessionManager;
+use aion_agent::session::{ForkBoundary, Session, SessionManager};
 use aion_config::compat::OpenAiApiMode;
 use aion_config::config::{McpServerConfig, TransportType};
 use aion_types::message::ImageInputCapability;
 use aionui_api_types::{
-    AionrsBuildExtra, ModelImageInputCapability, ModelOpenAiApiMode, ModelSettings, SessionMcpServer,
+    AionrsBuildExtra, ForkSpec, ModelImageInputCapability, ModelOpenAiApiMode, ModelSettings, SessionMcpServer,
     SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
 };
 use aionui_common::ProviderWithModel;
@@ -132,53 +133,12 @@ pub(super) async fn build(
 
     let session_directory = deps.data_dir.join("aionrs-sessions");
 
-    let resume_session = {
-        let session_mgr = SessionManager::new(session_directory.clone(), 100);
-        match session_mgr.load(&ctx.conversation_id) {
-            Ok(mut session) => {
-                // Drop orphaned assistant tool-calls left behind when the user
-                // pressed Stop mid-stream. Strict providers (Ollama-style,
-                // some OpenAI-compatible proxies) reject replayed assistants
-                // with `tool_calls != null` and `content == null` when no
-                // matching tool_result follows. See ELECTRON-1HV / ELECTRON-1J6.
-                let dropped = sanitize_session_messages(&mut session.messages);
-                info!(
-                    conversation_id = %ctx.conversation_id,
-                    session_id = %session.id,
-                    message_count = session.messages.len(),
-                    sanitized_dropped = dropped,
-                    "Loaded existing aionrs session for resume"
-                );
-                Some(session)
-            }
-            Err(_) => {
-                // Fallback: old architecture stored sessions inside the workspace
-                let legacy_dir = std::path::Path::new(&ctx.workspace).join(".aionrs/sessions");
-                let legacy_mgr = SessionManager::new(legacy_dir.clone(), 100);
-                match legacy_mgr.load(&ctx.conversation_id) {
-                    Ok(mut session) => {
-                        let dropped = sanitize_session_messages(&mut session.messages);
-                        info!(
-                            conversation_id = %ctx.conversation_id,
-                            session_id = %session.id,
-                            message_count = session.messages.len(),
-                            sanitized_dropped = dropped,
-                            "Loaded legacy aionrs session from workspace"
-                        );
-                        Some(session)
-                    }
-                    Err(e) => {
-                        debug!(
-                            conversation_id = %ctx.conversation_id,
-                            error = %e,
-                            "No existing aionrs session found, starting fresh"
-                        );
-                        None
-                    }
-                }
-            }
-        }
-    };
+    let resume_session = resolve_build_session(
+        &session_directory,
+        &ctx.workspace,
+        &ctx.conversation_id,
+        overrides.fork.as_ref(),
+    )?;
 
     let config = AionrsResolvedConfig {
         provider,
@@ -234,6 +194,113 @@ pub(super) async fn build(
 
     let agent = AionrsAgentManager::new(ctx.conversation_id, ctx.workspace, config, resume_session).await?;
     Ok(AgentInstance::Aionrs(Arc::new(agent)))
+}
+
+/// Resolve the session an aionrs build starts from.
+///
+/// Order: an existing session for this conversation (primary layout, then the
+/// legacy in-workspace layout) → a fork materialized from `extra.fork` (first
+/// open of a forked conversation) → none (fresh session).
+///
+/// Loaded histories are sanitized: orphaned assistant tool-calls left behind
+/// when the user pressed Stop mid-stream are dropped, because strict
+/// providers (Ollama-style, some OpenAI-compatible proxies) reject replayed
+/// assistants with `tool_calls != null` and `content == null` when no
+/// matching tool_result follows. See ELECTRON-1HV / ELECTRON-1J6.
+fn resolve_build_session(
+    session_directory: &Path,
+    workspace: &str,
+    conversation_id: &str,
+    fork: Option<&ForkSpec>,
+) -> Result<Option<Session>, AgentError> {
+    let session_mgr = SessionManager::new(session_directory.to_path_buf(), 100);
+    if let Ok(mut session) = session_mgr.load(conversation_id) {
+        let dropped = sanitize_session_messages(&mut session.messages);
+        info!(
+            conversation_id = %conversation_id,
+            session_id = %session.id,
+            message_count = session.messages.len(),
+            sanitized_dropped = dropped,
+            "Loaded existing aionrs session for resume"
+        );
+        return Ok(Some(session));
+    }
+
+    // Fallback: old architecture stored sessions inside the workspace.
+    let legacy_dir = Path::new(workspace).join(".aionrs/sessions");
+    let legacy_mgr = SessionManager::new(legacy_dir, 100);
+    if let Ok(mut session) = legacy_mgr.load(conversation_id) {
+        let dropped = sanitize_session_messages(&mut session.messages);
+        info!(
+            conversation_id = %conversation_id,
+            session_id = %session.id,
+            message_count = session.messages.len(),
+            sanitized_dropped = dropped,
+            "Loaded legacy aionrs session from workspace"
+        );
+        return Ok(Some(session));
+    }
+
+    // First open of a forked conversation: copy the parent's session (keyed
+    // by the parent conversation id — `ForkSpec.parent_session_id`) into this
+    // conversation's session id, cut at `fork.last_turn_id` when the fork was
+    // taken mid-history (None = fork at HEAD). The fork is persisted by
+    // `fork_from`, so later opens take the resume path above.
+    //
+    // Materialization failure is a hard error, never a silent fresh session:
+    // the visible history was already copied by the fork API, and an agent
+    // context that does not match it would silently answer from the wrong
+    // state. The error surfaces through the `runtime/ensure` call the
+    // frontend issues right after forking.
+    if let Some(fork) = fork {
+        let parent = session_mgr
+            .load(&fork.parent_session_id)
+            .or_else(|_| legacy_mgr.load(&fork.parent_session_id))
+            .map_err(|error| {
+                warn!(
+                    conversation_id = %conversation_id,
+                    parent_session_id = %fork.parent_session_id,
+                    error = %error,
+                    "Fork parent session not found"
+                );
+                AgentError::bad_request(format!(
+                    "Cannot fork: the parent conversation's session '{}' no longer exists",
+                    fork.parent_session_id
+                ))
+            })?;
+        let boundary = match fork.last_turn_id.as_deref() {
+            Some(anchor) => ForkBoundary::AtTurn(anchor),
+            None => ForkBoundary::Head,
+        };
+        let mut session = session_mgr
+            .fork_from(&parent, Some(conversation_id), boundary)
+            .map_err(|error| {
+                warn!(
+                    conversation_id = %conversation_id,
+                    parent_session_id = %fork.parent_session_id,
+                    last_turn_id = fork.last_turn_id.as_deref().unwrap_or("HEAD"),
+                    error = %error,
+                    "Failed to materialize aionrs fork session"
+                );
+                AgentError::bad_request(format!("Cannot fork the parent session: {error}"))
+            })?;
+        let dropped = sanitize_session_messages(&mut session.messages);
+        info!(
+            conversation_id = %conversation_id,
+            parent_session_id = %fork.parent_session_id,
+            last_turn_id = fork.last_turn_id.as_deref().unwrap_or("HEAD"),
+            message_count = session.messages.len(),
+            sanitized_dropped = dropped,
+            "Materialized aionrs fork session from parent"
+        );
+        return Ok(Some(session));
+    }
+
+    debug!(
+        conversation_id = %conversation_id,
+        "No existing aionrs session found, starting fresh"
+    );
+    Ok(None)
 }
 
 /// Map AionUi DB platform/protocol settings to the aionrs provider identifier.
@@ -1857,6 +1924,151 @@ mod tests {
             server.env.as_ref().and_then(|env| env.get("TOKEN")),
             Some(&"abc".to_owned())
         );
+    }
+
+    fn seeded_parent_session(dir: &Path, conversation_id: &str) -> Session {
+        use aion_types::message::{ContentBlock, Message, Role};
+
+        let mgr = SessionManager::new(dir.to_path_buf(), 100);
+        let mut session = mgr
+            .create("anthropic", "test-model", "/tmp", Some(conversation_id))
+            .expect("create parent session");
+        session.messages.push(Message::new(
+            Role::User,
+            vec![ContentBlock::Text { text: "hello".into() }],
+        ));
+        session.messages.push(Message::new(
+            Role::Assistant,
+            vec![ContentBlock::Text { text: "world".into() }],
+        ));
+        mgr.save(&session).expect("save parent session");
+        session
+    }
+
+    fn seeded_parent_session_with_turns(dir: &Path, conversation_id: &str) -> Session {
+        use aion_types::message::{ContentBlock, Message, Role};
+
+        let mgr = SessionManager::new(dir.to_path_buf(), 100);
+        let mut session = mgr
+            .create("anthropic", "test-model", "/tmp", Some(conversation_id))
+            .expect("create parent session");
+        for (turn, text) in [("turn_a", "u1"), ("turn_a", "a1"), ("turn_b", "u2"), ("turn_b", "a2")] {
+            let mut m = Message::now(Role::User, vec![ContentBlock::Text { text: text.into() }]);
+            m.turn_id = Some(turn.to_owned());
+            session.messages.push(m);
+        }
+        mgr.save(&session).expect("save parent session");
+        session
+    }
+
+    fn head_fork_spec(parent_conversation_id: &str) -> ForkSpec {
+        ForkSpec {
+            parent_conversation_id: parent_conversation_id.to_owned(),
+            parent_message_id: "m2".to_owned(),
+            parent_session_id: parent_conversation_id.to_owned(),
+            last_turn_id: None,
+        }
+    }
+
+    #[test]
+    fn resolve_build_session_materializes_fork_from_parent_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = seeded_parent_session(dir.path(), "parent-conv");
+        let spec = head_fork_spec("parent-conv");
+
+        let fork = resolve_build_session(dir.path(), "/nonexistent-workspace", "fork-conv", Some(&spec))
+            .expect("materialization must not error")
+            .expect("fork materialized");
+        assert_eq!(fork.id, "fork-conv");
+        assert_eq!(fork.forked_from.as_deref(), Some("parent-conv"));
+        assert_eq!(fork.messages.len(), parent.messages.len());
+
+        // The parent session is untouched and still loadable.
+        let mgr = SessionManager::new(dir.path().to_path_buf(), 100);
+        let reloaded_parent = mgr.load("parent-conv").expect("parent still loadable");
+        assert_eq!(reloaded_parent.messages.len(), parent.messages.len());
+        assert!(reloaded_parent.forked_from.is_none());
+
+        // Second open takes the resume path (the fork was persisted), not a
+        // second materialization.
+        let resumed = resolve_build_session(dir.path(), "/nonexistent-workspace", "fork-conv", Some(&spec))
+            .expect("resume must not error")
+            .expect("resume the materialized fork");
+        assert_eq!(resumed.id, "fork-conv");
+        assert_eq!(resumed.forked_from.as_deref(), Some("parent-conv"));
+    }
+
+    #[test]
+    fn resolve_build_session_at_turn_fork_truncates_at_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = seeded_parent_session_with_turns(dir.path(), "parent-conv");
+        let mut spec = head_fork_spec("parent-conv");
+        spec.last_turn_id = Some("turn_a".to_owned());
+
+        let fork = resolve_build_session(dir.path(), "/nonexistent-workspace", "fork-conv", Some(&spec))
+            .expect("materialization must not error")
+            .expect("fork materialized");
+        assert_eq!(fork.messages.len(), 2, "cut after the last turn_a message");
+        assert!(fork.messages.iter().all(|m| m.turn_id.as_deref() == Some("turn_a")));
+        assert!(fork.messages.len() < parent.messages.len());
+    }
+
+    #[test]
+    fn resolve_build_session_unresolvable_anchor_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        seeded_parent_session(dir.path(), "parent-conv");
+        let mut spec = head_fork_spec("parent-conv");
+        // Anchor matching no session message: pre-turn-tracking history or a
+        // compaction-folded turn. Must error, never silently fork elsewhere.
+        spec.last_turn_id = Some("turn_gone".to_owned());
+
+        let err = resolve_build_session(dir.path(), "/nonexistent-workspace", "fork-conv", Some(&spec))
+            .expect_err("unresolvable anchor must be a hard error");
+        assert!(err.to_string().contains("Cannot fork"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn resolve_build_session_missing_fork_parent_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = head_fork_spec("never-existed");
+
+        let err = resolve_build_session(dir.path(), "/nonexistent-workspace", "fork-conv", Some(&spec))
+            .expect_err("missing parent must be a hard error, not a silent fresh session");
+        assert!(err.to_string().contains("no longer exists"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn resolve_build_session_existing_session_wins_over_fork_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        seeded_parent_session(dir.path(), "parent-conv");
+        // The conversation already has its own session (e.g. the fork was
+        // materialized earlier and diverged): the fork spec must be ignored.
+        let mgr = SessionManager::new(dir.path().to_path_buf(), 100);
+        mgr.create("anthropic", "test-model", "/tmp", Some("fork-conv"))
+            .expect("existing session for the conversation");
+
+        let session = resolve_build_session(
+            dir.path(),
+            "/nonexistent-workspace",
+            "fork-conv",
+            Some(&head_fork_spec("parent-conv")),
+        )
+        .expect("resume must not error")
+        .expect("existing session returned");
+        assert_eq!(session.id, "fork-conv");
+        assert!(
+            session.forked_from.is_none(),
+            "the pre-existing session, not a re-fork of the parent"
+        );
+        assert!(session.messages.is_empty());
+    }
+
+    #[test]
+    fn resolve_build_session_no_session_no_fork_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_build_session(dir.path(), "/nonexistent-workspace", "conv", None)
+            .expect("fresh path must not error");
+        assert!(resolved.is_none());
     }
 
     #[test]

@@ -71,13 +71,47 @@ async fn decide() -> AntigravityHookOutput {
         .send()
         .await
     {
-        Ok(resp) => match resp.json::<AntigravityHookOutput>().await {
-            Ok(out) => out,
-            Err(e) => AntigravityHookOutput::deny(format!("aionui returned an unreadable decision: {e}")),
-        },
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            decision_from_response(status, &body)
+        }
         // The user closed AionUi, the turn was cancelled, or nobody answered in
         // time. Denying is the only safe reading of "no answer".
         Err(e) => AntigravityHookOutput::deny(format!("aionui did not answer: {e}")),
+    }
+}
+
+/// Turn a callback response into a decision.
+///
+/// **The status is read before the body.** A non-2xx carries an `ErrorResponse`,
+/// not an `AntigravityHookOutput`, so handing it to the decision parser reports
+/// a rejection as a parse failure. That is what users saw when CSRF was blocking
+/// this endpoint (fixed in #860): the reply carried
+/// `aionui returned an unreadable decision: error decoding response body`,
+/// which names the wrong thing to go looking at — the body was perfectly
+/// readable, the request had been refused.
+///
+/// Split out from the caller so the mapping is testable without standing up a
+/// server; the reasons above are exactly the cases worth pinning.
+///
+/// Every branch denies. A hook that cannot obtain a clear approval must never
+/// let the tool through.
+fn decision_from_response(status: reqwest::StatusCode, body: &str) -> AntigravityHookOutput {
+    if !status.is_success() {
+        // Name the code when the body is our own error envelope; some rejections
+        // (a proxy, a crash page) will not have one.
+        let code = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v["code"].as_str().map(str::to_owned));
+        return match code {
+            Some(code) => AntigravityHookOutput::deny(format!("aionui refused the request: HTTP {status} ({code})")),
+            None => AntigravityHookOutput::deny(format!("aionui refused the request: HTTP {status}")),
+        };
+    }
+    match serde_json::from_str::<AntigravityHookOutput>(body) {
+        Ok(out) => out,
+        Err(e) => AntigravityHookOutput::deny(format!("aionui returned an unreadable decision: {e}")),
     }
 }
 
@@ -95,6 +129,65 @@ mod tests {
         }
         let out = AntigravityHookOutput::deny("unconfigured");
         assert_eq!(out.decision, AntigravityHookDecision::Deny);
+    }
+
+    /// The bug this split exists for: a refusal used to be reported as a parse
+    /// failure. Live 2026-08-17, while CSRF was blocking this endpoint, the user
+    /// saw `aionui returned an unreadable decision: error decoding response
+    /// body` — which points at the body when the problem was the status.
+    #[test]
+    fn a_refusal_is_named_as_one_not_as_an_unreadable_body() {
+        let out = decision_from_response(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"success":false,"error":"CSRF token validation failed","code":"CSRF_INVALID"}"#,
+        );
+        assert_eq!(out.decision, AntigravityHookDecision::Deny);
+        let reason = serde_json::to_value(&out).unwrap()["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            reason.contains("403") && reason.contains("CSRF_INVALID"),
+            "the reason must name the status and the code, not the parser: {reason}"
+        );
+        assert!(
+            !reason.contains("unreadable"),
+            "a refused request is not an unreadable one: {reason}"
+        );
+    }
+
+    /// Not every rejection carries our error envelope — a proxy or a crash page
+    /// will not. The status alone still has to reach the user.
+    #[test]
+    fn a_refusal_without_our_error_envelope_still_names_the_status() {
+        let out = decision_from_response(reqwest::StatusCode::BAD_GATEWAY, "<html>502 Bad Gateway</html>");
+        assert_eq!(out.decision, AntigravityHookDecision::Deny);
+        let reason = serde_json::to_value(&out).unwrap()["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(reason.contains("502"), "reason must still name the status: {reason}");
+    }
+
+    /// The branch that keeps its old message: a 2xx whose body really is
+    /// unparseable. Here "unreadable" is the truth.
+    #[test]
+    fn an_unparseable_success_body_is_still_reported_as_unreadable() {
+        let out = decision_from_response(reqwest::StatusCode::OK, "not json");
+        assert_eq!(out.decision, AntigravityHookDecision::Deny);
+        let reason = serde_json::to_value(&out).unwrap()["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(reason.contains("unreadable"), "reason: {reason}");
+    }
+
+    /// The happy path must still get through, or this change would deny
+    /// everything and look like a fix.
+    #[test]
+    fn an_approval_is_passed_through_unchanged() {
+        let out = decision_from_response(reqwest::StatusCode::OK, r#"{"decision":"allow"}"#);
+        assert_eq!(out.decision, AntigravityHookDecision::Allow);
     }
 
     #[test]

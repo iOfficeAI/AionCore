@@ -8,11 +8,10 @@ use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, 
 use async_trait::async_trait;
 use tracing::{info, warn};
 
-use crate::capability::{supports_team_cli_fallback_backend, supports_team_mcp_backend};
 use crate::error::TeamError;
 use crate::mcp::TeamMcpStdioConfig;
-use crate::ports::TeamAssistantCatalogPort;
 use crate::ports::TeamConversationBindingLookup;
+use crate::ports::{TeamAssistantCatalogPort, TeamToolCapabilityPort};
 use crate::service::inherit_team_workspace;
 use crate::service::spawn_support::{agent_type_for_backend, cli_backend_metadata, session_mode_for_backend};
 use crate::types::{Team, TeamAgent, TeammateRole};
@@ -25,6 +24,7 @@ pub struct TeamAgentProvisioner {
     assistant_catalog: Arc<dyn TeamAssistantCatalogPort>,
     provider_repo: Arc<dyn IProviderRepository>,
     conversation_port: Arc<dyn TeamConversationProvisioningPort>,
+    capability_port: Arc<dyn TeamToolCapabilityPort>,
 }
 
 pub(crate) struct InitialProvisioningResult {
@@ -133,6 +133,7 @@ impl TeamAgentProvisioner {
         assistant_catalog: Arc<dyn TeamAssistantCatalogPort>,
         provider_repo: Arc<dyn IProviderRepository>,
         conversation_port: Arc<dyn TeamConversationProvisioningPort>,
+        capability_port: Arc<dyn TeamToolCapabilityPort>,
     ) -> Self {
         Self {
             repo,
@@ -140,6 +141,7 @@ impl TeamAgentProvisioner {
             assistant_catalog,
             provider_repo,
             conversation_port,
+            capability_port,
         }
     }
 
@@ -377,7 +379,20 @@ impl TeamAgentProvisioner {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), TeamError> {
         let team_id = mcp_stdio_cfg.team_id.clone();
-        let transport = self.team_tool_transport(user_id, agent).await?;
+        let (transport, capabilities) = self.resolve_team_tool_transport(user_id, agent).await?;
+        info!(
+            team_id = %team_id,
+            slot_id = %agent.slot_id,
+            conversation_id = %agent.conversation_id,
+            backend = %agent.backend,
+            capability_origin = capabilities.origin.as_str(),
+            mcp_stdio = capabilities.mcp.stdio,
+            mcp_sse = capabilities.mcp.sse,
+            mcp_streamable_http = capabilities.mcp.streamable_http,
+            cli_fallback = capabilities.cli_fallback,
+            selected_transport = ?transport,
+            "resolved Team tool transport"
+        );
         match transport {
             TeamToolTransport::Mcp => {
                 self.write_team_mcp_runtime_config(user_id, agent, mcp_stdio_cfg)
@@ -406,55 +421,35 @@ impl TeamAgentProvisioner {
         Ok(())
     }
 
-    /// Pick how team tools reach this agent. Deliberately a DIFFERENT question
-    /// from "may this agent join a team" (`AgentMetadata::team_capable`), and
-    /// deliberately judged from `agent_capabilities` ALONE:
-    ///
-    /// - The membership gate may say yes from `behavior_policy.supports_team` — a
-    ///   known-good whitelist that needs no probe evidence. That whitelist must
-    ///   NOT reach in here: which transport actually works is a property of the
-    ///   running agent, not of a policy row, and guessing MCP for an agent that
-    ///   silently ignores injected `mcpServers` loses every team tool with no
-    ///   error to show for it. CLI is the safe answer when unproven.
-    /// - `agent_capabilities` is only written by a live handshake (plus the seed
-    ///   backfills in migrations 003/033). So an agent that has never connected on
-    ///   this machine has NULL capabilities and lands on CLI even when it does
-    ///   support MCP — notably claude/codex/gemini on a fresh install. The next
-    ///   rebuild after its first handshake promotes it to MCP.
-    ///
-    /// Both transports coordinate a team; MCP exposes the tools natively, CLI
-    /// prompts the agent to shell out to `$AIONUI_HELPER_BIN team ...`.
+    /// Pick how team tools reach this agent from the unified capability port.
+    /// The Team domain deliberately does not know vendor ids or persistence
+    /// formats; constructed descriptors and ACP handshakes are resolved outside.
     pub(crate) async fn team_tool_transport(
         &self,
         user_id: &str,
         agent: &TeamAgent,
     ) -> Result<TeamToolTransport, TeamError> {
-        let capabilities = self.agent_capabilities(user_id, &agent.backend).await?;
-        if supports_team_mcp_backend(&agent.backend, capabilities.as_ref()) {
-            return Ok(TeamToolTransport::Mcp);
+        self.resolve_team_tool_transport(user_id, agent)
+            .await
+            .map(|(transport, _)| transport)
+    }
+
+    async fn resolve_team_tool_transport(
+        &self,
+        user_id: &str,
+        agent: &TeamAgent,
+    ) -> Result<(TeamToolTransport, aionui_common::ResolvedBackendCapabilities), TeamError> {
+        let capabilities = self.capability_port.resolve(user_id, &agent.backend, None).await?;
+        if capabilities.mcp.stdio {
+            return Ok((TeamToolTransport::Mcp, capabilities));
         }
-        if supports_team_cli_fallback_backend(capabilities.as_ref()) {
-            return Ok(TeamToolTransport::CliAssumed);
+        if capabilities.cli_fallback {
+            return Ok((TeamToolTransport::CliAssumed, capabilities));
         }
         Err(TeamError::InvalidRequest(format!(
             "agent backend is not eligible for Team transport: {}",
             agent.backend
         )))
-    }
-
-    async fn agent_capabilities(&self, user_id: &str, backend: &str) -> Result<Option<serde_json::Value>, TeamError> {
-        let Some(metadata) = cli_backend_metadata(&self.agent_metadata_repo, user_id, backend).await? else {
-            return Ok(None);
-        };
-        let Some(raw) = metadata
-            .agent_capabilities
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return Ok(None);
-        };
-        Ok(serde_json::from_str(raw).ok())
     }
 
     pub(crate) async fn write_team_mcp_runtime_config(
@@ -999,6 +994,35 @@ mod tests {
 
     struct EmptyProviderRepo;
 
+    struct TestCapabilityPort;
+
+    #[async_trait]
+    impl TeamToolCapabilityPort for TestCapabilityPort {
+        async fn resolve(
+            &self,
+            _user_id: &str,
+            backend: &str,
+            _agent_id: Option<&str>,
+        ) -> Result<aionui_common::ResolvedBackendCapabilities, TeamError> {
+            let direct = matches!(backend, "claude" | "codex" | "antigravity");
+            let internal = backend == "aionrs";
+            Ok(aionui_common::ResolvedBackendCapabilities {
+                mcp: aionui_common::McpTransportCapabilities {
+                    stdio: direct || internal,
+                    ..Default::default()
+                },
+                cli_fallback: !internal,
+                origin: if direct {
+                    aionui_common::CapabilityOrigin::DirectDescriptor
+                } else if internal {
+                    aionui_common::CapabilityOrigin::InternalDescriptor
+                } else {
+                    aionui_common::CapabilityOrigin::Unknown
+                },
+            })
+        }
+    }
+
     #[async_trait]
     impl IProviderRepository for EmptyProviderRepo {
         async fn list(&self, _user_id: &str) -> Result<Vec<Provider>, DbError> {
@@ -1037,6 +1061,7 @@ mod tests {
             Arc::new(EmptyTeamAssistantCatalog),
             Arc::new(EmptyProviderRepo),
             Arc::new(RecordingProvisioningPort { events, patches }),
+            Arc::new(TestCapabilityPort),
         )
     }
 
@@ -1074,6 +1099,24 @@ mod tests {
         let transport = provisioner.team_tool_transport("user-test", &agent).await.unwrap();
 
         assert_eq!(transport, TeamToolTransport::Mcp);
+    }
+
+    #[tokio::test]
+    async fn direct_cli_transport_uses_mcp_without_historical_acp_snapshot() {
+        let provisioner = test_provisioner(Arc::new(Mutex::new(Vec::new())));
+
+        for backend in ["claude", "codex", "antigravity"] {
+            let mut agent = test_agent();
+            agent.backend = backend.into();
+
+            let transport = provisioner.team_tool_transport("user-test", &agent).await.unwrap();
+
+            assert_eq!(
+                transport,
+                TeamToolTransport::Mcp,
+                "direct backend {backend} must use its adapter descriptor instead of an absent ACP snapshot"
+            );
+        }
     }
 
     #[tokio::test]

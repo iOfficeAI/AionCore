@@ -1163,3 +1163,113 @@ async fn fork_resolves_stream_msg_id_when_row_id_unknown() {
         "resolved to the real row"
     );
 }
+
+// ── Conversation fork: builtin aionrs agent (no acp_session row) ────
+
+fn aionrs_create_req() -> CreateConversationRequest {
+    let workspace = ensure_named_workspace_path("aionui-fork-test-aionrs");
+    serde_json::from_value(json!({
+        "type": "aionrs",
+        "extra": { "workspace": workspace, "backend": "aionrs" }
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn fork_head_aionrs_uses_conversation_id_anchor_without_acp_row() {
+    let (svc, repo, acp_repo) = setup_fork().await;
+    let parent = svc.create(USER_ID, aionrs_create_req()).await.unwrap();
+    // aionrs conversations own no acp_session row (create() only makes one
+    // for ACP/antigravity) — the whole point of this path. The agent
+    // identity resolves through the builtin binding ladder (agent_type
+    // "aionrs" -> seed row), no assistant snapshot required.
+    assert!(acp_repo.get_for_user(USER_ID, &parent.id).await.unwrap().is_none());
+    let m1 = make_message(&parent.id, "hello", 0);
+    let m2 = make_message(&parent.id, "world", 10);
+    repo.insert_message(USER_ID, &m1).await.unwrap();
+    repo.insert_message(USER_ID, &m2).await.unwrap();
+
+    let fork = svc.fork(USER_ID, &parent.id, fork_req(&m2.id)).await.unwrap();
+    assert_ne!(fork.id, parent.id);
+    assert_eq!(
+        fork.fork_capability,
+        Some(aionui_api_types::ForkCapabilityView { at_turn: true }),
+        "aionrs declares an at-turn fork capability (migration 038)"
+    );
+    let spec = fork.extra.get("fork").expect("fork lineage in extra");
+    assert_eq!(spec["parent_conversation_id"], parent.id);
+    assert_eq!(spec["parent_message_id"], m2.id);
+    assert_eq!(
+        spec["parent_session_id"], parent.id,
+        "aionrs sessions are keyed by conversation id, so the parent conversation id is the session anchor"
+    );
+    assert!(spec.get("last_turn_id").is_none(), "aionrs forks only at HEAD");
+
+    // Copied history.
+    let page = repo
+        .list_messages_page(
+            USER_ID,
+            &fork.id,
+            &aionui_db::MessagePageParams {
+                limit: 50,
+                direction: aionui_db::MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 2);
+
+    // The fork, like every aionrs conversation, owns no acp_session row.
+    assert!(acp_repo.get_for_user(USER_ID, &fork.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn fork_mid_history_without_anchor_is_refused_for_aionrs() {
+    let (svc, repo, _acp_repo) = setup_fork().await;
+    let parent = svc.create(USER_ID, aionrs_create_req()).await.unwrap();
+    // Rows without backend_turn_id: written before turn stamping existed.
+    let m1 = make_message(&parent.id, "one", 0);
+    let m2 = make_message(&parent.id, "two", 10);
+    repo.insert_message(USER_ID, &m1).await.unwrap();
+    repo.insert_message(USER_ID, &m2).await.unwrap();
+
+    let err = svc.fork(USER_ID, &parent.id, fork_req(&m1.id)).await.unwrap_err();
+    assert!(
+        matches!(&err, ConversationError::Unprocessable { reason } if reason.starts_with("FORK_POINT_UNSUPPORTED")),
+        "unanchored aionrs mid-history fork must be refused, not degraded to HEAD, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn fork_mid_history_resolves_aionrs_turn_anchor() {
+    let (svc, repo, _acp_repo) = setup_fork().await;
+    let parent = svc.create(USER_ID, aionrs_create_req()).await.unwrap();
+    // Rows stamped by the aionrs turn wiring (manager emits BackendTurnBound
+    // with the conversation-layer turn id).
+    let mut m1 = make_message(&parent.id, "one", 0);
+    m1.backend_turn_id = Some("turn_aion1".into());
+    let m2 = make_message(&parent.id, "two", 10);
+    repo.insert_message(USER_ID, &m1).await.unwrap();
+    repo.insert_message(USER_ID, &m2).await.unwrap();
+
+    let fork = svc.fork(USER_ID, &parent.id, fork_req(&m1.id)).await.unwrap();
+    let spec = fork.extra.get("fork").expect("fork lineage in extra");
+    assert_eq!(
+        spec["last_turn_id"], "turn_aion1",
+        "mid-history fork snapshots the resolved aionrs turn anchor"
+    );
+    assert_eq!(spec["parent_session_id"], parent.id);
+}
+
+#[tokio::test]
+async fn get_projects_fork_capability_for_aionrs_on_detail_path() {
+    let (svc, _repo, _acp_repo) = setup_fork().await;
+    let conv = svc.create(USER_ID, aionrs_create_req()).await.unwrap();
+
+    let detail = svc.get(USER_ID, &conv.id).await.unwrap();
+    assert_eq!(
+        detail.fork_capability,
+        Some(aionui_api_types::ForkCapabilityView { at_turn: true }),
+        "detail path projects the aionrs fork capability via the builtin binding ladder"
+    );
+}

@@ -15,7 +15,10 @@ use aionui_api_types::{
     AcpBuildExtra, AcpConfigOptionDto, AcpConfigSelectOptionDto, AddAgentRequest, CreateTeamRequest,
     GetConfigOptionsResponse, TeamAgentInput, TeamRunSource, WebSocketMessage,
 };
-use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
+use aionui_common::{
+    AgentKillReason, AgentType, CapabilityOrigin, McpTransportCapabilities, PaginatedResult, ProviderWithModel,
+    ResolvedBackendCapabilities,
+};
 use aionui_db::models::{
     AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, ConversationRow, MessageRow,
     UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
@@ -32,7 +35,7 @@ use aionui_realtime::EventBroadcaster;
 use aionui_team::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
     AgentTurnStarted, AgentTurnStatus, TeamAssistantCatalogEntry, TeamAssistantCatalogPort,
-    TeamConversationBindingLookup, TeamConversationLookupPort,
+    TeamConversationBindingLookup, TeamConversationLookupPort, TeamToolCapabilityPort,
 };
 use aionui_team::session::SpawnAgentRequest;
 use aionui_team::{
@@ -41,6 +44,34 @@ use aionui_team::{
 };
 use aionui_team::{TeamError, TeamSessionService};
 use common::MockTeamRepo;
+
+struct TestTeamToolCapabilityPort;
+
+#[async_trait::async_trait]
+impl TeamToolCapabilityPort for TestTeamToolCapabilityPort {
+    async fn resolve(
+        &self,
+        _user_id: &str,
+        backend: &str,
+        _agent_id: Option<&str>,
+    ) -> Result<ResolvedBackendCapabilities, TeamError> {
+        let constructed = matches!(backend, "aionrs" | "claude" | "codex" | "antigravity");
+        Ok(ResolvedBackendCapabilities {
+            mcp: McpTransportCapabilities {
+                stdio: constructed,
+                ..Default::default()
+            },
+            cli_fallback: !matches!(backend, "aionrs"),
+            origin: if backend == "aionrs" {
+                CapabilityOrigin::InternalDescriptor
+            } else if constructed {
+                CapabilityOrigin::DirectDescriptor
+            } else {
+                CapabilityOrigin::Unknown
+            },
+        })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Mock ConversationRepository — minimal impl for TeamSessionService tests
@@ -1841,7 +1872,7 @@ fn setup_with_factory_metadata_team_repo_and_conversation_repo(
     let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
-    let svc = TeamSessionService::new(
+    let svc = TeamSessionService::new_with_capability_port(
         team_repo_dyn,
         agent_metadata_repo,
         Arc::new(EmptyTeamAssistantCatalog),
@@ -1854,6 +1885,7 @@ fn setup_with_factory_metadata_team_repo_and_conversation_repo(
         task_manager_dyn,
         noop_turn_port(),
         noop_cancellation_port(),
+        Arc::new(TestTeamToolCapabilityPort),
         backend_binary_path,
     );
     (svc, team_repo, task_manager, conv_repo)
@@ -1886,7 +1918,7 @@ fn setup_with_factory_metadata_assistants_and_conversation_repo(
         assistant_definition_repo: assistant_definition_repo.clone(),
         assistant_overlay_repo: assistant_overlay_repo.clone(),
     });
-    let svc = TeamSessionService::new(
+    let svc = TeamSessionService::new_with_capability_port(
         team_repo_dyn,
         agent_metadata_repo,
         assistant_catalog,
@@ -1899,6 +1931,7 @@ fn setup_with_factory_metadata_assistants_and_conversation_repo(
         task_manager_dyn,
         noop_turn_port(),
         noop_cancellation_port(),
+        Arc::new(TestTeamToolCapabilityPort),
         backend_binary_path,
     );
     (svc, team_repo, task_manager, conv_repo)
@@ -1947,7 +1980,7 @@ fn setup_with_ports_metadata_assistants_and_conversation_repo(
         assistant_definition_repo: assistant_definition_repo.clone(),
         assistant_overlay_repo: assistant_overlay_repo.clone(),
     });
-    let svc = TeamSessionService::new(
+    let svc = TeamSessionService::new_with_capability_port(
         team_repo_dyn,
         agent_metadata_repo,
         assistant_catalog,
@@ -1960,6 +1993,7 @@ fn setup_with_ports_metadata_assistants_and_conversation_repo(
         task_manager,
         noop_turn_port(),
         noop_cancellation_port(),
+        Arc::new(TestTeamToolCapabilityPort),
         backend_binary_path,
     );
     (svc, team_repo, conversation_ports, conv_repo)
@@ -1982,7 +2016,7 @@ fn setup_with_recording_turn_port() -> (
     let turn_port = Arc::new(RecordingTurnPort::default());
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
-    let svc = TeamSessionService::new(
+    let svc = TeamSessionService::new_with_capability_port(
         team_repo_dyn,
         Arc::new(StubAgentMetadataRepo::empty()),
         Arc::new(EmptyTeamAssistantCatalog),
@@ -1995,6 +2029,7 @@ fn setup_with_recording_turn_port() -> (
         task_manager,
         turn_port.clone(),
         noop_cancellation_port(),
+        Arc::new(TestTeamToolCapabilityPort),
         backend_binary_path,
     );
     (svc, team_repo, turn_port, conv_repo)
@@ -2187,7 +2222,7 @@ fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<Recording
     let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(success_factory()));
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
-    let svc = TeamSessionService::new(
+    let svc = TeamSessionService::new_with_capability_port(
         team_repo,
         agent_metadata_repo,
         Arc::new(EmptyTeamAssistantCatalog),
@@ -2200,6 +2235,7 @@ fn setup_with_recording_broadcaster() -> (Arc<TeamSessionService>, Arc<Recording
         task_manager,
         noop_turn_port(),
         noop_cancellation_port(),
+        Arc::new(TestTeamToolCapabilityPort),
         backend_binary_path,
     );
     (svc, recorder)
@@ -2240,7 +2276,7 @@ fn setup_with_factory_recording_broadcaster_and_conversation_repo(factory: Agent
     let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
     let backend_binary_path = Arc::new(std::path::PathBuf::from("/tmp/aioncore-test"));
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(EmptyProviderRepo);
-    let svc = TeamSessionService::new(
+    let svc = TeamSessionService::new_with_capability_port(
         team_repo_dyn,
         agent_metadata_repo,
         Arc::new(EmptyTeamAssistantCatalog),
@@ -2253,6 +2289,7 @@ fn setup_with_factory_recording_broadcaster_and_conversation_repo(factory: Agent
         task_manager_dyn,
         noop_turn_port(),
         noop_cancellation_port(),
+        Arc::new(TestTeamToolCapabilityPort),
         backend_binary_path,
     );
     (svc, team_repo, task_manager, recorder, conv_repo)
@@ -6164,6 +6201,64 @@ async fn d9_ensure_session_persists_team_mcp_stdio_config() {
         .unwrap();
 
     svc.ensure_session("user1", &created.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn direct_cli_ensure_session_persists_team_mcp_stdio_config_for_every_descriptor() {
+    use futures_util::FutureExt;
+
+    for backend in ["claude", "codex", "antigravity"] {
+        let expected_backend = backend.to_owned();
+        let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
+            let expected_backend = expected_backend.clone();
+            async move {
+                let mcp = opts
+                    .context
+                    .team
+                    .as_ref()
+                    .and_then(|team| team.mcp.as_ref())
+                    .unwrap_or_else(|| panic!("{expected_backend} factory context has no Team MCP config"));
+                assert!(mcp.stdio.port > 0, "{expected_backend} Team MCP port");
+                assert!(!mcp.stdio.slot_id.is_empty(), "{expected_backend} Team MCP slot");
+                assert!(
+                    !mcp.stdio.binary_path.is_empty(),
+                    "{expected_backend} Team MCP binary path"
+                );
+                Ok(aionui_ai_agent::AgentInstance::Mock(Arc::new(
+                    mock_agent::MockAgent::new(opts.context.conversation.conversation_id, opts.context.workspace.path),
+                )))
+            }
+            .boxed()
+        });
+        let mut metadata = make_agent_metadata_row(&format!("{backend}-id"), backend, "");
+        if backend == "antigravity" {
+            metadata.agent_type = "antigravity".into();
+        }
+        let (svc, _tm) =
+            setup_with_factory_and_metadata(factory, Arc::new(StubAgentMetadataRepo::with_rows(vec![metadata])));
+        let created = svc
+            .create_team(
+                "user1",
+                CreateTeamRequest {
+                    name: format!("Direct {backend}"),
+                    agents: vec![TeamAgentInput {
+                        name: "Lead".into(),
+                        role: "lead".into(),
+                        backend: Some(backend.into()),
+                        model: backend.into(),
+                        assistant_id: None,
+                        conversation_id: None,
+                    }],
+                    workspace: None,
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{backend} team creation failed: {error}"));
+
+        svc.ensure_session("user1", &created.id)
+            .await
+            .unwrap_or_else(|error| panic!("{backend} Team session ensure failed: {error}"));
+    }
 }
 
 #[tokio::test]

@@ -30,6 +30,9 @@ use aionui_process::Spawner;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 
+#[cfg(any(test, feature = "test-support"))]
+use super::codex_title::NoTitleIo;
+use super::codex_title::{SpawnedTitleIo, TitleGen};
 use super::suspend::{ProcHandle, SuspendController, spawn_idle_timer};
 use super::types::{
     Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, PendingPermissionView,
@@ -40,6 +43,48 @@ use crate::adapter::AgentIo;
 use crate::capability::{BlockSet, Capabilities, CapabilityTier, CommandSet, PromptAcceptedSource, SignalSet};
 use crate::event::{CancelReason, ProvisioningPhase, SessionEvent, StopReason, SubagentStatus, TurnOutcome};
 use futures_util::stream::{BoxStream, StreamExt};
+
+const CODEX_CONFIG_FLAG: &str = "-c";
+const CODEX_ENV_POLICY_INHERIT_ALL: &str = "shell_environment_policy.inherit=all";
+const CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY: &str = "shell_environment_policy.include_only=[]";
+
+/// Config overrides that make Codex command-execution children inherit the
+/// runtime environment injected into the app-server process.
+pub fn codex_shell_environment_policy_args() -> [&'static str; 4] {
+    [
+        CODEX_CONFIG_FLAG,
+        CODEX_ENV_POLICY_INHERIT_ALL,
+        CODEX_CONFIG_FLAG,
+        CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY,
+    ]
+}
+
+/// Build the process-level app-server argv shared by initial open and idle
+/// wake. `codex app-server --help` documents the config override and uses
+/// `shell_environment_policy.inherit=all` as its example.
+fn codex_app_server_args(extra_args: &[String]) -> Vec<String> {
+    let mut args = vec!["app-server".to_owned()];
+    args.extend(extra_args.iter().cloned());
+    // Append the compatibility policy after user/configured extras, matching
+    // the former ACP launch policy and making these final overrides authoritative.
+    args.extend(codex_shell_environment_policy_args().map(str::to_owned));
+    args
+}
+
+fn log_codex_runtime_policy(spawn_env: &[aionui_common::EnvVar]) {
+    let mut runtime_env_keys = spawn_env
+        .iter()
+        .filter_map(|entry| entry.name.starts_with("AIONUI_").then_some(entry.name.as_str()))
+        .collect::<Vec<_>>();
+    runtime_env_keys.sort_unstable();
+    runtime_env_keys.dedup();
+    tracing::info!(
+        backend = "codex",
+        shell_env_policy_explicit = true,
+        ?runtime_env_keys,
+        "starting Codex app-server with explicit tool-shell environment policy"
+    );
+}
 
 /// Connection-level factory for codex. Holds the injected `Spawner`. Unlike
 /// claude (1:1), codex's app-server CAN multiplex threads on one process — but
@@ -73,8 +118,8 @@ impl BackendConnection for CodexConnection {
             SessionSpec::Resume { session_id, .. } => session_id.clone(),
             SessionSpec::Fork { session_id, .. } => session_id.clone(),
         };
-        let mut args = vec!["app-server".to_string()];
-        args.extend(config.extra_args.iter().cloned());
+        let args = codex_app_server_args(&config.extra_args);
+        log_codex_runtime_policy(&config.spawn_env);
         let cmd = aionui_common::CommandSpec {
             // Orchestration-resolved bundled CLI (packaged app) or bare "codex"
             // (dev → PATH). See SessionConfig.cli_program.
@@ -86,6 +131,7 @@ impl BackendConnection for CodexConnection {
             env: config.spawn_env.clone(),
             cwd: config.cwd.clone(),
         };
+        let title_cmd = cmd.clone();
         let proc = self
             .spawner
             .spawn(cmd, &[], "aionui-session")
@@ -100,7 +146,17 @@ impl BackendConnection for CodexConnection {
             spawner: Some(self.spawner.clone()),
             config: config.clone(),
         };
-        let mut backend = CodexSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms).await;
+        // First-turn title latch: armed only for a Fresh open (a brand-new
+        // conversation). Its runs go to a THROWAWAY process built from the same
+        // CommandSpec — same codex install, env and cwd, hence the same
+        // credentials — but never onto this session's connection.
+        let title_gen = Arc::new(TitleGen::new(
+            matches!(&spec, SessionSpec::Fresh { .. }),
+            Arc::new(SpawnedTitleIo::new(self.spawner.clone(), title_cmd)),
+        ));
+        title_gen.set_model(config.model.clone());
+        let mut backend =
+            CodexSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms, title_gen).await;
         // Report a codex whose version differs from the release AionUi verified.
         // codex runs from the user's own install (nothing is bundled), the same
         // situation agy has always been in. Placed here rather than at the two
@@ -536,8 +592,15 @@ fn build_codex_mcp_servers(servers: &[crate::backend::McpServerSpec]) -> Value {
             // neutral spec carries headers; codex takes a bearer_token_env_var, so we
             // pass the url and let codex's own auth/oauth path handle credentials
             // (inline arbitrary headers are not a codex config field).
-            McpTransport::Http { url, .. } | McpTransport::Sse { url, .. } => {
-                json!({ "url": url })
+            McpTransport::Http { url, .. } => json!({ "url": url }),
+            McpTransport::Sse { .. } => {
+                tracing::warn!(
+                    backend = "codex",
+                    server = %s.name,
+                    transport = "sse",
+                    "skipping unsupported MCP transport"
+                );
+                continue;
             }
         };
         map.insert(s.name.clone(), entry);
@@ -552,6 +615,13 @@ fn build_codex_mcp_servers(servers: &[crate::backend::McpServerSpec]) -> Value {
 pub fn codex_capabilities() -> Capabilities {
     Capabilities {
         tier: CapabilityTier::Hook,
+        // Unconditional, per codex's own schema: `thread/settings/update` documents
+        // `approvalPolicy`/`sandboxPolicy`/`permissions` as "for subsequent turns"
+        // (samples/codex-cli/0.146.0/schema/v2/ThreadSettingsUpdateParams.json, identical
+        // in 0.147.0). Only `turn/start` can carry a policy for the turn it opens, and
+        // aionCore sends `turn/start` with `{threadId, input}` alone. Not a defect — this
+        // is codex's contract; the UI just has to say so.
+        mode_switch_effect: crate::capability::ModeSwitchEffect::NextTurn,
         emits: SignalSet {
             heartbeat: true,
             tool_lifecycle: true,
@@ -893,6 +963,10 @@ struct CodexReaderState {
     /// terminal (TurnResult / Detached). The idle timer reads it so a streaming turn
     /// is never suspended mid-flight.
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// First-turn session-title latch. Fired by the reader on a successful turn
+    /// terminal; runs on its OWN process (see `codex_title`), so nothing here
+    /// touches `thread_binding` / `turn_in_flight` / the R8 `terminated` flag.
+    title_gen: Arc<TitleGen>,
 }
 
 /// Spawn a codex JSON-RPC reader over `stdout`/`io` using the shared state. Used
@@ -924,6 +998,7 @@ fn start_codex_reader(
             state.discovered,
             state.stdin,
             state.turn_in_flight,
+            state.title_gen,
         )
         .await;
     })
@@ -992,6 +1067,18 @@ impl CodexSessionBackend {
         Self::spawn(session_id.into(), io).await
     }
 
+    /// Test-support seam: build over an injected `AgentIo` WITH a caller-supplied
+    /// title latch, so the first-turn title wiring (reader terminal → fire) can be
+    /// driven without spawning a real codex.
+    #[cfg(test)]
+    pub(crate) async fn build_with_io_titled(
+        session_id: impl Into<String>,
+        io: Box<dyn AgentIo>,
+        title_gen: Arc<TitleGen>,
+    ) -> Self {
+        Self::spawn_with_wake(session_id.into(), io, CodexWakeRecipe::inert(), None, title_gen).await
+    }
+
     /// Test-support seam: build a SUSPENDABLE backend with a caller-supplied
     /// `Spawner` (to observe the wake re-spawn) + an `idle_ttl_ms`. Lets a test
     /// drive the suspend→wake path: the idle slot suspends, and the next dispatch
@@ -1007,7 +1094,14 @@ impl CodexSessionBackend {
             spawner: Some(spawner),
             config: SessionConfig::default(),
         };
-        Self::spawn_with_wake(session_id.into(), io, wake, Some(idle_ttl_ms)).await
+        Self::spawn_with_wake(
+            session_id.into(),
+            io,
+            wake,
+            Some(idle_ttl_ms),
+            Arc::new(TitleGen::new(false, Arc::new(NoTitleIo))),
+        )
+        .await
     }
 
     /// Test-support seam: pre-bind the backend threadId (the resume anchor the
@@ -1078,7 +1172,14 @@ impl CodexSessionBackend {
     /// wake recipe; only the `build_with_io` test seam uses this.
     #[cfg(any(test, feature = "test-support"))]
     async fn spawn(session_id: String, io: Box<dyn AgentIo>) -> Self {
-        Self::spawn_with_wake(session_id, io, CodexWakeRecipe::inert(), None).await
+        Self::spawn_with_wake(
+            session_id,
+            io,
+            CodexWakeRecipe::inert(),
+            None,
+            Arc::new(TitleGen::new(false, Arc::new(NoTitleIo))),
+        )
+        .await
     }
 
     /// Spawn + (optionally) enable F-4 idle self-suspend. `wake` carries what a
@@ -1089,6 +1190,7 @@ impl CodexSessionBackend {
         io: Box<dyn AgentIo>,
         wake: CodexWakeRecipe,
         idle_ttl_ms: Option<i64>,
+        title_gen: Arc<TitleGen>,
     ) -> Self {
         let io: Arc<dyn AgentIo> = Arc::from(io);
         let turn_gen = Arc::new(AtomicU64::new(0));
@@ -1132,6 +1234,7 @@ impl CodexSessionBackend {
             discovered: discovered.clone(),
             stdin: stdin.clone(),
             turn_in_flight: turn_in_flight.clone(),
+            title_gen: title_gen.clone(),
         };
         let reader = start_codex_reader(&reader_state, stdout, io.clone());
 
@@ -1355,8 +1458,8 @@ impl CodexSessionBackend {
             .spawner
             .as_ref()
             .ok_or_else(|| BackendError::Transport("codex wake: no spawner (suspension not enabled)".into()))?;
-        let mut args = vec!["app-server".to_string()];
-        args.extend(self.wake.config.extra_args.iter().cloned());
+        let args = codex_app_server_args(&self.wake.config.extra_args);
+        log_codex_runtime_policy(&self.wake.config.spawn_env);
         let cmd = aionui_common::CommandSpec {
             // Same bundled-CLI resolution + spawn env as the initial spawn
             // (R16 continuity).
@@ -1426,6 +1529,7 @@ async fn reader_task(
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    title_gen: Arc<TitleGen>,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1609,6 +1713,18 @@ async fn reader_task(
                                 // F-4: turn terminal → clear the turn-active flag so the
                                 // idle timer may suspend the now-idle process.
                                 turn_in_flight.store(false, Ordering::SeqCst);
+                                // First-turn title: every SUCCESSFUL turn fires
+                                // while the latch is armed (an error turn keeps it
+                                // armed for the next one). Detached onto its own
+                                // process — see `codex_title`.
+                                if let SessionEvent::TurnResult {
+                                    is_error: false,
+                                    result_text,
+                                    ..
+                                } = &ev
+                                {
+                                    title_gen.fire(&session_id, result_text, &event_tx, cur);
+                                }
                                 emit(&event_tx, &session_id, cur, ev);
                             } else if system_error_pending && !was_pending {
                                 // systemError was just deferred: arm the bounded grace
@@ -2906,6 +3022,60 @@ fn map_collab_status(s: &str) -> SubagentStatus {
     }
 }
 
+/// Turn codex's protocol-level `commandExecution` item into a compact,
+/// user-facing step label. The raw item is still carried as `ToolCall.input`,
+/// so this changes presentation only and does not discard command details.
+///
+/// `commandActions` is the semantic summary emitted by codex itself (for
+/// example `read`, `search`, or `listFiles`). Prefer it over reparsing the shell
+/// command; fall back to the command text for actions codex classifies as
+/// `unknown`.
+fn command_execution_display_name(item: &Value) -> String {
+    const MAX_DETAIL_CHARS: usize = 96;
+
+    fn bounded(value: &str) -> String {
+        let value = value.trim().replace(['\n', '\r'], " ");
+        let mut chars = value.chars();
+        let head: String = chars.by_ref().take(MAX_DETAIL_CHARS).collect();
+        if chars.next().is_some() {
+            format!("{head}…")
+        } else {
+            head
+        }
+    }
+
+    let actions = item.get("commandActions").and_then(Value::as_array);
+    let action = actions.and_then(|items| items.first());
+    let action_count = actions.map_or(0, Vec::len);
+
+    let (verb, detail) = match action.and_then(|a| a.get("type")).and_then(Value::as_str) {
+        Some("read") => (
+            "Read",
+            action
+                .and_then(|a| a.get("name").or_else(|| a.get("path")))
+                .and_then(Value::as_str),
+        ),
+        Some("search") => ("Search", action.and_then(|a| a.get("query")).and_then(Value::as_str)),
+        Some("listFiles") => ("List files", action.and_then(|a| a.get("path")).and_then(Value::as_str)),
+        Some("unknown") | Some(_) | None => (
+            "Run",
+            action
+                .and_then(|a| a.get("command"))
+                .and_then(Value::as_str)
+                .or_else(|| item.get("command").and_then(Value::as_str)),
+        ),
+    };
+
+    let mut label = match detail.map(bounded).filter(|s| !s.is_empty()) {
+        Some(detail) => format!("{verb} {detail}"),
+        None => format!("{verb} command"),
+    };
+    if action_count > 1 {
+        label.push_str(&format!(" · {action_count} actions"));
+    }
+    label
+}
+
 /// A1 CORE: match the item's `type` STRING with a fallthrough. The closed codex
 /// ThreadItem enum is NEVER constructed in our code, so an unknown future `type`
 /// becomes `AdapterSpecific` instead of a deserialization panic.
@@ -3048,7 +3218,11 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
             } else {
                 out.push(SessionEvent::ToolCall {
                     tool_use_id: id.clone(),
-                    name: item_type.to_string(),
+                    name: if item_type == "commandExecution" {
+                        command_execution_display_name(item)
+                    } else {
+                        item_type.to_string()
+                    },
                     subagent: crate::event::SubagentKind::Inline,
                     // Gap #4 / H2: carry the codex tool ARGUMENTS. On the started
                     // (non-completed) item the invocation fields (command/cwd/
@@ -3657,6 +3831,20 @@ impl SessionBackend for CodexSessionBackend {
                         command: crate::capability::block_kind_name(bad),
                     });
                 }
+                // While the first-turn title latch is armed, record the first
+                // prompt's text as the generation description (bounded inside;
+                // prompt content is never logged).
+                if self.reader_state.title_gen.is_armed() {
+                    let text = content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.reader_state.title_gen.record_first_prompt(&text);
+                }
                 // Bridge-parity slash routing (ELECTRON-3PX): the 6 advertised
                 // commands (builtin_slash_commands) translate to native ops the way
                 // the codex-acp bridge did in-process (v0.14.0 thread.rs:3252
@@ -4016,6 +4204,10 @@ impl SessionBackend for CodexSessionBackend {
                 // Track it so a subsequent SetMode can build collaborationMode (M1).
                 let tid = self.bound_thread().await?;
                 *self.current_model.lock().await = Some(model.clone());
+                // Keep the title latch on the model the user is actually talking
+                // to — a title run started after a switch must not use the stale
+                // open-time model.
+                self.reader_state.title_gen.set_model(Some(model.clone()));
                 let id = self.next_rpc_id();
                 // Register the rpc id so the reader claims the response: a JSON-RPC
                 // error (codex rejected the model) surfaces as a Notice instead of
@@ -5631,8 +5823,8 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("a ToolCall content event for c1, got {started:?}"));
         assert_eq!(
-            tool_call.0, "commandExecution",
-            "#1: ToolCall.name pinned (was unpinned)"
+            tool_call.0, "Run echo hi",
+            "#1: ToolCall.name is a readable command summary"
         );
         assert_eq!(
             tool_call.1.get("command").and_then(serde_json::Value::as_str),
@@ -5656,6 +5848,56 @@ mod tests {
                 .any(|e| matches!(e, SessionEvent::ToolResult { tool_use_id, .. } if tool_use_id == "c1")),
             "and the ToolResult content event, got {completed:?}"
         );
+    }
+
+    #[test]
+    fn command_execution_uses_codex_semantic_action_as_its_label() {
+        let read = serde_json::json!({
+            "type": "commandExecution",
+            "command": "/bin/zsh -lc 'sed -n 1,20p src/lib.rs'",
+            "commandActions": [{
+                "type": "read",
+                "command": "sed -n 1,20p src/lib.rs",
+                "name": "lib.rs",
+                "path": "/workspace/src/lib.rs"
+            }]
+        });
+        assert_eq!(command_execution_display_name(&read), "Read lib.rs");
+
+        let search = serde_json::json!({
+            "type": "commandExecution",
+            "commandActions": [
+                { "type": "search", "query": "SessionTitle", "path": "crates" },
+                { "type": "search", "query": "apply_agent_title", "path": "crates" }
+            ]
+        });
+        assert_eq!(
+            command_execution_display_name(&search),
+            "Search SessionTitle · 2 actions"
+        );
+
+        let list = serde_json::json!({
+            "type": "commandExecution",
+            "commandActions": [{ "type": "listFiles", "path": "crates/aionui-session" }]
+        });
+        assert_eq!(
+            command_execution_display_name(&list),
+            "List files crates/aionui-session"
+        );
+    }
+
+    #[test]
+    fn command_execution_falls_back_to_a_bounded_command_summary() {
+        let command = "x".repeat(120);
+        let item = serde_json::json!({
+            "type": "commandExecution",
+            "command": command,
+            "commandActions": [{ "type": "unknown", "command": command }]
+        });
+        let label = command_execution_display_name(&item);
+        assert!(label.starts_with("Run "));
+        assert!(label.ends_with('…'));
+        assert!(label.chars().count() <= 101, "label was not bounded: {label}");
     }
 
     #[tokio::test]
@@ -7661,6 +7903,10 @@ mod tests {
     #[test]
     fn thread_start_injects_codex_mcp_map_and_preset() {
         use crate::backend::{McpServerSpec, McpTransport, SessionInit};
+        let descriptor = crate::backend::backend_capability_descriptor("codex").unwrap();
+        assert!(descriptor.mcp.stdio);
+        assert!(descriptor.mcp.streamable_http);
+        assert!(!descriptor.mcp.sse);
         let frame = thread_start_params(&SessionConfig {
             cwd: Some("/work".into()),
             init: SessionInit {
@@ -7680,6 +7926,13 @@ mod tests {
                             headers: vec![],
                         },
                     },
+                    McpServerSpec {
+                        name: "unsupported-sse".into(),
+                        transport: McpTransport::Sse {
+                            url: "https://mcp.example/sse".into(),
+                            headers: vec![],
+                        },
+                    },
                 ],
                 preset_context: Some("You are a helpful assistant.".into()),
                 ..Default::default()
@@ -7694,6 +7947,10 @@ mod tests {
         // codex env is a MAP {KEY:VAL}, NOT acp's array of {name,value}.
         assert_eq!(mcp["fs"]["env"]["TOKEN"], "x");
         assert_eq!(mcp["remote"]["url"], "https://mcp.example/api");
+        assert!(
+            mcp.get("unsupported-sse").is_none(),
+            "Codex does not declare an SSE MCP transport; the adapter must filter it instead of serializing it as HTTP"
+        );
         // preset → baseInstructions.
         assert_eq!(frame["params"]["baseInstructions"], "You are a helpful assistant.");
     }
@@ -7781,13 +8038,16 @@ mod tests {
         let spec = spawner.last_command().await.expect("a CommandSpec was recorded");
         assert_eq!(spec.command.to_str(), Some("codex"), "spawns the codex binary");
         assert_eq!(
-            spec.args.first().map(String::as_str),
-            Some("app-server"),
-            "first arg is app-server"
-        );
-        assert!(
-            spec.args.iter().any(|a| a == "--flag"),
-            "extra_args threaded into the spawn"
+            spec.args,
+            [
+                "app-server",
+                "--flag",
+                "-c",
+                "shell_environment_policy.inherit=all",
+                "-c",
+                "shell_environment_policy.include_only=[]",
+            ],
+            "every app-server spawn must explicitly propagate the parent environment to commandExecution shells"
         );
         assert_eq!(spec.cwd.as_deref(), Some("/tmp/work"), "cwd threaded (workspace)");
         // #103 parity with claude_conn: the orchestration-filled spawn env
@@ -8991,10 +9251,16 @@ mod tests {
         assert_eq!(spawner.call_count(), 1, "wake routed through the injected spawner once");
         let spec = spawner.last_command().await.expect("a spawn was recorded");
         assert_eq!(spec.command.to_str(), Some("codex"), "wake re-spawns the codex binary");
-        assert!(
-            spec.args.iter().any(|a| a == "app-server"),
-            "wake re-spawns `codex app-server`, got {:?}",
-            spec.args
+        assert_eq!(
+            spec.args,
+            [
+                "app-server",
+                "-c",
+                "shell_environment_policy.inherit=all",
+                "-c",
+                "shell_environment_policy.include_only=[]",
+            ],
+            "wake must restore the same explicit commandExecution environment policy as the initial spawn"
         );
         drop(backend);
     }

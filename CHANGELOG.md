@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.1.67](https://github.com/iOfficeAI/AionCore/compare/v0.1.66...v0.1.67) (2026-08-14)
+
+
+### Features
+
+* **session:** report a deferred mode switch as pending instead of observed ([#846](https://github.com/iOfficeAI/AionCore/issues/846)) ([9700f88](https://github.com/iOfficeAI/AionCore/commit/9700f88306aa9c2d51d257e865866253db002bd6))
+
+
+### Bug Fixes
+
+* restore direct CLI Team MCP capabilities ([#853](https://github.com/iOfficeAI/AionCore/issues/853)) ([fe99ff6](https://github.com/iOfficeAI/AionCore/commit/fe99ff6051cf5d0a766332e56ffa66e9d8c61234))
+
+## [0.1.66](https://github.com/iOfficeAI/AionCore/compare/v0.1.65...v0.1.66) (2026-08-13)
+
+
+### Features
+
+* **conversation:** support forking aionrs conversations ([6e04e74](https://github.com/iOfficeAI/AionCore/commit/6e04e741c42425072a8296fdacd95e5d1261d4d7))
+* **conversation:** support forking aionrs conversations ([4b09341](https://github.com/iOfficeAI/AionCore/commit/4b0934145b46f208d75f63e14dfb190dd4fb06b8))
+
+
+### Bug Fixes
+
+* **session:** retry claude session-title generation with timeout and observability ([#843](https://github.com/iOfficeAI/AionCore/issues/843)) ([c59e937](https://github.com/iOfficeAI/AionCore/commit/c59e937a0cc49327a6756c32fb77213e1abe2224))
+
 ## [0.1.65](https://github.com/iOfficeAI/AionCore/compare/v0.1.64...v0.1.65) (2026-08-12)
 
 
