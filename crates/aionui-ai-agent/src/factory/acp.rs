@@ -63,14 +63,14 @@ pub(crate) fn route_for_backend(backend: Option<&str>) -> BackendRoute {
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AcpSessionBuildContext,
-    model: ProviderWithModel,
+    _model: ProviderWithModel,
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AgentError> {
     let mut config = build_context.config;
 
     // Resolve the catalog row — prefer explicit agent_id, fall
     // back to a vendor-label match for legacy payloads.
-    let mut meta = resolve_catalog_metadata(&deps.agent_registry, &config, &ctx.user_id).await?;
+    let meta = resolve_catalog_metadata(&deps.agent_registry, &config, &ctx.user_id).await?;
 
     // Trust the catalog row over the client-supplied `backend` when an
     // `agent_id` was provided. The frontend collapses row-scoped rows
