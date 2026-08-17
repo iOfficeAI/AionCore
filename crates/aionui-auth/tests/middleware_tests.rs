@@ -60,6 +60,10 @@ fn csrf_app() -> Router {
         .route("/login", post(|| async { "logged in" }))
         .route("/api/auth/qr-login", post(|| async { "qr ok" }))
         .route("/get-test", get(|| async { "get ok" }))
+        .route(
+            "/internal/antigravity-hook/{conversation_id}",
+            post(|| async { "hook ok" }),
+        )
         .layer(middleware::from_fn_with_state(config, csrf_middleware))
 }
 
@@ -71,6 +75,32 @@ async fn t12_2_get_requests_bypass_csrf() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// agy's PreToolUse callback must reach its handler without a CSRF token.
+///
+/// The hook is a local `aioncore antigravity-hook` process: no user session, no
+/// cookie, no token to present. It authenticates with a per-conversation
+/// `x-aionui-hook-token` that the handler checks. When CSRF rejected it, every
+/// call came back 403, the hook read that as "no answer" and denied, and agy
+/// turns produced no tool frames at all — measured 2026-08-14, 6/6 calls
+/// rejected.
+#[tokio::test]
+async fn the_antigravity_hook_is_not_blocked_by_csrf() {
+    let app = csrf_app();
+    let resp = app
+        .oneshot(
+            Request::post("/internal/antigravity-hook/conv-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a hook callback with no CSRF token must still reach the handler"
+    );
 }
 
 #[tokio::test]
