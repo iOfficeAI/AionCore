@@ -361,6 +361,17 @@ fn is_session_load_method(context: &str) -> bool {
 /// OpenCode actually emits — see ELECTRON-1HQ), return the session id.
 /// Returns `None` for any other shape so callers can fall through to
 /// the default `code`-based mapping.
+/// Pull a stale session id out of a JSON-RPC `data` payload.
+///
+/// Matches on the VALUE, not on a key name. Agents disagree about where they
+/// put this string — OpenCode/Codex use `error`, glm-acp-agent uses `details`
+/// — and a fixed key list fails closed: the payload degrades to
+/// `AgentInternal`, `is_acp_session_not_found` returns false, and the
+/// `session/load` rebuild in `open_session_resume` never fires. The stale id
+/// then survives on disk and every later turn replays it, so the real failure
+/// (live case: a missing `Z_AI_API_KEY`) stays permanently hidden behind
+/// `Session not found`. Scanning the object's string values keeps recovery
+/// working for agents we have never probed.
 fn extract_session_not_found(data: Option<&serde_json::Value>) -> Option<String> {
     let value = data?;
     let obj = match value {
@@ -368,10 +379,11 @@ fn extract_session_not_found(data: Option<&serde_json::Value>) -> Option<String>
         serde_json::Value::String(s) => serde_json::from_str(s).ok()?,
         _ => return None,
     };
-    let msg = obj.get("error")?.as_str()?;
     let prefix = "Session not found: ";
-    let sid = msg.strip_prefix(prefix)?.trim();
-    if sid.is_empty() { None } else { Some(sid.to_owned()) }
+    obj.as_object()?.values().filter_map(|v| v.as_str()).find_map(|msg| {
+        let sid = msg.strip_prefix(prefix)?.trim();
+        (!sid.is_empty()).then(|| sid.to_owned())
+    })
 }
 
 fn extract_resource_not_found(data: Option<&serde_json::Value>) -> Option<String> {
@@ -666,6 +678,40 @@ mod tests {
         let acp = AcpError::from_sdk(sdk_err, "ctx");
         match acp {
             AcpError::SessionNotFound { session_id } => assert_eq!(session_id, "sess-ie"),
+            other => panic!("expected SessionNotFound, got {other:?}"),
+        }
+    }
+
+    /// glm-acp-agent puts the reason under `details`, not `error`. Keying the
+    /// rescue on `error` alone left this shape as a bare `AgentInternal`, so
+    /// `open_session_resume` never rebuilt the session and the stale id was
+    /// replayed forever. Payload copied verbatim from the live wire dump
+    /// (conversation `66c25606`, `session/load`, 2026-08-17T09:53:31Z).
+    #[test]
+    fn from_sdk_internal_with_session_not_found_under_a_details_key() {
+        let sdk_err = SdkError::internal_error().data(serde_json::json!({
+            "details": "Session not found: deb7c49d-914b-4581-910e-703f550ce131"
+        }));
+        let acp = AcpError::from_sdk(sdk_err, "session/load");
+        match acp {
+            AcpError::SessionNotFound { session_id } => {
+                assert_eq!(session_id, "deb7c49d-914b-4581-910e-703f550ce131");
+            }
+            other => panic!("expected SessionNotFound, got {other:?}"),
+        }
+    }
+
+    /// The rescue keys on the value, so an agent that invents yet another key
+    /// still recovers. This is the property that makes the fix general rather
+    /// than a growing list of key names.
+    #[test]
+    fn from_sdk_session_not_found_is_found_under_an_unknown_key() {
+        let sdk_err = SdkError::internal_error().data(serde_json::json!({
+            "reason": "Session not found: sess-unknown-key"
+        }));
+        let acp = AcpError::from_sdk(sdk_err, "session/load");
+        match acp {
+            AcpError::SessionNotFound { session_id } => assert_eq!(session_id, "sess-unknown-key"),
             other => panic!("expected SessionNotFound, got {other:?}"),
         }
     }
