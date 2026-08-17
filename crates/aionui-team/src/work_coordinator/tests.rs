@@ -1075,6 +1075,39 @@ fn discard_policy_terminalizes_unclaimed_queue_but_keeps_replacement() {
     assert_eq!(replacement.mailbox_message_ids, vec!["replacement"]);
 }
 
+/// I2: Discard supersedes queued *instructions*. The Control lane carries the
+/// shutdown handshake, which has no retry path, so dropping it would strand the
+/// protocol forever.
+#[test]
+fn discard_policy_exempts_control_lane_work() {
+    for control_source in [WorkSource::McpShutdownRequest, WorkSource::ShutdownRejected] {
+        let coordinator = coordinator();
+        coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+        enqueue(&coordinator, WorkSource::UserIntervention, "instruction");
+        enqueue(&coordinator, control_source, "control");
+        enqueue(&coordinator, WorkSource::LeadIntervention, "replacement");
+
+        let discarded = coordinator.discard_queued_except("lead-1", "replacement");
+        assert_eq!(
+            discarded,
+            vec!["instruction".to_owned()],
+            "{control_source:?} must survive a discard"
+        );
+
+        // The replacement runs first (Foreground), then the retained control work.
+        let ReconcileDecision::Claim(replacement) = coordinator.next("lead-1") else {
+            panic!("replacement must remain queued");
+        };
+        assert_eq!(replacement.mailbox_message_ids, vec!["replacement"]);
+        coordinator.complete_batch(&replacement);
+
+        let ReconcileDecision::Claim(control) = coordinator.next("lead-1") else {
+            panic!("{control_source:?} must still be claimable after the discard");
+        };
+        assert_eq!(control.mailbox_message_ids, vec!["control"]);
+    }
+}
+
 // ── ELECTRON-3RN: recognized slash commands batch alone (FIFO, no preempt) ──
 
 // AC3: when a command shares the queue with other unread messages, it is claimed

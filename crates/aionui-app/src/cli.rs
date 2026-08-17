@@ -180,6 +180,7 @@ pub(crate) enum TeamCommand {
     Members,
     ReadMessages,
     SendMessage,
+    InterruptAgent,
     Task(TeamTaskArgs),
     ListAssistants,
     DescribeAssistant,
@@ -621,7 +622,9 @@ mod tests {
     use clap::Parser;
     use clap::error::ErrorKind;
 
-    use super::{Cli, Command, ConfigArgs, ConfigCommand, ManagedResourcesModeArg, PrepareManagedResourcesArgs};
+    use super::{
+        Cli, Command, ConfigArgs, ConfigCommand, ManagedResourcesModeArg, PrepareManagedResourcesArgs, TeamCommand,
+    };
 
     #[test]
     fn long_version_flag_uses_workspace_package_version() {
@@ -832,30 +835,67 @@ mod tests {
         }
     }
 
+    /// Resolves a `team ...` argv to its parsed subcommand, or `None` when clap
+    /// swallowed it into `TeamCommand::Unknown`.
+    ///
+    /// `Unknown` is an `external_subcommand`, so a missing subcommand still
+    /// parses successfully — asserting `is_ok()` alone proves nothing about
+    /// whether the command is actually wired.
+    fn parse_team_command(argv: &[&str]) -> Option<TeamCommand> {
+        let cli = Cli::try_parse_from(argv).ok()?;
+        let Some(Command::Team(args)) = cli.command else {
+            return None;
+        };
+        match args.command {
+            TeamCommand::Unknown(_) => None,
+            command => Some(command),
+        }
+    }
+
+    /// Every tool in the shared Team registry advertises a `cli_command`, and
+    /// that path is printed by `team capabilities`, `team help`, and the CLI
+    /// transport prompt. A tool present in the registry but missing from
+    /// `TeamCommand` sends agents at a command that can only fail, so the
+    /// registry is the source of truth for this test rather than a hand-kept
+    /// list that drifts when a tool is added.
+    #[test]
+    fn every_registry_tool_has_a_wired_team_cli_subcommand() {
+        for tool in aionui_api_types::team_tool_descriptors() {
+            let mut argv = vec!["aioncore", "team"];
+            argv.extend(tool.cli_command.iter().map(String::as_str));
+            assert!(
+                parse_team_command(&argv).is_some(),
+                "`{}` is advertised by tool {} but is not wired into TeamCommand",
+                argv[1..].join(" "),
+                tool.name
+            );
+        }
+    }
+
     #[test]
     fn team_cli_accepts_agent_facing_command_paths() {
+        // Registry-independent commands; the tool-backed paths are covered by
+        // `every_registry_tool_has_a_wired_team_cli_subcommand`.
         let commands: &[&[&str]] = &[
             &["aioncore", "team", "capabilities"],
             &["aioncore", "team", "help"],
             &["aioncore", "team", "context"],
-            &["aioncore", "team", "members"],
-            &["aioncore", "team", "read-messages"],
-            &["aioncore", "team", "send-message"],
-            &["aioncore", "team", "task", "create"],
-            &["aioncore", "team", "task", "update"],
-            &["aioncore", "team", "task", "list"],
-            &["aioncore", "team", "list-assistants"],
-            &["aioncore", "team", "describe-assistant"],
-            &["aioncore", "team", "spawn-agent"],
-            &["aioncore", "team", "rename-agent"],
-            &["aioncore", "team", "clear-agent-context"],
-            &["aioncore", "team", "shutdown-agent"],
         ];
 
         for command in commands {
-            let result = Cli::try_parse_from(*command);
-            assert!(result.is_ok(), "command should parse: {command:?}");
+            assert!(
+                parse_team_command(command).is_some(),
+                "command should parse to a wired subcommand: {command:?}"
+            );
         }
+    }
+
+    #[test]
+    fn unwired_team_subcommand_is_reported_as_unknown() {
+        assert!(
+            parse_team_command(&["aioncore", "team", "definitely-not-a-command"]).is_none(),
+            "the guard above only works if an unwired path resolves to Unknown"
+        );
     }
 
     #[test]

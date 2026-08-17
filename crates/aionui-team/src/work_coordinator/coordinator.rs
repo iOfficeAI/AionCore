@@ -944,6 +944,14 @@ impl SlotWorkCoordinator {
         self.lock_state().interrupted_batches.remove(batch_id)
     }
 
+    /// Pending interrupt metadata. Every entry must eventually be taken by the
+    /// interrupting caller or by the event loop, so a non-zero residue after a
+    /// batch is finished is a leak.
+    #[cfg(test)]
+    pub(crate) fn interrupted_batch_count(&self) -> usize {
+        self.lock_state().interrupted_batches.len()
+    }
+
     pub(crate) fn is_batch_cancelled(&self, batch: &WorkBatch) -> bool {
         let state = self.lock_state();
         batch.intent_ids.iter().all(|intent_id| {
@@ -964,6 +972,15 @@ impl SlotWorkCoordinator {
                 .is_some_and(|active| active.turn_id.as_deref() == turn_id)
     }
 
+    /// Terminalize the slot's queued work so only `retained_message_id` survives,
+    /// backing `TeamQueuedPolicy::Discard`. Returns the mailbox rows the caller
+    /// must mark read.
+    ///
+    /// Control-lane work is exempt. Discard means "supersede the queued
+    /// instructions", but the Control lane carries lifecycle protocol
+    /// (`team_shutdown_agent` handshakes) rather than instructions, and dropping
+    /// a queued shutdown request would strand that handshake forever with no
+    /// retry path.
     pub(crate) fn discard_queued_except(&self, slot_id: &str, retained_message_id: &str) -> Vec<String> {
         let mut state = self.lock_state();
         let queued_ids = state
@@ -978,6 +995,9 @@ impl SlotWorkCoordinator {
                 continue;
             };
             if intent.mailbox_message_id.as_deref() == Some(retained_message_id) {
+                continue;
+            }
+            if intent.source.priority() == WorkPriority::Control {
                 continue;
             }
             if let Some(message_id) = &intent.mailbox_message_id {

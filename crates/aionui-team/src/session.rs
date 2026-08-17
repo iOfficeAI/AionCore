@@ -1743,14 +1743,6 @@ impl TeamSession {
         let commit = self
             .commit_persisted_enqueue(&lease, mailbox_message.id.clone())
             .await?;
-        if queued_policy == TeamQueuedPolicy::Discard {
-            let discarded = self
-                .work_coordinator
-                .discard_queued_except(to_slot_id, &mailbox_message.id);
-            if !discarded.is_empty() {
-                self.mailbox.mark_read_batch(&self.team.id, &discarded).await?;
-            }
-        }
 
         let (outcome, interrupted_turn_id) = if let Some((batch, turn_id)) = active_before {
             let still_active = self.work_coordinator.is_active_batch(&batch, turn_id.as_deref());
@@ -1812,6 +1804,20 @@ impl TeamSession {
         } else {
             (TeamInterruptOutcome::QueuedNoActiveTurn, None)
         };
+
+        // Discarding is irreversible (the rows are marked read), so it runs only
+        // after the interruption itself has settled. Doing it before the cancel
+        // meant a cancellation failure returned `Err` with the queued work
+        // already destroyed, leaving the caller nothing to retry.
+        if queued_policy == TeamQueuedPolicy::Discard {
+            let discarded = self
+                .work_coordinator
+                .discard_queued_except(to_slot_id, &mailbox_message.id);
+            if !discarded.is_empty() {
+                self.mailbox.mark_read_batch(&self.team.id, &discarded).await?;
+            }
+        }
+
         self.event_loops.notify(to_slot_id);
         let target = self.work_coordinator.slot_snapshot(to_slot_id).unwrap_or(commit.slot);
         info!(
@@ -2499,6 +2505,33 @@ mod tests {
                 turn_id: "turn-background".into(),
                 status: crate::ports::AgentTurnStatus::Completed,
                 runtime: None,
+            })
+        }
+    }
+
+    /// Reports that the batch was claimed *without* invoking `on_started`, so the
+    /// slot has an active batch but no turn_id, then fails the start once released.
+    /// Reproduces the one path where interrupt metadata had no owner.
+    struct StartFailsWithoutStartedCallback {
+        claimed_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release_rx: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ports::AgentTurnExecutionPort for StartFailsWithoutStartedCallback {
+        async fn run_agent_turn(
+            &self,
+            _request: crate::ports::AgentTurnRequest,
+        ) -> Result<crate::ports::AgentTurnOutcome, crate::ports::AgentTurnExecutionError> {
+            if let Some(tx) = self.claimed_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let release_rx = self.release_rx.lock().unwrap().take();
+            if let Some(rx) = release_rx {
+                let _ = rx.await;
+            }
+            Err(crate::ports::AgentTurnExecutionError::Failed {
+                reason: "forced start failure".into(),
             })
         }
     }
@@ -3890,6 +3923,210 @@ mod tests {
         );
 
         release_tx.send(()).unwrap();
+        session.stop();
+    }
+
+    /// I2: `TeamQueuedPolicy::Discard` had no coverage above the coordinator, even
+    /// though it irreversibly marks the superseded rows read.
+    #[tokio::test]
+    async fn interrupt_with_discard_policy_drops_queued_work_but_keeps_the_replacement() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let session = Arc::new(
+            TeamSession::start(
+                make_team(),
+                repo,
+                broadcaster,
+                backend_path(),
+                empty_task_manager(),
+                Arc::new(BlockingRunningTurnPort::new(started_tx, release_rx)),
+                noop_cancellation_port(),
+                noop_projection_store(),
+                "user-test".into(),
+                Weak::<TeamSessionService>::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        register_test_event_loop(&session, "worker-1");
+
+        session
+            .send_message_to_agent("worker-1", "claimed input", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .expect("worker turn should start")
+            .expect("start signal should be sent");
+        session
+            .send_message_to_agent("worker-1", "superseded input", None)
+            .await
+            .unwrap();
+
+        let response = session
+            .interrupt_agent_from_user(
+                "worker-1",
+                "replacement instruction",
+                None,
+                None,
+                TeamQueuedPolicy::Discard,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.outcome, TeamInterruptOutcome::Interrupted);
+
+        let unread = session.mailbox.peek_unread("t1", "worker-1").await.unwrap();
+        let contents = unread.iter().map(|m| m.content.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            contents,
+            vec!["replacement instruction"],
+            "discard leaves only the replacement unread"
+        );
+        assert!(
+            !contents.contains(&"superseded input"),
+            "the superseded row must be marked read"
+        );
+
+        release_tx.send(()).unwrap();
+        session.stop();
+    }
+
+    /// I3: discarding used to run before the cancellation attempt, so a failing
+    /// cancel returned `Err` with the queued work already destroyed and nothing
+    /// left to retry. The discard must not happen on that path.
+    #[tokio::test]
+    async fn interrupt_cancellation_failure_does_not_discard_queued_work() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let session = Arc::new(
+            TeamSession::start(
+                make_team(),
+                repo,
+                broadcaster,
+                backend_path(),
+                empty_task_manager(),
+                Arc::new(BlockingRunningTurnPort::new(started_tx, release_rx)),
+                Arc::new(FailingCancellationPort),
+                noop_projection_store(),
+                "user-test".into(),
+                Weak::<TeamSessionService>::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        register_test_event_loop(&session, "worker-1");
+
+        session
+            .send_message_to_agent("worker-1", "active input", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .expect("worker turn should start")
+            .expect("start signal should be sent");
+        session
+            .send_message_to_agent("worker-1", "queued input", None)
+            .await
+            .unwrap();
+
+        let error = session
+            .interrupt_agent_from_user("worker-1", "replacement", None, None, TeamQueuedPolicy::Discard)
+            .await
+            .expect_err("cancellation failure must surface");
+        assert!(error.to_string().contains("forced cancellation failure"));
+
+        let unread = session.mailbox.peek_unread("t1", "worker-1").await.unwrap();
+        let contents = unread.iter().map(|m| m.content.as_str()).collect::<Vec<_>>();
+        assert!(
+            contents.contains(&"queued input"),
+            "a failed interruption must not destroy queued work, got {contents:?}"
+        );
+        assert!(
+            contents.contains(&"replacement"),
+            "the replacement stays durable so the caller can retry, got {contents:?}"
+        );
+
+        release_tx.send(()).unwrap();
+        session.stop();
+    }
+
+    /// I4: interrupting a batch that was claimed but never reached `mark_started`
+    /// left its metadata in the coordinator forever — the interrupting caller skips
+    /// the take (no turn_id) and the late-start callback never runs because the
+    /// start itself fails.
+    #[tokio::test]
+    async fn interrupt_metadata_is_drained_when_the_interrupted_turn_never_starts() {
+        let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let session = Arc::new(
+            TeamSession::start(
+                make_team(),
+                repo,
+                broadcaster,
+                backend_path(),
+                empty_task_manager(),
+                Arc::new(StartFailsWithoutStartedCallback {
+                    claimed_tx: Mutex::new(Some(claimed_tx)),
+                    release_rx: Mutex::new(Some(release_rx)),
+                }),
+                noop_cancellation_port(),
+                noop_projection_store(),
+                "user-test".into(),
+                Weak::<TeamSessionService>::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        register_test_event_loop(&session, "worker-1");
+
+        session
+            .send_message_to_agent("worker-1", "claimed input", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), claimed_rx)
+            .await
+            .expect("worker batch should be claimed")
+            .expect("claim signal should be sent");
+        assert_eq!(
+            session
+                .work_coordinator
+                .slot_snapshot("worker-1")
+                .unwrap()
+                .active_turn_id,
+            None,
+            "the batch must be claimed without a turn_id for this path"
+        );
+
+        session
+            .interrupt_agent_from_user("worker-1", "replacement", None, None, TeamQueuedPolicy::Retain)
+            .await
+            .unwrap();
+        assert_eq!(
+            session.work_coordinator.interrupted_batch_count(),
+            1,
+            "the interrupt records metadata that nobody has claimed yet"
+        );
+
+        // Release the blocked start so it fails; the event loop must drain the metadata.
+        release_tx.send(()).unwrap();
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while session.work_coordinator.interrupted_batch_count() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "interrupt metadata leaked: {} entries still pending",
+            session.work_coordinator.interrupted_batch_count()
+        );
+
         session.stop();
     }
 
