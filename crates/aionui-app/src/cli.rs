@@ -101,10 +101,9 @@ impl From<ManagedResourcesModeArg> for aionui_runtime::ManagedResourcesMode {
     }
 }
 
-// `Mcp` prefix is load-bearing on Mcp* variants — clap derives kebab-case
-// subcommand names (`mcp-bridge`, `mcp-team-stdio`)
-// that external callers (ACP agent CLI, team MCP bridge spec) depend on
-// verbatim.
+// `Mcp` prefix is load-bearing on Mcp* variants — clap derives the kebab-case
+// subcommand name (`mcp-team-stdio`) that external callers (the ACP agent CLI,
+// which spawns it from `session/new.mcpServers`) depend on verbatim.
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
     /// Print the top-level agent-facing CLI capability index.
@@ -120,7 +119,6 @@ pub(crate) enum Command {
     /// writes agy's decision to stdout.
     AntigravityHook,
     /// Stdio ↔ TCP bridge for the team MCP server (spawned by the ACP agent CLI).
-    McpBridge,
     /// MCP stdio server for team tools (spawned by the ACP agent CLI).
     McpTeamStdio,
     /// Self-check: hydrate the agent registry, probe every CLI on `$PATH`,
@@ -141,7 +139,6 @@ impl Command {
             Self::Diagnose(_) => "diagnose",
             Self::Team(_) => "team",
             Self::AntigravityHook => "antigravity-hook",
-            Self::McpBridge => "mcp-bridge",
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::Doctor => "doctor",
             Self::PrepareManagedResources(_) => "prepare-managed-resources",
@@ -740,7 +737,6 @@ mod tests {
                 }),
                 "config",
             ),
-            (Command::McpBridge, "mcp-bridge"),
             (Command::McpTeamStdio, "mcp-team-stdio"),
             (Command::AntigravityHook, "antigravity-hook"),
             (Command::Doctor, "doctor"),

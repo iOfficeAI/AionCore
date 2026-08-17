@@ -180,7 +180,7 @@ mod tests {
     fn tcp_connect_failed_uses_exit_3() {
         let err = CliBoundaryError::new(
             CliBoundaryCode::McpTcpConnectFailed,
-            "mcp-bridge",
+            "mcp-team-stdio",
             "failed to connect to local MCP TCP listener",
         );
         assert_eq!(err.exit_code(), ExitCode::from(3));

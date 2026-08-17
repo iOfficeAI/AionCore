@@ -183,6 +183,16 @@ resume 逻辑已在 `AcpAgentManager::session_resume_and_send`（`acp_agent.rs`�
 
 ### 4.4 ACP 注入链路（stdio 注入方式）
 
+> **⚠️ 4.4 – 4.6 是 phase 1 的设计稿，子进程部分已过时。**
+> 当时设计的 `aioncore mcp-bridge`（stdio ↔ TCP 裸管道）已被 `aioncore mcp-team-stdio`
+> 取代，前者已删除。现在 agent spawn 的是一个 rmcp server
+> （`aionui-app/src/commands/cmd_team_stdio.rs`），它自己声明工具并向 TCP 转发调用，
+> 而不是原样转发字节。注入点见 `aionui-ai-agent/src/factory/acp_assembler.rs`
+> 的 `team_mcp_server()`、`session_agent.rs`、`factory/aionrs.rs`。
+> 下文的 env 三元组（`TEAM_MCP_PORT` / `TEAM_MCP_TOKEN` / `TEAM_AGENT_SLOT_ID`）
+> 和 `session/new.mcpServers` 注入方式仍然准确，只有 `args` 从
+> `["mcp-bridge"]` 变成了 `["mcp-team-stdio"]`。
+
 team MCP 通过 ACP 标准的 `session/new` → `mcpServers` 声明注入，ACP CLI 自己 spawn bridge 子进程。后端不直接管 bridge 进程生命周期。
 
 **完整数据流**：

@@ -35,7 +35,7 @@ pub use crash_detection::{CrashReason, detect_crash, is_rate_limited};
 pub use error::TeamError;
 pub use events::TeamEventEmitter;
 pub use mailbox::Mailbox;
-pub use mcp::{TEAM_MCP_SERVER_NAME, TeamMcpServer, TeamMcpStdioConfig, TeamMcpStdioServerSpec};
+pub use mcp::{TEAM_MCP_SERVER_NAME, TeamMcpServer, TeamMcpStdioConfig};
 pub use message_projection::{
     ProjectedTeamMessage, TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest,
     TeamProjectionSource,

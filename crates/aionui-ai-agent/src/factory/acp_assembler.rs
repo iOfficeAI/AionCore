@@ -255,6 +255,18 @@ mod tests {
             McpServer::Stdio(s) => {
                 assert_eq!(s.name, TEAM_MCP_SERVER_NAME);
                 assert_eq!(s.args, vec!["mcp-team-stdio".to_owned()]);
+                assert_eq!(s.command.to_string_lossy(), "/bin/backend");
+                // The stdio server carries no port/token/slot arguments; the whole
+                // connection triple travels in env, so the teammate identity cannot
+                // be forged from the command line.
+                let env: std::collections::HashMap<_, _> = s
+                    .env
+                    .iter()
+                    .map(|variable| (variable.name.as_str(), variable.value.as_str()))
+                    .collect();
+                assert_eq!(env[TeamMcpStdioConfig::ENV_PORT], "9999");
+                assert_eq!(env[TeamMcpStdioConfig::ENV_TOKEN], "tok");
+                assert_eq!(env[TeamMcpStdioConfig::ENV_SLOT_ID], "slot-lead");
             }
             _ => panic!("expected stdio"),
         }

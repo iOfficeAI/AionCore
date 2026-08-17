@@ -18,7 +18,7 @@ use crate::error::TeamError;
 use crate::event_loop::EventLoopRegistry;
 use crate::events::{TEAM_CHILD_TURN_CANCELLED_EVENT, TeamEventEmitter};
 use crate::mailbox::Mailbox;
-use crate::mcp::{TeamMcpServer, TeamMcpStdioConfig, TeamMcpStdioServerSpec};
+use crate::mcp::{TeamMcpServer, TeamMcpStdioConfig};
 use crate::member_runtime::{
     AttachLease, AttachOutcome, BeginRemove, MemberRuntimeFailure, MemberRuntimeRegistry, MemberRuntimeSnapshot,
     ReserveAttach,
@@ -321,14 +321,6 @@ impl TeamSession {
             slot_id: slot_id.to_owned(),
             binary_path: self.backend_binary_path.to_string_lossy().into_owned(),
         }
-    }
-
-    /// Returns the stdio server spec that `TeamSessionService::ensure_session`
-    /// (D9) persists into each agent's `conversation.extra` and that ACP
-    /// `session/new` consumes via `mcp_servers`.
-    pub fn stdio_spec(&self, slot_id: &str) -> TeamMcpStdioServerSpec {
-        let binary_path = self.backend_binary_path.to_string_lossy();
-        TeamMcpStdioServerSpec::from_config(binary_path.as_ref(), &self.mcp_stdio_config(slot_id))
     }
 
     async fn team_tool_transport_for_agent(&self, agent: &TeamAgent) -> Result<TeamToolTransport, TeamError> {
@@ -2851,17 +2843,14 @@ mod tests {
         assert_eq!(config.team_id, "t1");
         assert_eq!(config.slot_id, "lead-1");
         assert_eq!(config.port, session.mcp_server.port());
-        session.stop();
-    }
+        assert_eq!(config.token, session.mcp_server.auth_token());
 
-    #[tokio::test]
-    async fn stdio_spec_uses_fixed_name_and_binary_path() {
-        let session = start_session().await;
-        let spec = session.stdio_spec("lead-1");
-        assert_eq!(spec.name, crate::mcp::TEAM_MCP_SERVER_NAME);
-        assert_eq!(spec.command, "/tmp/aioncore-test");
-        assert_eq!(spec.args, vec!["mcp-bridge".to_string()]);
-        assert!(spec.env.iter().any(|(k, v)| k == "TEAM_AGENT_SLOT_ID" && v == "lead-1"));
+        // Every agent shares the team's listener and token but must carry its own
+        // slot_id — that is the only thing distinguishing callers on the MCP server.
+        let worker = session.mcp_stdio_config("worker-1");
+        assert_eq!(worker.port, config.port);
+        assert_eq!(worker.token, config.token);
+        assert_ne!(worker.slot_id, config.slot_id);
         session.stop();
     }
 

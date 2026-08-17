@@ -2,8 +2,9 @@
 //!
 //! Uses the `rmcp` crate (Rust MCP SDK) for protocol handling. Tool calls are
 //! forwarded to the TeamMcpServer TCP listener via 4-byte big-endian
-//! length-prefixed JSON frames — the same wire protocol used by `mcp-bridge`,
-//! but with proper tool registration via rmcp instead of transparent proxying.
+//! length-prefixed JSON frames. Tools are registered properly through rmcp
+//! rather than proxied transparently, so the agent always sees a spec-shaped
+//! `tools/list` regardless of the internal TCP representation.
 //!
 //! Each tool call opens a fresh TCP connection, sends an `initialize` frame
 //! (injecting auth_token + slot_id), then sends the `tools/call` frame, reads
