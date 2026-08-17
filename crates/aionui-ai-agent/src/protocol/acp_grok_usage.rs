@@ -120,7 +120,7 @@ fn model_id_from_usage(usage: &Value) -> Option<String> {
         .get("modelUsage")
         .and_then(Value::as_object)
         .and_then(|models| models.keys().next())
-        .map(str::trim)
+        .map(|id| id.trim())
         .filter(|id| !id.is_empty())
         .map(str::to_owned)
 }
