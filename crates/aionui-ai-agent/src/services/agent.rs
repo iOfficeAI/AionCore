@@ -138,9 +138,7 @@ impl AgentService {
             .managed_runtime
             .as_ref()
             .ok_or_else(|| AgentError::bad_request("Agent does not use a managed application runtime"))?;
-        Err(AgentError::bad_request(
-            "DeepSeek Harness preview has been retired",
-        ))
+        Err(AgentError::bad_request("DeepSeek Harness preview has been retired"))
     }
 
     pub async fn provider_health_check(

@@ -1651,7 +1651,11 @@ mod tests {
         // when none of the CLIs are installed on the test host.
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
-        assert_eq!(all.len(), 44, "seed rows include antigravity and retired deepseek-harness");
+        assert_eq!(
+            all.len(),
+            44,
+            "seed rows include antigravity and retired deepseek-harness"
+        );
     }
 
     #[tokio::test]

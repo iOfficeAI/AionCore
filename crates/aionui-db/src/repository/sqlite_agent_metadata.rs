@@ -856,7 +856,11 @@ mod tests {
     async fn seed_rows_populated_after_migrations() {
         let (repo, _db) = setup().await;
         let rows = repo.list_all().await.unwrap();
-        assert_eq!(rows.len(), 44, "seed rows include antigravity and retired deepseek-harness");
+        assert_eq!(
+            rows.len(),
+            44,
+            "seed rows include antigravity and retired deepseek-harness"
+        );
         let harness = rows
             .iter()
             .find(|row| row.backend.as_deref() == Some("deepseek-harness"))
