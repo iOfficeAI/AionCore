@@ -59,7 +59,7 @@ impl AgentSendError {
                 message,
                 code,
                 ownership,
-                detail.map(|d| sanitize_error_detail(&d)),
+                detail.map(|d| bound_error_detail(&d)),
                 retryable,
                 feedback_recommended,
                 resolution,
@@ -79,7 +79,7 @@ impl AgentSendError {
                     message: "Current Agent failed to run in this workspace path".into(),
                     code: Some(AgentErrorCode::WorkspacePathRuntimeUnavailable),
                     ownership: Some(AgentErrorOwnership::Aionui),
-                    detail: Some(sanitize_error_detail(&detail)),
+                    detail: Some(bound_error_detail(&detail)),
                     workspace_path: Some(path.clone()),
                     retryable: Some(false),
                     feedback_recommended: Some(false),
@@ -420,7 +420,31 @@ fn classify_acp_error(err: &AcpError) -> AgentSendError {
                     let detail = acp_agent_internal_detail_for_classification(*code, classification, text);
                     classification.into_send_error(detail)
                 }
-                None => unknown_upstream_error(default_detail),
+                // Failing to CLASSIFY does not make the text worthless — the
+                // classifiers only recognise failure shapes we have already seen,
+                // so an unrecognised one is exactly where the agent's own
+                // explanation matters most. Dropping it left the user (and
+                // triage) with a bare "Agent internal error (code -32603)" while
+                // the answer sat in the JSON-RPC `data` we had already parsed
+                // (AIONUI-DESKTOP-9D: "No API key found. Set the Z_AI_API_KEY
+                // environment variable, or run `glm-acp-agent --setup`").
+                //
+                // Safe by the same rule the classified branch relies on:
+                // `AgentSendError::new` runs `bound_error_detail` on whatever
+                // detail it is handed, redacting secret VALUES (bearer/sk-/
+                // token=/api_key=, auth headers, URL queries) while keeping prose
+                // such as the variable NAME the user has to set.
+                //
+                // Do NOT sanitize here as well: that pass emits `<redacted
+                // header>`, which the second pass's `strip_markup` then deletes as
+                // if it were an HTML tag, silently blanking the whole detail.
+                None => match acp_agent_internal_texts(message, data.as_ref())
+                    .into_iter()
+                    .find(|text| !text.trim().is_empty())
+                {
+                    Some(text) => unknown_upstream_error(format!("{default_detail}: {text}")),
+                    None => unknown_upstream_error(default_detail),
+                },
             }
         }
         _ => AgentSendError::from_acp_non_internal(err, err.to_string()),
@@ -438,11 +462,14 @@ fn acp_agent_internal_detail_for_classification(code: i32, classification: Class
         return AWS_SSO_EXPIRED_DETAIL.to_owned();
     }
 
-    let sanitized = sanitize_error_detail(text);
-    if sanitized.is_empty() {
+    // Pass the text through RAW: `AgentSendError::new` sanitizes every detail it
+    // is handed. Sanitizing here as well was the second half of the blanking bug
+    // above — and the redundancy is easy to re-introduce, since callers cannot
+    // see that `new` already does it.
+    if text.trim().is_empty() {
         acp_agent_internal_public_detail(code)
     } else {
-        format!("{}: {}", acp_agent_internal_public_detail(code), sanitized)
+        format!("{}: {}", acp_agent_internal_public_detail(code), text)
     }
 }
 
@@ -1018,13 +1045,38 @@ fn openclaw_gateway_unreachable_send_error() -> AgentSendError {
     )
 }
 
-pub(crate) fn sanitize_error_detail(input: &str) -> String {
-    let stripped = strip_markup(input);
-    let without_query = redact_url_queries(&stripped);
-    let redacted = redact_lines(&without_query);
-    truncate_chars(redacted.trim(), MAX_DETAIL_CHARS)
+/// Bound an error detail's LENGTH. It is deliberately not redacted.
+///
+/// Redaction used to run here and was removed on purpose: it was destroying the
+/// diagnostic value of these details. It fired on any line containing
+/// `authorization:` and replaced the WHOLE line, so OpenAI's own help text
+/// ("You need to provide your API key in an Authorization header using Bearer
+/// auth") was erased down to a placeholder, leaving support with nothing to go
+/// on (live: conversation 04ec3221 / AIONUI-DESKTOP-9D). Meanwhile the word-level
+/// rule that was supposed to catch real tokens could never fire — it tested
+/// `word.starts_with("bearer ")` against whitespace-split words, which never
+/// contain a space — so it protected nothing it claimed to.
+///
+/// ⚠️ Consequence, accepted deliberately: this detail is persisted, rendered,
+/// AND shipped in feedback attachments (`recent_error_details`), so an upstream
+/// provider that echoes a request header can now put a live credential in front
+/// of whoever reads that report. If that has to be prevented, the right place is
+/// the feedback-collection boundary — the only point where the text leaves the
+/// user's machine — not here, where it also blinds local diagnosis.
+///
+/// Truncation stays: `append_provider_body` splices a raw upstream response body
+/// into the detail, and without a bound a provider error page would land whole in
+/// the message store and the chat bubble.
+pub(crate) fn bound_error_detail(input: &str) -> String {
+    truncate_chars(strip_markup(input).trim(), MAX_DETAIL_CHARS)
 }
 
+/// Strip HTML/XML tags, keeping the visible text.
+///
+/// Readability, NOT redaction: providers answer with whole error pages (a 504
+/// from openresty arrives as `<html><head><title>504 …`), and rendering that raw
+/// in a chat bubble helps nobody. It hides no diagnostic content — every visible
+/// word survives.
 fn strip_markup(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut in_tag = false;
@@ -1040,79 +1092,6 @@ fn strip_markup(input: &str) -> String {
         }
     }
     out
-}
-
-fn redact_lines(input: &str) -> String {
-    let mut out = String::new();
-    for line in input.lines() {
-        let cleaned = if is_sensitive_header_line(line) {
-            "<redacted header>".to_owned()
-        } else {
-            redact_secret_words(line)
-        };
-        push_bounded_line(&mut out, &cleaned);
-        if out.chars().count() >= MAX_DETAIL_CHARS {
-            break;
-        }
-    }
-    out
-}
-
-fn push_bounded_line(out: &mut String, line: &str) {
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out.push_str(line);
-}
-
-fn is_sensitive_header_line(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.contains("authorization:")
-        || lower.contains("x-api-key:")
-        || lower.contains("api-key:")
-        || lower.contains("api_key:")
-}
-
-fn redact_secret_words(line: &str) -> String {
-    line.split_whitespace()
-        .map(|word| {
-            let lower = word.to_ascii_lowercase();
-            if lower.starts_with("bearer ")
-                || lower.starts_with("sk-")
-                || lower.contains("api_key=")
-                || lower.contains("apikey=")
-                || lower.contains("access_token=")
-                || lower.contains("token=")
-            {
-                "<redacted>"
-            } else {
-                word
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn redact_url_queries(input: &str) -> String {
-    input
-        .split_whitespace()
-        .map(|word| {
-            if (word.starts_with("http://") || word.starts_with("https://")) && word.contains('?') {
-                let end_punct = word
-                    .chars()
-                    .last()
-                    .filter(|c| matches!(c, '.' | ',' | ';' | ')' | ']'))
-                    .map(|c| c.to_string())
-                    .unwrap_or_default();
-                let trimmed = word.trim_end_matches(['.', ',', ';', ')', ']']);
-                let base = trimmed.split_once('?').map(|(base, _)| base).unwrap_or(trimmed);
-                format!("{base}?<redacted>{end_punct}")
-            } else {
-                word.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn truncate_chars(value: &str, max: usize) -> String {
@@ -1285,6 +1264,126 @@ mod tests {
         assert!(err.stream_error().resolution.is_none());
     }
 
+    /// Verbatim payload from AIONUI-DESKTOP-9D. `glm-acp-agent` answers
+    /// `session/prompt` with a bare -32603 whose only actionable content is in
+    /// `data`. No classifier recognises it, but the text must still reach the
+    /// user instead of being replaced by the code alone.
+    #[test]
+    fn unclassified_agent_internal_keeps_the_agent_supplied_detail() {
+        let err = AgentSendError::from_agent_error(AgentError::Acp(AcpError::AgentInternal {
+            message: "Internal error".into(),
+            code: -32603,
+            data: Some(serde_json::json!({
+                "details": "No API key found. Set the Z_AI_API_KEY environment variable, or run `glm-acp-agent --setup` to store one."
+            })),
+        }));
+
+        assert_eq!(err.code(), Some(AgentErrorCode::UnknownUpstreamError));
+        let detail = err.stream_error().detail.clone().expect("detail must be present");
+        assert!(
+            detail.contains("Agent internal error (code -32603)"),
+            "the diagnostic code must be kept; got {detail}"
+        );
+        assert!(
+            detail.contains("Z_AI_API_KEY") && detail.contains("glm-acp-agent --setup"),
+            "the agent's own actionable text must survive; got {detail}"
+        );
+    }
+
+    /// `bound_error_detail` must be idempotent — it is applied at a single choke
+    /// point but callers handling external text may reasonably apply it too.
+    #[test]
+    fn bound_error_detail_is_idempotent() {
+        let cases = [
+            "plain prose with no markup",
+            "Provider error 504: <html><body>gateway</body></html>",
+            "Authorization: Bearer YOUR_KEY",
+            "",
+        ];
+        for input in cases {
+            let once = super::bound_error_detail(input);
+            let twice = super::bound_error_detail(&once);
+            assert_eq!(once, twice, "bounding twice must not change the result for {input:?}");
+        }
+    }
+
+    /// Truncation stays even though redaction is gone: `append_provider_body`
+    /// splices a raw upstream body in, and an unbounded provider error page must
+    /// not land whole in the message store.
+    #[test]
+    fn bound_error_detail_still_caps_length() {
+        let long = "x".repeat(5000);
+        let detail = super::bound_error_detail(&long);
+        // `truncate_chars` appends a "..." marker past the cap, so the bound is
+        // MAX_DETAIL_CHARS plus that ellipsis — not the cap alone.
+        assert!(
+            detail.chars().count() <= super::MAX_DETAIL_CHARS + 3,
+            "detail must stay bounded; got {} chars",
+            detail.chars().count()
+        );
+        assert!(
+            detail.ends_with("..."),
+            "truncation must be visible; got tail {:?}",
+            &detail[detail.len().saturating_sub(8)..]
+        );
+    }
+
+    /// With redaction gone, a bearer token in the agent's own text NOW REACHES
+    /// the detail — persisted, rendered, and shipped in feedback attachments.
+    /// This is the accepted consequence of removing redaction, pinned here so the
+    /// trade-off is visible rather than discovered later in a report.
+    #[test]
+    fn secrets_in_provider_text_are_no_longer_redacted() {
+        let err = AgentSendError::from_agent_error(AgentError::Acp(AcpError::AgentInternal {
+            message: "Internal error".into(),
+            code: -32603,
+            data: Some(serde_json::json!({
+                "details": "upstream rejected the call\nauthorization: Bearer eyJhbGciOiJIUzI1NiJ9.secret\nretry later"
+            })),
+        }));
+
+        let detail = err.stream_error().detail.clone().expect("detail must be present");
+        assert!(
+            detail.contains("retry later"),
+            "surrounding diagnostics must survive; got {detail}"
+        );
+        assert!(
+            detail.contains("eyJhbGciOiJIUzI1NiJ9.secret"),
+            "documents that credentials are NO LONGER stripped; got {detail}"
+        );
+    }
+
+    /// Single-line details — the common shape — keep their prose intact, so the
+    /// passthrough is genuinely useful and not always swallowed by redaction.
+    #[test]
+    fn unclassified_agent_internal_keeps_prose_when_no_secret_present() {
+        let err = AgentSendError::from_agent_error(AgentError::Acp(AcpError::AgentInternal {
+            message: "Internal error".into(),
+            code: -32603,
+            data: Some(serde_json::json!({ "details": "workspace is read-only, retry later" })),
+        }));
+
+        let detail = err.stream_error().detail.clone().expect("detail must be present");
+        assert!(
+            detail.contains("workspace is read-only, retry later"),
+            "prose with no secret must survive verbatim; got {detail}"
+        );
+    }
+
+    /// No `data` and a placeholder `message` → nothing to add, keep the old
+    /// code-only detail rather than emitting a dangling separator.
+    #[test]
+    fn agent_internal_without_usable_text_keeps_the_code_only_detail() {
+        let err = AgentSendError::from_agent_error(AgentError::Acp(AcpError::AgentInternal {
+            message: String::new(),
+            code: -32603,
+            data: None,
+        }));
+
+        let detail = err.stream_error().detail.clone().expect("detail must be present");
+        assert_eq!(detail, "Agent internal error (code -32603)");
+    }
+
     #[test]
     fn classifies_acp_protocol_errors_without_unknown_upstream_fallback() {
         let cases = [
@@ -1367,24 +1466,28 @@ mod tests {
         assert_eq!(err.stream_error().feedback_recommended, Some(false));
     }
 
+    /// Redaction was removed deliberately (see `bound_error_detail`). This pins
+    /// the new contract: the provider's own words reach the detail verbatim,
+    /// because obscuring them is what made these reports untriageable.
     #[test]
-    fn sanitizes_secrets_and_query_strings() {
-        let detail = sanitize_error_detail(
-            "Authorization: Bearer sk-secret\nGET https://example.com/v1?api_key=sk-secret\ninvalid_api_key sk-secret",
+    fn provider_text_reaches_the_detail_verbatim() {
+        let detail = bound_error_detail(
+            "You didn't provide an API key. You need to provide your API key in an Authorization header using Bearer auth (i.e. Authorization: Bearer YOUR_KEY)",
         );
 
-        assert!(!detail.contains("sk-secret"));
-        assert!(!detail.contains("api_key=sk"));
-        assert!(detail.contains("<redacted header>"));
-        assert_eq!(
-            redact_url_queries("GET https://example.com/v1?api_key=sk-secret"),
-            "GET https://example.com/v1?<redacted>"
+        assert!(
+            detail.contains("You didn't provide an API key"),
+            "the actionable sentence must survive; got {detail}"
+        );
+        assert!(
+            detail.contains("Authorization: Bearer YOUR_KEY"),
+            "the provider's instruction must not be rewritten; got {detail}"
         );
     }
 
     #[test]
     fn strip_markup_removes_html_tags_keeping_visible_text() {
-        let detail = sanitize_error_detail(
+        let detail = bound_error_detail(
             "Provider error: API error 504: <html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body><center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>openresty</center></body></html>",
         );
 
@@ -1397,22 +1500,9 @@ mod tests {
 
     #[test]
     fn strip_markup_is_identity_for_plain_text() {
-        let detail = sanitize_error_detail("Provider error: API error 504: error code: 524");
+        let detail = bound_error_detail("Provider error: API error 504: error code: 524");
 
         assert_eq!(detail, "Provider error: API error 504: error code: 524");
-    }
-
-    #[test]
-    fn redaction_runs_after_strip_markup() {
-        let detail = sanitize_error_detail(
-            "<html><body>Authorization: Bearer sk-secret\nGET https://example.com/v1?api_key=sk-secret</body></html>",
-        );
-
-        assert!(!detail.contains("sk-secret"));
-        assert!(!detail.contains("api_key=sk"));
-        assert!(detail.contains("<redacted header>"));
-        assert!(!detail.contains("<html"));
-        assert!(!detail.contains("</body>"));
     }
 
     #[test]
