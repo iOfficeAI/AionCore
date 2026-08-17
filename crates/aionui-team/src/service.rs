@@ -2366,7 +2366,7 @@ impl TeamSessionService {
         &self,
         team_id: &str,
         slot_id: &str,
-    ) -> Result<Vec<crate::types::MailboxMessage>, TeamError> {
+    ) -> Result<crate::session::AgentInboxPeek, TeamError> {
         self.published_session(team_id)?.peek_agent_messages(slot_id).await
     }
 
@@ -2374,10 +2374,11 @@ impl TeamSessionService {
         &self,
         team_id: &str,
         slot_id: &str,
+        expected_batch_id: &str,
         message_ids: &[String],
     ) -> Result<ObserveMessagesResult, TeamError> {
         self.published_session(team_id)?
-            .observe_agent_messages(slot_id, message_ids)
+            .observe_agent_messages(slot_id, expected_batch_id, message_ids)
             .await
     }
 

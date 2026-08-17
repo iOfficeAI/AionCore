@@ -16,6 +16,10 @@ pub(crate) enum WorkSource {
     SpawnWelcome,
     TeamMembershipChanged,
     SpawnAttachFailure,
+    /// A teammate exhausted its mailbox delivery retries and was paused. Wakes
+    /// the lead so a stalled teammate cannot go unnoticed. Deliberately does not
+    /// resume a paused slot: it is addressed to the lead, not the stalled slot.
+    DeliveryFailureNotification,
     IdleNotification,
     InterruptedNotification,
     ShutdownRejected,
@@ -33,6 +37,7 @@ impl WorkSource {
             Self::SpawnWelcome
             | Self::TeamMembershipChanged
             | Self::SpawnAttachFailure
+            | Self::DeliveryFailureNotification
             | Self::IdleNotification
             | Self::InterruptedNotification
             | Self::RecoveryDrain => WorkPriority::Background,
@@ -57,6 +62,7 @@ impl WorkSource {
                 | Self::McpShutdownRequest
                 | Self::SpawnWelcome
                 | Self::SpawnAttachFailure
+                | Self::DeliveryFailureNotification
                 | Self::InterruptedNotification
                 | Self::ShutdownRejected
                 | Self::RecoveryDrain
@@ -76,6 +82,7 @@ impl fmt::Display for WorkSource {
             Self::SpawnWelcome => "spawn_welcome",
             Self::TeamMembershipChanged => "team_membership_changed",
             Self::SpawnAttachFailure => "spawn_attach_failure",
+            Self::DeliveryFailureNotification => "delivery_failure_notification",
             Self::IdleNotification => "idle_notification",
             Self::InterruptedNotification => "interrupted_notification",
             Self::ShutdownRejected => "shutdown_rejected",
@@ -104,6 +111,23 @@ mod tests {
     #[test]
     fn mcp_send_message_uses_the_directed_lane() {
         assert_eq!(WorkSource::McpSendMessage.priority(), WorkPriority::Directed);
+    }
+
+    #[test]
+    fn delivery_failure_notification_wakes_the_lead_without_resuming_a_paused_slot() {
+        assert_eq!(
+            WorkSource::DeliveryFailureNotification.priority(),
+            WorkPriority::Background
+        );
+        assert!(WorkSource::DeliveryFailureNotification.requires_mailbox_message());
+        assert!(
+            !WorkSource::DeliveryFailureNotification.resumes_paused_slot(),
+            "the notice is addressed to the lead; it must not un-pause the stalled slot"
+        );
+        assert_eq!(
+            WorkSource::DeliveryFailureNotification.to_string(),
+            "delivery_failure_notification"
+        );
     }
 
     #[test]

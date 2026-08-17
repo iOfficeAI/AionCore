@@ -406,6 +406,21 @@ async fn finalize_failed_delivery(ctx: &AgentLoopContext, batch: &WorkBatch, fai
         "team batch delivery retry limit reached; messages abandoned and slot paused"
     );
     mark_message_ids_read(ctx, batch, &failure.exhausted_message_ids).await;
+    // The slot is now paused and only a user or lead intervention can resume it,
+    // so the lead has to hear about it or it will wait on a teammate forever.
+    if let Err(error) = ctx
+        .session
+        .notify_leader_delivery_exhausted(&ctx.slot_id, failure.exhausted_message_ids.len())
+        .await
+    {
+        warn!(
+            team_id = %ctx.team_id,
+            slot_id = %ctx.slot_id,
+            batch_id = %batch.batch_id,
+            error = %error,
+            "team delivery exhaustion notice to lead failed"
+        );
+    }
 }
 
 async fn mark_message_ids_read(ctx: &AgentLoopContext, batch: &WorkBatch, message_ids: &[String]) {

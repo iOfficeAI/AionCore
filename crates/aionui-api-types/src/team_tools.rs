@@ -331,15 +331,20 @@ fn tool_specs() -> Vec<TeamToolSpec> {
         TeamToolSpec {
             name: TeamToolName::TeamReadMessages,
             permission: TeamToolPermission::AnyTeamAgent,
-            description: "Peek at your own unread team mailbox messages. Each returned message includes message_id. Messages observed during an active turn are marked read only if that turn completes successfully; failed or cancelled turns preserve them for retry. Returns at most the most recent 50 messages in FIFO order; long content is truncated.",
+            description: "Peek at your own unread team mailbox messages. Returns at most the oldest 50 unread messages in FIFO order, each with a message_id. When has_more is true, call again with since_message_id set to the returned next_since_message_id to read the following page. Messages returned in full are marked read only if the current turn completes successfully; failed or cancelled turns preserve them for retry. A message with content_truncated=true is a preview only: it stays unread and is redelivered in full on a later turn, so do not act on it yet.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
-                "properties": {}
+                "properties": {
+                    "since_message_id": {
+                        "type": "string",
+                        "description": "Resume after this message_id; use the next_since_message_id from the previous page"
+                    }
+                }
             }),
             cli_command: &["read-messages"],
             when: "Check queued messages",
-            input_summary: "{}",
+            input_summary: "optional since_message_id",
         },
         TeamToolSpec {
             name: TeamToolName::TeamSendMessage,
@@ -630,6 +635,35 @@ mod tests {
         assert!(!names.contains(&"team_interrupt_agent".to_owned()));
         assert!(names.contains(&"team_read_messages".to_owned()));
         assert!(names.contains(&"team_send_message".to_owned()));
+    }
+
+    #[test]
+    fn read_messages_schema_exposes_only_an_optional_cursor() {
+        let descriptor = team_tool_descriptor("team_read_messages").expect("read messages descriptor");
+        assert_eq!(descriptor.permission, TeamToolPermission::AnyTeamAgent);
+        assert_eq!(descriptor.input_schema["additionalProperties"], json!(false));
+        assert!(
+            descriptor.input_schema.get("required").is_none(),
+            "every argument must stay optional so a bare call still works"
+        );
+        let properties = descriptor.input_schema["properties"].as_object().unwrap();
+        assert_eq!(
+            properties.keys().collect::<Vec<_>>(),
+            vec!["since_message_id"],
+            "the cursor is the only accepted argument"
+        );
+        assert!(
+            descriptor.description.contains("oldest 50"),
+            "the description must state the page starts at the oldest unread message"
+        );
+        assert!(
+            descriptor.description.contains("next_since_message_id"),
+            "has_more needs a documented follow-up path"
+        );
+        assert!(
+            descriptor.description.contains("redelivered in full"),
+            "truncated messages must be documented as previews that stay unread"
+        );
     }
 
     #[test]

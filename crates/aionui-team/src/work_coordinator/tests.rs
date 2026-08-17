@@ -616,7 +616,7 @@ fn observed_messages_complete_with_the_active_batch_and_do_not_requeue() {
     assert_eq!(coordinator.mark_started(&batch, "turn-1"), StartCommitResult::Accepted);
     enqueue(&coordinator, WorkSource::UserMessage, "late");
 
-    let observed = coordinator.observe_messages("lead-1", &["initial".into(), "late".into()]);
+    let observed = coordinator.observe_messages("lead-1", &batch.batch_id, &["initial".into(), "late".into()]);
     assert_eq!(observed.batch_id.as_deref(), Some(batch.batch_id.as_str()));
     assert_eq!(
         observed.observed_count, 1,
@@ -654,7 +654,7 @@ fn observed_messages_remain_queued_when_the_active_batch_fails() {
     };
     coordinator.mark_started(&batch, "turn-1");
     enqueue(&coordinator, WorkSource::UserMessage, "late");
-    coordinator.observe_messages("lead-1", &["late".into()]);
+    coordinator.observe_messages("lead-1", &batch.batch_id, &["late".into()]);
 
     let failure = coordinator.fail_batch(&batch, "turn_failed");
     assert_eq!(failure.commit_result, CommitResult::Committed);
@@ -675,7 +675,7 @@ fn observed_messages_remain_queued_when_the_active_batch_is_cancelled_or_interru
         };
         coordinator.mark_started(&batch, "turn-1");
         enqueue(&coordinator, WorkSource::UserMessage, "late");
-        coordinator.observe_messages("lead-1", &["late".into()]);
+        coordinator.observe_messages("lead-1", &batch.batch_id, &["late".into()]);
 
         if interruption {
             assert_eq!(
@@ -698,6 +698,67 @@ fn observed_messages_remain_queued_when_the_active_batch_is_cancelled_or_interru
     }
 }
 
+/// P3: a `team_read_messages` call that was still in flight when its turn got
+/// replaced must not bind its rows to whatever batch owns the slot now — the new
+/// batch would acknowledge messages its agent never saw.
+#[test]
+fn observations_from_a_replaced_turn_are_dropped_instead_of_rebound() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "initial");
+    let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
+        panic!("initial message must be claimable");
+    };
+    coordinator.mark_started(&first, "turn-1");
+    enqueue(&coordinator, WorkSource::UserMessage, "late");
+
+    // The turn the agent was reading in gets cancelled, and the next batch takes over.
+    assert_eq!(
+        coordinator.cancel_batch(&first, "turn_cancelled"),
+        CommitResult::Committed
+    );
+    let ReconcileDecision::Claim(second) = coordinator.next("lead-1") else {
+        panic!("late message must start the next batch");
+    };
+    coordinator.mark_started(&second, "turn-2");
+    assert_ne!(first.batch_id, second.batch_id);
+
+    // The in-flight tool call finally lands, still carrying the old batch id.
+    let observed = coordinator.observe_messages("lead-1", &first.batch_id, &["late".into()]);
+    assert_eq!(observed.batch_id, None, "a stale observation is rejected");
+    assert_eq!(observed.observed_count, 0);
+    assert!(
+        coordinator
+            .slot_snapshot("lead-1")
+            .unwrap()
+            .active_batch
+            .unwrap()
+            .observed_message_ids
+            .is_empty(),
+        "the replacement batch must not inherit the stale observation"
+    );
+}
+
+#[test]
+fn active_batch_id_tracks_turn_ownership() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    assert_eq!(coordinator.active_batch_id("lead-1"), None, "no slot, no turn");
+
+    enqueue(&coordinator, WorkSource::UserMessage, "initial");
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("initial message must be claimable");
+    };
+    assert_eq!(coordinator.active_batch_id("lead-1").as_ref(), Some(&batch.batch_id));
+
+    coordinator.complete_batch_with_ack(&batch);
+    assert_eq!(
+        coordinator.active_batch_id("lead-1"),
+        None,
+        "ownership is released with the batch"
+    );
+}
+
 #[test]
 fn messages_arriving_after_observation_are_left_for_the_next_batch() {
     let coordinator = coordinator();
@@ -708,7 +769,7 @@ fn messages_arriving_after_observation_are_left_for_the_next_batch() {
     };
     coordinator.mark_started(&batch, "turn-1");
     enqueue(&coordinator, WorkSource::UserMessage, "observed");
-    coordinator.observe_messages("lead-1", &["observed".into()]);
+    coordinator.observe_messages("lead-1", &batch.batch_id, &["observed".into()]);
     enqueue(&coordinator, WorkSource::UserMessage, "after-read");
 
     let completion = coordinator.complete_batch_with_ack(&batch);

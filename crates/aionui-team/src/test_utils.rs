@@ -129,6 +129,24 @@ impl ITeamRepository for MockTeamRepo {
         Ok(result)
     }
 
+    /// Filters directly instead of delegating to `peek_unread` so the
+    /// snapshot/release race hooks above stay bound to `peek_unread` alone.
+    async fn peek_unread_by_ids(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        to_agent_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        let state = self.state.lock().unwrap();
+        Ok(state
+            .messages
+            .iter()
+            .filter(|m| m.team_id == team_id && m.to_agent_id == to_agent_id && !m.read && ids.contains(&m.id))
+            .cloned()
+            .collect())
+    }
+
     async fn mark_read_batch(&self, _user_id: &str, team_id: &str, ids: &[String]) -> Result<(), DbError> {
         let mut state = self.state.lock().unwrap();
         for msg in &mut state.messages {
@@ -717,6 +735,28 @@ pub(crate) mod workspace_harness {
                 .collect())
         }
 
+        async fn peek_unread_by_ids(
+            &self,
+            _user_id: &str,
+            team_id: &str,
+            to_agent_id: &str,
+            ids: &[String],
+        ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+            Ok(self
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|message| {
+                    message.team_id == team_id
+                        && message.to_agent_id == to_agent_id
+                        && !message.read
+                        && ids.contains(&message.id)
+                })
+                .cloned()
+                .collect())
+        }
+
         async fn mark_read_batch(&self, _user_id: &str, team_id: &str, ids: &[String]) -> Result<(), DbError> {
             for message in self.messages.lock().unwrap().iter_mut() {
                 if message.team_id == team_id && ids.contains(&message.id) {
@@ -741,7 +781,7 @@ pub(crate) mod workspace_harness {
                 .filter(|message| message.team_id == team_id && message.to_agent_id == to_agent_id)
                 .cloned()
                 .collect();
-            messages.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+            messages.sort_by_key(|message| std::cmp::Reverse(message.created_at));
             messages.truncate(limit.unwrap_or(i64::MAX).max(0) as usize);
             Ok(messages)
         }
@@ -759,7 +799,7 @@ pub(crate) mod workspace_harness {
                 .filter(|message| message.team_id == team_id)
                 .cloned()
                 .collect();
-            messages.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+            messages.sort_by_key(|message| std::cmp::Reverse(message.created_at));
             messages.truncate(limit.max(0) as usize);
             Ok(messages)
         }

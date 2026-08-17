@@ -124,6 +124,14 @@ struct TeamStdioServer {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadMessagesParams {
+    /// Resume after this message_id; use the next_since_message_id from the previous page.
+    #[serde(default)]
+    since_message_id: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct SendMessageParams {
     /// Target agent slot_id or "*" for broadcast.
     to: String,
@@ -278,10 +286,15 @@ struct DescribeAssistantParams {
 impl TeamStdioServer {
     #[tool(
         name = "team_read_messages",
-        description = "Peek at your own unread team mailbox messages. Each returned message includes message_id. Messages observed during an active turn are marked read only if that turn completes successfully; failed or cancelled turns preserve them for retry. Returns at most the most recent 50 messages in FIFO order; long content is truncated."
+        description = "Peek at your own unread team mailbox messages. Returns at most the oldest 50 unread messages in FIFO order, each with a message_id. When has_more is true, call again with since_message_id set to the returned next_since_message_id to read the following page. Messages returned in full are marked read only if the current turn completes successfully; failed or cancelled turns preserve them for retry. A message with content_truncated=true is a preview only: it stays unread and is redelivered in full on a later turn, so do not act on it yet."
     )]
-    async fn read_messages(&self) -> CallToolResult {
-        self.forward_to_tcp("team_read_messages", &serde_json::json!({})).await
+    async fn read_messages(&self, Parameters(params): Parameters<ReadMessagesParams>) -> CallToolResult {
+        let mut arguments = serde_json::Map::new();
+        if let Some(since_message_id) = params.since_message_id {
+            arguments.insert("since_message_id".into(), serde_json::Value::String(since_message_id));
+        }
+        self.forward_to_tcp("team_read_messages", &serde_json::Value::Object(arguments))
+            .await
     }
 
     #[tool(

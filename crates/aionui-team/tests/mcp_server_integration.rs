@@ -310,7 +310,7 @@ async fn mc3_no_token_rejected() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tools_list_returns_all_12_tools() {
+async fn tools_list_returns_all_13_tools() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
@@ -513,6 +513,85 @@ async fn team_send_message_regular_message_rejects_without_live_team_run_service
     assert!(text.contains("Team service not available"));
     assert!(!text.contains("shutdown_approved_received"));
     assert!(!text.contains("shutdown_rejected_received"));
+
+    env.server.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Tests: team_read_messages argument contract on the real wire
+// ---------------------------------------------------------------------------
+
+/// The tool's schema must reach the wire, so an agent can discover the cursor.
+#[tokio::test]
+async fn read_messages_advertises_only_an_optional_cursor_over_the_wire() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
+
+    let req = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
+    send_request(&mut stream, &req).await;
+    let resp = read_response(&mut stream).await;
+    let tool = resp["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "team_read_messages")
+        .expect("team_read_messages must be visible to a teammate")
+        .clone();
+
+    // NOTE: `tools/list` serializes `TeamToolDescriptor` verbatim, so the wire key is
+    // `input_schema`. The `inputSchema` projection is only used for the prompt dump.
+    let schema = &tool["input_schema"];
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert!(
+        schema.get("required").is_none(),
+        "a bare team_read_messages call must stay valid"
+    );
+    assert!(
+        schema["properties"]["since_message_id"]["type"] == "string",
+        "the paging cursor must be discoverable, got {schema}"
+    );
+
+    env.server.stop();
+}
+
+/// Argument validation happens before the service lookup, so it is observable
+/// even in this standalone env (no live `TeamSessionService`, same as
+/// `sp1_lead_spawn_requires_live_session_service`). The deeper peek → observe →
+/// acknowledge path is covered by the `src/session.rs` lib tests that wire a
+/// real session and coordinator.
+#[tokio::test]
+async fn read_messages_rejects_unknown_arguments_before_touching_the_service() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
+
+    let resp = call_tool(&mut stream, 2, "team_read_messages", json!({"limit": 10})).await;
+    assert!(is_error_response(&resp));
+    let text = extract_text(&resp);
+    assert!(
+        text.starts_with("Invalid params:"),
+        "an unknown argument must fail schema validation, got {text:?}"
+    );
+    assert!(
+        !text.contains("Team service not available"),
+        "validation must run before the service lookup, got {text:?}"
+    );
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn read_messages_accepts_a_bare_call_and_a_cursor() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
+
+    for (id, args) in [(2, json!({})), (3, json!({"since_message_id": "message-01"}))] {
+        let resp = call_tool(&mut stream, id, "team_read_messages", args.clone()).await;
+        let text = extract_text(&resp);
+        assert!(
+            text.contains("Team service not available"),
+            "{args} must pass validation and reach the service lookup, got {text:?}"
+        );
+    }
 
     env.server.stop();
 }
