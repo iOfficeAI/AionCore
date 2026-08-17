@@ -1413,21 +1413,23 @@ fn tool_call_display_name(name: &str, input: &Value) -> String {
         }
     }
 
-    let field = |key: &str| {
+    let raw = |key: &str| {
         input
             .get(key)
             .and_then(Value::as_str)
-            .map(bounded)
+            .map(str::trim)
             .filter(|s| !s.is_empty())
     };
-    // The trailing path segment; a path ending in a separator falls back to the
-    // whole (bounded) value rather than yielding an empty label.
+    let field = |key: &str| raw(key).map(bounded).filter(|s| !s.is_empty());
+    // The trailing path segment, taken from the RAW value and bounded only
+    // afterwards. Bounding first would cut a real project path (well over
+    // MAX_DETAIL_CHARS) mid-directory and leave that fragment as the "file
+    // name": `.../components/Markdown/CodeBlock.tsx` became "Markdown…".
+    // A path ending in a separator falls back to the whole value.
     let file_name = || {
-        field("file_path").map(|path| {
-            path.rsplit(['/', '\\'])
-                .find(|seg| !seg.is_empty())
-                .unwrap_or(&path)
-                .to_string()
+        raw("file_path").map(|path| {
+            let tail = path.rsplit(['/', '\\']).find(|seg| !seg.is_empty()).unwrap_or(path);
+            bounded(tail)
         })
     };
 
@@ -1448,6 +1450,16 @@ fn tool_call_display_name(name: &str, input: &Value) -> String {
         "WebSearch" | "ToolSearch" => labeled("Search", field("query")),
         "WebFetch" => labeled("Fetch", field("url")),
         "Skill" => labeled("Skill", field("skill")),
+        // A plan is a run of TaskCreate calls; without the subject they all read
+        // identically and the work is only visible after expanding each row.
+        "TaskCreate" => field("subject").unwrap_or_else(|| name.to_string()),
+        "TaskUpdate" => match (field("taskId"), field("status")) {
+            (Some(id), Some(status)) => format!("Task {id} → {status}"),
+            (Some(id), None) => format!("Task {id}"),
+            _ => name.to_string(),
+        },
+        "TaskStop" => labeled("Stop task", field("task_id")),
+        "SendMessage" => labeled("Message", field("to")),
         // Unverified shape (every mcp__* tool lands here): keep claude's name.
         _ => name.to_string(),
     }
@@ -2139,6 +2151,41 @@ mod tests {
         );
     }
 
+    /// A REAL project path is longer than the detail bound, and the bound must
+    /// not be applied before the file name is extracted — doing so truncates the
+    /// path mid-directory and leaves that directory fragment as the "file name":
+    /// `.../renderer/components/Markdown/CodeBlock.tsx` (116 chars) rendered as
+    /// "Read Ma…" because the cut landed inside "Markdown".
+    #[test]
+    fn long_paths_still_yield_the_file_name() {
+        for (path, expected) in [
+            (
+                "/Users/z/Documents/github/AionUi-worktrees/rtl/packages/desktop/src/renderer/components/Markdown/CodeBlock.tsx",
+                "Read CodeBlock.tsx",
+            ),
+            (
+                "/Users/z/Documents/github/AionUi-worktrees/rtl/packages/desktop/src/renderer/services/i18n/index.ts",
+                "Read index.ts",
+            ),
+        ] {
+            assert!(path.chars().count() > 96, "fixture must exceed the detail bound");
+            assert_eq!(
+                tool_call_display_name("Read", &serde_json::json!({"file_path": path})),
+                expected
+            );
+        }
+    }
+
+    /// A pathological file NAME (not path) still has to be bounded.
+    #[test]
+    fn an_absurdly_long_file_name_is_still_elided() {
+        let name = format!("{}.rs", "n".repeat(200));
+        let label = tool_call_display_name("Write", &serde_json::json!({"file_path": format!("/a/b/{name}")}));
+        assert!(label.starts_with("Write nnn"), "label: {label}");
+        assert!(label.ends_with('…'), "an over-long file name must be elided: {label}");
+        assert!(label.chars().count() <= 103, "label was not bounded: {label}");
+    }
+
     #[test]
     fn file_tool_labels_show_the_file_name_not_the_whole_path() {
         // A full path is mostly shared prefix; the tail (the part that matters)
@@ -2161,6 +2208,45 @@ mod tests {
         assert_eq!(
             tool_call_display_name("Grep", &serde_json::json!({"pattern": "tool_call_display_name"})),
             "Search tool_call_display_name"
+        );
+    }
+
+    /// The task/messaging tools were left on the bare name by #870, so a plan of
+    /// five `TaskCreate` steps read as five identical rows — the subject was only
+    /// visible after expanding each one. Shapes from real traffic:
+    /// `TaskCreate {activeForm, description, subject}` (26 rows),
+    /// `TaskUpdate {status, taskId}` (37), `TaskStop {task_id}` (14),
+    /// `SendMessage {to, message, …}` (12).
+    #[test]
+    fn task_and_messaging_tools_say_what_they_act_on() {
+        assert_eq!(
+            tool_call_display_name(
+                "TaskCreate",
+                &serde_json::json!({
+                    "subject": "P1: dir/lang sync + Arco rtl + LTR code islands",
+                    "description": "Add direction.ts helper …",
+                    "activeForm": "Implementing P1 direction plumbing"
+                })
+            ),
+            "P1: dir/lang sync + Arco rtl + LTR code islands"
+        );
+        assert_eq!(
+            tool_call_display_name("TaskUpdate", &serde_json::json!({"taskId": "3", "status": "completed"})),
+            "Task 3 → completed"
+        );
+        // A status-less update still names the task rather than falling back to
+        // the tool name.
+        assert_eq!(
+            tool_call_display_name("TaskUpdate", &serde_json::json!({"taskId": "3"})),
+            "Task 3"
+        );
+        assert_eq!(
+            tool_call_display_name("TaskStop", &serde_json::json!({"task_id": "b4p422pva"})),
+            "Stop task b4p422pva"
+        );
+        assert_eq!(
+            tool_call_display_name("SendMessage", &serde_json::json!({"to": "reviewer", "message": "ping"})),
+            "Message reviewer"
         );
     }
 
