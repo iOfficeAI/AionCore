@@ -432,7 +432,8 @@ impl ClaudeAdapter {
                     }
                 }
                 "tool_use" => {
-                    let name = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                    let raw_name = b.get("name").and_then(Value::as_str).unwrap_or("");
+                    let name = raw_name.to_string();
                     // #486 (parity with aionrs output_sink): DROP a malformed empty-name
                     // tool_use before it reaches persistence. claude occasionally emits a
                     // tool_use block with a missing/blank `name`; emitting it produces a
@@ -444,16 +445,20 @@ impl ClaudeAdapter {
                     if name.trim().is_empty() {
                         tracing::warn!(item_id = %item_id, "claude tool_use has an empty name; dropping malformed call");
                     } else {
+                        let input = b.get("input").cloned().unwrap_or(Value::Null);
                         out.push(SessionEvent::ToolCall {
                             tool_use_id: b.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
-                            name,
+                            // Presentation only: a bare tool name ("Bash" × 73% of all
+                            // calls) says nothing about what the step is doing. The raw
+                            // `input` below is untouched.
+                            name: tool_call_display_name(raw_name, &input),
                             // 002/F1 single-agent path: inline tool. subagent topology
                             // (Task/Workflow → Spawned/Workflow) is the new ClaudeConnection's
                             // job (007 §9.14); this legacy adapter stays Inline.
                             subagent: crate::event::SubagentKind::Inline,
                             // Gap #4 / H2: carry the tool ARGUMENTS (Anthropic `input` object).
                             // Absent → Value::Null. TIO-13: never logged at info.
-                            input: b.get("input").cloned().unwrap_or(Value::Null),
+                            input,
                             // 009 H5: attribute to the subagent's turn (frame-level), main = None.
                             parent_tool_use_id: parent_tool_use_id.clone(),
                         });
@@ -1374,6 +1379,80 @@ async fn write_ndjson_line(stdin: &mut BoxedStdin, value: &Value) -> Result<(), 
     Ok(())
 }
 
+/// Turn a claude `tool_use` into a compact, user-facing step label.
+///
+/// A bare tool name is useless in the step list — "Bash" three times in a row
+/// says nothing about what ran. Mirrors what `command_execution_display_name`
+/// does for codex's `commandExecution`: presentation only, the raw `input` still
+/// rides along on `ToolCall.input`, so no detail is discarded.
+///
+/// Shapes are taken from real traffic (10969 persisted `tool_call` rows), not
+/// from assumptions about the tool set:
+/// - `Bash`/`Monitor` `{command, description}` — `description` is authored for
+///   humans, so it wins; the command is the fallback
+/// - `Read`/`Edit`/`Write` `{file_path, …}` — the file NAME, since a full path
+///   is mostly shared prefix and the meaningful tail is what truncation eats
+/// - `Grep` `{pattern}`, `WebSearch`/`ToolSearch` `{query}`, `Skill` `{skill}`,
+///   `WebFetch` `{url}`, `Agent`/`Task` `{description}`
+///
+/// Anything else — including every `mcp__*` tool, whose input shape we have not
+/// verified — keeps the name claude gave it. Never guess a shape.
+fn tool_call_display_name(name: &str, input: &Value) -> String {
+    const MAX_DETAIL_CHARS: usize = 96;
+
+    fn bounded(value: &str) -> String {
+        // Collapse all whitespace runs: a heredoc command must not turn one
+        // step into a wall of text.
+        let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut chars = value.chars();
+        let head: String = chars.by_ref().take(MAX_DETAIL_CHARS).collect();
+        if chars.next().is_some() {
+            format!("{head}…")
+        } else {
+            head
+        }
+    }
+
+    let field = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_str)
+            .map(bounded)
+            .filter(|s| !s.is_empty())
+    };
+    // The trailing path segment; a path ending in a separator falls back to the
+    // whole (bounded) value rather than yielding an empty label.
+    let file_name = || {
+        field("file_path").map(|path| {
+            path.rsplit(['/', '\\'])
+                .find(|seg| !seg.is_empty())
+                .unwrap_or(&path)
+                .to_string()
+        })
+    };
+
+    let labeled = |verb: &str, detail: Option<String>| match detail {
+        Some(detail) => format!("{verb} {detail}"),
+        None => format!("{verb} command"),
+    };
+
+    match name {
+        // claude authors `description` for a human reader — prefer it verbatim.
+        "Bash" | "Monitor" => field("description").unwrap_or_else(|| labeled("Run", field("command"))),
+        "Agent" | "Task" => field("description").unwrap_or_else(|| name.to_string()),
+        "Read" => labeled("Read", file_name()),
+        "Edit" | "NotebookEdit" => labeled("Edit", file_name()),
+        "Write" => labeled("Write", file_name()),
+        "Grep" => labeled("Search", field("pattern")),
+        "Glob" => labeled("Glob", field("pattern")),
+        "WebSearch" | "ToolSearch" => labeled("Search", field("query")),
+        "WebFetch" => labeled("Fetch", field("url")),
+        "Skill" => labeled("Skill", field("skill")),
+        // Unverified shape (every mcp__* tool lands here): keep claude's name.
+        _ => name.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1611,7 +1690,10 @@ mod tests {
                 },
             ] => {
                 assert_eq!(tool_use_id, "t-ok");
-                assert_eq!(name, "Read");
+                // `name` is the user-facing step label now, not the bare tool
+                // name — `Read {file_path:"/x"}` reads as "Read x". The raw tool
+                // identity and arguments still live in `input`, pinned below.
+                assert_eq!(name, "Read x");
                 // The tool ARGUMENTS (Gap #4 / H2) are load-bearing — the conversation
                 // layer renders/persists them. A regression that dropped `input` would
                 // pass a name-only assertion, so pin the full payload here.
@@ -2019,8 +2101,123 @@ mod tests {
         assert!(
             consolidated
                 .iter()
-                .any(|e| matches!(e, SessionEvent::ToolCall { name, .. } if name == "Bash")),
+                .any(|e| matches!(e, SessionEvent::ToolCall { tool_use_id, .. } if tool_use_id == "t1")),
             "tool_use is never deduped, got {consolidated:?}"
+        );
+    }
+
+    /// Step labels must say what the tool is DOING, not just name the tool.
+    /// Shapes below are the real ones (10969 persisted tool_call rows on this
+    /// machine): Bash/Monitor carry `{command, description}`, Read/Edit/Write
+    /// carry `file_path`, Grep carries `pattern`, Agent/Task carry
+    /// `description`, WebSearch/ToolSearch carry `query`.
+    #[test]
+    fn tool_call_label_prefers_claudes_own_description() {
+        // Bash is 73% of all calls and already ships a human-readable
+        // description — use it verbatim.
+        assert_eq!(
+            tool_call_display_name(
+                "Bash",
+                &serde_json::json!({"command": "cargo test -p aionui-session", "description": "Re-run format tests"})
+            ),
+            "Re-run format tests"
+        );
+        // No description → fall back to the command itself.
+        assert_eq!(
+            tool_call_display_name("Bash", &serde_json::json!({"command": "ls -la"})),
+            "Run ls -la"
+        );
+        // Neither → a bare verb, never an empty label.
+        assert_eq!(tool_call_display_name("Bash", &serde_json::json!({})), "Run command");
+        // Agent/Task also carry a description.
+        assert_eq!(
+            tool_call_display_name(
+                "Agent",
+                &serde_json::json!({"description": "Audit the login flow", "prompt": "…"})
+            ),
+            "Audit the login flow"
+        );
+    }
+
+    #[test]
+    fn file_tool_labels_show_the_file_name_not_the_whole_path() {
+        // A full path is mostly shared prefix; the tail (the part that matters)
+        // is exactly what gets truncated away. Show the file name instead.
+        assert_eq!(
+            tool_call_display_name(
+                "Read",
+                &serde_json::json!({"file_path": "/Users/z/repo/tests/unit/renderer/i18nFormat.test.ts"})
+            ),
+            "Read i18nFormat.test.ts"
+        );
+        assert_eq!(
+            tool_call_display_name("Edit", &serde_json::json!({"file_path": "/a/b/service.rs"})),
+            "Edit service.rs"
+        );
+        assert_eq!(
+            tool_call_display_name("Write", &serde_json::json!({"file_path": "/a/b/new_mod.rs"})),
+            "Write new_mod.rs"
+        );
+        assert_eq!(
+            tool_call_display_name("Grep", &serde_json::json!({"pattern": "tool_call_display_name"})),
+            "Search tool_call_display_name"
+        );
+    }
+
+    #[test]
+    fn unrecognized_and_mcp_tools_keep_their_own_name() {
+        // Never guess at a shape we have not verified — an unknown tool keeps
+        // the name claude gave it.
+        for name in [
+            "mcp__sentry__search_issues",
+            "mcp__aionui-team__team_send_message",
+            "AskUserQuestion",
+            "TodoWrite",
+        ] {
+            assert_eq!(
+                tool_call_display_name(name, &serde_json::json!({"whatever": 1})),
+                name,
+                "unknown tool must keep its name"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_call_labels_are_bounded_and_single_line() {
+        // A pasted heredoc must not turn one step into a wall of text.
+        let long = "x".repeat(400);
+        let label = tool_call_display_name("Bash", &serde_json::json!({"command": long}));
+        assert!(label.starts_with("Run xxx"), "label: {label}");
+        assert!(label.ends_with('…'), "long label must be elided: {label}");
+        assert!(label.chars().count() <= 101, "label was not bounded: {label}");
+
+        let multi = tool_call_display_name(
+            "Bash",
+            &serde_json::json!({"description": "line one\nline two\r\nline three"}),
+        );
+        assert_eq!(multi, "line one line two line three");
+    }
+
+    /// The label must reach the emitted event, not just exist as a helper.
+    #[test]
+    fn parsed_tool_use_carries_the_label_as_its_name() {
+        let mut a = ClaudeAdapter::default();
+        let frame = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t9","name":"Bash","input":{"command":"git status","description":"Show working tree status"}}]}}"#;
+        let events = a.parse_chunk(format!("{frame}\n").as_bytes());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::ToolCall { name, .. } if name == "Show working tree status")),
+            "the ToolCall must carry the readable label, got {events:?}"
+        );
+        // The raw input is still there — this changes presentation only.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SessionEvent::ToolCall { input, .. }
+                    if input.get("command").and_then(serde_json::Value::as_str) == Some("git status")
+            )),
+            "raw input must be preserved, got {events:?}"
         );
     }
 
