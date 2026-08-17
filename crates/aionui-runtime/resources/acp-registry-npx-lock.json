@@ -29,12 +29,12 @@
     "glm-acp-agent": {
       "registry_json_id": "glm-acp-agent",
       "package": "glm-acp-agent",
-      "version": "1.3.0"
+      "version": "1.5.0"
     },
     "grok": {
       "registry_json_id": "grok-build",
       "package": "@xai-official/grok",
-      "version": "1.0.4"
+      "version": "1.0.5"
     },
     "kilo": {
       "registry_json_id": "kilo",
@@ -48,7 +48,7 @@
     "nova": {
       "registry_json_id": "nova",
       "package": "@compass-ai/nova",
-      "version": "1.1.34"
+      "version": "1.1.35"
     },
     "pi": {
       "registry_json_id": "pi-acp",
