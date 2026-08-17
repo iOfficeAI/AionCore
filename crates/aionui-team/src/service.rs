@@ -87,6 +87,29 @@ pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &
     }
 }
 
+/// Why a member's model selection is being persisted. Decides whether a runtime
+/// that is mid-start may block the write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelPersistTrigger {
+    /// A direct preference update from the model endpoint. Nothing has been
+    /// applied yet, so a runtime that is mid-start is a legitimate reason to
+    /// refuse — the caller can retry once it settles.
+    ExplicitRequest,
+    /// The member's runtime has already accepted the switch through the generic
+    /// config-option path. Persistence must go through regardless of runtime
+    /// state: refusing would leave the roster disagreeing with a live runtime.
+    RuntimeConfirmed,
+}
+
+impl ModelPersistTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitRequest => "explicit_request",
+            Self::RuntimeConfirmed => "runtime_confirmed",
+        }
+    }
+}
+
 struct SessionEntry {
     session: Arc<TeamSession>,
     slow_monitor_handle: tokio::task::JoinHandle<()>,
@@ -307,59 +330,86 @@ impl TeamSessionService {
                 .into_iter()
                 .filter(|agent| agent.assistant_id.as_deref() == Some(event.assistant_id.as_str()))
             {
-                let fingerprint = match self
-                    .provisioner()
-                    .refresh_agent_mcp_snapshot(&event.user_id, &agent)
-                    .await
+                self.refresh_member_mcp_binding(&session, &event.user_id, &agent).await;
+            }
+        }
+    }
+
+    /// Re-resolve the MCP binding of EVERY member in EVERY active session.
+    ///
+    /// Recovery path for when binding-change events were missed rather than
+    /// observed — the shared event bus can drop events under load, and a dropped
+    /// event would otherwise leave a member running a stale MCP set until its
+    /// next attach. Idempotent: members whose fingerprint already matches take
+    /// the `Unchanged` branch and are left alone.
+    pub async fn reconcile_all_assistant_mcp_bindings(&self) {
+        let sessions = self
+            .sessions
+            .iter()
+            .map(|entry| Arc::clone(&entry.session))
+            .collect::<Vec<_>>();
+        let session_count = sessions.len();
+        let mut member_count = 0usize;
+        for session in sessions {
+            let user_id = session.user_id().to_owned();
+            for agent in session.scheduler().list_agents().await {
+                member_count += 1;
+                self.refresh_member_mcp_binding(&session, &user_id, &agent).await;
+            }
+        }
+        info!(
+            session_count,
+            member_count, "reconciled assistant MCP bindings across active team sessions"
+        );
+    }
+
+    /// Refresh one member's persisted MCP snapshot and decide what to do with its
+    /// runtime: leave dormant/failed slots alone, defer while attaching or
+    /// removing, and restart a ready idle runtime so it picks the new set up.
+    async fn refresh_member_mcp_binding(&self, session: &Arc<TeamSession>, user_id: &str, agent: &TeamAgent) {
+        let fingerprint = match self.provisioner().refresh_agent_mcp_snapshot(user_id, agent).await {
+            Ok(Some(fingerprint)) => fingerprint,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(
+                    team_id = session.team_id(),
+                    slot_id = agent.slot_id,
+                    assistant_id = agent.assistant_id.as_deref().unwrap_or_default(),
+                    error = %error,
+                    "assistant MCP snapshot refresh failed"
+                );
+                return;
+            }
+        };
+        match session.member_runtimes().snapshot(&agent.slot_id) {
+            MemberRuntimeSnapshot::Absent
+            | MemberRuntimeSnapshot::Failed { .. }
+            | MemberRuntimeSnapshot::SessionStopped => {}
+            MemberRuntimeSnapshot::Attaching { .. } | MemberRuntimeSnapshot::Removing { .. } => {
+                session
+                    .work_coordinator()
+                    .defer_mcp_refresh(&agent.slot_id, &fingerprint);
+            }
+            MemberRuntimeSnapshot::Ready => {
+                match session
+                    .work_coordinator()
+                    .request_mcp_refresh(&agent.slot_id, &fingerprint)
                 {
-                    Ok(Some(fingerprint)) => fingerprint,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        warn!(
-                            team_id = session.team_id(),
-                            slot_id = agent.slot_id,
-                            assistant_id = event.assistant_id,
-                            error = %error,
-                            "assistant MCP snapshot refresh failed"
-                        );
-                        continue;
-                    }
-                };
-                match session.member_runtimes().snapshot(&agent.slot_id) {
-                    MemberRuntimeSnapshot::Absent
-                    | MemberRuntimeSnapshot::Failed { .. }
-                    | MemberRuntimeSnapshot::SessionStopped => {}
-                    MemberRuntimeSnapshot::Attaching { .. } | MemberRuntimeSnapshot::Removing { .. } => {
-                        session
-                            .work_coordinator()
-                            .defer_mcp_refresh(&agent.slot_id, &fingerprint);
-                    }
-                    MemberRuntimeSnapshot::Ready => {
-                        match session
-                            .work_coordinator()
-                            .request_mcp_refresh(&agent.slot_id, &fingerprint)
+                    McpRefreshDisposition::Unchanged | McpRefreshDisposition::Deferred => {}
+                    McpRefreshDisposition::RestartNow => {
+                        if let Err(error) = self
+                            .restart_agent_runtime_for_mcp_refresh(user_id, session.team_id(), &agent.slot_id)
+                            .await
                         {
-                            McpRefreshDisposition::Unchanged | McpRefreshDisposition::Deferred => {}
-                            McpRefreshDisposition::RestartNow => {
-                                if let Err(error) = self
-                                    .restart_agent_runtime_for_mcp_refresh(
-                                        &event.user_id,
-                                        session.team_id(),
-                                        &agent.slot_id,
-                                    )
-                                    .await
-                                {
-                                    session
-                                        .work_coordinator()
-                                        .defer_mcp_refresh(&agent.slot_id, &fingerprint);
-                                    warn!(
-                                        team_id = session.team_id(),
-                                        slot_id = agent.slot_id,
-                                        error = %error,
-                                        "assistant MCP runtime refresh deferred after restart race"
-                                    );
-                                }
-                            }
+                            session
+                                .work_coordinator()
+                                .defer_mcp_refresh(&agent.slot_id, &fingerprint);
+                            warn!(
+                                team_id = session.team_id(),
+                                slot_id = agent.slot_id,
+                                error = %error,
+                                "assistant MCP runtime refresh deferred after restart race"
+                            );
                         }
                     }
                 }
@@ -783,8 +833,12 @@ impl TeamSessionService {
         // Project-bind side branch: lazily backfill binding only when a single
         // team is opened (never during list_teams / lease renew).
         self.backfill_team_binding_best_effort(&row).await;
-        let mut team = Team::from_row(&row)?;
-        self.reconcile_legacy_team_models(user_id, team_id, &mut team).await?;
+        let team = Team::from_row(&row)?;
+        // Deliberately does NOT reconcile legacy model facts. That repair reads
+        // three extra tables PER MEMBER, and this is a plain read endpoint the
+        // frontend hits whenever a team is opened. Session start owns the repair
+        // (`ensure_session`), which is the point where a stale roster would
+        // actually feed a rebuilt runtime.
         self.build_team_response(user_id, &team).await
     }
 
@@ -1127,7 +1181,27 @@ impl TeamSessionService {
         if model.is_empty() {
             return Err(TeamError::InvalidRequest("model must not be empty".into()));
         }
+        self.persist_member_model_selection(user_id, team_id, slot_id, model, ModelPersistTrigger::ExplicitRequest)
+            .await
+    }
 
+    /// Record that a team member's model is now `model`, in every place a rebuilt
+    /// member runtime reads it from.
+    ///
+    /// Sole implementation on purpose. A model switch has to land in three places
+    /// — the conversation's persisted runtime state, the team roster, and the live
+    /// session's in-memory agent — and both entry points (the explicit model
+    /// endpoint and the generic config-option path) must update all three.
+    /// Previously each did half and the frontend chained them, so a failure
+    /// between the two calls left the runtime switched and the roster stale.
+    async fn persist_member_model_selection(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        model: &str,
+        trigger: ModelPersistTrigger,
+    ) -> Result<(), TeamError> {
         let lock = self
             .add_agent_locks
             .entry(team_id.to_owned())
@@ -1141,7 +1215,11 @@ impl TeamSessionService {
             .find(|agent| agent.slot_id == slot_id)
             .cloned()
             .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
-        if self.member_runtime_is_starting(team_id, &target.slot_id) {
+        // Only an explicit preference update is refused mid-start. When the
+        // runtime has ALREADY accepted the switch, refusing here would drop the
+        // persistence and silently revert the member on its next rebuild.
+        if trigger == ModelPersistTrigger::ExplicitRequest && self.member_runtime_is_starting(team_id, &target.slot_id)
+        {
             return Err(Self::member_runtime_starting_error(team_id, &target));
         }
         let agent = team
@@ -1171,7 +1249,11 @@ impl TeamSessionService {
         }
         info!(
             team_id,
-            slot_id, conversation_id, model, "team agent model preference persisted"
+            slot_id,
+            conversation_id,
+            model,
+            trigger = trigger.as_str(),
+            "team agent model preference persisted"
         );
         Ok(())
     }
@@ -1768,10 +1850,51 @@ impl TeamSessionService {
         {
             return Err(Self::member_runtime_starting_error(team_id, starting_member));
         }
+        // Matches the frontend's own model-option lookup (category first, then a
+        // literal `model` id), so both sides agree on which option is the model.
+        let is_model_option = options.config_options.iter().any(|option| {
+            option.id == option_id && (option.category.as_deref() == Some("model") || option.id == "model")
+        });
+        let slot_id = member.slot_id.clone();
+        // Captured before the call moves `request`. This is the value to persist,
+        // NOT the option's `current_value` in the response: a `PendingNextTurn`
+        // confirmation deliberately still reads back the OLD value, so echoing the
+        // readback would persist the model the user just switched away from.
+        let requested_model = is_model_option.then(|| request.value.trim().to_owned());
 
-        self.conversation_port
+        let response = self
+            .conversation_port
             .set_config_option(conversation_id, option_id, request)
-            .await
+            .await?;
+
+        // The runtime accepted the switch, so the roster and the persisted
+        // conversation state must follow — including for `PendingNextTurn`, where
+        // the value governs from the next turn and would otherwise be lost on the
+        // next rebuild. A persistence failure must NOT be reported as a failed
+        // switch, because the switch already happened; log it and let the
+        // session-start reconcile repair the roster.
+        if let Some(model) = requested_model.filter(|value| !value.is_empty())
+            && let Err(error) = self
+                .persist_member_model_selection(
+                    user_id,
+                    team_id,
+                    &slot_id,
+                    &model,
+                    ModelPersistTrigger::RuntimeConfirmed,
+                )
+                .await
+        {
+            warn!(
+                team_id,
+                slot_id,
+                conversation_id,
+                model,
+                error = %error,
+                "team member model switch applied but could not be persisted"
+            );
+        }
+
+        Ok(response)
     }
 
     fn member_runtime_is_starting(&self, team_id: &str, slot_id: &str) -> bool {

@@ -393,7 +393,8 @@ pub(crate) mod workspace_harness {
     use aionui_ai_agent::{AgentError, IWorkerTaskManager};
     use aionui_api_types::{
         AcpConfigOptionDto, AcpConfigSelectOptionDto, ConfigOptionConfirmation, CreateTeamRequest,
-        GetConfigOptionsResponse, SessionMcpServer, SetConfigOptionRequest, SetConfigOptionResponse, WebSocketMessage,
+        GetConfigOptionsResponse, SessionMcpServer, SetConfigOptionRequest, SetConfigOptionResponse, TeamMcpSelection,
+        WebSocketMessage,
     };
     use aionui_common::{AgentKillReason, AgentType, PaginatedResult, now_ms};
     use aionui_db::models::{
@@ -417,6 +418,7 @@ pub(crate) mod workspace_harness {
     };
     use crate::provisioning::{
         TeamConversationCreateRequest, TeamConversationCreateResult, TeamConversationProvisioningPort,
+        TeamMcpSnapshotResolution,
     };
     use crate::{TeamError, TeamProjectionMessageStore, TeamSessionService};
 
@@ -1004,6 +1006,28 @@ pub(crate) mod workspace_harness {
                 conversation_id: id,
                 workspace,
             })
+        }
+
+        // This harness deliberately models NO assistant MCP bindings: the tests
+        // built on it cover scheduling, mailbox and runtime lifecycle, not MCP
+        // injection (see `tests/session_service_integration.rs` for that). Stated
+        // explicitly rather than inherited from a trait default so that "no MCP
+        // here" is a choice this double makes, not an accident.
+        async fn resolve_assistant_mcp_selection(
+            &self,
+            _user_id: &str,
+            _assistant_id: &str,
+        ) -> Result<Option<TeamMcpSelection>, TeamError> {
+            Ok(Some(TeamMcpSelection::default()))
+        }
+
+        async fn resolve_conversation_mcp_snapshot(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _assistant_id: Option<&str>,
+        ) -> Result<TeamMcpSnapshotResolution, TeamError> {
+            Ok(TeamMcpSnapshotResolution::default())
         }
 
         async fn conversation_workspace(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {

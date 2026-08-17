@@ -3,13 +3,41 @@ use aionui_common::TimestampMs;
 
 use crate::work_source::WorkSource;
 
+/// How many times a single mailbox message may fail delivery before it is
+/// abandoned and its slot paused.
+///
+/// Counted in memory, per slot: a process restart resets the count. That is
+/// deliberate — a restart is exactly the kind of change that can make a
+/// previously failing delivery succeed, so carrying the count across it would
+/// abandon messages that would now go through.
 pub(crate) const MAX_MESSAGE_DELIVERY_FAILURES: u8 = 3;
 
+/// What retiring a batch means for the delivery retry counters of the mailbox
+/// messages it claimed. The only behavioural difference between the terminal
+/// paths (`complete` / `cancel` / `fail`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryOutcome {
+    /// Delivery was not attempted, or it succeeded — the messages did not burn a
+    /// retry. Clears their counters so a later genuine failure starts from zero.
+    NotFailed,
+    /// Delivery was attempted and failed. Increments each claimed message's
+    /// counter and reports the ones that have now exhausted
+    /// `MAX_MESSAGE_DELIVERY_FAILURES`, whose slot is then paused.
+    Failed,
+}
+
+/// Lane a queued work intent sits in. Declared highest-priority first; the
+/// authoritative claim order lives in `SlotWorkCoordinator::next`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkPriority {
+    /// User-driven work. Always wins.
     Foreground,
-    Directed,
+    /// Shutdown request / rejection. Ranked above `Directed` because it is
+    /// low-volume and must not be pushed behind continuous teammate traffic.
     Control,
+    /// Messages addressed to this slot by another agent.
+    Directed,
+    /// System notifications, welcomes, membership changes, idle nudges.
     Background,
 }
 

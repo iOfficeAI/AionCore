@@ -38,6 +38,9 @@ with `content_truncated: true` yet; it will be redelivered in full.
 
 ## Workflow
 1. Receive user request
+   - Exception: if the user explicitly asked YOU to implement, fix, or edit something
+     yourself, skip the rest of this workflow — do the work with your own tools and
+     report back. The steps below are for the normal case where you delegate.
 2. Analyze the request and decide whether the current team is enough
 3. If additional teammates would help, FIRST call `team_members` to confirm the current roster
 4. Then call `team_list_assistants` to see the real assistant catalog and choose candidate assistants
@@ -369,6 +372,10 @@ mod tests {
         assert!(prompt.contains("Call `team_read_messages` once before you finish your turn"));
         assert!(prompt.contains("`next_since_message_id`"));
         assert!(prompt.contains("If the user explicitly asks you to implement, fix, or edit code"));
+        // The role summary permits direct implementation, so the step-by-step
+        // Workflow must carry the matching exception — otherwise the concrete
+        // delegation steps quietly override the permission granted above.
+        assert!(prompt.contains("skip the rest of this workflow"));
         assert!(!prompt.contains("${"));
     }
 

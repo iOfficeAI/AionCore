@@ -4461,23 +4461,28 @@ async fn restart_runtime_blocks_duplicate_restart_send_and_config_until_ready() 
         aionui_api_types::ConversationRuntimeStateKind::Restarting
     );
 
+    // All three gates report the SAME coded error, so a client has one rule to
+    // retry on rather than having to match each entry point's message text.
     let duplicate = svc
         .restart_runtime("user_1", &conv.id, &task_mgr_dyn)
         .await
         .expect_err("duplicate restart must fail");
-    assert!(matches!(duplicate, ConversationError::Busy { .. }));
+    assert!(matches!(duplicate, ConversationError::RuntimeRestarting { .. }));
+    assert_eq!(duplicate.error_code(), "runtime_restarting");
 
     let send = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
         .await
         .expect_err("send must fail at the backend gate while restart is in progress");
-    assert!(matches!(send, ConversationError::Busy { .. }));
+    assert!(matches!(send, ConversationError::RuntimeRestarting { .. }));
+    assert_eq!(send.error_code(), "runtime_restarting");
 
     let config = svc
         .get_config_options("user_1", &conv.id)
         .await
         .expect_err("config access must fail while restart is in progress");
-    assert!(matches!(config, ConversationError::Busy { .. }));
+    assert!(matches!(config, ConversationError::RuntimeRestarting { .. }));
+    assert_eq!(config.error_code(), "runtime_restarting");
 
     let response = restart.await.expect("restart task should not panic").unwrap();
     assert!(task_mgr.was_rebuilt());

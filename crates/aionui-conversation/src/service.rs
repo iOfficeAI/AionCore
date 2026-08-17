@@ -4027,6 +4027,17 @@ impl ConversationService {
             });
         }
 
+        // Checked BEFORE readiness: a restart in flight has already killed the
+        // task, so the readiness gate below would report a duplicate restart as
+        // "not ready to restart" — misleading, and a different code than the one
+        // the turn/config gates report for the very same state. `begin_restart`
+        // remains the authoritative guard for a genuine race.
+        if self.runtime_state.is_restarting(conversation_id) {
+            return Err(ConversationError::RuntimeRestarting {
+                conversation_id: conversation_id.to_owned(),
+            });
+        }
+
         if task_manager.get_task(conversation_id).is_none() {
             return Err(ConversationError::Busy {
                 reason: format!("conversation {conversation_id} runtime is not ready to restart"),
@@ -4867,70 +4878,6 @@ impl ConversationService {
         })
     }
 
-    /// Resolve the operator's globally enabled MCP servers into final snapshot
-    /// inputs: enabled non-builtin row ids + enabled
-    /// builtin rows (e.g. `chrome-devtools`) converted to neutral session
-    /// servers with stdio launch commands resolved.
-    ///
-    /// A repo read failure is an error — never a silently empty set — so team
-    /// provisioning can abort instead of dropping every user MCP.
-    pub async fn resolve_global_mcp_selection(&self, user_id: &str) -> Result<TeamMcpSelection, ConversationError> {
-        let mut mcp_server_ids: Vec<String> = Vec::new();
-        let mut session_mcp_servers: Vec<SessionMcpServer> = Vec::new();
-        let mut mcp_statuses: Vec<ConversationMcpStatus> = Vec::new();
-        let repo = {
-            let repo_guard = self
-                .mcp_server_repo
-                .read()
-                .map_err(|_| ConversationError::internal("MCP server repository lock is poisoned"))?;
-            repo_guard
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| ConversationError::internal("MCP server repository is unavailable"))?
-        };
-        let rows = repo
-            .list(user_id)
-            .await
-            .map_err(|e| ConversationError::internal(format!("Failed to list MCP servers: {e}")))?;
-        for row in rows {
-            if !row.enabled || row.name == TEAM_MCP_SERVER_NAME {
-                continue;
-            }
-            if row.builtin {
-                match aionui_ai_agent::mcp_resolve::row_to_session_mcp_server(&row).await {
-                    Ok(server) => session_mcp_servers.push(server),
-                    Err(err) => {
-                        mcp_statuses.push(ConversationMcpStatus {
-                            id: row.id.clone(),
-                            name: row.name.clone(),
-                            status: ConversationMcpStatusKind::Failed,
-                            reason: Some(err.clone()),
-                        });
-                        warn!(
-                            user_id,
-                            server_id = %row.id,
-                            server_name = %row.name,
-                            error = %err,
-                            "user_mcp: malformed builtin row skipped from global snapshot"
-                        );
-                    }
-                }
-            } else {
-                mcp_server_ids.push(row.id);
-            }
-        }
-        Ok(TeamMcpSelection {
-            selected_ids: mcp_server_ids
-                .iter()
-                .cloned()
-                .chain(session_mcp_servers.iter().map(|server| server.id.clone()))
-                .collect(),
-            mcp_server_ids,
-            session_mcp_servers,
-            mcp_statuses,
-        })
-    }
-
     /// Resolve one assistant's effective MCP binding using the same fixed/auto
     /// precedence as ordinary conversation creation. Explicit ids are loaded
     /// regardless of the MCP row's global `enabled` flag.
@@ -5037,29 +4984,6 @@ impl ConversationService {
             )
             .await?;
         Ok(Some((snapshot, fingerprint)))
-    }
-
-    /// Resolve the operator's globally enabled MCP servers into a full typed
-    /// runtime snapshot (four fields) classified against the given agent type
-    /// and `extra`. Used by the team attach path to refresh the persisted
-    /// snapshot before rebuilding a member session. Read-only — the caller
-    /// persists via `update_extra`.
-    pub async fn resolve_global_mcp_snapshot(
-        &self,
-        user_id: &str,
-        agent_type: &AgentType,
-        extra: &serde_json::Value,
-    ) -> Result<McpRuntimeSnapshot, ConversationError> {
-        let selection = self.resolve_global_mcp_selection(user_id).await?;
-        self.build_runtime_mcp_snapshot(
-            user_id,
-            Some(&selection.mcp_server_ids),
-            &selection.session_mcp_servers,
-            &selection.mcp_statuses,
-            agent_type,
-            extra,
-        )
-        .await
     }
 
     async fn resolve_mcp_support_policy(

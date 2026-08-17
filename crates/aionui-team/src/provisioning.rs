@@ -145,36 +145,45 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), TeamError>;
 
-    /// Resolve the user's globally enabled MCP servers (enabled non-builtin
-    /// rows by id + enabled builtin rows as neutral session servers) into the
-    /// two create-time request shapes. Used by team provisioning so member
-    /// conversations carry the operator's full MCP selection — including
-    /// builtin servers the generic enabled-set fallback hard-excludes.
+    /// Resolve ONE assistant's effective MCP binding (its fixed default list, or
+    /// the user's last selection in auto mode) into the two create-time request
+    /// shapes: non-builtin rows by id + builtin rows as neutral session servers.
+    /// Used by team provisioning so a member conversation carries the MCP set its
+    /// own assistant is bound to — including builtin servers the generic
+    /// enabled-set fallback hard-excludes.
     ///
-    /// A repo read failure is an error — never a silently empty set — so
-    /// provisioning aborts instead of dropping every user MCP.
+    /// `Ok(None)` means the assistant does not exist. An empty selection is still
+    /// `Ok(Some(..))` — an assistant deliberately bound to no MCP. A repo read
+    /// failure is an `Err`, never a silently empty set, so provisioning aborts
+    /// instead of dropping every MCP the assistant is bound to.
+    ///
+    /// Deliberately has NO default implementation: a silently empty selection
+    /// would look identical to "this assistant has no MCP servers", so every
+    /// implementor must state its own answer.
     async fn resolve_assistant_mcp_selection(
         &self,
         user_id: &str,
         assistant_id: &str,
-    ) -> Result<Option<TeamMcpSelection>, TeamError> {
-        let _ = (user_id, assistant_id);
-        Ok(Some(TeamMcpSelection::default()))
-    }
+    ) -> Result<Option<TeamMcpSelection>, TeamError>;
 
-    /// Resolve the user's globally enabled MCP servers into the full typed
-    /// four-field runtime snapshot for an existing conversation's agent
-    /// (names + statuses classified against its transport support). Used by
-    /// the attach path to refresh the persisted snapshot.
+    /// Resolve an existing member conversation's MCP binding into the full typed
+    /// four-field runtime snapshot (names + statuses classified against the
+    /// agent's transport support). Used by the attach and refresh paths before
+    /// rebuilding a member session.
+    ///
+    /// `assistant_id` of `None` — or an `assistant_id` that no longer resolves —
+    /// yields the snapshot already persisted on the conversation with a `None`
+    /// fingerprint, so a member whose assistant was deleted keeps working
+    /// instead of being stranded or silently downgraded to no MCP.
+    ///
+    /// Deliberately has NO default implementation, for the same reason as
+    /// `resolve_assistant_mcp_selection`.
     async fn resolve_conversation_mcp_snapshot(
         &self,
         user_id: &str,
         conversation_id: &str,
         assistant_id: Option<&str>,
-    ) -> Result<TeamMcpSnapshotResolution, TeamError> {
-        let _ = (user_id, conversation_id, assistant_id);
-        Ok(TeamMcpSnapshotResolution::default())
-    }
+    ) -> Result<TeamMcpSnapshotResolution, TeamError>;
 
     async fn delete_team_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), TeamError>;
 
@@ -253,11 +262,11 @@ impl TeamAgentProvisioner {
         let leader_slot_id = generate_id();
         let leader_role = TeammateRole::Lead;
         let leader_assistant_id = Self::effective_assistant_id(leader_input.assistant_id.as_deref());
-        // Resolve the user's globally enabled MCP selection ONCE, before any
-        // conversation is created, and share it across every member (leader +
-        // teammates): N queries would be redundant and could observe an
-        // inconsistent toggle state mid-provisioning. A read failure aborts
-        // here, before any orphan conversation can be created.
+        // Resolve the leader assistant's MCP binding before any conversation is
+        // created, so a read failure or an unknown assistant aborts here rather
+        // than after an orphan conversation exists. Teammates resolve their own
+        // bindings below — each member follows the assistant it is bound to, so
+        // this result is NOT shared across members.
         let leader_mcp_selection = self
             .resolve_assistant_mcp_selection(user_id, leader_assistant_id.as_deref())
             .await?;
@@ -495,11 +504,12 @@ impl TeamAgentProvisioner {
             selected_transport = ?transport,
             "resolved Team tool transport"
         );
-        // Refresh the user's globally enabled MCP snapshot (including builtin
-        // servers) BEFORE composing the patch so the rebuilt session carries
-        // the current selection. A repo read failure aborts the attach — it is
-        // never treated as "enabled set is empty", which would clear the
-        // stored snapshot.
+        // Re-resolve this member's assistant MCP binding (including builtin
+        // servers) BEFORE composing the patch so the rebuilt session carries the
+        // current selection. A repo read failure aborts the attach — it is never
+        // treated as "the binding is empty", which would clear the stored
+        // snapshot. A vanished assistant degrades to the persisted snapshot
+        // rather than failing; see `resolve_conversation_mcp_snapshot`.
         let mcp_resolution = self
             .conversation_port
             .resolve_conversation_mcp_snapshot(user_id, &agent.conversation_id, agent.assistant_id.as_deref())
@@ -537,6 +547,14 @@ impl TeamAgentProvisioner {
         Ok(mcp_resolution.fingerprint)
     }
 
+    /// Resolve the MCP selection for an agent that is about to be CREATED.
+    ///
+    /// An unresolvable `assistant_id` is a hard error here, matching
+    /// `resolve_requested_backend`: the caller passed an assistant that does not
+    /// exist, and failing before anything is persisted is the correct response.
+    /// This is deliberately asymmetric with the attach/refresh path — see
+    /// `resolve_conversation_mcp_snapshot`, where a vanished assistant must
+    /// degrade to the persisted snapshot instead of stranding a live member.
     async fn resolve_assistant_mcp_selection(
         &self,
         user_id: &str,

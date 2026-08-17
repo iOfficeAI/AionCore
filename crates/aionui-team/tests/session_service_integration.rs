@@ -13,8 +13,9 @@ use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{
     AcpBuildExtra, AcpConfigOptionDto, AcpConfigSelectOptionDto, AddAgentRequest, AssistantMcpBindingChanged,
-    CreateTeamRequest, GetConfigOptionsResponse, McpRuntimeSnapshot, SessionMcpServer, TeamAgentInput,
-    TeamMcpSelection, TeamRunSource, WebSocketMessage, assistant_mcp_binding_fingerprint,
+    ConfigOptionConfirmation, CreateTeamRequest, GetConfigOptionsResponse, McpRuntimeSnapshot, SessionMcpServer,
+    SetConfigOptionRequest, SetConfigOptionResponse, TeamAgentInput, TeamMcpSelection, TeamRunSource, WebSocketMessage,
+    assistant_mcp_binding_fingerprint,
 };
 use aionui_common::{
     AgentKillReason, AgentType, CapabilityOrigin, McpTransportCapabilities, PaginatedResult, ProviderWithModel,
@@ -348,6 +349,8 @@ struct FakeConversationPorts {
     workspace_root: std::path::PathBuf,
     preset_snapshots: Mutex<HashMap<String, FakePresetAssistantSnapshot>>,
     assistant_mcp_selections: Mutex<HashMap<String, TeamMcpSelection>>,
+    /// `(conversation_id, option_id, requested_value)` per `set_config_option`.
+    config_option_calls: Mutex<Vec<(String, String, String)>>,
     fail_team_temp_create: std::sync::atomic::AtomicBool,
     fail_leader_workspace_patch: std::sync::atomic::AtomicBool,
 }
@@ -368,9 +371,14 @@ impl FakeConversationPorts {
             workspace_root,
             preset_snapshots: Mutex::new(HashMap::new()),
             assistant_mcp_selections: Mutex::new(HashMap::new()),
+            config_option_calls: Mutex::new(Vec::new()),
             fail_team_temp_create: std::sync::atomic::AtomicBool::new(false),
             fail_leader_workspace_patch: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn config_option_calls(&self) -> Vec<(String, String, String)> {
+        self.config_option_calls.lock().unwrap().clone()
     }
 
     fn set_assistant_mcp_selection(&self, assistant_id: &str, selection: TeamMcpSelection) {
@@ -702,6 +710,38 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                     description: None,
                 }],
             }],
+        })
+    }
+
+    /// Stands in for a runtime that accepts the switch but only applies it from
+    /// the next turn — the case where echoing the option's `current_value` back
+    /// would persist the OLD model. Records the call so tests can assert the
+    /// runtime was actually asked, and deliberately leaves the stored
+    /// `current_model_id` alone so any persistence must come from the service.
+    async fn set_config_option(
+        &self,
+        conversation_id: &str,
+        option_id: &str,
+        request: SetConfigOptionRequest,
+    ) -> Result<SetConfigOptionResponse, aionui_team::TeamError> {
+        self.config_option_calls.lock().unwrap().push((
+            conversation_id.to_owned(),
+            option_id.to_owned(),
+            request.value.clone(),
+        ));
+        let mut options = self.get_config_options(conversation_id).await?.config_options;
+        // PendingNextTurn semantics: the readback still reports the old value.
+        if let Some(option) = options.iter_mut().find(|option| option.id == option_id) {
+            option.options.push(AcpConfigSelectOptionDto {
+                value: request.value.clone(),
+                name: None,
+                label: Some(request.value),
+                description: None,
+            });
+        }
+        Ok(SetConfigOptionResponse {
+            confirmation: ConfigOptionConfirmation::PendingNextTurn,
+            config_options: Some(options),
         })
     }
 
@@ -3703,6 +3743,135 @@ async fn assistant_mcp_change_refreshes_dormant_idle_and_duplicate_revisions() {
     assert!(duplicate_calls.build.is_empty());
     assert!(duplicate_calls.kill.is_empty());
 }
+
+/// The shared event bus drops events under load, so a binding change can be
+/// missed entirely. `reconcile_all_assistant_mcp_bindings` is the repair path:
+/// it must pick up a change that NO event was ever delivered for, and must stay
+/// a no-op once every member already matches.
+#[tokio::test]
+async fn full_reconcile_recovers_a_binding_change_whose_event_was_never_delivered() {
+    let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(PairAssistantDefinitionRepo {
+        rows: vec![word_creator_definition(), reviewer_definition()],
+    });
+    let (svc, _team_repo, conversation_ports, conv_repo, task_manager) =
+        setup_with_ports_metadata_assistants_and_conversation_repo(
+            success_factory(),
+            seeded_agent_metadata_repo(),
+            definition_repo,
+            Arc::new(EmptyAssistantOverlayRepo),
+        );
+    for (assistant_id, mcp_id) in [("word-creator", "mcp-a"), ("reviewer", "mcp-b")] {
+        conversation_ports.set_assistant_mcp_selection(
+            assistant_id,
+            TeamMcpSelection {
+                selected_ids: vec![mcp_id.into()],
+                mcp_server_ids: vec![mcp_id.into()],
+                ..Default::default()
+            },
+        );
+    }
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Lagged MCP".into(),
+                agents: vec![
+                    TeamAgentInput {
+                        name: "Lead".into(),
+                        role: "lead".into(),
+                        backend: None,
+                        model: "claude-sonnet-4".into(),
+                        assistant_id: Some("word-creator".into()),
+                        conversation_id: None,
+                    },
+                    TeamAgentInput {
+                        name: "Review".into(),
+                        role: "teammate".into(),
+                        backend: None,
+                        model: "claude-sonnet-4".into(),
+                        assistant_id: Some("reviewer".into()),
+                        conversation_id: None,
+                    },
+                ],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let lead = created
+        .assistants
+        .iter()
+        .find(|agent| agent.assistant_id.as_deref() == Some("word-creator"))
+        .unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|agent| agent.assistant_id.as_deref() == Some("reviewer"))
+        .unwrap();
+
+    // Bring the lead's runtime up so the reconcile has a Ready idle runtime to
+    // rebuild — the branch a dropped event would otherwise leave stale.
+    svc.attach_agent_runtime("user1", &created.id, &lead.slot_id)
+        .await
+        .unwrap();
+    for _ in 0..50 {
+        if task_manager.get_task(&lead.conversation_id).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(task_manager.get_task(&lead.conversation_id).is_some());
+
+    // Change BOTH bindings and deliver no event at all.
+    task_manager.reset_calls();
+    for (assistant_id, mcp_id) in [("word-creator", "mcp-a2"), ("reviewer", "mcp-b2")] {
+        conversation_ports.set_assistant_mcp_selection(
+            assistant_id,
+            TeamMcpSelection {
+                selected_ids: vec![mcp_id.into()],
+                mcp_server_ids: vec![mcp_id.into()],
+                ..Default::default()
+            },
+        );
+    }
+    assert_eq!(
+        conv_repo.get_extra(&worker.conversation_id).unwrap()["mcp_server_ids"],
+        serde_json::json!(["mcp-b"]),
+        "without an event the persisted snapshot is still stale"
+    );
+
+    svc.reconcile_all_assistant_mcp_bindings().await;
+
+    // Every member's persisted snapshot is repaired, regardless of runtime state.
+    assert_eq!(
+        conv_repo.get_extra(&worker.conversation_id).unwrap()["mcp_server_ids"],
+        serde_json::json!(["mcp-b2"])
+    );
+    assert_eq!(
+        conv_repo.get_extra(&lead.conversation_id).unwrap()["mcp_server_ids"],
+        serde_json::json!(["mcp-a2"])
+    );
+    // The ready idle lead runtime is rebuilt so it actually picks the new set up.
+    let calls = task_manager.snapshot();
+    assert!(calls.build.contains(&lead.conversation_id));
+    assert!(
+        calls
+            .kill
+            .iter()
+            .any(|(id, reason)| { id == &lead.conversation_id && *reason == Some(AgentKillReason::TeamMcpRebuild) })
+    );
+    // The dormant teammate must not be started eagerly by a reconcile.
+    assert!(!calls.build.contains(&worker.conversation_id));
+
+    // Idempotent: a second reconcile with nothing changed touches no runtime.
+    task_manager.reset_calls();
+    svc.reconcile_all_assistant_mcp_bindings().await;
+    let repeat = task_manager.snapshot();
+    assert!(repeat.build.is_empty());
+    assert!(repeat.kill.is_empty());
+}
+
 #[tokio::test]
 async fn spawned_preset_assistant_snapshot_is_frozen() {
     let definition_repo: Arc<dyn IAssistantDefinitionRepository> = Arc::new(SingleAssistantDefinitionRepo {
@@ -5908,6 +6077,146 @@ async fn ensure_session_repairs_legacy_model_facts_from_confirmed_selection() {
         .await
         .unwrap();
     assert_eq!(live_worker.model, "gpt-5.7-confirmed");
+}
+
+/// A model switch through the generic config-option path must persist itself.
+///
+/// This used to need a SECOND call from the client (`PATCH .../model`): the
+/// config-option path only told the runtime, so if the client never made the
+/// follow-up call — or it failed — the runtime was switched while the roster and
+/// the conversation seed still held the old model, and the next rebuild silently
+/// reverted it.
+#[tokio::test]
+async fn setting_the_model_config_option_persists_roster_conversation_and_live_session() {
+    let (svc, _team_repo, conversation_ports, conv_repo, _task_manager) =
+        setup_with_ports_metadata_assistants_and_conversation_repo(
+            success_factory(),
+            seeded_agent_metadata_repo(),
+            Arc::new(PairAssistantDefinitionRepo {
+                rows: vec![word_creator_definition(), reviewer_definition()],
+            }),
+            Arc::new(EmptyAssistantOverlayRepo),
+        );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|agent| agent.role == "teammate")
+        .unwrap();
+
+    let response = svc
+        .set_conversation_config_option(
+            "user1",
+            &created.id,
+            &worker.conversation_id,
+            "model",
+            SetConfigOptionRequest {
+                value: "gpt-5.9-switched".into(),
+            },
+        )
+        .await
+        .expect("model switch must be accepted");
+    // The runtime only promised to apply it from the next turn — persistence must
+    // still happen, otherwise the pending switch is lost on the next rebuild.
+    assert_eq!(response.confirmation, ConfigOptionConfirmation::PendingNextTurn);
+    assert_eq!(
+        conversation_ports.config_option_calls(),
+        vec![(
+            worker.conversation_id.clone(),
+            "model".to_owned(),
+            "gpt-5.9-switched".to_owned()
+        )],
+        "the runtime must be asked exactly once"
+    );
+
+    // 1. the conversation seed a rebuilt runtime reads
+    assert_eq!(
+        conv_repo.get_extra(&worker.conversation_id).unwrap()["current_model_id"],
+        "gpt-5.9-switched"
+    );
+    // 2. the persisted team roster
+    let persisted = svc.get_team("user1", &created.id).await.unwrap();
+    let persisted_worker = persisted
+        .assistants
+        .iter()
+        .find(|agent| agent.slot_id == worker.slot_id)
+        .unwrap();
+    assert_eq!(persisted_worker.model, "gpt-5.9-switched");
+    // 3. the live in-memory session agent
+    let live_worker = svc
+        .get_session_scheduler(&created.id)
+        .unwrap()
+        .get_agent(&worker.slot_id)
+        .await
+        .unwrap();
+    assert_eq!(live_worker.model, "gpt-5.9-switched");
+}
+
+/// Non-model options must not be mistaken for a model switch.
+#[tokio::test]
+async fn setting_a_non_model_config_option_leaves_the_model_untouched() {
+    let (svc, _team_repo, conversation_ports, conv_repo, _task_manager) =
+        setup_with_ports_metadata_assistants_and_conversation_repo(
+            success_factory(),
+            seeded_agent_metadata_repo(),
+            Arc::new(PairAssistantDefinitionRepo {
+                rows: vec![word_creator_definition(), reviewer_definition()],
+            }),
+            Arc::new(EmptyAssistantOverlayRepo),
+        );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let worker = created
+        .assistants
+        .iter()
+        .find(|agent| agent.role == "teammate")
+        .unwrap();
+    let model_before = conv_repo.get_extra(&worker.conversation_id).unwrap()["current_model_id"].clone();
+
+    svc.set_conversation_config_option(
+        "user1",
+        &created.id,
+        &worker.conversation_id,
+        "thought_level",
+        SetConfigOptionRequest { value: "high".into() },
+    )
+    .await
+    .expect("non-model option must still be forwarded");
+
+    assert_eq!(conversation_ports.config_option_calls().len(), 1);
+    assert_eq!(
+        conv_repo.get_extra(&worker.conversation_id).unwrap()["current_model_id"],
+        model_before,
+        "a thought-level change must not rewrite the model"
+    );
+    let persisted = svc.get_team("user1", &created.id).await.unwrap();
+    let persisted_worker = persisted
+        .assistants
+        .iter()
+        .find(|agent| agent.slot_id == worker.slot_id)
+        .unwrap();
+    assert_eq!(persisted_worker.model, worker.model);
 }
 
 #[tokio::test]

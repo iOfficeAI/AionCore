@@ -105,19 +105,24 @@ async fn update_agent_model_persists_the_team_roster_value() {
     assert_eq!(worker["model"], "gpt-5.6-sol");
 }
 
+/// Legacy model facts are repaired when a session STARTS, not when a team is
+/// merely read. `GET /api/teams/{id}` is a plain read: making it repair cost
+/// three extra table reads per member on every team open. Session start is where
+/// a stale roster would actually feed a rebuilt runtime, so that is where the
+/// repair belongs.
 #[tokio::test]
-async fn opening_a_legacy_team_repairs_roster_and_seed_from_the_confirmed_snapshot() {
+async fn starting_a_legacy_team_session_repairs_roster_and_seed_from_the_confirmed_snapshot() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let team = create_team(&mut app, &services, &token, &csrf).await;
-    let team_id = team["id"].as_str().unwrap();
-    let conversation_id = team["assistants"][1]["conversation_id"].as_str().unwrap();
+    let team_id = team["id"].as_str().unwrap().to_owned();
+    let conversation_id = team["assistants"][1]["conversation_id"].as_str().unwrap().to_owned();
 
     sqlx::query(
         "UPDATE conversation_assistant_snapshots SET resolved_model_id = 'gpt-5.7-confirmed' \
          WHERE conversation_id = ?",
     )
-    .bind(conversation_id)
+    .bind(&conversation_id)
     .execute(services.database.pool())
     .await
     .unwrap();
@@ -125,20 +130,44 @@ async fn opening_a_legacy_team_repairs_roster_and_seed_from_the_confirmed_snapsh
         "UPDATE acp_session SET session_config = json_set(session_config, \
          '$.runtime.current_model_id', 'gpt-5.4-stale') WHERE conversation_id = ?",
     )
-    .bind(conversation_id)
+    .bind(&conversation_id)
     .execute(services.database.pool())
     .await
     .unwrap();
 
+    // Reading the team does NOT repair: the roster still shows the stale model
+    // and the conversation seed is untouched.
     let req = common::get_with_token(&format!("/api/teams/{team_id}"), &token);
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
-    let worker = &body["data"]["assistants"][1];
-    assert_eq!(worker["model"], "gpt-5.7-confirmed");
+    assert_ne!(
+        body["data"]["assistants"][1]["model"], "gpt-5.7-confirmed",
+        "a plain read must not run the legacy repair"
+    );
+    let extra_before: String = sqlx::query_scalar("SELECT extra FROM conversations WHERE id = ?")
+        .bind(&conversation_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_ne!(
+        serde_json::from_str::<Value>(&extra_before).unwrap()["current_model_id"],
+        "gpt-5.7-confirmed"
+    );
+
+    // Starting the session repairs both the persisted seed and the roster.
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/session"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let extra: String = sqlx::query_scalar("SELECT extra FROM conversations WHERE id = ?")
-        .bind(conversation_id)
+        .bind(&conversation_id)
         .fetch_one(services.database.pool())
         .await
         .unwrap();
@@ -146,6 +175,12 @@ async fn opening_a_legacy_team_repairs_roster_and_seed_from_the_confirmed_snapsh
         serde_json::from_str::<Value>(&extra).unwrap()["current_model_id"],
         "gpt-5.7-confirmed"
     );
+
+    let req = common::get_with_token(&format!("/api/teams/{team_id}"), &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["assistants"][1]["model"], "gpt-5.7-confirmed");
 }
 
 #[tokio::test]

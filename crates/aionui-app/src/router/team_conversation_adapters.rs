@@ -378,6 +378,31 @@ fn parse_available_command_names(raw: &str) -> Option<Vec<String>> {
     )
 }
 
+/// Read back the MCP snapshot already persisted in a conversation's `extra`.
+///
+/// Used when no assistant binding can be resolved (the member carries no
+/// assistant, or its assistant no longer exists). The fingerprint is `None`:
+/// there is no assistant binding to compare against, so callers must not treat
+/// the result as an up-to-date binding — only as "keep what is already there".
+fn persisted_mcp_snapshot_resolution(extra: &serde_json::Value) -> TeamMcpSnapshotResolution {
+    fn field<T: serde::de::DeserializeOwned + Default>(extra: &serde_json::Value, key: &str) -> T {
+        extra
+            .get(key)
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
+    }
+    TeamMcpSnapshotResolution {
+        snapshot: McpRuntimeSnapshot {
+            mcp_server_ids: field(extra, "mcp_server_ids"),
+            session_mcp_servers: field(extra, "session_mcp_servers"),
+            mcp_servers: field(extra, "mcp_servers"),
+            mcp_statuses: field(extra, "mcp_statuses"),
+        },
+        fingerprint: None,
+    }
+}
+
 #[async_trait]
 impl TeamProjectionMessageStore for TeamConversationAdapters {
     fn mint_message_id(&self) -> String {
@@ -530,40 +555,24 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             })?;
         let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
         let Some(assistant_id) = assistant_id else {
-            return Ok(TeamMcpSnapshotResolution {
-                snapshot: McpRuntimeSnapshot {
-                    mcp_server_ids: extra
-                        .get("mcp_server_ids")
-                        .cloned()
-                        .and_then(|value| serde_json::from_value(value).ok())
-                        .unwrap_or_default(),
-                    session_mcp_servers: extra
-                        .get("session_mcp_servers")
-                        .cloned()
-                        .and_then(|value| serde_json::from_value(value).ok())
-                        .unwrap_or_default(),
-                    mcp_servers: extra
-                        .get("mcp_servers")
-                        .cloned()
-                        .and_then(|value| serde_json::from_value(value).ok())
-                        .unwrap_or_default(),
-                    mcp_statuses: extra
-                        .get("mcp_statuses")
-                        .cloned()
-                        .and_then(|value| serde_json::from_value(value).ok())
-                        .unwrap_or_default(),
-                },
-                fingerprint: None,
-            });
+            return Ok(persisted_mcp_snapshot_resolution(&extra));
         };
-        let resolved = self
+        // An assistant that no longer resolves (deleted, or soft-deleted while a
+        // team still references it) must NOT fail the attach: the member would
+        // become permanently unstartable. Fall back to the snapshot already
+        // persisted on the conversation, exactly like the no-assistant path.
+        let Some(resolved) = self
             .conversation_service
             .resolve_assistant_mcp_snapshot(user_id, assistant_id, &agent_type, &extra)
             .await
             .map_err(map_conversation_update_error)?
-            .ok_or_else(|| {
-                TeamError::InvalidRequest(format!("Assistant MCP binding is unavailable: {assistant_id}"))
-            })?;
+        else {
+            warn!(
+                user_id,
+                conversation_id, assistant_id, "assistant MCP binding unavailable; reusing persisted MCP snapshot"
+            );
+            return Ok(persisted_mcp_snapshot_resolution(&extra));
+        };
         Ok(TeamMcpSnapshotResolution {
             snapshot: resolved.0,
             fingerprint: Some(resolved.1),
@@ -772,6 +781,46 @@ mod tests {
         // (caller logs a `warn` and falls through to the next catalog source).
         assert_eq!(parse_available_command_names("not json"), None);
         assert_eq!(parse_available_command_names("{}"), None);
+    }
+
+    #[test]
+    fn persisted_snapshot_fallback_preserves_every_stored_mcp_field() {
+        // The fallback used when an assistant binding cannot be resolved: it must
+        // hand back exactly what the conversation already carries, so a member
+        // whose assistant was deleted keeps its working MCP set instead of being
+        // downgraded to "no MCP".
+        let extra = serde_json::json!({
+            "mcp_server_ids": ["mcp-a", "mcp-b"],
+            "session_mcp_servers": [{
+                "id": "mcp-builtin",
+                "name": "chrome-devtools",
+                "transport": { "type": "stdio", "command": "node", "args": [], "env": {} }
+            }],
+            "mcp_servers": ["mcp-a", "chrome-devtools"],
+            "mcp_statuses": [{ "id": "mcp-c", "name": "broken", "status": "failed", "reason": "boom" }],
+        });
+
+        let resolution = persisted_mcp_snapshot_resolution(&extra);
+
+        assert_eq!(resolution.snapshot.mcp_server_ids, vec!["mcp-a", "mcp-b"]);
+        assert_eq!(resolution.snapshot.session_mcp_servers.len(), 1);
+        assert_eq!(resolution.snapshot.session_mcp_servers[0].name, "chrome-devtools");
+        assert_eq!(resolution.snapshot.mcp_servers, vec!["mcp-a", "chrome-devtools"]);
+        assert_eq!(resolution.snapshot.mcp_statuses.len(), 1);
+        // No assistant binding was resolved, so there is no fingerprint to
+        // compare against — callers must not record one.
+        assert_eq!(resolution.fingerprint, None);
+    }
+
+    #[test]
+    fn persisted_snapshot_fallback_tolerates_absent_and_malformed_fields() {
+        let resolution = persisted_mcp_snapshot_resolution(&serde_json::json!({ "mcp_server_ids": "not-a-list" }));
+
+        assert!(resolution.snapshot.mcp_server_ids.is_empty());
+        assert!(resolution.snapshot.session_mcp_servers.is_empty());
+        assert!(resolution.snapshot.mcp_servers.is_empty());
+        assert!(resolution.snapshot.mcp_statuses.is_empty());
+        assert_eq!(resolution.fingerprint, None);
     }
 
     #[test]

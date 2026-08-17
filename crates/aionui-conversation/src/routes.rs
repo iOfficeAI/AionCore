@@ -71,6 +71,12 @@ impl From<ConversationError> for ApiError {
                     "requested": requested,
                 })),
             ),
+            ConversationError::RuntimeRestarting { conversation_id } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "runtime_restarting",
+                "Conversation runtime is restarting",
+                Some(serde_json::json!({ "conversation_id": conversation_id })),
+            ),
             ConversationError::TeamRuntimeRequired {
                 conversation_id,
                 team_id,

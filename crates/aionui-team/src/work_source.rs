@@ -32,8 +32,8 @@ impl WorkSource {
             Self::UserMessage | Self::UserCommand | Self::UserIntervention | Self::LeadIntervention => {
                 WorkPriority::Foreground
             }
-            Self::McpSendMessage => WorkPriority::Directed,
             Self::McpShutdownRequest | Self::ShutdownRejected => WorkPriority::Control,
+            Self::McpSendMessage => WorkPriority::Directed,
             Self::SpawnWelcome
             | Self::TeamMembershipChanged
             | Self::SpawnAttachFailure

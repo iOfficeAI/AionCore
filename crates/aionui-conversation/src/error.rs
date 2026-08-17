@@ -62,6 +62,12 @@ pub enum ConversationError {
         requested: String,
     },
 
+    /// The conversation's runtime is mid-restart, so it cannot take work or
+    /// config changes yet. A distinct variant rather than a `Busy { reason }`
+    /// so clients can recognise it by code instead of matching the message text.
+    #[error("Conversation runtime is restarting: {conversation_id}")]
+    RuntimeRestarting { conversation_id: String },
+
     #[error("Team runtime is required for conversation: {conversation_id}")]
     TeamRuntimeRequired { conversation_id: String, team_id: String },
 
@@ -114,6 +120,9 @@ impl ConversationError {
             Self::Timeout { reason } => AgentError::timeout(reason.clone()),
             Self::ConfigConfirmationTimeout { .. } => AgentError::timeout("ACP config option confirmation timed out"),
             Self::ConfigUpdateInProgress { .. } => AgentError::conflict("ACP config update is already in progress"),
+            Self::RuntimeRestarting { conversation_id } => {
+                AgentError::conflict(format!("conversation {conversation_id} runtime is restarting"))
+            }
             Self::TeamRuntimeRequired { .. } => {
                 AgentError::conflict("This conversation belongs to a team; use the team runtime session")
             }
@@ -147,6 +156,7 @@ impl ConversationError {
             Self::Timeout { .. } => "TIMEOUT",
             Self::ConfigConfirmationTimeout { .. } => "confirmation_timeout",
             Self::ConfigUpdateInProgress { .. } => "config_update_in_progress",
+            Self::RuntimeRestarting { .. } => "runtime_restarting",
             Self::TeamRuntimeRequired { .. } => "TEAM_RUNTIME_REQUIRED",
             Self::Unprocessable { .. } => "UNPROCESSABLE_ENTITY",
             Self::Archived { .. } => "CONVERSATION_ARCHIVED",

@@ -83,8 +83,8 @@ impl ConversationRuntimeStateService {
                 conversation_id,
                 turn_id, "conversation runtime turn claim rejected during restart"
             );
-            return Err(ConversationError::Busy {
-                reason: format!("conversation {conversation_id} runtime is restarting"),
+            return Err(ConversationError::RuntimeRestarting {
+                conversation_id: conversation_id.to_owned(),
             });
         }
 
@@ -267,8 +267,11 @@ impl ConversationRuntimeStateService {
             });
         }
         if !state.restarting_conversations.insert(conversation_id.to_owned()) {
-            return Err(ConversationError::Busy {
-                reason: format!("conversation {conversation_id} runtime is already restarting"),
+            // Same condition the turn/config gates report, so it carries the same
+            // code: a caller retrying on `runtime_restarting` needs one rule, not
+            // one per entry point.
+            return Err(ConversationError::RuntimeRestarting {
+                conversation_id: conversation_id.to_owned(),
             });
         }
         info!(conversation_id, "conversation runtime marked restarting");
@@ -710,11 +713,15 @@ mod tests {
         let duplicate = state
             .begin_restart("conv-1")
             .expect_err("duplicate restart should be rejected");
-        assert!(duplicate.to_string().contains("already restarting"));
+        assert!(matches!(duplicate, ConversationError::RuntimeRestarting { .. }));
+        assert_eq!(duplicate.error_code(), "runtime_restarting");
         let turn = state
             .try_claim_turn("conv-1", "turn-1")
             .expect_err("send must be rejected while restart owns the runtime");
-        assert!(turn.to_string().contains("runtime is restarting"));
+        // Asserted by CODE, not message text: clients gate on the code, so the
+        // wording must stay free to change without breaking them.
+        assert!(matches!(turn, ConversationError::RuntimeRestarting { .. }));
+        assert_eq!(turn.error_code(), "runtime_restarting");
 
         let summary = state.summary_from_parts("conv-1", None, false, 0);
         assert_eq!(summary.state, ConversationRuntimeStateKind::Restarting);

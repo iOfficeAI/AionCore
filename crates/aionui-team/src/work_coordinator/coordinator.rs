@@ -25,9 +25,10 @@ pub(super) struct ActiveBatch {
 #[derive(Debug)]
 pub(super) struct SlotState {
     pub(super) role: TeamRunTargetRole,
+    // Declared in claim order; see `SlotWorkCoordinator::next`.
     pub(super) foreground: VecDeque<String>,
-    pub(super) directed: VecDeque<String>,
     pub(super) control: VecDeque<String>,
+    pub(super) directed: VecDeque<String>,
     pub(super) background: VecDeque<String>,
     pub(super) active: Option<ActiveBatch>,
     pub(super) paused: bool,
@@ -45,8 +46,8 @@ impl SlotState {
         Self {
             role,
             foreground: VecDeque::new(),
-            directed: VecDeque::new(),
             control: VecDeque::new(),
+            directed: VecDeque::new(),
             background: VecDeque::new(),
             active: None,
             paused: false,
@@ -63,8 +64,8 @@ impl SlotState {
     fn queue(&self, priority: WorkPriority) -> &VecDeque<String> {
         match priority {
             WorkPriority::Foreground => &self.foreground,
-            WorkPriority::Directed => &self.directed,
             WorkPriority::Control => &self.control,
+            WorkPriority::Directed => &self.directed,
             WorkPriority::Background => &self.background,
         }
     }
@@ -72,8 +73,8 @@ impl SlotState {
     fn queue_mut(&mut self, priority: WorkPriority) -> &mut VecDeque<String> {
         match priority {
             WorkPriority::Foreground => &mut self.foreground,
-            WorkPriority::Directed => &mut self.directed,
             WorkPriority::Control => &mut self.control,
+            WorkPriority::Directed => &mut self.directed,
             WorkPriority::Background => &mut self.background,
         }
     }
@@ -81,16 +82,16 @@ impl SlotState {
     pub(super) fn queued_ids(&self) -> impl Iterator<Item = &String> {
         self.foreground
             .iter()
-            .chain(self.directed.iter())
             .chain(self.control.iter())
+            .chain(self.directed.iter())
             .chain(self.background.iter())
     }
 
     fn remove_queued(&mut self, intent_id: &str) {
         for queue in [
             &mut self.foreground,
-            &mut self.directed,
             &mut self.control,
+            &mut self.directed,
             &mut self.background,
         ] {
             queue.retain(|candidate| candidate != intent_id);
@@ -462,10 +463,17 @@ impl SlotWorkCoordinator {
             return ReconcileDecision::Quiescent;
         }
 
+        // Control outranks Directed. Control carries only shutdown request /
+        // rejection — at most a couple of messages per slot — so putting it first
+        // cannot starve the directed lane, while the reverse is not true: teammate
+        // traffic arrives continuously and would keep pushing a shutdown request
+        // behind another round of work. A teammate that wants to finish what it is
+        // holding can still answer `shutdown_rejected` with a reason; that is the
+        // right place for that decision, not the lane order.
         let selected_priority = [
             WorkPriority::Foreground,
-            WorkPriority::Directed,
             WorkPriority::Control,
+            WorkPriority::Directed,
             WorkPriority::Background,
         ]
         .into_iter()
@@ -841,59 +849,24 @@ impl SlotWorkCoordinator {
     }
 
     pub(crate) fn fail_batch(&self, batch: &WorkBatch, classification: &'static str) -> BatchFailureResult {
-        let mut state = self.lock_state();
-        if !self.is_current_batch(&state, batch) {
-            self.log_stale_batch(batch, "fail_batch");
-            return BatchFailureResult {
-                commit_result: CommitResult::StaleOwner,
-                exhausted_message_ids: Vec::new(),
-            };
-        }
-        for intent_id in &batch.intent_ids {
-            if let Some(intent) = state.intents.get_mut(intent_id) {
-                intent.state = WorkIntentState::Failed { classification };
-            }
-        }
-        let slot = state.slots.get_mut(&batch.slot_id).expect("current batch slot exists");
-        slot.active = None;
-        let mut exhausted_message_ids = Vec::new();
-        // Only messages this batch actually tried to deliver count toward the retry
-        // limit. Rows merely observed through `team_read_messages` were never a
-        // delivery attempt, so they keep their counter and stay unread — they accrue
-        // failures later if a batch genuinely claims and fails to deliver them.
-        for message_id in &batch.mailbox_message_ids {
-            let failure_count = slot.delivery_failure_counts.entry(message_id.clone()).or_default();
-            *failure_count = failure_count.saturating_add(1);
-            if *failure_count >= MAX_MESSAGE_DELIVERY_FAILURES {
-                exhausted_message_ids.push(message_id.clone());
-            }
-        }
-        if !exhausted_message_ids.is_empty() {
-            slot.paused = true;
-        }
-        let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
-        let summaries = Self::run_summaries_locked(&state, batch.team_run_ids.iter().cloned());
-        drop(state);
-        self.publish_run_summaries(summaries);
-        self.publish_slot_work_snapshot(slot_snapshot);
-        info!(
-            team_id = %self.team_id,
-            session_generation = %self.session_generation,
-            slot_id = %batch.slot_id,
-            batch_id = %batch.batch_id,
-            operation_id = batch.operation_id,
+        self.terminalize_batch(
+            batch,
+            WorkIntentState::Failed { classification },
             classification,
-            exhausted_message_count = exhausted_message_ids.len(),
-            "team work batch terminal"
-        );
-        BatchFailureResult {
-            commit_result: CommitResult::Committed,
-            exhausted_message_ids,
-        }
+            DeliveryOutcome::Failed,
+        )
     }
 
     pub(crate) fn cancel_batch(&self, batch: &WorkBatch, classification: &'static str) -> CommitResult {
-        self.terminalize_batch(batch, WorkIntentState::Cancelled { classification }, classification)
+        // A cancelled batch never reached the agent, so it is not a failed delivery
+        // attempt and must not consume the message's retry budget.
+        self.terminalize_batch(
+            batch,
+            WorkIntentState::Cancelled { classification },
+            classification,
+            DeliveryOutcome::NotFailed,
+        )
+        .commit_result
     }
 
     pub(crate) fn interrupt_batch(
@@ -1518,16 +1491,26 @@ impl SlotWorkCoordinator {
         intents
     }
 
+    /// Retire the current batch: mark its intents terminal, release the slot, and
+    /// publish the resulting snapshots.
+    ///
+    /// `delivery` decides what happens to the per-message delivery retry counters,
+    /// which is the ONLY thing that differs between a batch that ended cleanly and
+    /// one that failed.
     fn terminalize_batch(
         &self,
         batch: &WorkBatch,
         terminal_state: WorkIntentState,
         classification: &'static str,
-    ) -> CommitResult {
+        delivery: DeliveryOutcome,
+    ) -> BatchFailureResult {
         let mut state = self.lock_state();
         if !self.is_current_batch(&state, batch) {
             self.log_stale_batch(batch, "terminalize_batch");
-            return CommitResult::StaleOwner;
+            return BatchFailureResult {
+                commit_result: CommitResult::StaleOwner,
+                exhausted_message_ids: Vec::new(),
+            };
         }
         for intent_id in &batch.intent_ids {
             if let Some(intent) = state.intents.get_mut(intent_id) {
@@ -1536,8 +1519,30 @@ impl SlotWorkCoordinator {
         }
         let slot = state.slots.get_mut(&batch.slot_id).expect("current batch slot exists");
         slot.active = None;
-        for message_id in &batch.mailbox_message_ids {
-            slot.delivery_failure_counts.remove(message_id);
+        let mut exhausted_message_ids = Vec::new();
+        match delivery {
+            DeliveryOutcome::NotFailed => {
+                for message_id in &batch.mailbox_message_ids {
+                    slot.delivery_failure_counts.remove(message_id);
+                }
+            }
+            DeliveryOutcome::Failed => {
+                // Only messages this batch actually tried to deliver count toward
+                // the retry limit. Rows merely observed through
+                // `team_read_messages` were never a delivery attempt, so they keep
+                // their counter and stay unread — they accrue failures later if a
+                // batch genuinely claims and fails to deliver them.
+                for message_id in &batch.mailbox_message_ids {
+                    let failure_count = slot.delivery_failure_counts.entry(message_id.clone()).or_default();
+                    *failure_count = failure_count.saturating_add(1);
+                    if *failure_count >= MAX_MESSAGE_DELIVERY_FAILURES {
+                        exhausted_message_ids.push(message_id.clone());
+                    }
+                }
+                if !exhausted_message_ids.is_empty() {
+                    slot.paused = true;
+                }
+            }
         }
         let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
         let summaries = Self::run_summaries_locked(&state, batch.team_run_ids.iter().cloned());
@@ -1551,9 +1556,13 @@ impl SlotWorkCoordinator {
             batch_id = %batch.batch_id,
             operation_id = batch.operation_id,
             classification,
+            exhausted_message_count = exhausted_message_ids.len(),
             "team work batch terminal"
         );
-        CommitResult::Committed
+        BatchFailureResult {
+            commit_result: CommitResult::Committed,
+            exhausted_message_ids,
+        }
     }
 
     fn validate_enqueue_constraint(slot_id: &str, slot: &SlotState) -> Result<(), TeamError> {

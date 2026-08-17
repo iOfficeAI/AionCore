@@ -106,7 +106,7 @@ fn run_less_batch_lifecycle_publishes_per_slot_work_snapshots() {
 }
 
 #[test]
-fn priority_lanes_claim_foreground_then_directed_then_control_then_background() {
+fn priority_lanes_claim_foreground_then_control_then_directed_then_background() {
     let coordinator = coordinator();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
     enqueue(&coordinator, WorkSource::TeamMembershipChanged, "background-1");
@@ -125,25 +125,56 @@ fn priority_lanes_claim_foreground_then_directed_then_control_then_background() 
     );
     assert_eq!(coordinator.complete_batch(&foreground), CommitResult::Committed);
 
-    let ReconcileDecision::Claim(directed) = coordinator.next("lead-1") else {
-        panic!("directed batch must follow foreground");
-    };
-    assert_eq!(directed.highest_priority, WorkPriority::Directed);
-    assert_eq!(directed.mailbox_message_ids, vec!["directed-1"]);
-    assert_eq!(coordinator.complete_batch(&directed), CommitResult::Committed);
-
     let ReconcileDecision::Claim(control) = coordinator.next("lead-1") else {
-        panic!("control batch must follow directed");
+        panic!("control batch must follow foreground");
     };
     assert_eq!(control.highest_priority, WorkPriority::Control);
     assert_eq!(control.mailbox_message_ids, vec!["control-1"]);
     assert_eq!(coordinator.complete_batch(&control), CommitResult::Committed);
 
+    let ReconcileDecision::Claim(directed) = coordinator.next("lead-1") else {
+        panic!("directed batch must follow control");
+    };
+    assert_eq!(directed.highest_priority, WorkPriority::Directed);
+    assert_eq!(directed.mailbox_message_ids, vec!["directed-1"]);
+    assert_eq!(coordinator.complete_batch(&directed), CommitResult::Committed);
+
     let ReconcileDecision::Claim(background) = coordinator.next("lead-1") else {
-        panic!("background batch must follow control");
+        panic!("background batch must follow directed");
     };
     assert_eq!(background.highest_priority, WorkPriority::Background);
     assert_eq!(background.mailbox_message_ids, vec!["background-1"]);
+}
+
+/// A shutdown request must not be pushed behind teammate traffic that keeps
+/// arriving. This is the case that motivated ranking Control above Directed: the
+/// directed lane refills between batches, so a lower-ranked control lane could be
+/// deferred round after round.
+#[test]
+fn a_shutdown_request_is_claimed_before_continuously_arriving_directed_messages() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::McpSendMessage, "directed-1");
+    enqueue(&coordinator, WorkSource::McpShutdownRequest, "control-1");
+    // More teammate traffic lands before the coordinator picks a lane.
+    enqueue(&coordinator, WorkSource::McpSendMessage, "directed-2");
+
+    let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
+        panic!("a batch must be claimable");
+    };
+    assert_eq!(first.highest_priority, WorkPriority::Control);
+    assert_eq!(first.mailbox_message_ids, vec!["control-1"]);
+    assert_eq!(coordinator.complete_batch(&first), CommitResult::Committed);
+
+    // The directed backlog is still there, coalesced, and claimed next.
+    let ReconcileDecision::Claim(second) = coordinator.next("lead-1") else {
+        panic!("directed backlog must follow");
+    };
+    assert_eq!(second.highest_priority, WorkPriority::Directed);
+    assert_eq!(
+        second.mailbox_message_ids,
+        vec!["directed-1".to_owned(), "directed-2".to_owned()]
+    );
 }
 
 #[test]
