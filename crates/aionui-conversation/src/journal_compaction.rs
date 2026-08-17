@@ -2,10 +2,15 @@
 //! measurement. Projection-only: the journal stays append-only.
 
 use crate::journal_transcript::{DraftItem, TranscriptVisibility};
+use crate::stream_persistence::{CanonicalEventJournal, CanonicalJournalEvent, canonical_event_id};
+use serde_json::json;
 
-pub(crate) const KEEP_RECENT_TOOL_RESULTS: usize = 3;
+pub(crate) const DEFAULT_KEEP_RECENT_TOOL_RESULTS: usize = 3;
+pub(crate) const MIN_KEEP_RECENT_TOOL_RESULTS: usize = 1;
+pub(crate) const MAX_KEEP_RECENT_TOOL_RESULTS: usize = 20;
 pub(crate) const KIND_COMPACTION_START: &str = "CompactionStart";
 pub(crate) const KIND_COMPACTION_END: &str = "CompactionEnd";
+pub(crate) const KIND_COMPACTION_POLICY: &str = "CompactionPolicy";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompactionLock {
@@ -37,14 +42,61 @@ pub(crate) struct TranscriptTokenNode {
     pub tokens: u64,
 }
 
-pub(crate) fn compact_old_tool_results(items: &mut [DraftItem]) {
+pub(crate) fn parse_keep_n(value: u64) -> Option<usize> {
+    let keep_n = usize::try_from(value).ok()?;
+    (MIN_KEEP_RECENT_TOOL_RESULTS..=MAX_KEEP_RECENT_TOOL_RESULTS)
+        .contains(&keep_n)
+        .then_some(keep_n)
+}
+
+pub(crate) fn fold_compaction_keep_n(events: &[CanonicalJournalEvent]) -> usize {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.kind == KIND_COMPACTION_POLICY)
+        .and_then(|event| {
+            event
+                .payload
+                .pointer("/data/keep_n")
+                .or_else(|| event.payload.pointer("/keep_n"))
+                .and_then(serde_json::Value::as_u64)
+        })
+        .and_then(parse_keep_n)
+        .unwrap_or(DEFAULT_KEEP_RECENT_TOOL_RESULTS)
+}
+
+pub(crate) async fn append_compaction_policy(
+    journal: &CanonicalEventJournal,
+    user_id: &str,
+    conversation_id: &str,
+    keep_n: usize,
+) -> Result<CanonicalJournalEvent, std::io::Error> {
+    let payload = json!({
+        "type": "compaction_policy",
+        "data": { "keep_n": keep_n as u64 }
+    });
+    let seed = format!("compaction_policy:{conversation_id}:{keep_n}");
+    let event_id = canonical_event_id(&seed, &payload);
+    journal
+        .append(
+            user_id,
+            conversation_id,
+            event_id,
+            KIND_COMPACTION_POLICY.to_owned(),
+            payload,
+        )
+        .await
+}
+
+pub(crate) fn compact_old_tool_results(items: &mut [DraftItem], keep_n: usize) {
+    let keep_n = keep_n.clamp(MIN_KEEP_RECENT_TOOL_RESULTS, MAX_KEEP_RECENT_TOOL_RESULTS);
     let tool_indexes: Vec<usize> = items
         .iter()
         .enumerate()
         .filter(|(_, item)| item.transcript_kind == "tool/call" && item.visibility == TranscriptVisibility::Model)
         .map(|(index, _)| index)
         .collect();
-    let prune_end = tool_indexes.len().saturating_sub(KEEP_RECENT_TOOL_RESULTS);
+    let prune_end = tool_indexes.len().saturating_sub(keep_n);
     for &index in &tool_indexes[..prune_end] {
         let item = &mut items[index];
         item.content = item.summary.clone();
@@ -176,6 +228,24 @@ mod tests {
             kind: kind.into(),
             payload,
         }
+    }
+
+    #[test]
+    fn last_keep_n_policy_wins_and_rejects_out_of_range() {
+        assert_eq!(fold_compaction_keep_n(&[]), DEFAULT_KEEP_RECENT_TOOL_RESULTS);
+        let events = vec![
+            event(1, KIND_COMPACTION_POLICY, serde_json::json!({"data":{"keep_n":10}})),
+            event(2, KIND_COMPACTION_POLICY, serde_json::json!({"data":{"keep_n":1}})),
+        ];
+        assert_eq!(fold_compaction_keep_n(&events), 1);
+        let invalid = vec![event(
+            1,
+            KIND_COMPACTION_POLICY,
+            serde_json::json!({"data":{"keep_n":99}}),
+        )];
+        assert_eq!(fold_compaction_keep_n(&invalid), DEFAULT_KEEP_RECENT_TOOL_RESULTS);
+        assert!(parse_keep_n(0).is_none());
+        assert!(parse_keep_n(21).is_none());
     }
 
     #[test]

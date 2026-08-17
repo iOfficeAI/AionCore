@@ -12,12 +12,13 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
-    CanonicalReplayProjectionResponse, ConfigOptionConfirmation, GetConfigOptionsResponse, JournalTranscriptResponse,
-    RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse,
-    SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
+    CanonicalReplayProjectionResponse, ConfigOptionConfirmation, GetConfigOptionsResponse, HostPolicyResponse,
+    JournalTranscriptResponse, RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse,
+    SetHostPolicyRequest, SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery,
+    WorkspaceEntry,
 };
 use aionui_common::{AgentKillReason, ErrorChain};
-use aionui_db::SaveRuntimeStateParams;
+
 use tracing::warn;
 
 use crate::ConversationError;
@@ -82,13 +83,17 @@ impl ConversationService {
             .replay_projection(user_id, conversation_id)
             .await
             .map_err(|error| ConversationError::internal(format!("Failed to project canonical events: {error}")))?;
-        if let Err(violation) = crate::model_visible::check_model_surface_reconstructible(&events) {
-            warn!(
-                conversation_id,
-                error = %violation,
-                "Model-visible invariant violated while deriving transcript"
-            );
-        }
+        let model_surface_reconstructible = match crate::model_visible::check_model_surface_reconstructible(&events) {
+            Ok(()) => true,
+            Err(violation) => {
+                warn!(
+                    conversation_id,
+                    error = %violation,
+                    "Model-visible invariant violated while deriving transcript"
+                );
+                false
+            }
+        };
         let transcript = derive_transcript(conversation_id, &events, requested);
         Ok(JournalTranscriptResponse {
             schema_version: transcript.schema_version,
@@ -127,6 +132,78 @@ impl ConversationService {
                     .collect(),
             },
             tool_pairing_balanced: transcript.tool_pairing_balanced,
+            model_surface_reconstructible,
+            approval_policy: transcript.approval_policy.to_owned(),
+            compaction_keep_n: transcript.compaction_keep_n as u32,
+        })
+    }
+
+    pub async fn set_host_policy(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: SetHostPolicyRequest,
+    ) -> Result<HostPolicyResponse, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        if req.approval.is_none() && req.compaction_keep_n.is_none() {
+            return Err(ConversationError::BadRequest {
+                reason: "approval or compaction_keep_n is required".to_owned(),
+            });
+        }
+
+        let journal = self.canonical_event_journal();
+        let events = journal
+            .replay(user_id, conversation_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to replay canonical events: {error}")))?;
+        let current_approval = crate::approval_audit::fold_approval_policy(&events);
+        let current_keep_n = crate::journal_compaction::fold_compaction_keep_n(&events);
+
+        let next_approval = match req.approval.as_deref() {
+            Some(value) => aionui_ai_agent::shared_kernel::ApprovalPolicy::parse(value).ok_or_else(|| {
+                ConversationError::BadRequest {
+                    reason: format!("unsupported approval policy '{value}'"),
+                }
+            })?,
+            None => current_approval,
+        };
+        let next_keep_n = match req.compaction_keep_n {
+            Some(value) => crate::journal_compaction::parse_keep_n(u64::from(value)).ok_or_else(|| {
+                ConversationError::BadRequest {
+                    reason: format!("compaction_keep_n must be between 1 and 20, got {value}"),
+                }
+            })?,
+            None => current_keep_n,
+        };
+
+        if next_approval != current_approval {
+            crate::approval_audit::append_approval_policy(&journal, user_id, conversation_id, next_approval)
+                .await
+                .map_err(|error| ConversationError::internal(format!("Failed to journal approval policy: {error}")))?;
+        }
+        if next_keep_n != current_keep_n {
+            crate::journal_compaction::append_compaction_policy(&journal, user_id, conversation_id, next_keep_n)
+                .await
+                .map_err(|error| {
+                    ConversationError::internal(format!("Failed to journal compaction policy: {error}"))
+                })?;
+        }
+
+        self.update_extra(
+            user_id,
+            conversation_id,
+            serde_json::json!({
+                "host_policy": {
+                    "approval": next_approval.as_str(),
+                    "compaction_keep_n": next_keep_n as u64
+                }
+            }),
+        )
+        .await?;
+
+        Ok(HostPolicyResponse {
+            approval: next_approval.as_str().to_owned(),
+            compaction_keep_n: next_keep_n as u32,
         })
     }
 
@@ -191,65 +268,14 @@ impl ConversationService {
         }
         self.ensure_owned_conversation(user_id, conversation_id).await?;
         let agent = self.task(conversation_id)?;
-        let response = if option_id == "model" && agent.backend() == Some("deepseek-harness") {
-            let snapshot = agent.get_config_options().await.map_err(ConversationError::from)?;
-            let model_option = snapshot
-                .config_options
-                .iter()
-                .find(|option| option.id == "model" || option.category.as_deref() == Some("model"));
-            if model_option.is_some_and(|option| {
-                !option.options.is_empty() && !option.options.iter().any(|item| item.value == req.value)
-            }) {
-                return Err(ConversationError::BadRequest {
-                    reason: format!("model '{}' is not enabled for the default DeepSeek provider", req.value),
-                });
-            }
-
-            let current_model = self
-                .acp_session_repo()
-                .load_runtime_state_for_user(user_id, conversation_id)
-                .await
-                .map_err(|error| ConversationError::internal(format!("Failed to load DSH model: {error}")))?
-                .and_then(|state| state.current_model_id);
-            let options = if current_model.as_deref() == Some(req.value.as_str()) {
-                snapshot.config_options
-            } else {
-                // DSH's model is process configuration rather than a live ACP option.
-                // Persist the new model, drop the private vendor session anchor, then
-                // converge the whole process tree before opening a fresh session/new.
-                self.acp_session_repo()
-                    .save_runtime_state_for_user(
-                        user_id,
-                        conversation_id,
-                        &SaveRuntimeStateParams {
-                            current_model_id: Some(Some(req.value.as_str())),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(|error| ConversationError::internal(format!("Failed to persist DSH model: {error}")))?;
-                self.acp_session_repo()
-                    .clear_session_id_for_user(user_id, conversation_id)
-                    .await
-                    .map_err(|error| ConversationError::internal(format!("Failed to clear DSH session: {error}")))?;
-                self.task_manager()
-                    .kill_and_wait(conversation_id, Some(AgentKillReason::ModelChanged))
-                    .await;
-                let task_manager = Arc::clone(self.task_manager());
-                let (replacement, _) = self
-                    .ensure_runtime_agent(user_id, conversation_id, &task_manager, "model_rebuild")
-                    .await?;
-                replacement
-                    .get_config_options()
-                    .await
-                    .map_err(ConversationError::from)?
-                    .config_options
-            };
-            SetConfigOptionResponse {
-                confirmation: ConfigOptionConfirmation::Observed,
-                config_options: Some(options),
-            }
-        } else {
+        if agent.backend() == Some("deepseek-harness") {
+            return Err(ConversationError::Archived {
+                id: conversation_id.to_owned(),
+                reason: "This historical conversation can no longer be continued. Please start a new conversation."
+                    .into(),
+            });
+        }
+        let response = {
             match agent.set_config_option(option_id, &req.value).await {
                 Ok(response) => response,
                 Err(err @ AgentError::Acp(AcpError::NotConnected)) => {

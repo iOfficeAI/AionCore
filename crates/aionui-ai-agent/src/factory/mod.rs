@@ -5,7 +5,6 @@ mod acp_launch_policy;
 pub(crate) mod aionrs;
 mod antigravity;
 mod context;
-pub(crate) mod deepseek_harness;
 
 use std::path::PathBuf;
 use std::sync::Arc;

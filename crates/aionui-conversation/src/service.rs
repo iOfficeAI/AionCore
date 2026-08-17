@@ -284,12 +284,26 @@ fn parse_agent_type_from_row(row: &ConversationRow) -> Option<AgentType> {
     serde_json::from_value::<AgentType>(serde_json::Value::String(row.r#type.clone())).ok()
 }
 
+fn extra_backend(row: &ConversationRow) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&row.extra)
+        .ok()?
+        .get("backend")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn is_retired_preview_backend(row: &ConversationRow) -> bool {
+    extra_backend(row).as_deref() == Some("deepseek-harness")
+}
+
 fn reject_deprecated_runtime_row(row: &ConversationRow) -> Result<(), ConversationError> {
     let Some(agent_type) = parse_agent_type_from_row(row) else {
         return Ok(());
     };
 
-    if agent_type.is_deprecated_runtime() {
+    if agent_type.is_deprecated_runtime() || is_retired_preview_backend(row) {
         debug!(
             conversation_id = %row.id,
             agent_type = agent_type.serde_name(),
@@ -2219,6 +2233,14 @@ impl ConversationService {
         {
             return Err(ConversationError::BadRequest {
                 reason: "extra.skills and MCP snapshots are immutable post-creation".into(),
+            });
+        }
+
+        if let Some(incoming) = &req.extra
+            && incoming.get("host_policy").is_some()
+        {
+            return Err(ConversationError::BadRequest {
+                reason: "host policy must be changed via /host-policy, not conversation.extra".into(),
             });
         }
 

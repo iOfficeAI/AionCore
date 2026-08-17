@@ -199,6 +199,40 @@ pub struct JournalTranscriptResponse {
     /// False when a tool call is still open on the current journal surface.
     #[serde(default)]
     pub tool_pairing_balanced: bool,
+    /// False when a model-visible user/ask event has no reconstructible payload.
+    /// Older AionCore builds omit this; clients should default to true.
+    #[serde(default = "default_true")]
+    pub model_surface_reconstructible: bool,
+    /// `ask` / `never`. Absent on older AionCore builds.
+    #[serde(default = "default_approval_policy")]
+    pub approval_policy: String,
+    /// How many recent model-visible tool results stay uncompacted.
+    #[serde(default = "default_compaction_keep_n")]
+    pub compaction_keep_n: u32,
+}
+
+fn default_approval_policy() -> String {
+    "ask".to_owned()
+}
+
+fn default_compaction_keep_n() -> u32 {
+    3
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SetHostPolicyRequest {
+    pub approval: Option<String>,
+    pub compaction_keep_n: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostPolicyResponse {
+    pub approval: String,
+    pub compaction_keep_n: u32,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Inner model info payload matching the frontend's `AcpModelInfo` type.

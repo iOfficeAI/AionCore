@@ -538,8 +538,19 @@ fn parse_extra(row: &ConversationRow) -> Result<serde_json::Value, ConversationE
     serde_json::from_str(&row.extra).map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))
 }
 
+fn extra_backend(row: &ConversationRow) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&row.extra)
+        .ok()?
+        .get("backend")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 fn reject_deprecated_runtime_kind(row: &ConversationRow, agent_type: &AgentType) -> Result<(), ConversationError> {
-    if !agent_type.is_deprecated_runtime() {
+    let retired_preview = extra_backend(row).as_deref() == Some("deepseek-harness");
+    if !agent_type.is_deprecated_runtime() && !retired_preview {
         return Ok(());
     }
 

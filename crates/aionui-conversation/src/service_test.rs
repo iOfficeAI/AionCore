@@ -8179,6 +8179,83 @@ async fn update_allows_other_extra_fields() {
 }
 
 #[tokio::test]
+async fn update_rejects_extra_host_policy() {
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace, "backend": "claude" },
+    }))
+    .unwrap();
+    let resp = svc.create("u", req).await.unwrap();
+
+    let update_req: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "host_policy": { "approval": "never" } },
+    }))
+    .unwrap();
+    let err = svc.update("u", &resp.id, update_req, &task_mgr).await.unwrap_err();
+
+    match err {
+        ConversationError::BadRequest { reason: msg } => {
+            assert!(msg.contains("/host-policy"), "msg = {msg:?}")
+        }
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn set_host_policy_journals_never_and_keep_n() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let policy = svc
+        .set_host_policy(
+            "user_1",
+            &conv.id,
+            aionui_api_types::SetHostPolicyRequest {
+                approval: Some("never".into()),
+                compaction_keep_n: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(policy.approval, "never");
+    assert_eq!(policy.compaction_keep_n, 1);
+
+    let events = svc.canonical_event_journal().replay("user_1", &conv.id).await.unwrap();
+    assert!(events.iter().any(|event| event.kind == "ApprovalPolicy"));
+    assert!(events.iter().any(|event| event.kind == "CompactionPolicy"));
+
+    let transcript = svc
+        .derive_event_transcript("user_1", &conv.id, Some("host"))
+        .await
+        .unwrap();
+    assert_eq!(transcript.approval_policy, "never");
+    assert_eq!(transcript.compaction_keep_n, 1);
+
+    let stored = svc.get("user_1", &conv.id).await.unwrap();
+    assert_eq!(stored.extra["host_policy"]["approval"], "never");
+    assert_eq!(stored.extra["host_policy"]["compaction_keep_n"], 1);
+
+    let err = svc
+        .set_host_policy(
+            "user_1",
+            &conv.id,
+            aionui_api_types::SetHostPolicyRequest {
+                approval: None,
+                compaction_keep_n: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    match err {
+        ConversationError::BadRequest { reason } => assert!(reason.contains("required")),
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn get_backfills_legacy_row_and_persists() {
     let resolver = Arc::new(FixedSkillResolver {
         names: vec!["cron".into(), "todo-tracker".into()],

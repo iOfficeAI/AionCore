@@ -164,41 +164,20 @@ pub(super) async fn build(
         return Ok(instance);
     }
 
-    let mut command_spec = if config.backend.as_deref() == Some(super::deepseek_harness::BACKEND) {
-        let launch = super::deepseek_harness::resolve_launch(
-            deps.provider_repo.as_ref(),
-            &deps.encryption_key,
-            &deps.data_dir,
-            &ctx.user_id,
-            &ctx.conversation_id,
-            &ctx.workspace,
-            &model,
-        )
-        .await?;
-        info!(
-            conversation_id = %ctx.conversation_id,
-            provider_id = %launch.provider_id,
-            model_id = %launch.model_id,
-            "DeepSeek Harness launch configuration resolved"
-        );
-        meta.handshake.available_models = Some(serde_json::json!({
-            "current_model_id": launch.model_id,
-            "available_models": launch.enabled_models.iter().map(|id| serde_json::json!({
-                "id": id,
-                "label": id,
-            })).collect::<Vec<_>>(),
-        }));
-        launch.command_spec
-    } else {
-        resolve_agent_command_spec(
-            &meta,
-            &ctx.user_id,
-            &ctx.workspace,
-            &ctx.conversation_id,
-            deps.broadcaster.clone(),
-        )
-        .await?
-    };
+    if config.backend.as_deref() == Some("deepseek-harness") {
+        return Err(AgentError::bad_request(
+            "DeepSeek Harness preview has been retired. Open the conversation as history, or start a new chat with another agent.",
+        ));
+    }
+
+    let mut command_spec = resolve_agent_command_spec(
+        &meta,
+        &ctx.user_id,
+        &ctx.workspace,
+        &ctx.conversation_id,
+        deps.broadcaster.clone(),
+    )
+    .await?;
     apply_acp_launch_policy(
         &mut command_spec,
         AcpLaunchPolicyInput {
@@ -1297,5 +1276,10 @@ mod tests {
         assert_eq!(route_for_backend(Some("gemini")), BackendRoute::AcpManager);
         assert_eq!(route_for_backend(Some("opencode")), BackendRoute::AcpManager);
         assert_eq!(route_for_backend(None), BackendRoute::AcpManager);
+    }
+
+    #[test]
+    fn retired_deepseek_harness_has_no_special_factory_route() {
+        assert_eq!(route_for_backend(Some("deepseek-harness")), BackendRoute::AcpManager);
     }
 }

@@ -90,9 +90,8 @@ pub(crate) async fn append_approval_decided(
         .await
 }
 
-/// Journal the session approval policy. Production callers arrive once a
-/// settings path exists; tests already write this event to exercise `never`.
-#[cfg_attr(not(test), expect(dead_code))]
+/// Journal the session approval policy. Production callers arrive from
+/// `set_host_policy`; tests already write this event to exercise `never`.
 pub(crate) async fn append_approval_policy(
     journal: &CanonicalEventJournal,
     user_id: &str,

@@ -2,9 +2,9 @@
 
 use crate::state::ConversationRouterState;
 use aionui_api_types::{
-    ApiResponse, CanonicalReplayProjectionResponse, JournalTranscriptResponse, RetainedOutputResponse,
-    SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
-    WorkspaceBrowseQuery, WorkspaceEntry,
+    ApiResponse, CanonicalReplayProjectionResponse, HostPolicyResponse, JournalTranscriptResponse,
+    RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse, SetHostPolicyRequest, SideQuestionRequest,
+    SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -23,6 +23,7 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
         .route("/api/usage", get(list_usage_events).delete(clear_usage_events))
         .route("/api/conversations/{id}/event-replay", get(replay_event_projection))
         .route("/api/conversations/{id}/transcript", get(get_event_transcript))
+        .route("/api/conversations/{id}/host-policy", put(set_host_policy))
         .route("/api/conversations/{id}/outputs/{reference}", get(get_retained_output))
         .route(
             "/api/conversations/{id}/config-options/{option_id}",
@@ -87,6 +88,22 @@ async fn get_retained_output(
 }
 
 // ── Route handlers ─────────────────────────────────────────────────
+
+async fn set_host_policy(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<SetHostPolicyRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<HostPolicyResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .set_host_policy(&user.id, &id, req)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
 
 async fn set_config_option(
     State(state): State<ConversationRouterState>,

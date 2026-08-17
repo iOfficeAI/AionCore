@@ -213,8 +213,8 @@ async fn run_probe(
     meta: &AgentMetadata,
     user_id: &str,
     kind: AgentSnapshotCheckKind,
-    encryption_key: &[u8; 32],
-    data_dir: &std::path::Path,
+    _encryption_key: &[u8; 32],
+    _data_dir: &std::path::Path,
 ) -> AvailabilitySnapshot {
     let started_at = now_ms();
     let start = Instant::now();
@@ -223,8 +223,8 @@ async fn run_probe(
     let mut guidance: Option<String> = None;
 
     let (status, error_code, error_message) =
-        if meta.backend.as_deref() == Some(crate::factory::deepseek_harness::BACKEND) {
-            probe_deepseek_harness(registry, provider_repo, meta, user_id, encryption_key, data_dir).await
+        if meta.backend.as_deref() == Some("deepseek-harness") {
+            probe_retired_deepseek_harness()
         } else if meta.agent_source == AgentSource::Builtin
             && matches!(
                 meta.backend.as_deref(),
@@ -371,76 +371,12 @@ async fn run_probe(
     }
 }
 
-async fn probe_deepseek_harness(
-    registry: &Arc<AgentRegistry>,
-    provider_repo: &Arc<dyn IProviderRepository>,
-    meta: &AgentMetadata,
-    user_id: &str,
-    encryption_key: &[u8; 32],
-    data_dir: &std::path::Path,
-) -> (AgentSnapshotCheckStatus, Option<String>, Option<String>) {
-    if aionui_runtime::probe_deepseek_harness_runtime().is_none() {
-        return (
-            AgentSnapshotCheckStatus::Offline,
-            Some("managed_runtime_unavailable".to_owned()),
-            Some("DeepSeek Harness runtime is not installed".to_owned()),
-        );
-    }
-    let launch = match crate::factory::deepseek_harness::resolve_probe_launch(
-        provider_repo.as_ref(),
-        encryption_key,
-        data_dir,
-        user_id,
+fn probe_retired_deepseek_harness() -> (AgentSnapshotCheckStatus, Option<String>, Option<String>) {
+    (
+        AgentSnapshotCheckStatus::Offline,
+        Some("retired".to_owned()),
+        Some("DeepSeek Harness preview has been retired".to_owned()),
     )
-    .await
-    {
-        Ok(launch) => launch,
-        Err(error) => {
-            let message = error.to_string();
-            let code = if message.contains("no enabled models") {
-                "no_model"
-            } else if message.contains("provider") || message.contains("credential") || message.contains("API key") {
-                "no_provider"
-            } else {
-                "health_check_failed"
-            };
-            return (AgentSnapshotCheckStatus::Offline, Some(code.to_owned()), Some(message));
-        }
-    };
-    let command = launch.command_spec.command.to_string_lossy().into_owned();
-    let env: HashMap<String, String> = launch
-        .command_spec
-        .env
-        .iter()
-        .map(|entry| (entry.name.clone(), entry.value.clone()))
-        .collect();
-    match custom_agent_probe::try_connect_custom_agent_with_catalog(&command, &launch.command_spec.args, &env, None)
-        .await
-    {
-        (TryConnectCustomAgentResponse::Success, catalog) => {
-            if let Some(partial) = catalog {
-                registry
-                    .catalog_sender()
-                    .send_partial(user_id.to_owned(), meta.id.clone(), *partial);
-            }
-            (AgentSnapshotCheckStatus::Online, None, None)
-        }
-        (TryConnectCustomAgentResponse::FailCli { .. }, _) => (
-            AgentSnapshotCheckStatus::Offline,
-            Some("managed_runtime_unavailable".to_owned()),
-            Some("Managed DeepSeek Harness runtime could not be started".to_owned()),
-        ),
-        (TryConnectCustomAgentResponse::FailAcp { .. }, _) => (
-            AgentSnapshotCheckStatus::Offline,
-            Some("acp_init_failed".to_owned()),
-            Some("DeepSeek Harness ACP initialization failed".to_owned()),
-        ),
-        (TryConnectCustomAgentResponse::FailAuth { .. }, _) => (
-            AgentSnapshotCheckStatus::Offline,
-            Some("auth_required".to_owned()),
-            Some("DeepSeek provider authentication failed".to_owned()),
-        ),
-    }
 }
 
 fn explicit_probe_args(meta: &AgentMetadata) -> Result<Vec<String>, String> {

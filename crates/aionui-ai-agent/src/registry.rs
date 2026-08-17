@@ -1043,8 +1043,7 @@ fn is_builtin_managed_agent(meta: &AgentMetadata) -> bool {
 
 fn managed_runtime_status(meta: &AgentMetadata) -> Option<ManagedRuntimeStatus> {
     let source = meta.agent_source_info.managed_runtime.as_ref()?;
-    let ready = source.runtime_id == aionui_runtime::DEEPSEEK_HARNESS_RUNTIME_ID
-        && aionui_runtime::probe_deepseek_harness_runtime().is_some();
+    let ready = false;
     Some(ManagedRuntimeStatus {
         runtime_id: source.runtime_id.clone(),
         release: source.release.clone(),
@@ -1573,12 +1572,10 @@ fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableRe
 
     if let Some(runtime) = meta.agent_source_info.managed_runtime.as_ref() {
         if runtime.runtime_id == aionui_runtime::DEEPSEEK_HARNESS_RUNTIME_ID {
-            return aionui_runtime::probe_deepseek_harness_runtime()
-                .map(|resolved| resolved.node_path)
-                .ok_or_else(|| UnavailableReason::ManagedRuntimeUnavailable {
-                    resource: runtime.runtime_id.clone(),
-                    detail: format!("release {} is not installed", runtime.release),
-                });
+            return Err(UnavailableReason::ManagedRuntimeUnavailable {
+                resource: runtime.runtime_id.clone(),
+                detail: "DeepSeek Harness preview has been retired".to_owned(),
+            });
         }
         return Err(UnavailableReason::ManagedRuntimeUnavailable {
             resource: runtime.runtime_id.clone(),
@@ -1654,7 +1651,7 @@ mod tests {
         // when none of the CLIs are installed on the test host.
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
-        assert_eq!(all.len(), 44, "seed rows include antigravity and deepseek-harness");
+        assert_eq!(all.len(), 44, "seed rows include antigravity and retired deepseek-harness");
     }
 
     #[tokio::test]

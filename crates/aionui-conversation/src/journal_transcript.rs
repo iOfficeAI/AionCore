@@ -10,10 +10,10 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::approval_audit::{KIND_APPROVAL_ASKED, KIND_APPROVAL_DECIDED, KIND_APPROVAL_POLICY};
+use crate::approval_audit::{KIND_APPROVAL_ASKED, KIND_APPROVAL_DECIDED, KIND_APPROVAL_POLICY, fold_approval_policy};
 use crate::journal_compaction::{
-    CompactionLock, TranscriptTokenMeasurement, compact_old_tool_results, compaction_lock, measure_model_surface,
-    tool_pairing_balanced,
+    CompactionLock, TranscriptTokenMeasurement, compact_old_tool_results, compaction_lock, fold_compaction_keep_n,
+    measure_model_surface, tool_pairing_balanced,
 };
 use crate::stream_persistence::CanonicalJournalEvent;
 
@@ -76,6 +76,8 @@ pub(crate) struct DerivedTranscript {
     pub compaction_lock: CompactionLock,
     pub tokens: TranscriptTokenMeasurement,
     pub tool_pairing_balanced: bool,
+    pub approval_policy: &'static str,
+    pub compaction_keep_n: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,7 +115,8 @@ pub(crate) fn derive_transcript(
     requested: RequestedVisibility,
 ) -> DerivedTranscript {
     let mut drafts = merge_assistant_text(events.iter().filter_map(classify_event).collect());
-    compact_old_tool_results(&mut drafts);
+    let compaction_keep_n = fold_compaction_keep_n(events);
+    compact_old_tool_results(&mut drafts, compaction_keep_n);
     let tokens = measure_model_surface(&drafts, events.len() as u64);
     let model_visible_count = drafts
         .iter()
@@ -147,6 +150,8 @@ pub(crate) fn derive_transcript(
         compaction_lock: lock,
         tokens,
         tool_pairing_balanced: tool_pairing_balanced(events),
+        approval_policy: fold_approval_policy(events).as_str(),
+        compaction_keep_n: compaction_keep_n as u64,
     }
 }
 
@@ -189,7 +194,8 @@ fn classify_kind(kind: &str) -> Option<(TranscriptVisibility, &'static str)> {
         | KIND_APPROVAL_DECIDED
         | KIND_APPROVAL_POLICY
         | crate::journal_compaction::KIND_COMPACTION_START
-        | crate::journal_compaction::KIND_COMPACTION_END => Some((TranscriptVisibility::Host, "host/notice")),
+        | crate::journal_compaction::KIND_COMPACTION_END
+        | crate::journal_compaction::KIND_COMPACTION_POLICY => Some((TranscriptVisibility::Host, "host/notice")),
         "SegmentBreak"
         | "BackendTurnBound"
         | "AcpDialectSignal"
@@ -420,6 +426,28 @@ mod tests {
         assert_eq!(model.items[0].summary, "exit 0\nhello world");
         assert_eq!(model.items[0].content, "exit 0\nhello world");
         assert!(!model.items[0].compacted);
+    }
+
+    #[test]
+    fn compaction_keep_n_from_journal_policy_event() {
+        let mut events: Vec<_> = (1..=4)
+            .map(|sequence| {
+                event(
+                    sequence,
+                    "ToolCall",
+                    serde_json::json!({"data":{"name":"Bash","output":"ok"}}),
+                )
+            })
+            .collect();
+        events.push(event(
+            5,
+            crate::journal_compaction::KIND_COMPACTION_POLICY,
+            serde_json::json!({"data":{"keep_n":1}}),
+        ));
+        let model = derive_transcript("conv", &events, RequestedVisibility::Model);
+        assert_eq!(model.compaction_keep_n, 1);
+        assert_eq!(model.items.iter().filter(|item| item.compacted).count(), 3);
+        assert!(!model.items[3].compacted);
     }
 
     #[test]

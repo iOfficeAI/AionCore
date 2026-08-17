@@ -50,25 +50,14 @@ impl AgentService {
             encryption_key,
             data_dir,
         );
-        let manifest = aionui_runtime::deepseek_harness_manifest()
-            .expect("embedded DeepSeek Harness runtime manifest must be valid");
-        let current_runtime = aionui_runtime::probe_deepseek_harness_current_runtime();
-        let installed_runtime = aionui_runtime::probe_deepseek_harness_runtime();
-        let update_available = current_runtime.is_none() && installed_runtime.is_some();
         let deepseek_runtime = Arc::new(RwLock::new(ManagedRuntimeStatus {
-            runtime_id: manifest.runtime_id,
-            release: installed_runtime
-                .as_ref()
-                .map_or(manifest.release, |runtime| runtime.release.clone()),
-            state: if installed_runtime.is_some() {
-                ManagedRuntimeState::Ready
-            } else {
-                ManagedRuntimeState::NotInstalled
-            },
-            phase: update_available.then(|| "update_available".to_owned()),
+            runtime_id: aionui_runtime::DEEPSEEK_HARNESS_RUNTIME_ID.to_owned(),
+            release: String::new(),
+            state: ManagedRuntimeState::NotInstalled,
+            phase: Some("retired".to_owned()),
             progress: None,
-            error_code: None,
-            error_message: None,
+            error_code: Some("retired".to_owned()),
+            error_message: Some("DeepSeek Harness preview has been retired".to_owned()),
         }));
         Arc::new(Self {
             registry,
@@ -144,97 +133,14 @@ impl AgentService {
             .management_row_by_id(user_id, id)
             .await?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
-        let source = row
+        let _source = row
             .agent_source_info
             .managed_runtime
             .as_ref()
             .ok_or_else(|| AgentError::bad_request("Agent does not use a managed application runtime"))?;
-        if source.runtime_id != aionui_runtime::DEEPSEEK_HARNESS_RUNTIME_ID {
-            return Err(AgentError::bad_request("Managed application runtime is not supported"));
-        }
-
-        if aionui_runtime::probe_deepseek_harness_current_runtime().is_some() {
-            self.set_runtime_status(ManagedRuntimeState::Ready, Some("ready"), Some(100), None, None);
-            return Ok(self.overlay_runtime_status(row));
-        }
-
-        {
-            let mut status = self
-                .deepseek_runtime
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if status.state != ManagedRuntimeState::Installing {
-                status.state = ManagedRuntimeState::Installing;
-                status.phase = Some("waiting_for_lock".to_owned());
-                status.progress = Some(0);
-                status.error_code = None;
-                status.error_message = None;
-
-                let shared_status = self.deepseek_runtime.clone();
-                let registry = self.registry.clone();
-                tokio::spawn(async move {
-                    let reporter_status = shared_status.clone();
-                    let reporter = move |update: aionui_runtime::ManagedNpmAppProgress| {
-                        let (phase, progress) = match update.phase {
-                            aionui_runtime::ManagedNpmAppProgressPhase::WaitingForLock => ("waiting_for_lock", 0),
-                            aionui_runtime::ManagedNpmAppProgressPhase::Installing => ("installing", 25),
-                            aionui_runtime::ManagedNpmAppProgressPhase::Validating => ("validating", 90),
-                            aionui_runtime::ManagedNpmAppProgressPhase::Ready => ("ready", 100),
-                            aionui_runtime::ManagedNpmAppProgressPhase::Failed => ("failed", 0),
-                        };
-                        let mut status = reporter_status.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        status.state = if update.phase == aionui_runtime::ManagedNpmAppProgressPhase::Failed {
-                            ManagedRuntimeState::Failed
-                        } else if update.phase == aionui_runtime::ManagedNpmAppProgressPhase::Ready {
-                            ManagedRuntimeState::Ready
-                        } else {
-                            ManagedRuntimeState::Installing
-                        };
-                        status.phase = Some(phase.to_owned());
-                        status.progress = Some(progress);
-                    };
-                    match aionui_runtime::ensure_deepseek_harness_runtime(Some(&reporter), None).await {
-                        Ok(runtime) => {
-                            let candidate_release = aionui_runtime::deepseek_harness_manifest()
-                                .map(|manifest| manifest.release)
-                                .unwrap_or_default();
-                            let rolled_back = runtime.release != candidate_release;
-                            {
-                                let mut status = shared_status.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-                                status.state = ManagedRuntimeState::Ready;
-                                status.release = runtime.release;
-                                status.phase = Some(if rolled_back { "rollback" } else { "ready" }.to_owned());
-                                status.progress = Some(100);
-                                status.error_code = rolled_back.then(|| "runtime_update_failed".to_owned());
-                                status.error_message = rolled_back.then(|| {
-                                    "The candidate runtime failed validation; AionCore kept the previous verified release."
-                                        .to_owned()
-                                });
-                            }
-                            registry.refresh_availability().await;
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                runtime_id = aionui_runtime::DEEPSEEK_HARNESS_RUNTIME_ID,
-                                error_code = "runtime_install_failed",
-                                error = %error,
-                                "Managed runtime installation failed"
-                            );
-                            let mut status = shared_status.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-                            status.state = ManagedRuntimeState::Failed;
-                            status.phase = Some("failed".to_owned());
-                            status.progress = None;
-                            status.error_code = Some("runtime_install_failed".to_owned());
-                            status.error_message = Some(
-                                "DeepSeek Harness runtime installation failed. Retry the installation or inspect server logs."
-                                    .to_owned(),
-                            );
-                        }
-                    }
-                });
-            }
-        }
-        Ok(self.overlay_runtime_status(row))
+        Err(AgentError::bad_request(
+            "DeepSeek Harness preview has been retired",
+        ))
     }
 
     pub async fn provider_health_check(
@@ -343,25 +249,6 @@ impl AgentService {
             row.runtime = Some(status);
         }
         row
-    }
-
-    fn set_runtime_status(
-        &self,
-        state: ManagedRuntimeState,
-        phase: Option<&str>,
-        progress: Option<u8>,
-        error_code: Option<&str>,
-        error_message: Option<String>,
-    ) {
-        let mut status = self
-            .deepseek_runtime
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        status.state = state;
-        status.phase = phase.map(str::to_owned);
-        status.progress = progress;
-        status.error_code = error_code.map(str::to_owned);
-        status.error_message = error_message;
     }
 }
 
