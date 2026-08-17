@@ -8,7 +8,6 @@
 //! over 2000 lines.
 
 use std::path::Component;
-use std::sync::Arc;
 
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
