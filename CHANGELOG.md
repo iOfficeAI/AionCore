@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.77](https://github.com/suoak/AionCore/compare/v0.1.76...v0.1.77) (2026-08-17)
+
+### Features
+
+* **conversation:** retire the DeepSeek Harness preview agent and persist journaled host approval/keep-N policies
+* **conversation:** expose reconstructible transcript metadata on `/transcript`
+
 ## [0.1.76](https://github.com/suoak/AionCore/compare/v0.1.75...v0.1.76) (2026-08-17)
 
 ### Bug Fixes
