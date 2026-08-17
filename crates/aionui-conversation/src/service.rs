@@ -16,15 +16,16 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 use crate::runtime_state::ConversationRuntimeStateService;
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
-    ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
-    ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
-    ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
-    ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
-    MessageSearchResponse, PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding,
-    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
+    ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
+    AssistantMcpBindingChanged, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
+    ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
+    ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
+    EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest, ListConversationsQuery,
+    ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchResponse,
+    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
+    SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_common::{
@@ -1757,6 +1758,16 @@ impl ConversationService {
                 .map(|row| row.last_mcp_ids.clone())
                 .unwrap_or_else(|| "[]".to_string())
         };
+        // Computed BEFORE the upsert overwrites the stored value: in `auto` mode
+        // this preference IS the assistant's effective MCP binding (see
+        // `resolve_effective_assistant_mcp_ids`), so changing it here is the same
+        // event a live team session gets from an assistant update. Only an
+        // already-seeded preference counts — first-time seeding is not a change.
+        let mcp_binding_fingerprint = changed_assistant_mcp_fingerprint(
+            &snapshot.default_modes.mcps,
+            &snapshot.resolved_defaults.mcp_ids,
+            existing_preference.as_ref().map(|row| row.last_mcp_ids.as_str()),
+        )?;
 
         preference_repo
             .upsert_for_user(
@@ -1774,7 +1785,40 @@ impl ConversationService {
             .await
             .map_err(|e| ConversationError::internal(format!("assistant preference upsert failed: {e}")))?;
 
+        if let Some(fingerprint) = mcp_binding_fingerprint {
+            self.publish_assistant_mcp_binding_changed(user_id, &snapshot.assistant_id, fingerprint);
+        }
+
         Ok(())
+    }
+
+    /// Announce that an assistant's effective MCP binding changed.
+    ///
+    /// The assistant domain publishes the same event on assistant create/update.
+    /// Preferences are the OTHER half of the same binding for `auto`-mode
+    /// assistants, and a running team session that never hears about this half
+    /// keeps its members on the previous MCP set until their next attach.
+    fn publish_assistant_mcp_binding_changed(&self, user_id: &str, assistant_id: &str, fingerprint: String) {
+        let payload = AssistantMcpBindingChanged {
+            user_id: user_id.to_owned(),
+            assistant_id: assistant_id.to_owned(),
+            fingerprint,
+        };
+        match serde_json::to_value(&payload) {
+            Ok(value) => {
+                info!(
+                    user_id,
+                    assistant_id,
+                    fingerprint = %payload.fingerprint,
+                    "assistant MCP binding changed through a conversation preference"
+                );
+                self.broadcaster
+                    .broadcast(WebSocketMessage::new(ASSISTANT_MCP_BINDING_CHANGED_EVENT, value));
+            }
+            Err(error) => {
+                warn!(user_id, assistant_id, error = %error, "failed to encode assistant MCP binding event");
+            }
+        }
     }
 
     pub(crate) async fn persist_runtime_assistant_snapshot(
@@ -5323,6 +5367,33 @@ fn parse_json_string_list(raw: Option<&str>, field: &str) -> Result<Vec<String>,
     }
 }
 
+/// The new binding fingerprint when writing `resolved_mcp_ids` changes an
+/// `auto`-mode assistant's effective MCP selection, else `None`.
+///
+/// `fixed` mode is excluded because its effective ids come from the definition
+/// rather than the preference — `persist_assistant_preferences_from_snapshot`
+/// does not rewrite the preference in that mode at all, so it can never be a
+/// binding change. A missing `stored_mcp_ids` is first-time seeding, not a
+/// change: announcing it would restart a member that is already starting with
+/// exactly this selection.
+fn changed_assistant_mcp_fingerprint(
+    mode: &str,
+    resolved_mcp_ids: &[String],
+    stored_mcp_ids: Option<&str>,
+) -> Result<Option<String>, ConversationError> {
+    if mode != "auto" {
+        return Ok(None);
+    }
+    let Some(stored) = stored_mcp_ids else {
+        return Ok(None);
+    };
+    let previous = parse_json_string_list(Some(stored), "last_mcp_ids")?;
+    let next = assistant_mcp_binding_fingerprint(resolved_mcp_ids);
+    // Compare fingerprints rather than raw JSON: the fingerprint sorts and
+    // dedups, so a reordered selection is correctly treated as unchanged.
+    Ok((assistant_mcp_binding_fingerprint(&previous) != next).then_some(next))
+}
+
 fn resolve_effective_assistant_mcp_ids(
     mode: &str,
     default_mcp_ids: &str,
@@ -5693,6 +5764,55 @@ mod tests {
     fn fixed_empty_mcp_binding_stays_explicitly_empty() {
         let ids = resolve_effective_assistant_mcp_ids("fixed", "[]", Some(r#"["globally-enabled"]"#)).unwrap();
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn overwriting_an_auto_mcp_preference_reports_the_new_fingerprint() {
+        let fingerprint =
+            changed_assistant_mcp_fingerprint("auto", &["mcp-b".to_owned()], Some(r#"["mcp-a"]"#)).unwrap();
+
+        assert_eq!(fingerprint.as_deref(), Some(r#"["mcp-b"]"#));
+    }
+
+    #[test]
+    fn reordered_auto_mcp_preference_is_not_a_binding_change() {
+        let fingerprint = changed_assistant_mcp_fingerprint(
+            "auto",
+            &["mcp-b".to_owned(), "mcp-a".to_owned()],
+            Some(r#"["mcp-a","mcp-b"]"#),
+        )
+        .unwrap();
+
+        assert_eq!(fingerprint, None, "sorting/dedup must absorb pure reordering");
+    }
+
+    #[test]
+    fn clearing_an_auto_mcp_preference_reports_the_empty_fingerprint() {
+        // "no MCP" is a real selection, not a no-op: a member left running the
+        // previous set would keep tools the user just removed.
+        let fingerprint = changed_assistant_mcp_fingerprint("auto", &[], Some(r#"["mcp-a"]"#)).unwrap();
+
+        assert_eq!(fingerprint.as_deref(), Some("[]"));
+    }
+
+    #[test]
+    fn first_time_auto_mcp_seeding_is_not_a_binding_change() {
+        let fingerprint = changed_assistant_mcp_fingerprint("auto", &["mcp-a".to_owned()], None).unwrap();
+
+        assert_eq!(
+            fingerprint, None,
+            "seeding a brand new preference must not restart a member that is already starting with it"
+        );
+    }
+
+    #[test]
+    fn fixed_mode_never_reports_a_preference_binding_change() {
+        // In `fixed` mode the effective ids come from the definition, and the
+        // preference is copied through untouched — it can never be the change.
+        let fingerprint =
+            changed_assistant_mcp_fingerprint("fixed", &["mcp-b".to_owned()], Some(r#"["mcp-a"]"#)).unwrap();
+
+        assert_eq!(fingerprint, None);
     }
 
     #[test]

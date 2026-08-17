@@ -580,13 +580,8 @@ impl TeamAgentProvisioner {
             .conversation_port
             .resolve_conversation_mcp_snapshot(user_id, &agent.conversation_id, agent.assistant_id.as_deref())
             .await?;
-        let patch = serde_json::json!({
-            "mcp_server_ids": resolution.snapshot.mcp_server_ids,
-            "session_mcp_servers": resolution.snapshot.session_mcp_servers,
-            "mcp_servers": resolution.snapshot.mcp_servers,
-            "mcp_statuses": resolution.snapshot.mcp_statuses,
-            "assistant_mcp_fingerprint": resolution.fingerprint,
-        });
+        let mut patch = serde_json::json!({});
+        merge_mcp_snapshot_into_patch(&mut patch, &resolution);
         self.conversation_port
             .patch_runtime_config(&agent.conversation_id, patch)
             .await?;
@@ -632,30 +627,18 @@ impl TeamAgentProvisioner {
         preserve_session_mode: bool,
         mcp_resolution: &TeamMcpSnapshotResolution,
     ) -> Result<(), TeamError> {
-        let mcp_snapshot = &mcp_resolution.snapshot;
         let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?;
         let agent_type = agent_type_for_backend(cli_metadata.as_ref(), &agent.backend)?;
         let session_mode = session_mode_for_backend(&agent.backend, agent_type, cli_metadata.as_ref());
-        let patch = if preserve_session_mode {
-            serde_json::json!({
-                "team_mcp_stdio_config": mcp_stdio_cfg,
-                "mcp_server_ids": mcp_snapshot.mcp_server_ids,
-                "session_mcp_servers": mcp_snapshot.session_mcp_servers,
-                "mcp_servers": mcp_snapshot.mcp_servers,
-                "mcp_statuses": mcp_snapshot.mcp_statuses,
-                "assistant_mcp_fingerprint": mcp_resolution.fingerprint,
-            })
+        let mut patch = if preserve_session_mode {
+            serde_json::json!({ "team_mcp_stdio_config": mcp_stdio_cfg })
         } else {
             serde_json::json!({
                 "team_mcp_stdio_config": mcp_stdio_cfg,
                 "session_mode": session_mode,
-                "mcp_server_ids": mcp_snapshot.mcp_server_ids,
-                "session_mcp_servers": mcp_snapshot.session_mcp_servers,
-                "mcp_servers": mcp_snapshot.mcp_servers,
-                "mcp_statuses": mcp_snapshot.mcp_statuses,
-                "assistant_mcp_fingerprint": mcp_resolution.fingerprint,
             })
         };
+        merge_mcp_snapshot_into_patch(&mut patch, mcp_resolution);
         self.conversation_port
             .patch_runtime_config(&agent.conversation_id, patch)
             .await
@@ -674,30 +657,18 @@ impl TeamAgentProvisioner {
         preserve_session_mode: bool,
         mcp_resolution: &TeamMcpSnapshotResolution,
     ) -> Result<(), TeamError> {
-        let mcp_snapshot = &mcp_resolution.snapshot;
         let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?;
         let agent_type = agent_type_for_backend(cli_metadata.as_ref(), &agent.backend)?;
         let session_mode = session_mode_for_backend(&agent.backend, agent_type, cli_metadata.as_ref());
-        let patch = if preserve_session_mode {
-            serde_json::json!({
-                "team_mcp_stdio_config": null,
-                "mcp_server_ids": mcp_snapshot.mcp_server_ids,
-                "session_mcp_servers": mcp_snapshot.session_mcp_servers,
-                "mcp_servers": mcp_snapshot.mcp_servers,
-                "mcp_statuses": mcp_snapshot.mcp_statuses,
-                "assistant_mcp_fingerprint": mcp_resolution.fingerprint,
-            })
+        let mut patch = if preserve_session_mode {
+            serde_json::json!({ "team_mcp_stdio_config": null })
         } else {
             serde_json::json!({
                 "team_mcp_stdio_config": null,
                 "session_mode": session_mode,
-                "mcp_server_ids": mcp_snapshot.mcp_server_ids,
-                "session_mcp_servers": mcp_snapshot.session_mcp_servers,
-                "mcp_servers": mcp_snapshot.mcp_servers,
-                "mcp_statuses": mcp_snapshot.mcp_statuses,
-                "assistant_mcp_fingerprint": mcp_resolution.fingerprint,
             })
         };
+        merge_mcp_snapshot_into_patch(&mut patch, mcp_resolution);
         self.conversation_port
             .patch_runtime_config(&agent.conversation_id, patch)
             .await
@@ -972,6 +943,35 @@ impl TeamAgentProvisioner {
             }
         }
         None
+    }
+}
+
+/// Merge a resolved MCP snapshot into a conversation runtime-config patch.
+///
+/// The four snapshot fields are always written — an empty selection is a real
+/// selection and must overwrite whatever was stored. `assistant_mcp_fingerprint`
+/// is written ONLY when the resolution carries one: a `None` fingerprint means
+/// the assistant binding could not be resolved and the snapshot came from what
+/// was already persisted (see `resolve_conversation_mcp_snapshot`). Writing
+/// `null` there would erase the last known binding identity and leave no way to
+/// tell which MCP set a degraded member is actually running.
+fn merge_mcp_snapshot_into_patch(patch: &mut serde_json::Value, resolution: &TeamMcpSnapshotResolution) {
+    let Some(object) = patch.as_object_mut() else {
+        return;
+    };
+    let snapshot = &resolution.snapshot;
+    object.insert("mcp_server_ids".to_owned(), serde_json::json!(snapshot.mcp_server_ids));
+    object.insert(
+        "session_mcp_servers".to_owned(),
+        serde_json::json!(snapshot.session_mcp_servers),
+    );
+    object.insert("mcp_servers".to_owned(), serde_json::json!(snapshot.mcp_servers));
+    object.insert("mcp_statuses".to_owned(), serde_json::json!(snapshot.mcp_statuses));
+    if let Some(fingerprint) = resolution.fingerprint.as_deref() {
+        object.insert(
+            "assistant_mcp_fingerprint".to_owned(),
+            serde_json::Value::String(fingerprint.to_owned()),
+        );
     }
 }
 
@@ -1800,5 +1800,76 @@ mod tests {
 
         assert!(extra.get("selected_mcp_server_ids").is_none());
         assert!(extra.get("selected_session_mcp_servers").is_none());
+    }
+
+    fn snapshot_with_one_server() -> McpRuntimeSnapshot {
+        McpRuntimeSnapshot {
+            mcp_server_ids: vec!["mcp-a".to_owned()],
+            session_mcp_servers: Vec::new(),
+            mcp_servers: vec!["server-a".to_owned()],
+            mcp_statuses: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolved_fingerprint_is_written_into_the_patch() {
+        let mut patch = serde_json::json!({ "session_mode": "build" });
+
+        merge_mcp_snapshot_into_patch(
+            &mut patch,
+            &TeamMcpSnapshotResolution {
+                snapshot: snapshot_with_one_server(),
+                fingerprint: Some(r#"["mcp-a"]"#.to_owned()),
+            },
+        );
+
+        assert_eq!(patch["session_mode"], "build", "pre-existing keys must survive");
+        assert_eq!(patch["mcp_server_ids"], serde_json::json!(["mcp-a"]));
+        assert_eq!(patch["mcp_servers"], serde_json::json!(["server-a"]));
+        assert_eq!(patch["assistant_mcp_fingerprint"], r#"["mcp-a"]"#);
+    }
+
+    #[test]
+    fn degraded_snapshot_keeps_the_stored_fingerprint_instead_of_nulling_it() {
+        // A `None` fingerprint means the assistant vanished and the snapshot was
+        // reused from what was already persisted. Writing the key as `null` here
+        // would erase the only record of which MCP set the member is running.
+        let mut patch = serde_json::json!({ "team_mcp_stdio_config": null });
+
+        merge_mcp_snapshot_into_patch(
+            &mut patch,
+            &TeamMcpSnapshotResolution {
+                snapshot: snapshot_with_one_server(),
+                fingerprint: None,
+            },
+        );
+
+        assert!(
+            !patch.as_object().unwrap().contains_key("assistant_mcp_fingerprint"),
+            "the key must be absent, not null: {patch}"
+        );
+        // The snapshot itself is still refreshed — only the fingerprint is held back.
+        assert_eq!(patch["mcp_server_ids"], serde_json::json!(["mcp-a"]));
+        assert_eq!(patch["mcp_servers"], serde_json::json!(["server-a"]));
+    }
+
+    #[test]
+    fn empty_snapshot_fields_still_overwrite_stored_values() {
+        let mut patch = serde_json::json!({});
+
+        merge_mcp_snapshot_into_patch(
+            &mut patch,
+            &TeamMcpSnapshotResolution {
+                snapshot: McpRuntimeSnapshot::default(),
+                fingerprint: Some("[]".to_owned()),
+            },
+        );
+
+        // "no MCP" must be persisted as an explicit empty selection, never skipped.
+        assert_eq!(patch["mcp_server_ids"], serde_json::json!([]));
+        assert_eq!(patch["session_mcp_servers"], serde_json::json!([]));
+        assert_eq!(patch["mcp_servers"], serde_json::json!([]));
+        assert_eq!(patch["mcp_statuses"], serde_json::json!([]));
+        assert_eq!(patch["assistant_mcp_fingerprint"], "[]");
     }
 }
