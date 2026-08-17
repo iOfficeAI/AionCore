@@ -210,6 +210,61 @@ impl ConversationService {
         }
     }
 
+    /// Drop the persisted ACP session id once the agent process has been killed.
+    ///
+    /// The session lives INSIDE that process, so killing it destroys the session
+    /// while the id stayed on disk. Every later turn then replayed the dead id at
+    /// `session/new`-less warmup and the agent answered `Session not found`,
+    /// which is not only wrong but PERMANENT: the real failure (live case: a
+    /// missing `Z_AI_API_KEY`, reported once and then never again) became
+    /// unreachable because warmup now failed before the prompt was ever sent.
+    /// The user saw a retryable USER_AGENT_SESSION_NOT_FOUND that no amount of
+    /// retrying could clear.
+    ///
+    /// Gated on `UserAgentSessionNotFound` — the one code where the agent itself
+    /// has declared the id dead. It must NOT be cleared for every terminal error:
+    /// a retryable failure triggers an auto-replay rebuild that deliberately
+    /// carries the session id forward so the replay resumes the same session
+    /// instead of losing the conversation's context (see
+    /// `auto_replay_rebuild_keeps_existing_acp_session_id_in_build_options`).
+    async fn clear_persisted_acp_session_after_eviction(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        error_code: Option<AgentErrorCode>,
+    ) {
+        if error_code != Some(AgentErrorCode::UserAgentSessionNotFound) {
+            return;
+        }
+        if !self
+            .runtime_persistence()
+            .allows(conversation_id, RuntimeWriteKind::AcpRecoveryCleanup)
+        {
+            return;
+        }
+
+        match self
+            .acp_session_repo()
+            .clear_session_id_for_user(user_id, conversation_id)
+            .await
+        {
+            Ok(true) => info!(
+                conversation_id,
+                reason = ?AgentKillReason::AgentErrorRecovery,
+                "Cleared persisted ACP session id after task eviction"
+            ),
+            Ok(false) => {}
+            Err(err) => warn!(
+                user_id,
+                conversation_id,
+                error = %err,
+                reason = ?AgentKillReason::AgentErrorRecovery,
+                "Failed to clear persisted ACP session id after task eviction; \
+                 the next turn may fail with Session not found"
+            ),
+        }
+    }
+
     pub(crate) async fn evict_acp_task_after_terminal_error(
         &self,
         user_id: &str,
@@ -235,6 +290,8 @@ impl ConversationService {
         );
         task_manager
             .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
+            .await;
+        self.clear_persisted_acp_session_after_eviction(user_id, conversation_id, error_code)
             .await;
         self.clear_persisted_acp_model_after_model_not_found(user_id, conversation_id, error_code)
             .await;
