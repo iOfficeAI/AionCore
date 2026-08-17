@@ -146,6 +146,11 @@ impl AcpStartupConnectError {
     }
 }
 
+/// How many trailing stderr lines to keep when an agent fails to reach a live
+/// ACP session. Both startup failure paths (child exited / handshake failed)
+/// read the same window so their diagnostics are comparable.
+const STARTUP_STDERR_PEEK_LINES: usize = 64;
+
 async fn spawn_and_connect_acp(
     params: &AcpSessionParams,
     runtime: &AgentRuntime,
@@ -255,7 +260,7 @@ async fn spawn_and_connect_acp_once(
     let protocol = tokio::select! {
         biased;
         exit = process.wait_for_exit() => {
-            let stderr = process.peek_stderr_tail(64).await;
+            let stderr = process.peek_stderr_tail(STARTUP_STDERR_PEEK_LINES).await;
             let (exit_code, signal) = exit_status_parts(exit);
             error!(
                 conversation_id = %params.conversation_id,
@@ -267,16 +272,44 @@ async fn spawn_and_connect_acp_once(
             let _ = unregister_agent_process(&params.data_dir, process.pid());
             return Err(AcpStartupConnectError::StartupCrash { exit_code, signal, stderr });
         }
-        res = &mut connect_fut => res.map_err(|e| {
-            error!(
-                conversation_id = %params.conversation_id,
-                error = %ErrorChain(&e),
-                "Failed to establish ACP protocol connection"
-            );
-            process.force_kill_tree();
-            let _ = unregister_agent_process(&params.data_dir, process.pid());
-            AcpStartupConnectError::Agent(AgentError::from(e))
-        })?,
+        res = &mut connect_fut => match res {
+            Ok(protocol) => protocol,
+            Err(e) => {
+                // The handshake future can WIN the race against `wait_for_exit`
+                // even when the child is what died: a crashing agent closes the
+                // pipe first, so connect fails with `incoming_transport_closed`
+                // before the exit is observed. The `wait_for_exit` arm above then
+                // never runs, and its `peek_stderr_tail` — the only record of WHY
+                // — is lost, leaving the user a bare "upstream error"
+                // (AIONUI-DESKTOP-9D). Peek here too.
+                //
+                // stderr is for OUR logs only — never folded into the error that
+                // reaches the client ("stderr intentionally NOT included — may
+                // carry secrets", `protocol::error`).
+                let stderr = process.peek_stderr_tail(STARTUP_STDERR_PEEK_LINES).await;
+                error!(
+                    conversation_id = %params.conversation_id,
+                    error = %ErrorChain(&e),
+                    stderr = %stderr,
+                    "Failed to establish ACP protocol connection"
+                );
+                process.force_kill_tree();
+                let _ = unregister_agent_process(&params.data_dir, process.pid());
+                // Classify STRUCTURALLY. `AgentError::from(e)` would flatten this
+                // into a string, and `classify_upstream_detail` then has to guess
+                // the cause back out of that string by substring match — which
+                // fails for a transport close and lands on the catch-all
+                // UNKNOWN_UPSTREAM_ERROR (AIONUI-DESKTOP-9D). We already KNOW the
+                // structural fact: the handshake did not complete. Say so, and
+                // `from_acp_error_ref` maps it to USER_AGENT_STARTUP_FAILED with
+                // UserAgent ownership and a CheckAgentInstallation resolution.
+                return Err(AcpStartupConnectError::StartupCrash {
+                    exit_code: None,
+                    signal: None,
+                    stderr,
+                });
+            }
+        },
     };
 
     Ok(AcpStartupConnection {
