@@ -30,6 +30,7 @@ use aionui_process::Spawner;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 
+use super::codex_title::{NoTitleIo, SpawnedTitleIo, TitleGen};
 use super::suspend::{ProcHandle, SuspendController, spawn_idle_timer};
 use super::types::{
     Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, PendingPermissionView,
@@ -128,6 +129,7 @@ impl BackendConnection for CodexConnection {
             env: config.spawn_env.clone(),
             cwd: config.cwd.clone(),
         };
+        let title_cmd = cmd.clone();
         let proc = self
             .spawner
             .spawn(cmd, &[], "aionui-session")
@@ -142,7 +144,17 @@ impl BackendConnection for CodexConnection {
             spawner: Some(self.spawner.clone()),
             config: config.clone(),
         };
-        let mut backend = CodexSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms).await;
+        // First-turn title latch: armed only for a Fresh open (a brand-new
+        // conversation). Its runs go to a THROWAWAY process built from the same
+        // CommandSpec — same codex install, env and cwd, hence the same
+        // credentials — but never onto this session's connection.
+        let title_gen = Arc::new(TitleGen::new(
+            matches!(&spec, SessionSpec::Fresh { .. }),
+            Arc::new(SpawnedTitleIo::new(self.spawner.clone(), title_cmd)),
+        ));
+        title_gen.set_model(config.model.clone());
+        let mut backend =
+            CodexSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms, title_gen).await;
         // Report a codex whose version differs from the release AionUi verified.
         // codex runs from the user's own install (nothing is bundled), the same
         // situation agy has always been in. Placed here rather than at the two
@@ -910,6 +922,10 @@ struct CodexReaderState {
     /// terminal (TurnResult / Detached). The idle timer reads it so a streaming turn
     /// is never suspended mid-flight.
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// First-turn session-title latch. Fired by the reader on a successful turn
+    /// terminal; runs on its OWN process (see `codex_title`), so nothing here
+    /// touches `thread_binding` / `turn_in_flight` / the R8 `terminated` flag.
+    title_gen: Arc<TitleGen>,
 }
 
 /// Spawn a codex JSON-RPC reader over `stdout`/`io` using the shared state. Used
@@ -940,6 +956,7 @@ fn start_codex_reader(
             state.discovered,
             state.stdin,
             state.turn_in_flight,
+            state.title_gen,
         )
         .await;
     })
@@ -1008,6 +1025,18 @@ impl CodexSessionBackend {
         Self::spawn(session_id.into(), io).await
     }
 
+    /// Test-support seam: build over an injected `AgentIo` WITH a caller-supplied
+    /// title latch, so the first-turn title wiring (reader terminal → fire) can be
+    /// driven without spawning a real codex.
+    #[cfg(test)]
+    pub(crate) async fn build_with_io_titled(
+        session_id: impl Into<String>,
+        io: Box<dyn AgentIo>,
+        title_gen: Arc<TitleGen>,
+    ) -> Self {
+        Self::spawn_with_wake(session_id.into(), io, CodexWakeRecipe::inert(), None, title_gen).await
+    }
+
     /// Test-support seam: build a SUSPENDABLE backend with a caller-supplied
     /// `Spawner` (to observe the wake re-spawn) + an `idle_ttl_ms`. Lets a test
     /// drive the suspend→wake path: the idle slot suspends, and the next dispatch
@@ -1023,7 +1052,14 @@ impl CodexSessionBackend {
             spawner: Some(spawner),
             config: SessionConfig::default(),
         };
-        Self::spawn_with_wake(session_id.into(), io, wake, Some(idle_ttl_ms)).await
+        Self::spawn_with_wake(
+            session_id.into(),
+            io,
+            wake,
+            Some(idle_ttl_ms),
+            Arc::new(TitleGen::new(false, Arc::new(NoTitleIo))),
+        )
+        .await
     }
 
     /// Test-support seam: pre-bind the backend threadId (the resume anchor the
@@ -1086,7 +1122,14 @@ impl CodexSessionBackend {
     /// wake recipe; only the `build_with_io` test seam uses this.
     #[cfg(any(test, feature = "test-support"))]
     async fn spawn(session_id: String, io: Box<dyn AgentIo>) -> Self {
-        Self::spawn_with_wake(session_id, io, CodexWakeRecipe::inert(), None).await
+        Self::spawn_with_wake(
+            session_id,
+            io,
+            CodexWakeRecipe::inert(),
+            None,
+            Arc::new(TitleGen::new(false, Arc::new(NoTitleIo))),
+        )
+        .await
     }
 
     /// Spawn + (optionally) enable F-4 idle self-suspend. `wake` carries what a
@@ -1097,6 +1140,7 @@ impl CodexSessionBackend {
         io: Box<dyn AgentIo>,
         wake: CodexWakeRecipe,
         idle_ttl_ms: Option<i64>,
+        title_gen: Arc<TitleGen>,
     ) -> Self {
         let io: Arc<dyn AgentIo> = Arc::from(io);
         let turn_gen = Arc::new(AtomicU64::new(0));
@@ -1138,6 +1182,7 @@ impl CodexSessionBackend {
             discovered: discovered.clone(),
             stdin: stdin.clone(),
             turn_in_flight: turn_in_flight.clone(),
+            title_gen: title_gen.clone(),
         };
         let reader = start_codex_reader(&reader_state, stdout, io.clone());
 
@@ -1429,6 +1474,7 @@ async fn reader_task(
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    title_gen: Arc<TitleGen>,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1612,6 +1658,18 @@ async fn reader_task(
                                 // F-4: turn terminal → clear the turn-active flag so the
                                 // idle timer may suspend the now-idle process.
                                 turn_in_flight.store(false, Ordering::SeqCst);
+                                // First-turn title: every SUCCESSFUL turn fires
+                                // while the latch is armed (an error turn keeps it
+                                // armed for the next one). Detached onto its own
+                                // process — see `codex_title`.
+                                if let SessionEvent::TurnResult {
+                                    is_error: false,
+                                    result_text,
+                                    ..
+                                } = &ev
+                                {
+                                    title_gen.fire(&session_id, result_text, &event_tx, cur);
+                                }
                                 emit(&event_tx, &session_id, cur, ev);
                             } else if system_error_pending && !was_pending {
                                 // systemError was just deferred: arm the bounded grace
@@ -3633,6 +3691,20 @@ impl SessionBackend for CodexSessionBackend {
                         command: crate::capability::block_kind_name(bad),
                     });
                 }
+                // While the first-turn title latch is armed, record the first
+                // prompt's text as the generation description (bounded inside;
+                // prompt content is never logged).
+                if self.reader_state.title_gen.is_armed() {
+                    let text = content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.reader_state.title_gen.record_first_prompt(&text);
+                }
                 // Bridge-parity slash routing (ELECTRON-3PX): the 6 advertised
                 // commands (builtin_slash_commands) translate to native ops the way
                 // the codex-acp bridge did in-process (v0.14.0 thread.rs:3252
@@ -3901,6 +3973,10 @@ impl SessionBackend for CodexSessionBackend {
                 // Track it so a subsequent SetMode can build collaborationMode (M1).
                 let tid = self.bound_thread().await?;
                 *self.current_model.lock().await = Some(model.clone());
+                // Keep the title latch on the model the user is actually talking
+                // to — a title run started after a switch must not use the stale
+                // open-time model.
+                self.reader_state.title_gen.set_model(Some(model.clone()));
                 let id = self.next_rpc_id();
                 // Register the rpc id so the reader claims the response: a JSON-RPC
                 // error (codex rejected the model) surfaces as a Notice instead of

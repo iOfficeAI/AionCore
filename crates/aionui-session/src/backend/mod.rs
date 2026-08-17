@@ -13,6 +13,7 @@ mod antigravity;
 mod claude_conn;
 mod cli_version;
 mod codex_conn;
+mod codex_title;
 mod conversation_session;
 mod descriptor;
 mod orchestrator;
