@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.76](https://github.com/suoak/AionCore/compare/v0.1.75...v0.1.76) (2026-08-17)
+
+### Bug Fixes
+
+* **acp:** record Grok `_x.ai/session/update` turn_completed usage into the ledger
+
 ## [0.1.75](https://github.com/suoak/AionCore/compare/v0.1.74...v0.1.75) (2026-08-17)
 
 ### Features
