@@ -11,8 +11,8 @@ use aionui_api_types::{
     SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
 };
 use aionui_common::ProviderWithModel;
-use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
+use aionui_db::{IMcpServerRepository, IOAuthTokenRepository};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::ensure_runtime_command_with_reporter;
 use serde_json::{Map, Value};
@@ -57,6 +57,7 @@ pub(super) async fn build(
             &ctx.user_id,
             &ctx.conversation_id,
             deps.broadcaster.clone(),
+            deps.oauth_token_repo.as_deref(),
         )
         .await
         {
@@ -514,6 +515,7 @@ async fn load_user_mcp_servers(
     user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
+    oauth_token_repo: Option<&dyn IOAuthTokenRepository>,
 ) -> HashMap<String, McpServerConfig> {
     let rows_result = match selected_ids {
         Some(ids) => repo.list_by_ids_any(user_id, ids).await,
@@ -543,7 +545,7 @@ async fn load_user_mcp_servers(
             continue;
         }
 
-        match row_to_mcp_server_config(&row, user_id, conversation_id, broadcaster.clone()).await {
+        match row_to_mcp_server_config(&row, user_id, conversation_id, broadcaster.clone(), oauth_token_repo).await {
             Ok(config) => {
                 servers.insert(row.name.clone(), config);
             }
@@ -567,6 +569,7 @@ async fn row_to_mcp_server_config(
     user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
+    oauth_token_repo: Option<&dyn IOAuthTokenRepository>,
 ) -> Result<McpServerConfig, String> {
     let value: serde_json::Value =
         serde_json::from_str(&row.transport_config).map_err(|e| format!("invalid transport_config JSON: {e}"))?;
@@ -610,7 +613,7 @@ async fn row_to_mcp_server_config(
                 .get("url")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "http: missing url".to_owned())?;
-            let headers = value
+            let mut headers = value
                 .get("headers")
                 .and_then(|v| v.as_object())
                 .map(|obj| {
@@ -619,6 +622,7 @@ async fn row_to_mcp_server_config(
                         .collect::<HashMap<_, _>>()
                 })
                 .unwrap_or_default();
+            crate::mcp_resolve::inject_oauth_bearer_header(&mut headers, user_id, url, oauth_token_repo).await;
 
             Ok(McpServerConfig {
                 transport: TransportType::StreamableHttp,
@@ -636,7 +640,7 @@ async fn row_to_mcp_server_config(
                 .get("url")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "sse: missing url".to_owned())?;
-            let headers = value
+            let mut headers = value
                 .get("headers")
                 .and_then(|v| v.as_object())
                 .map(|obj| {
@@ -645,6 +649,7 @@ async fn row_to_mcp_server_config(
                         .collect::<HashMap<_, _>>()
                 })
                 .unwrap_or_default();
+            crate::mcp_resolve::inject_oauth_bearer_header(&mut headers, user_id, url, oauth_token_repo).await;
 
             Ok(McpServerConfig {
                 transport: TransportType::Sse,
@@ -1045,6 +1050,91 @@ mod tests {
         Arc::new(BroadcastEventBus::new(16))
     }
 
+    // Regression coverage: the aionrs ("Nabd CLI") backend loads MCP servers
+    // through its own row_to_mcp_server_config, separate from
+    // mcp_resolve::row_to_session_mcp_server used by claude/codex/antigravity.
+    // A stored OAuth token must reach this path's outbound Authorization
+    // header too, not just the other one.
+
+    struct MockOAuthRepo {
+        row: Option<aionui_db::models::OAuthTokenRow>,
+    }
+
+    #[async_trait::async_trait]
+    impl IOAuthTokenRepository for MockOAuthRepo {
+        async fn get_by_url(
+            &self,
+            _user_id: &str,
+            _server_url: &str,
+        ) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
+            Ok(self.row.clone())
+        }
+        async fn upsert(
+            &self,
+            _params: aionui_db::UpsertOAuthTokenParams<'_>,
+        ) -> Result<aionui_db::models::OAuthTokenRow, aionui_db::DbError> {
+            unimplemented!("not needed")
+        }
+        async fn delete(&self, _user_id: &str, _server_url: &str) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed")
+        }
+        async fn list_authenticated_urls(&self, _user_id: &str) -> Result<Vec<String>, aionui_db::DbError> {
+            unimplemented!("not needed")
+        }
+    }
+
+    fn token_row(access_token: &str) -> aionui_db::models::OAuthTokenRow {
+        aionui_db::models::OAuthTokenRow {
+            user_id: TEST_USER_ID.to_owned(),
+            server_url: "http://localhost:54321/mcp".to_owned(),
+            access_token: access_token.to_owned(),
+            refresh_token: None,
+            token_type: "bearer".to_owned(),
+            expires_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn row_to_mcp_server_config_attaches_bearer_header_when_token_stored() {
+        let row = make_row(
+            "higgsfield",
+            "http",
+            r#"{"url":"http://localhost:54321/mcp"}"#,
+            true,
+            false,
+        );
+        let oauth_repo = MockOAuthRepo {
+            row: Some(token_row("tok-abc")),
+        };
+
+        let config = row_to_mcp_server_config(&row, TEST_USER_ID, "conv-oauth", test_broadcaster(), Some(&oauth_repo))
+            .await
+            .expect("convert");
+
+        let headers = config.headers.expect("headers present");
+        assert_eq!(headers.get("Authorization"), Some(&"Bearer tok-abc".to_string()));
+    }
+
+    #[tokio::test]
+    async fn row_to_mcp_server_config_omits_header_when_no_oauth_repo_given() {
+        let row = make_row(
+            "higgsfield",
+            "http",
+            r#"{"url":"http://localhost:54321/mcp"}"#,
+            true,
+            false,
+        );
+
+        let config = row_to_mcp_server_config(&row, TEST_USER_ID, "conv-oauth", test_broadcaster(), None)
+            .await
+            .expect("convert");
+
+        let headers = config.headers.expect("headers present");
+        assert!(!headers.contains_key("Authorization"));
+    }
+
     #[tokio::test]
     async fn aionrs_loads_mcp_servers_from_frozen_selection_snapshot() {
         let mut row = make_row(
@@ -1064,6 +1154,7 @@ mod tests {
             TEST_USER_ID,
             "conv-frozen-mcp",
             test_broadcaster(),
+            None,
         )
         .await;
 
@@ -1087,7 +1178,7 @@ mod tests {
             false,
         );
 
-        let config = row_to_mcp_server_config(&row, "user-row", "conv-row", test_broadcaster())
+        let config = row_to_mcp_server_config(&row, "user-row", "conv-row", test_broadcaster(), None)
             .await
             .expect("convert");
         let command = config.command.as_deref().expect("resolved command");
@@ -1976,7 +2067,7 @@ mod tests {
         };
         let mut assembled = resolve_mcp_servers(&overrides);
         for (name, config) in
-            load_user_mcp_servers(&repo, None, TEST_USER_ID, "conv-assembly", test_broadcaster()).await
+            load_user_mcp_servers(&repo, None, TEST_USER_ID, "conv-assembly", test_broadcaster(), None).await
         {
             assembled.entry(name).or_insert(config);
         }

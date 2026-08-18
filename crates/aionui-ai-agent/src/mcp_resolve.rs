@@ -183,7 +183,7 @@ pub async fn row_to_session_mcp_server(
 /// Best-effort: an expired token or a repo error just means the server
 /// won't have a token attached and the tool call fails with a normal
 /// auth-required error downstream, exactly as if OAuth had never run.
-async fn inject_oauth_bearer_header(
+pub(crate) async fn inject_oauth_bearer_header(
     headers: &mut std::collections::HashMap<String, String>,
     user_id: &str,
     server_url: &str,
