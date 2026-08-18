@@ -5326,7 +5326,7 @@ impl ConversationService {
                 continue;
             }
             if row.builtin {
-                match aionui_ai_agent::mcp_resolve::row_to_session_mcp_server(&row).await {
+                match aionui_ai_agent::mcp_resolve::row_to_session_mcp_server(&row, user_id, None).await {
                     Ok(server) => session_mcp_servers.push(server),
                     Err(err) => mcp_statuses.push(ConversationMcpStatus {
                         id: row.id,

@@ -34,7 +34,7 @@ use crate::shared_kernel::PersistedSessionState;
 use crate::types::{PromptMediaCaps, SendMessageData};
 use aionui_api_types::{AcpBuildExtra, TEAM_MCP_SERVER_NAME};
 use aionui_common::AgentType;
-use aionui_db::{IAcpSessionRepository, IMcpServerRepository, SaveRuntimeStateParams};
+use aionui_db::{IAcpSessionRepository, IMcpServerRepository, IOAuthTokenRepository, SaveRuntimeStateParams};
 use aionui_realtime::EventBroadcaster;
 
 const EVENT_CHANNEL_CAPACITY: usize = 512;
@@ -1485,6 +1485,12 @@ pub struct SessionBuildInputs<'a> {
     /// User-configured MCP server repository (feature ELECTRON-1JG). `None` on
     /// paths that never inject MCP (tests) ⇒ no injection.
     pub mcp_server_repo: Option<&'a Arc<dyn IMcpServerRepository>>,
+    /// OAuth token repository, so HTTP/SSE MCP servers a user has logged
+    /// into get their stored token attached as an `Authorization: Bearer`
+    /// header. `None` on paths that never inject MCP (tests) ⇒ OAuth-gated
+    /// servers get no token and fail their tool calls as unauthenticated,
+    /// same as if OAuth had never run.
+    pub oauth_token_repo: Option<&'a Arc<dyn IOAuthTokenRepository>>,
     /// The conversation runtime context env (`AIONUI_USER_ID` /
     /// `AIONUI_CONVERSATION_ID` / `AIONUI_HELPER_BIN` / `AIONUI_BASE_URL` /
     /// `AIONUI_RUNTIME_TOKEN`, filled by `apply_conversation_runtime_context`).
@@ -1661,6 +1667,7 @@ pub async fn build_antigravity_instance(
         session_snapshot,
         backend_session_id,
         mcp_server_repo,
+        oauth_token_repo,
         runtime_env,
         broadcaster,
         catalog_writeback,
@@ -1684,6 +1691,7 @@ pub async fn build_antigravity_instance(
                 config.mcp_server_ids.as_deref(),
                 &conversation_id,
                 broadcaster.clone(),
+                oauth_token_repo.map(|r| r.as_ref()),
             )
             .await
         }
@@ -1773,6 +1781,7 @@ pub async fn build_session_instance(
         session_snapshot,
         backend_session_id,
         mcp_server_repo,
+        oauth_token_repo,
         runtime_env,
         broadcaster,
         catalog_writeback,
@@ -1800,6 +1809,7 @@ pub async fn build_session_instance(
                 config.mcp_server_ids.as_deref(),
                 &conversation_id,
                 broadcaster.clone(),
+                oauth_token_repo.map(|r| r.as_ref()),
             )
             .await
         }
@@ -4883,6 +4893,7 @@ mod build_mapping_tests {
                 session_snapshot: None,
                 backend_session_id: None,
                 mcp_server_repo: Some(&repo),
+                oauth_token_repo: None,
                 runtime_env: &[],
                 broadcaster,
                 catalog_writeback: None,
