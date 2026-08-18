@@ -36,6 +36,54 @@ struct OAuthServerMetadata {
     token_endpoint: String,
 }
 
+/// Candidate well-known discovery URLs for one MCP server, in the order they
+/// should be tried: RFC 8414 §3.1 path-aware form first, then the bare-origin
+/// form some servers publish instead.
+#[derive(Debug)]
+struct WellKnownCandidates {
+    origin: String,
+    path: String,
+}
+
+impl WellKnownCandidates {
+    /// URLs to try for a given well-known type (e.g. "oauth-authorization-server").
+    fn for_type(&self, well_known_type: &str) -> Vec<String> {
+        let mut urls = vec![format!("{}/.well-known/{well_known_type}{}", self.origin, self.path)];
+        if !self.path.is_empty() {
+            urls.push(format!("{}/.well-known/{well_known_type}", self.origin));
+        }
+        urls
+    }
+}
+
+/// Build the well-known discovery URL candidates for an MCP server URL.
+///
+/// Per RFC 8414 §3.1, when the issuer URL has a path component (as MCP
+/// server URLs like `https://host/mcp` typically do), the well-known suffix
+/// is inserted between the authority and that path — it is NOT appended
+/// after the full URL. `https://host/mcp` therefore discovers at
+/// `https://host/.well-known/oauth-authorization-server/mcp`, not
+/// `https://host/mcp/.well-known/oauth-authorization-server` (which 404s
+/// against any RFC 8414-compliant server).
+fn well_known_urls(server_url: &str) -> Result<WellKnownCandidates, McpError> {
+    let parsed =
+        oauth2::url::Url::parse(server_url).map_err(|e| McpError::OAuth(format!("Invalid server URL: {e}")))?;
+    Ok(WellKnownCandidates {
+        origin: parsed.origin().ascii_serialization(),
+        path: parsed.path().trim_end_matches('/').to_string(),
+    })
+}
+
+/// The MCP server's own OAuth discovery document controls `authorization_endpoint`
+/// and `token_endpoint` — treat them as untrusted input, not values this
+/// server generated. Reject anything but http(s) before ever building a
+/// client or handing a URL to a browser from these fields.
+fn is_safe_http_url(url: &str) -> bool {
+    oauth2::url::Url::parse(url)
+        .map(|u| u.scheme() == "https" || u.scheme() == "http")
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Pending login state
 // ---------------------------------------------------------------------------
@@ -274,31 +322,42 @@ impl McpOAuthService {
 
     /// Discover OAuth authorization server metadata.
     ///
-    /// Tries `.well-known/oauth-authorization-server` first,
-    /// falls back to `.well-known/openid-configuration`.
+    /// Per RFC 8414 §3.1, when the issuer URL has a path component (as MCP
+    /// server URLs like `https://host/mcp` typically do), the well-known
+    /// suffix is inserted between the authority and that path — it is NOT
+    /// appended after the full URL. `https://host/mcp` therefore discovers
+    /// at `https://host/.well-known/oauth-authorization-server/mcp`, not
+    /// `https://host/mcp/.well-known/oauth-authorization-server` (which
+    /// 404s against any RFC 8414-compliant server). Falls back to the
+    /// bare-origin well-known path for servers that publish metadata there
+    /// instead, then tries OIDC discovery the same way.
     async fn discover_endpoints(&self, server_url: &str) -> Result<OAuthServerMetadata, McpError> {
-        let base = server_url.trim_end_matches('/');
+        let candidates = well_known_urls(server_url)?;
 
-        let well_known_url = format!("{base}/.well-known/oauth-authorization-server");
-        if let Ok(metadata) = self.fetch_metadata(&well_known_url).await {
-            debug!(server_url, "Discovered OAuth metadata via RFC 8414");
-            return Ok(metadata);
-        }
-
-        let oidc_url = format!("{base}/.well-known/openid-configuration");
-        if let Ok(metadata) = self.fetch_metadata(&oidc_url).await {
-            debug!(server_url, "Discovered OAuth metadata via OIDC");
-            return Ok(metadata);
+        for well_known_type in ["oauth-authorization-server", "openid-configuration"] {
+            for url in candidates.for_type(well_known_type) {
+                if let Ok(metadata) = self.fetch_metadata(&url).await {
+                    debug!(server_url, url, "Discovered OAuth metadata");
+                    return Ok(metadata);
+                }
+            }
         }
 
         Err(McpError::OAuth(format!(
             "Failed to discover OAuth endpoints for '{server_url}': \
              no .well-known/oauth-authorization-server or \
-             .well-known/openid-configuration found"
+             .well-known/openid-configuration found (tried both RFC 8414 \
+             path-aware and origin-root locations)"
         )))
     }
 
     /// Fetch and parse OAuth server metadata from a URL.
+    ///
+    /// The MCP server's own discovery document controls `authorization_endpoint`
+    /// and `token_endpoint` — treat them as untrusted input, not values this
+    /// server generated. Reject anything but http(s) here, once, centrally,
+    /// rather than at each of the several places downstream that build a
+    /// `reqwest`/`oauth2` client or hand a URL to a browser from these fields.
     async fn fetch_metadata(&self, url: &str) -> Result<OAuthServerMetadata, McpError> {
         let resp = self
             .http_client
@@ -311,9 +370,18 @@ impl McpOAuthService {
             return Err(McpError::OAuth(format!("Metadata endpoint returned {}", resp.status())));
         }
 
-        resp.json()
+        let metadata: OAuthServerMetadata = resp
+            .json()
             .await
-            .map_err(|e| McpError::OAuth(format!("Failed to parse metadata: {e}")))
+            .map_err(|e| McpError::OAuth(format!("Failed to parse metadata: {e}")))?;
+
+        if !is_safe_http_url(&metadata.authorization_endpoint) || !is_safe_http_url(&metadata.token_endpoint) {
+            return Err(McpError::OAuth(
+                "OAuth metadata endpoint URLs must use http or https".to_string(),
+            ));
+        }
+
+        Ok(metadata)
     }
 
     /// Build a no-redirect reqwest client for OAuth token exchange.
@@ -458,6 +526,92 @@ mod tests {
     use super::*;
 
     const TEST_USER_ID: &str = "user-1";
+
+    // -- well_known_urls -------------------------------------------------------
+    //
+    // Regression coverage for a bug where the well-known discovery suffix was
+    // appended after the server URL's full path (`https://host/mcp/.well-known/
+    // oauth-authorization-server`), which 404s against any RFC 8414-compliant
+    // server, instead of being inserted right after the origin per RFC 8414 §3.1
+    // (`https://host/.well-known/oauth-authorization-server/mcp`).
+
+    #[test]
+    fn well_known_urls_path_aware_form_comes_first_for_pathed_server() {
+        let candidates = well_known_urls("https://mcp.example.com/mcp").unwrap();
+        let urls = candidates.for_type("oauth-authorization-server");
+        assert_eq!(
+            urls,
+            vec![
+                "https://mcp.example.com/.well-known/oauth-authorization-server/mcp",
+                "https://mcp.example.com/.well-known/oauth-authorization-server",
+            ]
+        );
+    }
+
+    #[test]
+    fn well_known_urls_never_puts_well_known_after_the_original_path() {
+        let candidates = well_known_urls("https://mcp.example.com/mcp").unwrap();
+        for url in candidates.for_type("oauth-authorization-server") {
+            assert!(
+                !url.starts_with("https://mcp.example.com/mcp/.well-known"),
+                "well-known suffix must not be appended after the server's path: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn well_known_urls_root_only_server_has_a_single_candidate() {
+        let candidates = well_known_urls("https://mcp.example.com").unwrap();
+        assert_eq!(
+            candidates.for_type("oauth-authorization-server"),
+            vec!["https://mcp.example.com/.well-known/oauth-authorization-server"]
+        );
+    }
+
+    #[test]
+    fn well_known_urls_strips_trailing_slash_from_path() {
+        let candidates = well_known_urls("https://mcp.example.com/mcp/").unwrap();
+        let urls = candidates.for_type("openid-configuration");
+        assert_eq!(urls[0], "https://mcp.example.com/.well-known/openid-configuration/mcp");
+    }
+
+    #[test]
+    fn well_known_urls_rejects_invalid_server_url() {
+        let err = well_known_urls("not a url").unwrap_err();
+        assert!(err.to_string().contains("Invalid server URL"));
+    }
+
+    // -- is_safe_http_url --------------------------------------------------
+    //
+    // The MCP server's own OAuth discovery document controls the endpoint
+    // URLs this server later navigates a browser to — reject anything but
+    // http(s) so a malicious/misconfigured server can't get a javascript:
+    // or data: URL into that redirect.
+
+    #[test]
+    fn is_safe_http_url_accepts_https() {
+        assert!(is_safe_http_url("https://mcp.example.com/oauth2/authorize"));
+    }
+
+    #[test]
+    fn is_safe_http_url_accepts_http() {
+        assert!(is_safe_http_url("http://127.0.0.1:8080/oauth2/authorize"));
+    }
+
+    #[test]
+    fn is_safe_http_url_rejects_javascript_scheme() {
+        assert!(!is_safe_http_url("javascript:alert(document.cookie)"));
+    }
+
+    #[test]
+    fn is_safe_http_url_rejects_data_scheme() {
+        assert!(!is_safe_http_url("data:text/html,<script>alert(1)</script>"));
+    }
+
+    #[test]
+    fn is_safe_http_url_rejects_unparseable_url() {
+        assert!(!is_safe_http_url("not a url"));
+    }
 
     // -- McpOAuthService construction ----------------------------------------
 
