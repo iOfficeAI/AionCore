@@ -206,6 +206,15 @@ impl WorkflowCard {
     /// A rosterless background task (`local_bash` / `local_agent`). `desc` is the
     /// launching call's own description of the work; `task_id` rides in the
     /// headline so the user can name the task when asking to stop it.
+    ///
+    /// `desc` is DROPPED when it merely repeats `tool_name`. The step row draws
+    /// the name and the description side by side and dedupes only on exact
+    /// equality, so once a backend derives its step label from the same argument
+    /// the headline quotes — since #870 a claude Bash label IS that call's own
+    /// `description` — keeping both printed the text twice: "Wait for instance
+    /// readiness" + "Wait for instance readiness · bg task bdyspm202 · 00:09".
+    /// Where the label is still a bare tool name, `desc` is the only thing
+    /// saying what the task does, so it is kept.
     pub fn new_background(
         call_id: String,
         tool_name: String,
@@ -217,6 +226,7 @@ impl WorkflowCard {
         let mut card = Self::new(call_id, tool_name, args, now_ms);
         card.kind = CardKind::BackgroundTask;
         card.bg_headline = match desc {
+            Some(d) if d.trim() == card.tool_name.trim() => format!("bg task {task_id}"),
             Some(d) => format!("{} · bg task {task_id}", elide_middle(&d, SUMMARY_MAX)),
             None => format!("bg task {task_id}"),
         };
@@ -622,6 +632,57 @@ mod tests {
         assert_ne!(
             ea[0].call_id, eb[0].call_id,
             "two workflows must not claim the same messages.id"
+        );
+    }
+
+    #[test]
+    fn background_headline_does_not_repeat_the_step_label() {
+        // The step row draws `name` then `description`, deduping only on EXACT
+        // equality. Since #870 a claude Bash step's label IS that call's own
+        // `description`, so a headline that also quoted it printed the text
+        // twice: "Wait for instance readiness" + "Wait for instance readiness ·
+        // bg task bdyspm202 · 00:09".
+        let label = "Wait for instance readiness";
+        let mut c = WorkflowCard::new_background(
+            "toolu_bg".into(),
+            label.into(),
+            serde_json::json!({"command": "until grep -q READY log; do sleep 1; done", "description": label}),
+            "bdyspm202",
+            Some(label.to_string()),
+            0,
+        );
+        let (f, _) = c.take_emission(9_000, true).expect("background cards open immediately");
+        let description = f.description.as_deref().unwrap();
+
+        assert!(
+            !description.contains(label),
+            "headline must not repeat the label the row already shows: {description:?}"
+        );
+        // It still has to say WHICH task, so the user can ask to stop it.
+        assert!(
+            description.contains("bg task bdyspm202"),
+            "lost the task id: {description:?}"
+        );
+        assert!(description.ends_with("00:09"), "lost the clock: {description:?}");
+    }
+
+    /// The other direction: where the label is still a BARE tool name, the desc
+    /// is the only thing saying what the task does, so it must be kept.
+    #[test]
+    fn background_headline_keeps_a_desc_that_adds_information() {
+        let mut c = WorkflowCard::new_background(
+            "toolu_bg".into(),
+            "Bash".into(),
+            serde_json::Value::Null,
+            "b7",
+            Some("Sleep 15 seconds".into()),
+            0,
+        );
+        let (f, _) = c.take_emission(0, true).unwrap();
+        let description = f.description.as_deref().unwrap();
+        assert!(
+            description.contains("Sleep 15 seconds") && description.contains("bg task b7"),
+            "a desc distinct from the label carries the only description of the work: {description:?}"
         );
     }
 
