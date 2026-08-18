@@ -356,8 +356,9 @@ async fn oauth_callback(
         .await
     {
         Ok(()) => Html(
-            "<html><body><h1>Authorization successful</h1>\
-             <p>You can close this tab and return to Nabd Agentic OS.</p></body></html>",
+            "<html><head><meta http-equiv=\"refresh\" content=\"2;url=/\"></head><body>\
+             <h1>Authorization successful</h1>\
+             <p>Redirecting you back — you can also close this tab.</p></body></html>",
         ),
         Err(_) => Html(
             "<html><body><h1>Authorization failed</h1>\
