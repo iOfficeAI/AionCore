@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use common::{body_json, build_app, json_with_token, setup_and_login};
+use common::{body_json, build_app, build_app_with_mock_agents, json_with_token, setup_and_login};
 
 const TEAM_ASSISTANT_ID: &str = "team-model-e2e-assistant";
 const TEAM_AGENT_ID: &str = "2d23ff1c";
@@ -112,7 +112,11 @@ async fn update_agent_model_persists_the_team_roster_value() {
 /// repair belongs.
 #[tokio::test]
 async fn starting_a_legacy_team_session_repairs_roster_and_seed_from_the_confirmed_snapshot() {
-    let (mut app, services) = build_app().await;
+    // Mock agents: the repair itself runs before any runtime preparation, but
+    // `ensure_session` still fails the whole call when the leader runtime fails
+    // to attach. Spawning a real CLI process would make the status assertion
+    // depend on the host, which is what `build_app_with_mock_agents` exists for.
+    let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let team = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = team["id"].as_str().unwrap().to_owned();
@@ -164,7 +168,11 @@ async fn starting_a_legacy_team_session_repairs_roster_and_seed_from_the_confirm
         &csrf,
     );
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Carry the error envelope into the panic message: a session start can fail
+    // for several coded reasons, and a bare status comparison hides which one.
+    let status = resp.status();
+    let session_body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "session start failed: {session_body}");
 
     let extra: String = sqlx::query_scalar("SELECT extra FROM conversations WHERE id = ?")
         .bind(&conversation_id)
