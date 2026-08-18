@@ -6,8 +6,8 @@ use aionui_common::{TimestampMs, now_ms};
 use aionui_db::{IOAuthTokenRepository, UpsertOAuthTokenParams};
 use oauth2::basic::BasicClient;
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken,
-    TokenResponse, TokenUrl,
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl,
+    RefreshToken, TokenResponse, TokenUrl,
 };
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -34,6 +34,19 @@ const EXPIRY_MARGIN_MS: i64 = 5 * 60 * 1000;
 struct OAuthServerMetadata {
     authorization_endpoint: String,
     token_endpoint: String,
+    /// RFC 7591 Dynamic Client Registration endpoint. When present, the
+    /// authorization server expects each client to register itself and get
+    /// its own `client_id` — a fixed shared `client_id` (like our
+    /// `DEFAULT_CLIENT_ID`) won't be recognized (see `ensure_client`).
+    registration_endpoint: Option<String>,
+}
+
+/// A client_id (and optional secret) issued by an authorization server's
+/// RFC 7591 Dynamic Client Registration endpoint.
+#[derive(Debug, Clone, Deserialize)]
+struct DynamicClient {
+    client_id: String,
+    client_secret: Option<String>,
 }
 
 /// Candidate well-known discovery URLs for one MCP server, in the order they
@@ -100,6 +113,12 @@ struct PendingLogin {
     token_url: String,
     redirect_url: String,
     server_url: String,
+    /// The client_id used to build the authorize_url — either
+    /// `DEFAULT_CLIENT_ID` or one issued by Dynamic Client Registration.
+    /// The same client_id (and secret, if any) must be used again for the
+    /// token exchange, or a DCR-registered server will reject it.
+    client_id: String,
+    client_secret: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +135,9 @@ pub struct McpOAuthService {
     http_client: reqwest::Client,
     /// Mutex protecting pending login state by (user_id, oauth_state).
     pending: Arc<Mutex<HashMap<(String, String), PendingLogin>>>,
+    /// In-memory cache of RFC 7591 dynamically-registered clients, keyed by
+    /// registration_endpoint. See `ensure_client` for why this isn't persisted.
+    registered_clients: Arc<Mutex<HashMap<String, DynamicClient>>>,
 }
 
 impl McpOAuthService {
@@ -124,6 +146,7 @@ impl McpOAuthService {
             token_repo,
             http_client,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            registered_clients: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -274,10 +297,25 @@ impl McpOAuthService {
         let redirect = RedirectUrl::new(redirect_url_str.clone())
             .map_err(|e| McpError::OAuth(format!("Invalid redirect URL: {e}")))?;
 
-        let client = BasicClient::new(ClientId::new(DEFAULT_CLIENT_ID.to_string()))
+        // Some authorization servers (Higgsfield/Clerk among them) require
+        // RFC 7591 Dynamic Client Registration and reject a fixed shared
+        // client_id outright — a registration_endpoint in the discovery
+        // document means that's mandatory here, not optional.
+        let (client_id, client_secret) = match metadata.registration_endpoint.as_deref() {
+            Some(registration_endpoint) => {
+                let registered = self.ensure_client(registration_endpoint, redirect_base).await?;
+                (registered.client_id, registered.client_secret)
+            }
+            None => (DEFAULT_CLIENT_ID.to_string(), None),
+        };
+
+        let mut client = BasicClient::new(ClientId::new(client_id.clone()))
             .set_auth_uri(auth_url)
             .set_token_uri(token_url)
             .set_redirect_uri(redirect);
+        if let Some(secret) = client_secret.clone() {
+            client = client.set_client_secret(ClientSecret::new(secret));
+        }
 
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
@@ -297,6 +335,8 @@ impl McpOAuthService {
                     token_url: token_url_str,
                     redirect_url: redirect_url_str,
                     server_url: server_url.to_string(),
+                    client_id,
+                    client_secret,
                 },
             );
         }
@@ -375,13 +415,76 @@ impl McpOAuthService {
             .await
             .map_err(|e| McpError::OAuth(format!("Failed to parse metadata: {e}")))?;
 
-        if !is_safe_http_url(&metadata.authorization_endpoint) || !is_safe_http_url(&metadata.token_endpoint) {
+        let registration_endpoint_safe = metadata.registration_endpoint.as_deref().is_none_or(is_safe_http_url);
+        if !is_safe_http_url(&metadata.authorization_endpoint)
+            || !is_safe_http_url(&metadata.token_endpoint)
+            || !registration_endpoint_safe
+        {
             return Err(McpError::OAuth(
                 "OAuth metadata endpoint URLs must use http or https".to_string(),
             ));
         }
 
         Ok(metadata)
+    }
+
+    /// Get (registering if needed) the client_id this server uses to talk to
+    /// the given authorization server.
+    ///
+    /// Some authorization servers (Higgsfield/Clerk among them) advertise a
+    /// `registration_endpoint` and don't recognize a fixed shared client_id
+    /// at all — RFC 7591 Dynamic Client Registration is mandatory for them,
+    /// not optional. Cache the issued client_id in memory per registration
+    /// endpoint so repeated logins to the same server don't re-register each
+    /// time; this cache is intentionally not persisted to disk, so a process
+    /// restart re-registers (harmless — DCR is designed to be repeatable,
+    /// and avoiding a new DB migration here was a deliberate choice: the
+    /// previous migration mismatch already caused one production incident
+    /// tonight).
+    async fn ensure_client(&self, registration_endpoint: &str, redirect_base: &str) -> Result<DynamicClient, McpError> {
+        {
+            let cache = self.registered_clients.lock().await;
+            if let Some(client) = cache.get(registration_endpoint) {
+                return Ok(client.clone());
+            }
+        }
+
+        let redirect_uri = format!("{}/api/mcp/oauth/callback", redirect_base.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "client_name": "AionUi",
+            "redirect_uris": [redirect_uri],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        });
+
+        let resp = self
+            .http_client
+            .post(registration_endpoint)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| McpError::OAuth(format!("Dynamic client registration request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            return Err(McpError::OAuth(format!(
+                "Dynamic client registration returned {}",
+                resp.status()
+            )));
+        }
+
+        let client: DynamicClient = resp
+            .json()
+            .await
+            .map_err(|e| McpError::OAuth(format!("Failed to parse client registration response: {e}")))?;
+
+        self.registered_clients
+            .lock()
+            .await
+            .insert(registration_endpoint.to_string(), client.clone());
+
+        debug!(registration_endpoint, client_id = %client.client_id, "Registered dynamic OAuth client");
+        Ok(client)
     }
 
     /// Build a no-redirect reqwest client for OAuth token exchange.
@@ -398,7 +501,7 @@ impl McpOAuthService {
     /// stashed at login time, since the browser's callback redirect only
     /// carries `code` and `state`.
     async fn exchange_code(&self, user_id: &str, code: String, state: String) -> Result<(), McpError> {
-        let (auth_url_str, token_url_str, redirect_url_str, pkce_verifier, server_url) = {
+        let (auth_url_str, token_url_str, redirect_url_str, pkce_verifier, server_url, client_id, client_secret) = {
             let mut guard = self.pending.lock().await;
             let pending = guard
                 .remove(&(user_id.to_string(), state))
@@ -409,6 +512,8 @@ impl McpOAuthService {
                 pending.redirect_url,
                 pending.pkce_verifier,
                 pending.server_url,
+                pending.client_id,
+                pending.client_secret,
             )
         };
 
@@ -417,10 +522,17 @@ impl McpOAuthService {
         let redirect =
             RedirectUrl::new(redirect_url_str).map_err(|e| McpError::OAuth(format!("Invalid redirect URL: {e}")))?;
 
-        let client = BasicClient::new(ClientId::new(DEFAULT_CLIENT_ID.to_string()))
+        // Must match the client_id (and secret, if any) used to build the
+        // authorize_url — a DCR-registered server rejects a mismatched or
+        // fixed shared client_id at token exchange just as it would at
+        // authorization.
+        let mut client = BasicClient::new(ClientId::new(client_id))
             .set_auth_uri(auth_url)
             .set_token_uri(token_url)
             .set_redirect_uri(redirect);
+        if let Some(secret) = client_secret {
+            client = client.set_client_secret(ClientSecret::new(secret));
+        }
 
         let http_client = Self::build_no_redirect_client()?;
 
@@ -608,6 +720,97 @@ mod tests {
         assert!(!is_safe_http_url("data:text/html,<script>alert(1)</script>"));
     }
 
+    // -- ensure_client (RFC 7591 Dynamic Client Registration) ----------------
+    //
+    // Higgsfield/Clerk-style authorization servers advertise a
+    // registration_endpoint and reject a fixed shared client_id outright —
+    // regression coverage for registering, parsing the response, and caching
+    // so repeated logins don't re-register every time.
+
+    /// Minimal one-shot HTTP server: accepts a single connection, records the
+    /// request body, and replies with a fixed JSON body. Good enough to
+    /// exercise ensure_client's real HTTP round-trip without a mocking crate.
+    async fn serve_once_and_record_request_count(
+        response_body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_clone = count.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        (format!("http://{addr}"), count)
+    }
+
+    #[tokio::test]
+    async fn ensure_client_registers_and_parses_client_id() {
+        let (registration_endpoint, _count) =
+            serve_once_and_record_request_count(r#"{"client_id":"issued-client-123"}"#).await;
+        let svc = McpOAuthService::new(Arc::new(MockTokenRepo), reqwest::Client::new());
+
+        let client = svc
+            .ensure_client(&registration_endpoint, "https://host.example.com")
+            .await
+            .unwrap();
+
+        assert_eq!(client.client_id, "issued-client-123");
+        assert_eq!(client.client_secret, None);
+    }
+
+    #[tokio::test]
+    async fn ensure_client_parses_client_secret_when_present() {
+        let (registration_endpoint, _count) =
+            serve_once_and_record_request_count(r#"{"client_id":"c1","client_secret":"s1"}"#).await;
+        let svc = McpOAuthService::new(Arc::new(MockTokenRepo), reqwest::Client::new());
+
+        let client = svc
+            .ensure_client(&registration_endpoint, "https://host.example.com")
+            .await
+            .unwrap();
+
+        assert_eq!(client.client_secret.as_deref(), Some("s1"));
+    }
+
+    #[tokio::test]
+    async fn ensure_client_caches_and_does_not_re_register() {
+        let (registration_endpoint, count) =
+            serve_once_and_record_request_count(r#"{"client_id":"cached-client"}"#).await;
+        let svc = McpOAuthService::new(Arc::new(MockTokenRepo), reqwest::Client::new());
+
+        let first = svc
+            .ensure_client(&registration_endpoint, "https://host.example.com")
+            .await
+            .unwrap();
+        let second = svc
+            .ensure_client(&registration_endpoint, "https://host.example.com")
+            .await
+            .unwrap();
+
+        assert_eq!(first.client_id, second.client_id);
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "second call must be served from cache, not a second registration request"
+        );
+    }
+
     #[test]
     fn is_safe_http_url_rejects_unparseable_url() {
         assert!(!is_safe_http_url("not a url"));
@@ -702,6 +905,8 @@ mod tests {
                 token_url: "https://auth.example.com/token".to_string(),
                 redirect_url: "http://127.0.0.1/callback".to_string(),
                 server_url: "https://mcp.example.com".to_string(),
+                client_id: "aionui".to_string(),
+                client_secret: None,
             },
         );
     }
