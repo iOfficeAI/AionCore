@@ -265,6 +265,241 @@ async fn rename_moves_entry() {
     assert!(dir.path().join("renamed.txt").exists());
 }
 
+// ══ fs/copy · fs/move (drag-transfer) ════════════════════════════════════════
+
+#[tokio::test]
+async fn copy_file_into_subdir_keeps_source() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                40,
+                "fs/copy",
+                json!({"from":dir_ref(&pe, "a.txt"),"to_dir":dir_ref(&pe, "sub")}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["result"]["name"], "a.txt");
+    assert_eq!(reply["result"]["to"]["relative_path"], "sub/a.txt");
+    assert!(dir.path().join("sub").join("a.txt").is_file());
+    // Copy keeps the source.
+    assert!(dir.path().join("a.txt").is_file());
+}
+
+#[tokio::test]
+async fn copy_into_same_dir_auto_renames() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+
+    // Copy a.txt into the dir it already lives in → deliberate duplicate,
+    // auto-renamed with the extension preserved.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                41,
+                "fs/copy",
+                json!({"from":dir_ref(&pe, "a.txt"),"to_dir":dir_ref(&pe, "")}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["result"]["name"], "a copy.txt");
+    assert_eq!(reply["result"]["to"]["relative_path"], "a copy.txt");
+    assert!(dir.path().join("a.txt").is_file());
+    assert!(dir.path().join("a copy.txt").is_file());
+}
+
+#[tokio::test]
+async fn copy_directory_is_recursive() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src").join("child.txt"), b"x").unwrap();
+    std::fs::create_dir(dir.path().join("dest")).unwrap();
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                42,
+                "fs/copy",
+                json!({"from":dir_ref(&pe, "src"),"to_dir":dir_ref(&pe, "dest")}),
+            ),
+        )
+        .await;
+
+    assert!(push.last_for("1").unwrap()["result"].is_object());
+    assert!(dir.path().join("dest").join("src").join("child.txt").is_file());
+    // Source tree untouched.
+    assert!(dir.path().join("src").join("child.txt").is_file());
+}
+
+#[tokio::test]
+async fn move_file_into_subdir_removes_source() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                43,
+                "fs/move",
+                json!({"from":dir_ref(&pe, "a.txt"),"to_dir":dir_ref(&pe, "sub")}),
+            ),
+        )
+        .await;
+
+    assert!(push.last_for("1").unwrap()["result"].is_object());
+    assert!(dir.path().join("sub").join("a.txt").is_file());
+    // Move removes the source.
+    assert!(!dir.path().join("a.txt").exists());
+}
+
+#[tokio::test]
+async fn move_into_own_parent_is_noop() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+
+    // Moving into the directory it already sits in must not manufacture a copy.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                44,
+                "fs/move",
+                json!({"from":dir_ref(&pe, "a.txt"),"to_dir":dir_ref(&pe, "")}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["result"]["name"], "a.txt");
+    assert!(dir.path().join("a.txt").is_file());
+    assert!(!dir.path().join("a copy.txt").exists());
+}
+
+#[tokio::test]
+async fn copy_directory_into_own_descendant_is_rejected() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::create_dir(dir.path().join("a")).unwrap();
+    std::fs::create_dir(dir.path().join("a").join("b")).unwrap();
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                45,
+                "fs/copy",
+                json!({"from":dir_ref(&pe, "a"),"to_dir":dir_ref(&pe, "a/b")}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["error"]["code"], -32602);
+    assert_eq!(reply["error"]["message"], "invalid_params");
+}
+
+#[tokio::test]
+async fn transfer_missing_source_is_resource_not_found() {
+    let (mut actor, _rx, push, pe, _dir, _db) = setup().await;
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                46,
+                "fs/copy",
+                json!({"from":dir_ref(&pe, "ghost.txt"),"to_dir":dir_ref(&pe, "")}),
+            ),
+        )
+        .await;
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["error"]["code"], -32002);
+    assert_eq!(reply["error"]["message"], "resource_not_found");
+}
+
+#[tokio::test]
+async fn transfer_root_source_is_invalid_params() {
+    let (mut actor, _rx, push, pe, _dir, _db) = setup().await;
+    // The workspace root cannot itself be a transfer source.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                47,
+                "fs/copy",
+                json!({"from":dir_ref(&pe, ""),"to_dir":dir_ref(&pe, "")}),
+            ),
+        )
+        .await;
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn copy_across_project_explorers() {
+    // Two independently-bound roots on one service → cross-pe copy resolves each
+    // reference against its own root.
+    let db = init_database_memory().await.unwrap();
+    let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
+    let service = Arc::new(ProjectService::new(Arc::clone(&store), std::env::temp_dir()));
+
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let pe_a = service
+        .create_standard("system_default_user", to_file_uri(dir_a.path()).unwrap())
+        .await
+        .unwrap()
+        .project_explorer
+        .pe_id;
+    let pe_b = service
+        .create_standard("system_default_user", to_file_uri(dir_b.path()).unwrap())
+        .await
+        .unwrap()
+        .project_explorer
+        .pe_id;
+    std::fs::write(dir_a.path().join("x.txt"), b"cross").unwrap();
+
+    let push = RecordingPush::default();
+    let (mut actor, _rx) = FsMonitorActor::new(service, Arc::new(push.clone()), 4096).unwrap();
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                48,
+                "fs/copy",
+                json!({"from":dir_ref(&pe_a, "x.txt"),"to_dir":dir_ref(&pe_b, "")}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["result"]["name"], "x.txt");
+    assert_eq!(reply["result"]["to"]["pe_id"], pe_b);
+    assert!(dir_b.path().join("x.txt").is_file());
+    // Source root untouched.
+    assert!(dir_a.path().join("x.txt").is_file());
+}
+
 #[tokio::test]
 async fn mkdir_existing_dir_is_provider_unavailable() {
     let (mut actor, _rx, push, pe, dir, _db) = setup().await;

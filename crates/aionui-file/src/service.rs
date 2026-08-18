@@ -389,6 +389,81 @@ fn copy_single_file_sync(src: &Path, dest: &Path) -> Result<(), FileError> {
     Ok(())
 }
 
+/// Recursively copy a directory tree from `src` to `dest`. `dest` must not yet
+/// exist (the caller picks a conflict-free name); the whole subtree is recreated
+/// underneath it, so no inner-file collision handling is needed.
+fn copy_dir_recursive_sync(src: &Path, dest: &Path) -> Result<(), FileError> {
+    std::fs::create_dir_all(dest)
+        .map_err(|e| FileError::Internal(format!("cannot create directory '{}': {e}", dest.display())))?;
+
+    let entries = std::fs::read_dir(src)
+        .map_err(|e| FileError::Internal(format!("cannot read directory '{}': {e}", src.display())))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| FileError::Internal(format!("cannot read directory entry: {e}")))?;
+        let child_src = entry.path();
+        let child_dest = dest.join(entry.file_name());
+        // `file_type()` does not follow symlinks; a symlinked subdir is copied as
+        // a plain file via `std::fs::copy` rather than being followed (avoids
+        // cycles and escaping the source tree).
+        let file_type = entry
+            .file_type()
+            .map_err(|e| FileError::Internal(format!("cannot stat '{}': {e}", child_src.display())))?;
+        if file_type.is_dir() {
+            copy_dir_recursive_sync(&child_src, &child_dest)?;
+        } else {
+            std::fs::copy(&child_src, &child_dest).map_err(|e| {
+                FileError::Internal(format!(
+                    "cannot copy '{}' to '{}': {e}",
+                    child_src.display(),
+                    child_dest.display()
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Split a filename into `(stem, extension-including-dot)` at the last interior
+/// dot. A leading dot (dotfile) is not an extension separator, so `.gitignore`
+/// → `(".gitignore", "")`. Mirrors the monitor WS transfer path.
+fn split_ext(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    }
+}
+
+/// The conflict-free candidate name for the `attempt`-th try (0 = the original).
+/// Files keep their extension (`report.txt` → `report copy.txt`); directories and
+/// dotfiles take the suffix wholesale. Mirrors the monitor WS transfer path
+/// (`aionui-project::monitor::dispatch`) so OS-external drops and in-app copies
+/// produce identical collision-avoidance names.
+fn candidate_name(base: &str, attempt: usize, is_dir: bool) -> String {
+    if attempt == 0 {
+        return base.to_owned();
+    }
+    let (stem, ext) = if is_dir { (base, "") } else { split_ext(base) };
+    if attempt == 1 {
+        format!("{stem} copy{ext}")
+    } else {
+        format!("{stem} copy {attempt}{ext}")
+    }
+}
+
+/// Pick the first non-colliding destination path under `parent_dir` for `base`
+/// (`name` → `name copy` → `name copy 2` …), never overwriting. Returns `None`
+/// if every candidate up to the cap is taken.
+fn free_dest_path(parent_dir: &Path, base: &str, is_dir: bool) -> Option<std::path::PathBuf> {
+    const MAX_ATTEMPTS: usize = 10_000;
+    for attempt in 0..MAX_ATTEMPTS {
+        let candidate = parent_dir.join(candidate_name(base, attempt, is_dir));
+        if !candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Read a local image file and return a base64 Data URL.
 fn get_image_base64_sync(path: &Path) -> Result<String, FileError> {
     let bytes =
@@ -728,11 +803,11 @@ impl crate::traits::IFileService for FileService {
 
             for fp in &file_paths_owned {
                 let source_extra = source_root_owned.as_deref().or_else(|| Path::new(fp).parent());
-                let src = match validate_path_with_extra_root(fp, &roots_refs, source_extra) {
-                    Ok(p) if p.is_file() => p,
+                let (src, is_dir) = match validate_path_with_extra_root(fp, &roots_refs, source_extra) {
+                    Ok(p) if p.is_dir() => (p, true),
+                    Ok(p) if p.is_file() => (p, false),
                     Ok(_) => {
-                        // Directories are not copied this round (files-only).
-                        fail(fp, "not a file (directories are not supported yet)");
+                        fail(fp, "source is neither a file nor a directory");
                         continue;
                     }
                     Err(_) => {
@@ -741,6 +816,8 @@ impl crate::traits::IFileService for FileService {
                     }
                 };
 
+                // Relative path under the workspace: with a source_root the source
+                // subtree is preserved; otherwise the item lands at its basename.
                 let relative = match &sr_canonical {
                     Some(sr) => src
                         .strip_prefix(sr)
@@ -749,13 +826,37 @@ impl crate::traits::IFileService for FileService {
                     None => Path::new(src.file_name().unwrap_or_default()).to_path_buf(),
                 };
 
-                let dest = ws_canonical.join(&relative);
-                // Never silently overwrite: a name collision is a reported failure.
-                if dest.exists() {
-                    fail(fp, "a file with the same name already exists at the destination");
+                // Auto-rename on collision (never overwrite): the last path segment
+                // is the name we vary; everything above it is the preserved parent.
+                let base = match relative.file_name().and_then(|n| n.to_str()) {
+                    Some(name) if !name.is_empty() => name.to_owned(),
+                    _ => {
+                        fail(fp, "source has no valid file name");
+                        continue;
+                    }
+                };
+                let parent_dir = match relative.parent() {
+                    Some(p) => ws_canonical.join(p),
+                    None => ws_canonical.clone(),
+                };
+                if let Err(e) = std::fs::create_dir_all(&parent_dir) {
+                    fail(fp, &format!("cannot create destination directory: {e}"));
                     continue;
                 }
-                match copy_single_file_sync(&src, &dest) {
+                let dest = match free_dest_path(&parent_dir, &base, is_dir) {
+                    Some(d) => d,
+                    None => {
+                        fail(fp, "too many name collisions at the destination");
+                        continue;
+                    }
+                };
+
+                let outcome = if is_dir {
+                    copy_dir_recursive_sync(&src, &dest)
+                } else {
+                    copy_single_file_sync(&src, &dest)
+                };
+                match outcome {
                     Ok(()) => copied.push(fp.clone()),
                     Err(_) => fail(fp, "copy failed"),
                 }
@@ -1411,6 +1512,65 @@ mod tests {
 
         let result = copy_single_file_sync(&src, &dest);
         assert!(result.is_err());
+    }
+
+    // -- candidate_name / split_ext tests (auto-rename, mirrors WS transfer) --
+
+    #[test]
+    fn candidate_name_scheme_matches_ws_transfer() {
+        // attempt 0 keeps the original; 1 appends " copy"; N≥2 appends " copy N".
+        assert_eq!(candidate_name("report.txt", 0, false), "report.txt");
+        assert_eq!(candidate_name("report.txt", 1, false), "report copy.txt");
+        assert_eq!(candidate_name("report.txt", 2, false), "report copy 2.txt");
+        // Directories take the suffix wholesale (no extension split).
+        assert_eq!(candidate_name("assets", 1, true), "assets copy");
+        assert_eq!(candidate_name("assets.v2", 1, true), "assets.v2 copy");
+        // Dotfiles are not split on the leading dot.
+        assert_eq!(candidate_name(".env", 1, false), ".env copy");
+    }
+
+    #[test]
+    fn split_ext_splits_at_last_interior_dot_only() {
+        assert_eq!(split_ext("a.tar.gz"), ("a.tar", ".gz"));
+        assert_eq!(split_ext("noext"), ("noext", ""));
+        assert_eq!(split_ext(".gitignore"), (".gitignore", ""));
+    }
+
+    // -- free_dest_path tests (never overwrite) --
+
+    #[test]
+    fn free_dest_path_returns_original_when_no_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = free_dest_path(dir.path(), "a.txt", false).unwrap();
+        assert_eq!(dest, dir.path().join("a.txt"));
+    }
+
+    #[test]
+    fn free_dest_path_avoids_existing_names() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "").unwrap();
+        fs::write(dir.path().join("a copy.txt"), "").unwrap();
+        let dest = free_dest_path(dir.path(), "a.txt", false).unwrap();
+        assert_eq!(dest, dir.path().join("a copy 2.txt"));
+    }
+
+    // -- copy_dir_recursive_sync tests (OS-external directory drop) --
+
+    #[test]
+    fn copy_dir_recursive_sync_copies_nested_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        fs::create_dir_all(src.join("nested/deep")).unwrap();
+        fs::write(src.join("top.txt"), "top").unwrap();
+        fs::write(src.join("nested/mid.txt"), "mid").unwrap();
+        fs::write(src.join("nested/deep/leaf.txt"), "leaf").unwrap();
+
+        let dest = root.path().join("dest");
+        copy_dir_recursive_sync(&src, &dest).unwrap();
+
+        assert_eq!(fs::read_to_string(dest.join("top.txt")).unwrap(), "top");
+        assert_eq!(fs::read_to_string(dest.join("nested/mid.txt")).unwrap(), "mid");
+        assert_eq!(fs::read_to_string(dest.join("nested/deep/leaf.txt")).unwrap(), "leaf");
     }
 
     // -- get_image_base64_sync tests (task 7.6) --

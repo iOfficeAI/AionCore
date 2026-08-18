@@ -120,11 +120,13 @@ async fn copy_files_empty_list() {
 }
 
 #[tokio::test]
-async fn copy_files_directory_in_list_is_failed() {
+async fn copy_files_directory_in_list_is_copied_recursively() {
     let dir = tempfile::tempdir().unwrap();
     let sub = dir.path().join("subdir");
     let ws = dir.path().join("ws");
-    fs::create_dir_all(&sub).unwrap();
+    fs::create_dir_all(sub.join("inner")).unwrap();
+    fs::write(sub.join("top.txt"), "top").unwrap();
+    fs::write(sub.join("inner/leaf.txt"), "leaf").unwrap();
     fs::create_dir_all(&ws).unwrap();
 
     let svc = make_service(dir.path());
@@ -134,9 +136,11 @@ async fn copy_files_directory_in_list_is_failed() {
         .await
         .unwrap();
 
-    // Directories are not valid source files
-    assert!(result.copied_files.is_empty());
-    assert_eq!(result.failed_files.len(), 1);
+    // Directories are now copied recursively (OS-external folder drop).
+    assert_eq!(result.copied_files.len(), 1);
+    assert!(result.failed_files.is_empty());
+    assert_eq!(fs::read_to_string(ws.join("subdir/top.txt")).unwrap(), "top");
+    assert_eq!(fs::read_to_string(ws.join("subdir/inner/leaf.txt")).unwrap(), "leaf");
 }
 
 #[tokio::test]

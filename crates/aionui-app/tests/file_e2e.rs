@@ -526,6 +526,105 @@ async fn copy_files_to_workspace_accepts_non_sandbox_source_and_target_roots() {
     );
 }
 
+#[tokio::test]
+async fn copy_files_to_workspace_copies_a_directory_recursively() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    // A dragged Finder folder with a nested tree.
+    let src_root = tempfile::tempdir().unwrap();
+    let src_dir = src_root.path().join("assets");
+    std::fs::create_dir_all(src_dir.join("img")).unwrap();
+    std::fs::write(src_dir.join("readme.md"), "top").unwrap();
+    std::fs::write(src_dir.join("img/logo.svg"), "leaf").unwrap();
+
+    let ws_dir = tempfile::tempdir().unwrap();
+    let created = services
+        .project_service
+        .create_standard(
+            "system_default_user",
+            aionui_project::canonical::to_file_uri(ws_dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let pe_id = created.project_explorer.pe_id;
+
+    let req = json_with_token(
+        "POST",
+        "/api/fs/copy",
+        json!({
+            "file_paths": [src_dir.to_str().unwrap()],
+            "target": { "pe_id": pe_id, "relative_path": "" }
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    assert_eq!(json["data"]["copied_files"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(ws_dir.path().join("assets/readme.md")).unwrap(),
+        "top"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws_dir.path().join("assets/img/logo.svg")).unwrap(),
+        "leaf"
+    );
+}
+
+#[tokio::test]
+async fn copy_files_to_workspace_auto_renames_on_collision_instead_of_failing() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let src_dir = tempfile::tempdir().unwrap();
+    std::fs::write(src_dir.path().join("note.txt"), "new").unwrap();
+
+    let ws_dir = tempfile::tempdir().unwrap();
+    // A file of the same name already sits at the destination.
+    std::fs::write(ws_dir.path().join("note.txt"), "existing").unwrap();
+
+    let created = services
+        .project_service
+        .create_standard(
+            "system_default_user",
+            aionui_project::canonical::to_file_uri(ws_dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let pe_id = created.project_explorer.pe_id;
+
+    let req = json_with_token(
+        "POST",
+        "/api/fs/copy",
+        json!({
+            "file_paths": [src_dir.path().join("note.txt").to_str().unwrap()],
+            "target": { "pe_id": pe_id, "relative_path": "" }
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    // The copy succeeded (not reported as a failure) and never overwrote the original.
+    assert_eq!(json["data"]["copied_files"].as_array().unwrap().len(), 1);
+    assert!(json["data"]["failed_files"].as_array().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(ws_dir.path().join("note.txt")).unwrap(),
+        "existing"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws_dir.path().join("note copy.txt")).unwrap(),
+        "new"
+    );
+}
+
 // ===========================================================================
 // Image processing
 // ===========================================================================
