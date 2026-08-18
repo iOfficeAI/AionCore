@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.69](https://github.com/iOfficeAI/AionCore/compare/v0.1.68...v0.1.69) (2026-08-18)
+
+
+### Features
+
+* **claude:** label tool steps by what they do ([#870](https://github.com/iOfficeAI/AionCore/issues/870)) ([6757d0f](https://github.com/iOfficeAI/AionCore/commit/6757d0fdd2aec726e2be65b210176712972f56cb))
+* **team:** team mode reliability improvements, model switch persistence and runtime restart ([#787](https://github.com/iOfficeAI/AionCore/issues/787)) ([e9b6f13](https://github.com/iOfficeAI/AionCore/commit/e9b6f13983cc787bbc329b0e2d98cd89e157b76a))
+
+
+### Bug Fixes
+
+* **claude:** three follow-ups to the tool-step labels ([#872](https://github.com/iOfficeAI/AionCore/issues/872)) ([f8f7174](https://github.com/iOfficeAI/AionCore/commit/f8f7174f6c768c3653e2f57843b161fa23758266))
+
 ## [0.1.68](https://github.com/iOfficeAI/AionCore/compare/v0.1.67...v0.1.68) (2026-08-17)
 
 
