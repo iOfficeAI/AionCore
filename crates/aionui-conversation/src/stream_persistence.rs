@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -12,6 +12,7 @@ use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 use aionui_db::models::MessageRow;
 use aionui_db::{ConversationRowUpdate, DbError, IConversationRepository, MessageRowUpdate};
 use aionui_realtime::EventBroadcaster;
+use dashmap::DashMap;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -215,7 +216,16 @@ pub(crate) struct CanonicalEventJournal {
     root: PathBuf,
 }
 
-static JOURNAL_APPEND_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+#[derive(Debug, Default)]
+struct JournalAppendCursor {
+    file_len: u64,
+    last_sequence: u64,
+    events_by_id: HashMap<String, CanonicalJournalEvent>,
+    initialized: bool,
+}
+
+static JOURNAL_APPEND_CURSORS: OnceLock<DashMap<PathBuf, Arc<tokio::sync::Mutex<JournalAppendCursor>>>> =
+    OnceLock::new();
 
 impl CanonicalEventJournal {
     pub fn new(root: PathBuf) -> Self {
@@ -230,21 +240,37 @@ impl CanonicalEventJournal {
         kind: String,
         payload: serde_json::Value,
     ) -> Result<CanonicalJournalEvent, std::io::Error> {
-        let _guard = JOURNAL_APPEND_LOCK
-            .get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await;
         let path = self.path(user_id, conversation_id)?;
+        let cursor_lock = JOURNAL_APPEND_CURSORS
+            .get_or_init(DashMap::new)
+            .entry(path.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(JournalAppendCursor::default())))
+            .clone();
+        let mut cursor = cursor_lock.lock().await;
         self.repair_incomplete_tail(&path).await?;
-        let events = self.replay_unlocked(&path).await?;
-        if let Some(existing) = events.iter().find(|event| event.event_id == event_id) {
+        let current_len = match tokio::fs::metadata(&path).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        if !cursor.initialized || cursor.file_len != current_len {
+            let events = self.replay_unlocked(&path).await?;
+            cursor.last_sequence = events.last().map_or(0, |event| event.sequence);
+            cursor.events_by_id = events
+                .into_iter()
+                .map(|event| (event.event_id.clone(), event))
+                .collect();
+            cursor.file_len = current_len;
+            cursor.initialized = true;
+        }
+        if let Some(existing) = cursor.events_by_id.get(&event_id) {
             return Ok(existing.clone());
         }
         let event = CanonicalJournalEvent {
             schema_version: 1,
             event_id,
             conversation_id: conversation_id.to_owned(),
-            sequence: events.last().map_or(1, |event| event.sequence.saturating_add(1)),
+            sequence: cursor.last_sequence.saturating_add(1),
             timestamp: now_ms(),
             kind,
             payload,
@@ -263,12 +289,14 @@ impl CanonicalEventJournal {
         file.write_all(&encoded).await?;
         file.flush().await?;
         file.sync_data().await?;
+        cursor.file_len = cursor.file_len.saturating_add(encoded.len() as u64);
+        cursor.last_sequence = event.sequence;
+        cursor.events_by_id.insert(event.event_id.clone(), event.clone());
         Ok(event)
     }
 
-    /// Record the user's model-visible prompt in the journal. This is the
-    /// host equivalent of DeepSeek Harness logging `user/message` before the
-    /// turn so `deriveMessages()` can reconstruct the full context.
+    /// Record the user's model-visible prompt before dispatch so replay can
+    /// reconstruct the exact model context.
     pub async fn append_user_prompt(
         &self,
         user_id: &str,

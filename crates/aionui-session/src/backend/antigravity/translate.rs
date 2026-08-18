@@ -347,6 +347,7 @@ fn usage_delta(u: &AgyUsage) -> SessionEvent {
         // agy reports no cost figures.
         cost_usd: None,
         breakdown: UsageBreakdown {
+            turn_total_tokens: Some(u.total_tokens),
             cached_read_tokens: u.cache_read_tokens,
             cached_write_tokens: 0,
             thought_tokens: u.thinking_tokens,

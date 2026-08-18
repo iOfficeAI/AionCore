@@ -1,0 +1,1 @@
+ALTER TABLE usage_events ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0;

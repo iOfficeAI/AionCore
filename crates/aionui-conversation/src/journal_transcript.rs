@@ -1,6 +1,6 @@
 //! Derive a host transcript from the canonical event journal.
 //!
-//! This is AionCore's equivalent of DeepSeek Harness `deriveMessages()`:
+//! This derives a replayable transcript from AionCore's canonical journal:
 //! the journal is the source of truth, and anything model-visible must be
 //! reconstructible from it. Internal stream machinery never appears in the
 //! model-visible projection.

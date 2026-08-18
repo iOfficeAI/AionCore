@@ -620,6 +620,12 @@ impl ClaudeAdapter {
                 // the breakdown answers "what did this turn cost", so counting every
                 // API call is the correct reading.
                 breakdown: crate::event::UsageBreakdown {
+                    turn_total_tokens: Some(
+                        input_tokens
+                            .saturating_add(output_tokens)
+                            .saturating_add(cache_read)
+                            .saturating_add(cache_creation),
+                    ),
                     cached_read_tokens: cache_read,
                     cached_write_tokens: cache_creation,
                     thought_tokens: std::mem::take(&mut self.turn_thought_tokens),

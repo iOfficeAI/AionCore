@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.78](https://github.com/suoak/AionCore/compare/v0.1.77...v0.1.78) (2026-08-18)
+
+### Features
+
+* **conversation:** add journal-backed persistent input queues and capability contracts
+* **conversation:** retire the DeepSeek Harness runtime while preserving historical session compatibility
+* **journal:** shard append locks and maintain incremental sequence cursors
+* **tools:** expose enforcement levels for native, approval-gate, and observe-only execution
+
+### Bug Fixes
+
+* **conversation:** preserve team ownership and retired-runtime gates before queue persistence
+* **deps:** update aionrs to v0.2.15 and h2 to the patched 0.4.16 release
+
 ## [0.1.77](https://github.com/suoak/AionCore/compare/v0.1.76...v0.1.77) (2026-08-17)
 
 ### Features

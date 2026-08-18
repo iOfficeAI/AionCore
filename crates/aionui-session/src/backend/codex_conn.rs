@@ -3197,6 +3197,7 @@ fn map_usage(params: &Value) -> Vec<SessionEvent> {
         // (verified: TokenUsageBreakdown in the generated schema), including the
         // reasoning tokens claude only exposes per-call.
         breakdown: crate::event::UsageBreakdown {
+            turn_total_tokens: Some(g("totalTokens")),
             cached_read_tokens: g("cachedInputTokens"),
             cached_write_tokens: g("cacheWriteInputTokens"),
             thought_tokens: g("reasoningOutputTokens"),

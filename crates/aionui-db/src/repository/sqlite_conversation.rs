@@ -4,12 +4,13 @@ use aionui_common::{PaginatedResult, TimestampMs};
 
 use crate::error::DbError;
 use crate::models::{
-    ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow,
+    ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationInputRow, ConversationRow, MessageRow,
     UpsertConversationAssistantSnapshotParams,
 };
 use crate::repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
+    ConversationFilters, ConversationInputInsert, ConversationInputUpdate, ConversationRowUpdate,
+    IConversationRepository, MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult,
+    MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
 };
 
 /// Bump `conversations.updated_at` so the conversation-list sort
@@ -1384,6 +1385,159 @@ impl IConversationRepository for SqliteConversationRepository {
 
         Ok(rows)
     }
+
+    async fn insert_conversation_input(
+        &self,
+        input: &ConversationInputInsert<'_>,
+    ) -> Result<ConversationInputRow, DbError> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO conversation_inputs \
+                (id, user_id, conversation_id, mode, status, content, files, inject_skills, hidden, client_key, created_at, updated_at) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+             WHERE EXISTS (SELECT 1 FROM conversations WHERE id = ? AND user_id = ?)",
+        )
+        .bind(input.id)
+        .bind(input.user_id)
+        .bind(input.conversation_id)
+        .bind(input.mode)
+        .bind(input.status)
+        .bind(input.content)
+        .bind(input.files)
+        .bind(input.inject_skills)
+        .bind(input.hidden)
+        .bind(input.client_key)
+        .bind(input.created_at)
+        .bind(input.created_at)
+        .bind(input.conversation_id)
+        .bind(input.user_id)
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query_as::<_, ConversationInputRow>(
+            "SELECT * FROM conversation_inputs WHERE user_id = ? AND conversation_id = ? AND client_key = ?",
+        )
+        .bind(input.user_id)
+        .bind(input.conversation_id)
+        .bind(input.client_key)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("Conversation '{}' not found", input.conversation_id)))
+    }
+
+    async fn get_conversation_input(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        input_id: &str,
+    ) -> Result<Option<ConversationInputRow>, DbError> {
+        Ok(sqlx::query_as::<_, ConversationInputRow>(
+            "SELECT i.* FROM conversation_inputs i \
+             INNER JOIN conversations c ON c.id = i.conversation_id \
+             WHERE c.user_id = ? AND i.user_id = ? AND i.conversation_id = ? AND i.id = ?",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(conversation_id)
+        .bind(input_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn list_conversation_inputs(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<ConversationInputRow>, DbError> {
+        self.ensure_conversation_for_user(user_id, conversation_id).await?;
+        Ok(sqlx::query_as::<_, ConversationInputRow>(
+            "SELECT * FROM conversation_inputs \
+             WHERE user_id = ? AND conversation_id = ? \
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(user_id)
+        .bind(conversation_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn claim_next_conversation_input(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        updated_at: i64,
+    ) -> Result<Option<ConversationInputRow>, DbError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        let result: Result<Option<ConversationInputRow>, DbError> = async {
+            let id = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM conversation_inputs \
+                 WHERE user_id = ? AND conversation_id = ? AND status = 'held' \
+                 ORDER BY created_at ASC, id ASC LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(conversation_id)
+            .fetch_optional(&mut *connection)
+            .await?;
+            let Some(id) = id else { return Ok(None) };
+            let changed = sqlx::query(
+                "UPDATE conversation_inputs SET status = 'dispatching', updated_at = ? \
+                 WHERE id = ? AND user_id = ? AND conversation_id = ? AND status = 'held'",
+            )
+            .bind(updated_at)
+            .bind(&id)
+            .bind(user_id)
+            .bind(conversation_id)
+            .execute(&mut *connection)
+            .await?;
+            if changed.rows_affected() != 1 {
+                return Ok(None);
+            }
+            Ok(
+                sqlx::query_as::<_, ConversationInputRow>("SELECT * FROM conversation_inputs WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(&mut *connection)
+                    .await?,
+            )
+        }
+        .await;
+        match result {
+            Ok(row) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(row)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn update_conversation_input(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        input_id: &str,
+        update: &ConversationInputUpdate<'_>,
+    ) -> Result<Option<ConversationInputRow>, DbError> {
+        sqlx::query(
+            "UPDATE conversation_inputs SET \
+                status = COALESCE(?, status), turn_id = COALESCE(?, turn_id), \
+                msg_id = COALESCE(?, msg_id), error_code = COALESCE(?, error_code), updated_at = ? \
+             WHERE id = ? AND user_id = ? AND conversation_id = ? \
+               AND status NOT IN ('applied', 'canceled', 'failed')",
+        )
+        .bind(update.status)
+        .bind(update.turn_id)
+        .bind(update.msg_id)
+        .bind(update.error_code)
+        .bind(update.updated_at)
+        .bind(input_id)
+        .bind(user_id)
+        .bind(conversation_id)
+        .execute(&self.pool)
+        .await?;
+        self.get_conversation_input(user_id, conversation_id, input_id).await
+    }
 }
 
 // ── Dynamic bind helpers ────────────────────────────────────────────
@@ -2317,6 +2471,100 @@ mod tests {
     }
 
     // ── Filters tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn conversation_input_insert_is_idempotent_by_client_key() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+        let input = ConversationInputInsert {
+            id: "input_one",
+            user_id: SYSTEM_USER_ID,
+            conversation_id: &conv.id,
+            mode: "followup",
+            status: "held",
+            content: "first",
+            files: "[]",
+            inject_skills: "[]",
+            hidden: false,
+            client_key: "client-one",
+            created_at: 100,
+        };
+        let first = repo.insert_conversation_input(&input).await.unwrap();
+        let duplicate = repo
+            .insert_conversation_input(&ConversationInputInsert {
+                id: "input_different",
+                content: "different",
+                ..input
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(first.id, "input_one");
+        assert_eq!(duplicate.id, first.id);
+        assert_eq!(duplicate.content, "first");
+    }
+
+    #[tokio::test]
+    async fn conversation_input_claims_one_fifo_head() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+        for (id, created_at) in [("input_later", 200), ("input_first", 100)] {
+            repo.insert_conversation_input(&ConversationInputInsert {
+                id,
+                user_id: SYSTEM_USER_ID,
+                conversation_id: &conv.id,
+                mode: "followup",
+                status: "held",
+                content: id,
+                files: "[]",
+                inject_skills: "[]",
+                hidden: false,
+                client_key: id,
+                created_at,
+            })
+            .await
+            .unwrap();
+        }
+        let claimed = repo
+            .claim_next_conversation_input(SYSTEM_USER_ID, &conv.id, 300)
+            .await
+            .unwrap()
+            .unwrap();
+        let remaining = repo.list_conversation_inputs(SYSTEM_USER_ID, &conv.id).await.unwrap();
+
+        assert_eq!(claimed.id, "input_first");
+        assert_eq!(claimed.status, "dispatching");
+        assert_eq!(remaining.iter().filter(|row| row.status == "held").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn conversation_inputs_are_not_visible_cross_user() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+        repo.insert_conversation_input(&ConversationInputInsert {
+            id: "input_private",
+            user_id: SYSTEM_USER_ID,
+            conversation_id: &conv.id,
+            mode: "followup",
+            status: "held",
+            content: "private",
+            files: "[]",
+            inject_skills: "[]",
+            hidden: false,
+            client_key: "private",
+            created_at: 100,
+        })
+        .await
+        .unwrap();
+        let result = repo
+            .get_conversation_input("other-user", &conv.id, "input_private")
+            .await;
+
+        assert!(result.unwrap().is_none());
+    }
 
     #[test]
     fn effective_limit_default() {

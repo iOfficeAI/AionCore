@@ -180,7 +180,7 @@ pub struct JournalTranscriptTokenNode {
 
 /// Host transcript projected from the canonical event journal.
 ///
-/// `visibility=model` is the DeepSeek Harness `deriveMessages()` equivalent:
+/// `visibility=model` returns only events that can be replayed into model context:
 /// only model-visible items. `visibility=host` also includes UI-only notices.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JournalTranscriptResponse {

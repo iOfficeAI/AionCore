@@ -1,4 +1,4 @@
-//! Closed approval outcomes, modeled on DeepSeek Harness `ApprovalOutcome`.
+//! Closed approval outcomes shared by host-side authorization flows.
 //!
 //! The only grant is `allowed-once`. Missing, unparseable, or unattended
 //! answers fail closed. `AllowAlways` is a host overlay after a grant, not a

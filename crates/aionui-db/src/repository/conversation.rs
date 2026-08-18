@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::DbError;
 use crate::models::{
-    ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow,
+    ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationInputRow, ConversationRow, MessageRow,
     UpsertConversationAssistantSnapshotParams,
 };
 
@@ -274,6 +274,51 @@ pub trait IConversationRepository: Send + Sync {
     ) -> Result<Vec<MessageRow>, DbError> {
         Ok(Vec::new())
     }
+
+    async fn insert_conversation_input(
+        &self,
+        _input: &ConversationInputInsert<'_>,
+    ) -> Result<ConversationInputRow, DbError> {
+        Err(DbError::Init(
+            "conversation inputs are not supported by this repository".into(),
+        ))
+    }
+
+    async fn get_conversation_input(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _input_id: &str,
+    ) -> Result<Option<ConversationInputRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn list_conversation_inputs(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+    ) -> Result<Vec<ConversationInputRow>, DbError> {
+        Ok(Vec::new())
+    }
+
+    async fn claim_next_conversation_input(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _updated_at: TimestampMs,
+    ) -> Result<Option<ConversationInputRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn update_conversation_input(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _input_id: &str,
+        _update: &ConversationInputUpdate<'_>,
+    ) -> Result<Option<ConversationInputRow>, DbError> {
+        Ok(None)
+    }
 }
 
 // ── Supporting types ────────────────────────────────────────────────
@@ -319,6 +364,30 @@ pub struct MessagePageResult {
 pub struct StaleRuntimeMessageRow {
     pub user_id: String,
     pub message: MessageRow,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConversationInputInsert<'a> {
+    pub id: &'a str,
+    pub user_id: &'a str,
+    pub conversation_id: &'a str,
+    pub mode: &'a str,
+    pub status: &'a str,
+    pub content: &'a str,
+    pub files: &'a str,
+    pub inject_skills: &'a str,
+    pub hidden: bool,
+    pub client_key: &'a str,
+    pub created_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConversationInputUpdate<'a> {
+    pub status: Option<&'a str>,
+    pub turn_id: Option<&'a str>,
+    pub msg_id: Option<&'a str>,
+    pub error_code: Option<&'a str>,
+    pub updated_at: TimestampMs,
 }
 
 /// Filters for paginated conversation listing.

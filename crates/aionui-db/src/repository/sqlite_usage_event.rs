@@ -23,10 +23,10 @@ impl IUsageEventRepository for SqliteUsageEventRepository {
         let result = sqlx::query(
             "INSERT OR IGNORE INTO usage_events (\
                 id, user_id, conversation_id, recorded_at, fingerprint, backend, conversation_source, \
-                conversation_name, assistant_id, assistant_name, model_id, turn_id, \
+                conversation_name, assistant_id, assistant_name, model_id, turn_id, total_tokens, \
                 input_tokens, output_tokens, thought_tokens, cached_read_tokens, cached_write_tokens, \
                 cost_delta, session_cost_amount, cost_currency, event_source\
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(params.user_id)
@@ -40,6 +40,7 @@ impl IUsageEventRepository for SqliteUsageEventRepository {
         .bind(params.assistant_name)
         .bind(params.model_id)
         .bind(params.turn_id)
+        .bind(params.total_tokens)
         .bind(params.input_tokens)
         .bind(params.output_tokens)
         .bind(params.thought_tokens)
@@ -69,6 +70,7 @@ impl IUsageEventRepository for SqliteUsageEventRepository {
             assistant_name: params.assistant_name.map(str::to_owned),
             model_id: params.model_id.map(str::to_owned),
             turn_id: params.turn_id.map(str::to_owned),
+            total_tokens: params.total_tokens,
             input_tokens: params.input_tokens,
             output_tokens: params.output_tokens,
             thought_tokens: params.thought_tokens,
@@ -87,11 +89,11 @@ impl IUsageEventRepository for SqliteUsageEventRepository {
         since: Option<TimestampMs>,
         limit: i64,
     ) -> Result<Vec<UsageEventRow>, DbError> {
-        let limit = limit.clamp(1, 5_000);
+        let limit = limit.clamp(1, 50_000);
         let rows = if let Some(since) = since {
             sqlx::query_as::<_, UsageEventRow>(
                 "SELECT id, user_id, conversation_id, recorded_at, fingerprint, backend, conversation_source, \
-                 conversation_name, assistant_id, assistant_name, model_id, turn_id, \
+                 conversation_name, assistant_id, assistant_name, model_id, turn_id, total_tokens, \
                  input_tokens, output_tokens, thought_tokens, cached_read_tokens, cached_write_tokens, \
                  cost_delta, session_cost_amount, cost_currency, event_source \
                  FROM usage_events WHERE user_id = ? AND recorded_at >= ? \
@@ -105,7 +107,7 @@ impl IUsageEventRepository for SqliteUsageEventRepository {
         } else {
             sqlx::query_as::<_, UsageEventRow>(
                 "SELECT id, user_id, conversation_id, recorded_at, fingerprint, backend, conversation_source, \
-                 conversation_name, assistant_id, assistant_name, model_id, turn_id, \
+                 conversation_name, assistant_id, assistant_name, model_id, turn_id, total_tokens, \
                  input_tokens, output_tokens, thought_tokens, cached_read_tokens, cached_write_tokens, \
                  cost_delta, session_cost_amount, cost_currency, event_source \
                  FROM usage_events WHERE user_id = ? \

@@ -3523,6 +3523,7 @@ async fn persist_context_usage(
         usage.insert(
             "_meta".into(),
             serde_json::json!({
+                "total_tokens": breakdown.turn_total_tokens,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "cached_read_tokens": breakdown.cached_read_tokens,
@@ -4355,6 +4356,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             // rather than a row of zeros.
             if !breakdown.is_empty() {
                 usage["_meta"] = serde_json::json!({
+                    "total_tokens": breakdown.turn_total_tokens,
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
                     "cached_read_tokens": breakdown.cached_read_tokens,
@@ -5131,6 +5133,7 @@ mod translate_tests {
                 cost_usd: None,
                 context_window: Some(256_000),
                 breakdown: aionui_session::UsageBreakdown {
+                    turn_total_tokens: Some(18_321),
                     cached_read_tokens: 16_900,
                     cached_write_tokens: 79,
                     thought_tokens: 242,
@@ -5145,6 +5148,7 @@ mod translate_tests {
         };
         assert_eq!(v["_meta"]["input_tokens"], 1_100);
         assert_eq!(v["_meta"]["output_tokens"], 194);
+        assert_eq!(v["_meta"]["total_tokens"], 18_321);
         assert_eq!(v["_meta"]["cached_read_tokens"], 16_900);
         assert_eq!(v["_meta"]["cached_write_tokens"], 79);
         assert_eq!(v["_meta"]["thought_tokens"], 242);

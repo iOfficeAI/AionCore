@@ -1,13 +1,13 @@
-//! Host-side tool pipeline, modeled on DeepSeek Harness
+//! Host-side observation pipeline for tool events emitted by agent backends.
 //! `tools/pre-execute` → `tools/execute` → `tools/post-execute`.
 //!
-//! Agents still execute tools in their own process. AionCore owns the host
-//! gates that sit around those results:
-//! - pre-execute: classify permission / in-flight tool frames
+//! Agents still execute tools in their own process. This pipeline observes and
+//! projects their events; it is not an authoritative execution interceptor:
+//! - pre-execute: classify permission / in-flight tool frames when visible
 //! - post-execute: spill oversized output, or bound it if spill fails
 //!
-//! Future sandbox / MCP / audit hooks attach here instead of forking
-//! retain/bound logic in the relay.
+//! Authoritative policy gates belong in native executors. Future audit hooks
+//! can attach here without forking retain/bound logic in the relay.
 
 use aionui_ai_agent::AgentStreamEvent;
 use aionui_ai_agent::protocol::events::tool_call::{AcpToolCallStatus, ToolCallStatus};

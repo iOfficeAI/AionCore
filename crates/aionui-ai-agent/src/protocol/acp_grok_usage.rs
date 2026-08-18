@@ -52,7 +52,13 @@ pub(crate) fn frame_from_usage_object(usage: &Value) -> Option<Value> {
         return None;
     }
 
+    let used = if billed_total > 0 {
+        billed_total
+    } else {
+        input.saturating_add(output)
+    };
     let mut breakdown = serde_json::json!({
+        "total_tokens": used,
         "input_tokens": input,
         "output_tokens": output,
     });
@@ -69,11 +75,6 @@ pub(crate) fn frame_from_usage_object(usage: &Value) -> Option<Value> {
         breakdown["model_id"] = model_id.into();
     }
 
-    let used = if billed_total > 0 {
-        billed_total
-    } else {
-        input.saturating_add(output).saturating_add(thought)
-    };
     let mut frame = serde_json::json!({
         "used": used,
         "size": 0,
@@ -174,6 +175,7 @@ mod tests {
         assert_eq!(frame["_meta"]["input_tokens"], 14883);
         assert_eq!(frame["_meta"]["output_tokens"], 40);
         assert_eq!(frame["_meta"]["thought_tokens"], 28);
+        assert_eq!(frame["_meta"]["total_tokens"], 14923);
     }
 
     #[test]

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UsageEventDto {
     pub id: String,
+    pub fingerprint: String,
     pub recorded_at: TimestampMs,
     pub conversation_id: String,
     pub conversation_name: Option<String>,
@@ -12,6 +13,8 @@ pub struct UsageEventDto {
     pub assistant_id: Option<String>,
     pub assistant_name: Option<String>,
     pub model_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub total_tokens: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub thought_tokens: i64,

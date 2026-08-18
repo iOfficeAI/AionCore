@@ -9,10 +9,12 @@ use axum::routing::{get, patch, post};
 use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationCapabilities,
+    ConversationInputListResponse, ConversationInputMode, ConversationInputReceipt, ConversationListResponse,
+    ConversationResponse, CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest,
+    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SubmitConversationInputRequest,
+    UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -84,6 +86,12 @@ impl From<ConversationError> for ApiError {
                 })),
             ),
             ConversationError::Unprocessable { reason } => ApiError::UnprocessableEntity(reason),
+            ConversationError::CapabilityUnsupported { capability } => ApiError::coded(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "capability_unsupported",
+                format!("Conversation capability '{capability}' is not supported"),
+                Some(serde_json::json!({ "capability": capability })),
+            ),
             ConversationError::Internal { reason } => ApiError::Internal(reason),
             ConversationError::WorkspacePathUnavailable { path } => ApiError::WorkspacePathUnavailable(path),
             ConversationError::WorkspacePathRuntimeUnavailable { path } => {
@@ -117,6 +125,12 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
         .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
+        .route("/api/conversations/{id}/inputs", get(list_inputs).post(submit_input))
+        .route(
+            "/api/conversations/{id}/inputs/{inputId}",
+            axum::routing::delete(cancel_input),
+        )
+        .route("/api/conversations/{id}/capabilities", get(capabilities))
         .route("/api/conversations/{id}/artifacts", get(list_artifacts))
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
         .route("/api/conversations/{id}/cancel", post(cancel))
@@ -279,12 +293,91 @@ async fn send_msg(
     body: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let response = state
+    let receipt = state
         .service
-        .send_message(&user.id, &id, req, &state.task_manager)
+        .submit_input(
+            &user.id,
+            &id,
+            SubmitConversationInputRequest {
+                mode: ConversationInputMode::Followup,
+                content: req.content,
+                files: req.files,
+                inject_skills: req.inject_skills,
+                hidden: req.hidden,
+                client_key: format!("legacy_{}", aionui_common::generate_short_id()),
+            },
+        )
         .await
         .map_err(ApiError::from)?;
+    let response = SendMessageResponse {
+        msg_id: receipt
+            .input
+            .msg_id
+            .clone()
+            .unwrap_or_else(|| receipt.input.input_id.clone()),
+        turn_id: receipt.input.turn_id.clone().unwrap_or_default(),
+        runtime: receipt.runtime,
+        input_id: Some(receipt.input.input_id),
+        input_status: Some(receipt.input.status),
+    };
     Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))
+}
+
+async fn submit_input(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<SubmitConversationInputRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<ConversationInputReceipt>>), ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let receipt = state
+        .service
+        .submit_input(&user.id, &id, req)
+        .await
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(receipt))))
+}
+
+async fn list_inputs(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<ConversationInputListResponse>>, ApiError> {
+    let inputs = state.service.list_inputs(&user.id, &id).await.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(inputs)))
+}
+
+#[derive(serde::Deserialize)]
+struct InputPathParams {
+    id: String,
+    #[serde(rename = "inputId")]
+    input_id: String,
+}
+
+async fn cancel_input(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<InputPathParams>,
+) -> Result<Json<ApiResponse<aionui_api_types::ConversationInputResponse>>, ApiError> {
+    let input = state
+        .service
+        .cancel_input(&user.id, &params.id, &params.input_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(input)))
+}
+
+async fn capabilities(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<ConversationCapabilities>>, ApiError> {
+    let capabilities = state
+        .service
+        .conversation_capabilities(&user.id, &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(capabilities)))
 }
 
 async fn list_artifacts(

@@ -17,6 +17,7 @@ pub struct InsertUsageEventParams<'a> {
     pub assistant_name: Option<&'a str>,
     pub model_id: Option<&'a str>,
     pub turn_id: Option<&'a str>,
+    pub total_tokens: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub thought_tokens: i64,

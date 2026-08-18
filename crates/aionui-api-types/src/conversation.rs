@@ -159,6 +159,97 @@ pub struct SendMessageResponse {
     pub msg_id: String,
     pub turn_id: String,
     pub runtime: ConversationRuntimeSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_status: Option<ConversationInputStatus>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationInputMode {
+    Followup,
+    Steer,
+    Inject,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationInputStatus {
+    Held,
+    Dispatching,
+    Accepted,
+    Applied,
+    Canceled,
+    Failed,
+}
+
+impl ConversationInputStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Applied | Self::Canceled | Self::Failed)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolEnforcementLevel {
+    Native,
+    ApprovalGate,
+    ObserveOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationCapabilities {
+    pub followup: bool,
+    pub steer: bool,
+    pub inject: bool,
+    pub tool_enforcement: ToolEnforcementLevel,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubmitConversationInputRequest {
+    pub mode: ConversationInputMode,
+    pub content: String,
+    #[serde(default)]
+    pub files: Vec<ChatFileRef>,
+    #[serde(default)]
+    pub inject_skills: Vec<String>,
+    #[serde(default)]
+    pub hidden: bool,
+    pub client_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConversationInputResponse {
+    pub input_id: String,
+    pub conversation_id: String,
+    pub mode: ConversationInputMode,
+    pub status: ConversationInputStatus,
+    pub content: String,
+    pub files: Vec<ChatFileRef>,
+    pub inject_skills: Vec<String>,
+    pub hidden: bool,
+    pub client_key: String,
+    pub turn_id: Option<String>,
+    pub msg_id: Option<String>,
+    pub error_code: Option<String>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+pub type ConversationInputListResponse = Vec<ConversationInputResponse>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConversationInputReceipt {
+    pub input: ConversationInputResponse,
+    pub runtime: ConversationRuntimeSummary,
+    pub capabilities: ConversationCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InputChangedEvent {
+    pub user_id: String,
+    pub input: ConversationInputResponse,
 }
 
 /// Body for `POST /api/conversations/:id/cancel`.

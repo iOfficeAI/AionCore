@@ -53,7 +53,7 @@ pub use agent_build_extra::{
 pub use agent_discovery::{
     AgentEnvEntry, AgentHandshake, AgentLogoEntry, AgentManagementRow, AgentManagementStatus, AgentMetadata,
     AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource, AgentSourceInfo, BehaviorPolicy,
-    ManagedRuntimeSource, ManagedRuntimeState, ManagedRuntimeStatus, SessionLifetime,
+    ManagedRuntimeSource, ManagedRuntimeState, ManagedRuntimeStatus, RETIRED_DEEPSEEK_HARNESS_BACKEND, SessionLifetime,
 };
 pub use agent_error::{
     AgentErrorCode, AgentErrorOwnership, AgentErrorResolution, AgentErrorResolutionKind, AgentErrorResolutionTarget,
@@ -94,12 +94,14 @@ pub use conversation::{
     ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,
     CancelConversationRequest, CancelConversationResponse, CloneConversationRequest, ConversationArtifactKind,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
-    ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
-    ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
+    ConversationAssistantIdentityResponse, ConversationCapabilities, ConversationInputListResponse,
+    ConversationInputMode, ConversationInputReceipt, ConversationInputResponse, ConversationInputStatus,
+    ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind, ConversationNameUpdatedPayload,
+    ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest,
+    EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest, InputChangedEvent,
     ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem,
     MessageSearchResponse, PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    UpdateConversationArtifactRequest, UpdateConversationRequest,
+    SubmitConversationInputRequest, ToolEnforcementLevel, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,

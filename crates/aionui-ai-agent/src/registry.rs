@@ -1571,7 +1571,7 @@ fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableRe
     }
 
     if let Some(runtime) = meta.agent_source_info.managed_runtime.as_ref() {
-        if runtime.runtime_id == aionui_runtime::DEEPSEEK_HARNESS_RUNTIME_ID {
+        if runtime.runtime_id == aionui_api_types::RETIRED_DEEPSEEK_HARNESS_BACKEND {
             return Err(UnavailableReason::ManagedRuntimeUnavailable {
                 resource: runtime.runtime_id.clone(),
                 detail: "DeepSeek Harness preview has been retired".to_owned(),

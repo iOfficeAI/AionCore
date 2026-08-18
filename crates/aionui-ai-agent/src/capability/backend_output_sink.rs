@@ -133,9 +133,13 @@ impl OutputSink for BackendOutputSink {
         cache_creation_tokens: u64,
         cache_read_tokens: u64,
     ) {
-        let used = input_tokens.saturating_add(output_tokens);
+        let used = input_tokens
+            .saturating_add(output_tokens)
+            .saturating_add(cache_creation_tokens)
+            .saturating_add(cache_read_tokens);
         if used > 0 {
             let mut meta = serde_json::json!({
+                "total_tokens": used,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
             });
@@ -306,9 +310,10 @@ mod tests {
         sink.emit_stream_end("msg-1", 3, 1000, 500, 100, 200);
         match rx.try_recv().unwrap() {
             AgentStreamEvent::AcpContextUsage(payload) => {
-                assert_eq!(payload["used"], 1500);
+                assert_eq!(payload["used"], 1800);
                 assert_eq!(payload["_meta"]["input_tokens"], 1000);
                 assert_eq!(payload["_meta"]["output_tokens"], 500);
+                assert_eq!(payload["_meta"]["total_tokens"], 1800);
             }
             other => panic!("Expected AcpContextUsage, got {:?}", other),
         }

@@ -27,6 +27,10 @@
 /// the renderer then omits the line entirely.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageBreakdown {
+    /// Backend-normalized total tokens consumed by this completed turn.
+    /// This is distinct from `UsageDelta.total_tokens`, which is context occupancy.
+    #[serde(default)]
+    pub turn_total_tokens: Option<u64>,
     /// Cache HITS — tokens read from an existing prefix cache.
     pub cached_read_tokens: u64,
     /// Cache WRITES — tokens newly committed to the cache this turn.
@@ -1744,6 +1748,19 @@ mod additive_tests {
 
     #[test]
     fn additive_defaults_keep_old_frames_deserializable() {
+        let old_usage = r#"{"UsageDelta":{"input_tokens":1,"output_tokens":2,"total_tokens":3,"cost_usd":null,"context_window":null,"breakdown":{"cached_read_tokens":0,"cached_write_tokens":0,"thought_tokens":0}}}"#;
+        let ev: SessionEvent = serde_json::from_str(old_usage).expect("old usage frame deserializes");
+        assert!(matches!(
+            ev,
+            SessionEvent::UsageDelta {
+                breakdown: UsageBreakdown {
+                    turn_total_tokens: None,
+                    ..
+                },
+                ..
+            }
+        ));
+
         // An OLD TurnResult frame (no `outcome`) must still deserialize (the
         // #[serde(default)] guarantee) → outcome defaults to EndTurn.
         let old = r#"{"TurnResult":{"is_error":false,"api_error_status":null,"result_text":"hi","epoch":2}}"#;

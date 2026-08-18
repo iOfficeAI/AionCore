@@ -1,4 +1,4 @@
-//! Host-only approval audit pair, modeled on DeepSeek Harness
+//! Host-only approval audit events and projection.
 //! `approval/asked` + `approval/decided`.
 //!
 //! These events never enter the model transcript. The grant itself is the

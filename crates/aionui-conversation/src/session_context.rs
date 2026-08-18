@@ -8,7 +8,7 @@ use aionui_ai_agent::session_context::{
 };
 use aionui_ai_agent::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, PersistedSessionState};
 use aionui_ai_agent::types::BuildTaskOptions;
-use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, TeamSessionBinding};
+use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, RETIRED_DEEPSEEK_HARNESS_BACKEND, TeamSessionBinding};
 use aionui_common::{AgentType, WorkspacePathValidationError, validate_workspace_path_availability};
 use aionui_db::models::ConversationRow;
 use aionui_db::{IAcpSessionRepository, IAgentMetadataRepository};
@@ -549,7 +549,7 @@ fn extra_backend(row: &ConversationRow) -> Option<String> {
 }
 
 fn reject_deprecated_runtime_kind(row: &ConversationRow, agent_type: &AgentType) -> Result<(), ConversationError> {
-    let retired_preview = extra_backend(row).as_deref() == Some("deepseek-harness");
+    let retired_preview = extra_backend(row).as_deref() == Some(RETIRED_DEEPSEEK_HARNESS_BACKEND);
     if !agent_type.is_deprecated_runtime() && !retired_preview {
         return Ok(());
     }

@@ -16,6 +16,7 @@ pub struct UsageEventRow {
     pub assistant_name: Option<String>,
     pub model_id: Option<String>,
     pub turn_id: Option<String>,
+    pub total_tokens: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub thought_tokens: i64,

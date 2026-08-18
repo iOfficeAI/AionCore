@@ -17,7 +17,7 @@ use std::sync::{Arc, RwLock};
 
 use aionui_api_types::{
     AgentLogoEntry, AgentManagementRow, ManagedRuntimeState, ManagedRuntimeStatus, ProviderHealthCheckRequest,
-    ProviderHealthCheckResponse,
+    ProviderHealthCheckResponse, RETIRED_DEEPSEEK_HARNESS_BACKEND,
 };
 use aionui_db::IProviderRepository;
 use aionui_realtime::EventBroadcaster;
@@ -51,7 +51,7 @@ impl AgentService {
             data_dir,
         );
         let deepseek_runtime = Arc::new(RwLock::new(ManagedRuntimeStatus {
-            runtime_id: aionui_runtime::DEEPSEEK_HARNESS_RUNTIME_ID.to_owned(),
+            runtime_id: RETIRED_DEEPSEEK_HARNESS_BACKEND.to_owned(),
             release: String::new(),
             state: ManagedRuntimeState::NotInstalled,
             phase: Some("retired".to_owned()),

@@ -87,3 +87,23 @@ pub struct UpsertConversationAssistantSnapshotParams<'a> {
     pub default_mcps_mode: &'a str,
     pub resolved_mcp_ids: &'a str,
 }
+
+/// Durable projection of one host input lifecycle recorded in the canonical journal.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ConversationInputRow {
+    pub id: String,
+    pub user_id: String,
+    pub conversation_id: String,
+    pub mode: String,
+    pub status: String,
+    pub content: String,
+    pub files: String,
+    pub inject_skills: String,
+    pub hidden: bool,
+    pub client_key: String,
+    pub turn_id: Option<String>,
+    pub msg_id: Option<String>,
+    pub error_code: Option<String>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}

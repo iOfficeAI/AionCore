@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use aionui_api_types::{
     AgentManagementRow, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource,
-    TryConnectCustomAgentResponse,
+    RETIRED_DEEPSEEK_HARNESS_BACKEND, TryConnectCustomAgentResponse,
 };
 use aionui_common::AgentType;
 use aionui_common::now_ms;
@@ -222,7 +222,7 @@ async fn run_probe(
     // has nothing extra to say.
     let mut guidance: Option<String> = None;
 
-    let (status, error_code, error_message) = if meta.backend.as_deref() == Some("deepseek-harness") {
+    let (status, error_code, error_message) = if meta.backend.as_deref() == Some(RETIRED_DEEPSEEK_HARNESS_BACKEND) {
         probe_retired_deepseek_harness()
     } else if meta.agent_source == AgentSource::Builtin
         && matches!(

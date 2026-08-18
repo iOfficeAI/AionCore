@@ -641,6 +641,7 @@ fn event_is_user_visible_output(event: &AgentStreamEvent) -> bool {
 /// sizes > 0.
 fn end_turn_usage_frame(usage: &Usage) -> Value {
     let mut breakdown = serde_json::json!({
+        "total_tokens": usage.total_tokens,
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
     });
@@ -874,12 +875,14 @@ mod tests {
         );
         assert_eq!(frame["_meta"]["input_tokens"], 1000);
         assert_eq!(frame["_meta"]["output_tokens"], 200);
+        assert_eq!(frame["_meta"]["total_tokens"], 1200);
 
         // The breakdown must survive the typed round-trip — `_meta` is a real
         // UsageUpdate field, so the snapshot (and GET /usage) keeps it.
         let round_tripped = serde_json::to_value(&update).expect("serialize");
         assert_eq!(round_tripped["_meta"]["input_tokens"], 1000);
         assert_eq!(round_tripped["_meta"]["output_tokens"], 200);
+        assert_eq!(round_tripped["_meta"]["total_tokens"], 1200);
     }
 
     #[test]
@@ -967,6 +970,7 @@ mod tests {
         assert_eq!(frame["_meta"]["output_tokens"], 40);
         assert_eq!(frame["_meta"]["thought_tokens"], 28);
         assert_eq!(frame["_meta"]["cached_read_tokens"], 11648);
+        assert_eq!(frame["_meta"]["total_tokens"], 14923);
     }
 
     /// OpenCode regression: a mid-turn UsageUpdate notification stores the

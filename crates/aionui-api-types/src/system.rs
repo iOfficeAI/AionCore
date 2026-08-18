@@ -22,7 +22,7 @@ impl Default for SystemSettingsResponse {
             language: "en-US".to_owned(),
             notification_enabled: true,
             cron_notification_enabled: false,
-            command_queue_enabled: false,
+            command_queue_enabled: true,
             save_upload_to_workspace: false,
         }
     }
@@ -133,7 +133,7 @@ mod tests {
         assert_eq!(resp.language, "en-US");
         assert!(resp.notification_enabled);
         assert!(!resp.cron_notification_enabled);
-        assert!(!resp.command_queue_enabled);
+        assert!(resp.command_queue_enabled);
         assert!(!resp.save_upload_to_workspace);
     }
 
@@ -144,7 +144,7 @@ mod tests {
         assert_eq!(json["language"], "en-US");
         assert_eq!(json["notification_enabled"], true);
         assert_eq!(json["cron_notification_enabled"], false);
-        assert_eq!(json["command_queue_enabled"], false);
+        assert_eq!(json["command_queue_enabled"], true);
         assert_eq!(json["save_upload_to_workspace"], false);
         // Verify snake_case, not camelCase
         assert!(json.get("notificationEnabled").is_none());

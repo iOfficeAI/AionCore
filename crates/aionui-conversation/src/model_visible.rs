@@ -1,6 +1,6 @@
 //! Runtime invariant: model-visible input is reconstructible from the journal.
 //!
-//! DeepSeek Harness states this as "model visible ⇒ recorded". Adding a
+//! The invariant is "model visible ⇒ recorded". Adding a
 //! model-facing input requires a journal event that `derive_transcript` can
 //! project. The check is diagnostic: production logs a contract violation
 //! instead of failing the turn.

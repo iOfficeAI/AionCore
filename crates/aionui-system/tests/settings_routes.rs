@@ -119,7 +119,7 @@ async fn get_settings_default_values() {
     assert_eq!(json["data"]["language"], "en-US");
     assert_eq!(json["data"]["notification_enabled"], true);
     assert_eq!(json["data"]["cron_notification_enabled"], false);
-    assert_eq!(json["data"]["command_queue_enabled"], false);
+    assert_eq!(json["data"]["command_queue_enabled"], true);
     assert_eq!(json["data"]["save_upload_to_workspace"], false);
 }
 

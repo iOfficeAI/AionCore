@@ -12,19 +12,98 @@ use std::path::Component;
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
     CanonicalReplayProjectionResponse, ConfigOptionConfirmation, GetConfigOptionsResponse, HostPolicyResponse,
-    JournalTranscriptResponse, RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse,
-    SetHostPolicyRequest, SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery,
-    WorkspaceEntry,
+    InputChangedEvent, JournalTranscriptResponse, RETIRED_DEEPSEEK_HARNESS_BACKEND, RetainedOutputResponse,
+    SetConfigOptionRequest, SetConfigOptionResponse, SetHostPolicyRequest, SideQuestionRequest, SideQuestionResponse,
+    SlashCommandItem, SubmitConversationInputRequest, ToolEnforcementLevel, WorkspaceBrowseQuery, WorkspaceEntry,
 };
-use aionui_common::{AgentKillReason, ErrorChain};
+use aionui_api_types::{
+    ConversationCapabilities, ConversationInputMode, ConversationInputReceipt, ConversationInputResponse,
+    ConversationInputStatus, SendMessageRequest, WebSocketMessage,
+};
+use aionui_common::{AgentKillReason, ErrorChain, now_ms};
+use aionui_db::models::ConversationInputRow;
+use aionui_db::{ConversationInputInsert, ConversationInputUpdate};
+use sha2::{Digest, Sha256};
 
 use tracing::warn;
 
 use crate::ConversationError;
 use crate::journal_transcript::{RequestedVisibility, derive_transcript};
-use crate::service::{AssistantRuntimePreferenceUpdate, ConversationService};
+use crate::service::{
+    AssistantRuntimePreferenceUpdate, ConversationService, reject_deprecated_runtime_row, team_id_from_extra,
+};
 
 const MAX_DIR_DEPTH: usize = 10;
+
+struct InputStatusChange<'a> {
+    status: ConversationInputStatus,
+    turn_id: Option<&'a str>,
+    msg_id: Option<&'a str>,
+    error_code: Option<&'a str>,
+}
+
+fn input_mode_name(mode: ConversationInputMode) -> &'static str {
+    match mode {
+        ConversationInputMode::Followup => "followup",
+        ConversationInputMode::Steer => "steer",
+        ConversationInputMode::Inject => "inject",
+    }
+}
+
+fn input_status_name(status: ConversationInputStatus) -> &'static str {
+    match status {
+        ConversationInputStatus::Held => "held",
+        ConversationInputStatus::Dispatching => "dispatching",
+        ConversationInputStatus::Accepted => "accepted",
+        ConversationInputStatus::Applied => "applied",
+        ConversationInputStatus::Canceled => "canceled",
+        ConversationInputStatus::Failed => "failed",
+    }
+}
+
+fn input_row_response(row: ConversationInputRow) -> Result<ConversationInputResponse, ConversationError> {
+    let mode = match row.mode.as_str() {
+        "followup" => ConversationInputMode::Followup,
+        "steer" => ConversationInputMode::Steer,
+        "inject" => ConversationInputMode::Inject,
+        value => {
+            return Err(ConversationError::internal(format!(
+                "Invalid conversation input mode '{value}'"
+            )));
+        }
+    };
+    let status = match row.status.as_str() {
+        "held" => ConversationInputStatus::Held,
+        "dispatching" => ConversationInputStatus::Dispatching,
+        "accepted" => ConversationInputStatus::Accepted,
+        "applied" => ConversationInputStatus::Applied,
+        "canceled" => ConversationInputStatus::Canceled,
+        "failed" => ConversationInputStatus::Failed,
+        value => {
+            return Err(ConversationError::internal(format!(
+                "Invalid conversation input status '{value}'"
+            )));
+        }
+    };
+    Ok(ConversationInputResponse {
+        input_id: row.id,
+        conversation_id: row.conversation_id,
+        mode,
+        status,
+        content: row.content,
+        files: serde_json::from_str(&row.files)
+            .map_err(|error| ConversationError::internal(format!("Invalid input files projection: {error}")))?,
+        inject_skills: serde_json::from_str(&row.inject_skills)
+            .map_err(|error| ConversationError::internal(format!("Invalid input skills projection: {error}")))?,
+        hidden: row.hidden,
+        client_key: row.client_key,
+        turn_id: row.turn_id,
+        msg_id: row.msg_id,
+        error_code: row.error_code,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
+}
 
 impl ConversationService {
     pub async fn replay_event_projection(
@@ -267,7 +346,7 @@ impl ConversationService {
         }
         self.ensure_owned_conversation(user_id, conversation_id).await?;
         let agent = self.task(conversation_id)?;
-        if agent.backend() == Some("deepseek-harness") {
+        if agent.backend() == Some(RETIRED_DEEPSEEK_HARNESS_BACKEND) {
             return Err(ConversationError::Archived {
                 id: conversation_id.to_owned(),
                 reason: "This historical conversation can no longer be continued. Please start a new conversation."
@@ -435,6 +514,411 @@ impl ConversationService {
             .handle_side_question(req)
             .await
             .map_err(ConversationError::from)
+    }
+
+    pub async fn conversation_capabilities(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConversationCapabilities, ConversationError> {
+        let row = self
+            .conversation_repo()
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        Ok(ConversationCapabilities {
+            followup: true,
+            steer: false,
+            inject: false,
+            tool_enforcement: if row.r#type == "aionrs" {
+                ToolEnforcementLevel::Native
+            } else {
+                ToolEnforcementLevel::ObserveOnly
+            },
+        })
+    }
+
+    pub async fn submit_input(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: SubmitConversationInputRequest,
+    ) -> Result<ConversationInputReceipt, ConversationError> {
+        if req.content.trim().is_empty() {
+            return Err(ConversationError::bad_request("Input content must not be empty"));
+        }
+        if req.client_key.trim().is_empty() || req.client_key.len() > 256 {
+            return Err(ConversationError::bad_request(
+                "client_key must contain between 1 and 256 bytes",
+            ));
+        }
+        let row = self
+            .conversation_repo()
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        if team_id_from_extra(&row.extra).is_some() {
+            return Err(ConversationError::Forbidden {
+                reason: "Team-owned conversations must be sent through Team API".into(),
+            });
+        }
+        reject_deprecated_runtime_row(&row)?;
+        let capabilities = self.conversation_capabilities(user_id, conversation_id).await?;
+        let supported = match req.mode {
+            ConversationInputMode::Followup => capabilities.followup,
+            ConversationInputMode::Steer => capabilities.steer,
+            ConversationInputMode::Inject => capabilities.inject,
+        };
+        if !supported {
+            return Err(ConversationError::CapabilityUnsupported {
+                capability: input_mode_name(req.mode).to_owned(),
+            });
+        }
+
+        let input_id = {
+            let digest = Sha256::digest(format!("{user_id}\0{conversation_id}\0{}", req.client_key.trim()).as_bytes());
+            format!("input_{}", &hex::encode(digest)[..24])
+        };
+        let created_at = now_ms();
+        let files = serde_json::to_string(&req.files)
+            .map_err(|error| ConversationError::internal(format!("Failed to encode input files: {error}")))?;
+        let inject_skills = serde_json::to_string(&req.inject_skills)
+            .map_err(|error| ConversationError::internal(format!("Failed to encode input skills: {error}")))?;
+
+        let lock = self.input_queue_lock(conversation_id);
+        {
+            let _guard = lock.lock().await;
+            let payload = serde_json::json!({
+                "type": "conversation_input",
+                "visibility": "host",
+                "data": {
+                    "input_id": input_id,
+                    "mode": input_mode_name(req.mode),
+                    "status": "held",
+                    "content": req.content,
+                    "files": req.files,
+                    "inject_skills": req.inject_skills,
+                    "hidden": req.hidden,
+                    "client_key": req.client_key,
+                }
+            });
+            let event_id =
+                crate::stream_persistence::canonical_event_id(&format!("conversation_input:{input_id}:held"), &payload);
+            self.canonical_event_journal()
+                .append(user_id, conversation_id, event_id, "InputHeld".into(), payload)
+                .await
+                .map_err(|error| {
+                    ConversationError::internal(format!("Failed to journal conversation input: {error}"))
+                })?;
+            let row = self
+                .conversation_repo()
+                .insert_conversation_input(&ConversationInputInsert {
+                    id: &input_id,
+                    user_id,
+                    conversation_id,
+                    mode: input_mode_name(req.mode),
+                    status: "held",
+                    content: &req.content,
+                    files: &files,
+                    inject_skills: &inject_skills,
+                    hidden: req.hidden,
+                    client_key: req.client_key.trim(),
+                    created_at,
+                })
+                .await?;
+            self.broadcast_input_changed(user_id, input_row_response(row)?);
+        }
+
+        self.dispatch_next_held_input(user_id, conversation_id).await;
+        let input = self
+            .conversation_repo()
+            .get_conversation_input(user_id, conversation_id, &input_id)
+            .await?
+            .ok_or_else(|| ConversationError::internal("Input projection disappeared after submission"))?;
+        Ok(ConversationInputReceipt {
+            input: input_row_response(input)?,
+            runtime: self.runtime_summary_for(conversation_id).await,
+            capabilities,
+        })
+    }
+
+    pub async fn list_inputs(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<ConversationInputResponse>, ConversationError> {
+        self.conversation_repo()
+            .list_conversation_inputs(user_id, conversation_id)
+            .await?
+            .into_iter()
+            .map(input_row_response)
+            .collect()
+    }
+
+    pub async fn cancel_input(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        input_id: &str,
+    ) -> Result<ConversationInputResponse, ConversationError> {
+        let lock = self.input_queue_lock(conversation_id);
+        let _guard = lock.lock().await;
+        let current = self
+            .conversation_repo()
+            .get_conversation_input(user_id, conversation_id, input_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFoundReason {
+                reason: format!("Conversation input '{input_id}' not found"),
+            })?;
+        let current = input_row_response(current)?;
+        if current.status.is_terminal() {
+            return Err(ConversationError::Busy {
+                reason: "conversation input is already terminal".into(),
+            });
+        }
+        let changed = self
+            .persist_input_status(
+                user_id,
+                conversation_id,
+                input_id,
+                InputStatusChange {
+                    status: ConversationInputStatus::Canceled,
+                    turn_id: None,
+                    msg_id: None,
+                    error_code: None,
+                },
+            )
+            .await?;
+        Ok(changed)
+    }
+
+    pub(crate) async fn dispatch_next_held_input(&self, user_id: &str, conversation_id: &str) {
+        if !self.runtime_summary_for(conversation_id).await.can_send_message {
+            return;
+        }
+        let lock = self.input_queue_lock(conversation_id);
+        let _guard = lock.lock().await;
+        if !self.runtime_summary_for(conversation_id).await.can_send_message {
+            return;
+        }
+        let rows = match self
+            .conversation_repo()
+            .list_conversation_inputs(user_id, conversation_id)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!(conversation_id, error = %error, "Failed to read durable input queue");
+                return;
+            }
+        };
+        let Some(next) = rows.into_iter().find(|row| row.status == "held") else {
+            return;
+        };
+        if let Err(error) = self
+            .append_input_status_event(
+                user_id,
+                conversation_id,
+                &next.id,
+                ConversationInputStatus::Dispatching,
+                None,
+            )
+            .await
+        {
+            warn!(conversation_id, input_id = next.id, error = %error, "Failed to journal input dispatch");
+            return;
+        }
+        let claimed = match self
+            .conversation_repo()
+            .claim_next_conversation_input(user_id, conversation_id, now_ms())
+            .await
+        {
+            Ok(Some(row)) if row.id == next.id => row,
+            Ok(_) => return,
+            Err(error) => {
+                warn!(conversation_id, input_id = next.id, error = %error, "Failed to claim queued input");
+                return;
+            }
+        };
+        let claimed_response = match input_row_response(claimed.clone()) {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(conversation_id, input_id = next.id, error = %error, "Invalid queued input projection");
+                return;
+            }
+        };
+        self.broadcast_input_changed(user_id, claimed_response.clone());
+        let request = SendMessageRequest {
+            content: claimed_response.content,
+            files: claimed_response.files,
+            inject_skills: claimed_response.inject_skills,
+            hidden: claimed_response.hidden,
+        };
+        match self
+            .send_message(user_id, conversation_id, request, self.task_manager())
+            .await
+        {
+            Ok(response) => {
+                if let Err(error) = self
+                    .persist_input_status(
+                        user_id,
+                        conversation_id,
+                        &next.id,
+                        InputStatusChange {
+                            status: ConversationInputStatus::Accepted,
+                            turn_id: Some(&response.turn_id),
+                            msg_id: Some(&response.msg_id),
+                            error_code: None,
+                        },
+                    )
+                    .await
+                {
+                    warn!(conversation_id, input_id = next.id, error = %error, "Failed to project accepted input");
+                    return;
+                }
+                if let Err(error) = self
+                    .persist_input_status(
+                        user_id,
+                        conversation_id,
+                        &next.id,
+                        InputStatusChange {
+                            status: ConversationInputStatus::Applied,
+                            turn_id: Some(&response.turn_id),
+                            msg_id: Some(&response.msg_id),
+                            error_code: None,
+                        },
+                    )
+                    .await
+                {
+                    warn!(conversation_id, input_id = next.id, error = %error, "Failed to project applied input");
+                }
+            }
+            Err(ConversationError::Busy { .. }) => {
+                if let Err(error) = self
+                    .persist_input_status(
+                        user_id,
+                        conversation_id,
+                        &next.id,
+                        InputStatusChange {
+                            status: ConversationInputStatus::Held,
+                            turn_id: None,
+                            msg_id: None,
+                            error_code: None,
+                        },
+                    )
+                    .await
+                {
+                    warn!(conversation_id, input_id = next.id, error = %error, "Failed to requeue raced input");
+                }
+            }
+            Err(error) => {
+                let error_code = error.error_code();
+                if let Err(persist_error) = self
+                    .persist_input_status(
+                        user_id,
+                        conversation_id,
+                        &next.id,
+                        InputStatusChange {
+                            status: ConversationInputStatus::Failed,
+                            turn_id: None,
+                            msg_id: None,
+                            error_code: Some(error_code),
+                        },
+                    )
+                    .await
+                {
+                    warn!(conversation_id, input_id = next.id, error = %persist_error, "Failed to project failed input");
+                }
+            }
+        }
+    }
+
+    async fn persist_input_status(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        input_id: &str,
+        change: InputStatusChange<'_>,
+    ) -> Result<ConversationInputResponse, ConversationError> {
+        self.append_input_status_event(user_id, conversation_id, input_id, change.status, change.error_code)
+            .await?;
+        let row = self
+            .conversation_repo()
+            .update_conversation_input(
+                user_id,
+                conversation_id,
+                input_id,
+                &ConversationInputUpdate {
+                    status: Some(input_status_name(change.status)),
+                    turn_id: change.turn_id,
+                    msg_id: change.msg_id,
+                    error_code: change.error_code,
+                    updated_at: now_ms(),
+                },
+            )
+            .await?
+            .ok_or_else(|| ConversationError::NotFoundReason {
+                reason: format!("Conversation input '{input_id}' not found"),
+            })?;
+        let response = input_row_response(row)?;
+        self.broadcast_input_changed(user_id, response.clone());
+        Ok(response)
+    }
+
+    async fn append_input_status_event(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        input_id: &str,
+        status: ConversationInputStatus,
+        error_code: Option<&str>,
+    ) -> Result<(), ConversationError> {
+        let payload = serde_json::json!({
+            "type": "conversation_input_status",
+            "visibility": "host",
+            "data": {
+                "input_id": input_id,
+                "status": input_status_name(status),
+                "error_code": error_code,
+            }
+        });
+        let event_id = crate::stream_persistence::canonical_event_id(
+            &format!("conversation_input:{input_id}:{}", input_status_name(status)),
+            &payload,
+        );
+        self.canonical_event_journal()
+            .append(
+                user_id,
+                conversation_id,
+                event_id,
+                match status {
+                    ConversationInputStatus::Held => "InputHeld",
+                    ConversationInputStatus::Dispatching => "InputDispatching",
+                    ConversationInputStatus::Accepted => "InputAccepted",
+                    ConversationInputStatus::Applied => "InputApplied",
+                    ConversationInputStatus::Canceled => "InputCanceled",
+                    ConversationInputStatus::Failed => "InputFailed",
+                }
+                .into(),
+                payload,
+            )
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to journal input status: {error}")))?;
+        Ok(())
+    }
+
+    fn broadcast_input_changed(&self, user_id: &str, input: ConversationInputResponse) {
+        self.broadcaster().broadcast(WebSocketMessage::new(
+            "conversation.inputChanged",
+            serde_json::json!(InputChangedEvent {
+                user_id: user_id.to_owned(),
+                input,
+            }),
+        ));
     }
 
     async fn ensure_owned_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), ConversationError> {

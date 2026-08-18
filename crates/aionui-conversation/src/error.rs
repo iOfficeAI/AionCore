@@ -68,6 +68,9 @@ pub enum ConversationError {
     #[error("Unprocessable entity: {reason}")]
     Unprocessable { reason: String },
 
+    #[error("Conversation capability is not supported: {capability}")]
+    CapabilityUnsupported { capability: String },
+
     #[error("Internal error: {reason}")]
     Internal { reason: String },
 
@@ -118,6 +121,9 @@ impl ConversationError {
                 AgentError::conflict("This conversation belongs to a team; use the team runtime session")
             }
             Self::Unprocessable { reason } => AgentError::bad_request(reason.clone()),
+            Self::CapabilityUnsupported { capability } => {
+                AgentError::bad_request(format!("Capability '{capability}' is not supported"))
+            }
             Self::Internal { reason } => AgentError::internal(reason.clone()),
             Self::WorkspacePathUnavailable { path } => {
                 AgentError::bad_request(format!("Workspace path is unavailable: {path}"))
@@ -149,6 +155,7 @@ impl ConversationError {
             Self::ConfigUpdateInProgress { .. } => "config_update_in_progress",
             Self::TeamRuntimeRequired { .. } => "TEAM_RUNTIME_REQUIRED",
             Self::Unprocessable { .. } => "UNPROCESSABLE_ENTITY",
+            Self::CapabilityUnsupported { .. } => "capability_unsupported",
             Self::Archived { .. } => "CONVERSATION_ARCHIVED",
             Self::WorkspacePathUnavailable { .. } => "WORKSPACE_PATH_UNAVAILABLE",
             Self::WorkspacePathRuntimeUnavailable { .. } => "WORKSPACE_PATH_RUNTIME_UNAVAILABLE",

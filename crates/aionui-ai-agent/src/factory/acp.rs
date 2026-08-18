@@ -12,7 +12,7 @@ use crate::session_context::AcpSessionBuildContext;
 use agent_client_protocol::schema::v1::{
     EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
 };
-use aionui_api_types::{AgentMetadata, SessionMcpServer, SessionMcpTransport};
+use aionui_api_types::{AgentMetadata, RETIRED_DEEPSEEK_HARNESS_BACKEND, SessionMcpServer, SessionMcpTransport};
 use aionui_common::CommandSpec;
 use aionui_common::ProviderWithModel;
 use aionui_db::IMcpServerRepository;
@@ -164,7 +164,7 @@ pub(super) async fn build(
         return Ok(instance);
     }
 
-    if config.backend.as_deref() == Some("deepseek-harness") {
+    if config.backend.as_deref() == Some(RETIRED_DEEPSEEK_HARNESS_BACKEND) {
         return Err(AgentError::bad_request(
             "DeepSeek Harness preview has been retired. Open the conversation as history, or start a new chat with another agent.",
         ));

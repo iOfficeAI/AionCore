@@ -13,6 +13,10 @@
 
 use aionui_common::{AgentType, TimestampMs};
 use serde::{Deserialize, Serialize};
+
+/// Historical backend identifier retained only so persisted conversations can
+/// fail with a stable retired-runtime error instead of becoming unreadable.
+pub const RETIRED_DEEPSEEK_HARNESS_BACKEND: &str = "deepseek-harness";
 use std::path::PathBuf;
 
 /// How an agent row was sourced.

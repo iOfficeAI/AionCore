@@ -10,9 +10,10 @@ use tracing::warn;
 use crate::error::ConversationError;
 
 const USAGE_RETENTION_MS: i64 = 180 * 24 * 60 * 60 * 1000;
-const USAGE_MAX_EVENTS: i64 = 5_000;
+const USAGE_MAX_EVENTS: i64 = 50_000;
 
 pub struct ContextUsageSpend {
+    pub total_tokens: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub thought_tokens: i64,
@@ -50,6 +51,7 @@ pub fn spend_from_context_usage(payload: &Value) -> Option<ContextUsageSpend> {
     let thought_tokens = spend_counter(payload, meta, "thought_tokens", "reasoningTokens");
     let cached_read_tokens = spend_counter(payload, meta, "cached_read_tokens", "cachedReadTokens");
     let cached_write_tokens = spend_counter(payload, meta, "cached_write_tokens", "cacheCreationTokens");
+    let explicit_total_tokens = spend_counter(payload, meta, "total_tokens", "totalTokens");
     let cost = payload.get("cost");
     let session_cost_amount = cost
         .and_then(|c| c.get("amount"))
@@ -70,7 +72,16 @@ pub fn spend_from_context_usage(payload: &Value) -> Option<ContextUsageSpend> {
         return None;
     }
 
+    let cache_tokens = cached_read_tokens.saturating_add(cached_write_tokens);
+    let input_includes_cache = cache_tokens > 0 && input_tokens >= cache_tokens;
     Some(ContextUsageSpend {
+        total_tokens: if explicit_total_tokens > 0 {
+            explicit_total_tokens
+        } else {
+            input_tokens
+                .saturating_add(output_tokens)
+                .saturating_add(if input_includes_cache { 0 } else { cache_tokens })
+        },
         input_tokens,
         output_tokens,
         thought_tokens,
@@ -140,6 +151,7 @@ pub fn usage_event_fingerprint(turn_id: Option<&str>, spend: &ContextUsageSpend)
 pub fn row_to_usage_dto(row: UsageEventRow) -> UsageEventDto {
     UsageEventDto {
         id: row.id,
+        fingerprint: row.fingerprint,
         recorded_at: row.recorded_at,
         conversation_id: row.conversation_id,
         conversation_name: row.conversation_name,
@@ -148,6 +160,8 @@ pub fn row_to_usage_dto(row: UsageEventRow) -> UsageEventDto {
         assistant_id: row.assistant_id,
         assistant_name: row.assistant_name,
         model_id: row.model_id,
+        turn_id: row.turn_id,
+        total_tokens: row.total_tokens,
         input_tokens: row.input_tokens,
         output_tokens: row.output_tokens,
         thought_tokens: row.thought_tokens,
@@ -231,6 +245,7 @@ pub async fn record_context_usage_spend(
         assistant_name: None,
         model_id: model_id.as_deref(),
         turn_id,
+        total_tokens: spend.total_tokens,
         input_tokens: spend.input_tokens,
         output_tokens: spend.output_tokens,
         thought_tokens: spend.thought_tokens,
@@ -262,8 +277,14 @@ pub async fn list_usage_events(
     since: Option<i64>,
     limit: Option<i64>,
 ) -> Result<UsageListResponse, ConversationError> {
+    if let Err(error) = usage_repo
+        .prune_for_user(user_id, now_ms() - USAGE_RETENTION_MS, USAGE_MAX_EVENTS)
+        .await
+    {
+        warn!(user_id, error = %error, "Failed to prune usage ledger before listing");
+    }
     let events = usage_repo
-        .list_for_user(user_id, since, limit.unwrap_or(5_000))
+        .list_for_user(user_id, since, limit.unwrap_or(USAGE_MAX_EVENTS))
         .await
         .map_err(|e| ConversationError::internal(format!("Failed to list usage: {e}")))?;
     Ok(UsageListResponse {
@@ -307,6 +328,7 @@ mod tests {
         .expect("spend");
         assert_eq!(spend.input_tokens, 900);
         assert_eq!(spend.output_tokens, 80);
+        assert_eq!(spend.total_tokens, 980);
     }
 
     #[test]
@@ -328,5 +350,23 @@ mod tests {
         assert_eq!(spend.output_tokens, 119);
         assert_eq!(spend.thought_tokens, 77);
         assert_eq!(spend.cached_read_tokens, 11648);
+        assert_eq!(spend.total_tokens, 14794);
+    }
+
+    #[test]
+    fn explicit_turn_total_is_preserved() {
+        let spend = spend_from_context_usage(&json!({
+            "used": 200_000,
+            "size": 200_000,
+            "_meta": {
+                "total_tokens": 41_224,
+                "input_tokens": 919,
+                "output_tokens": 305,
+                "cached_read_tokens": 20_000,
+                "cached_write_tokens": 20_000
+            }
+        }))
+        .expect("spend");
+        assert_eq!(spend.total_tokens, 41_224);
     }
 }

@@ -19,6 +19,7 @@ fn spend_params<'a>(
         assistant_name: Some("Claude"),
         model_id: Some("sonnet"),
         turn_id: Some("turn-1"),
+        total_tokens: input_tokens + 4,
         input_tokens,
         output_tokens: 4,
         thought_tokens: 0,
@@ -49,6 +50,9 @@ async fn insert_is_idempotent_on_fingerprint() {
     let listed = repo.list_for_user("user-1", None, 50).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].input_tokens, 10);
+    assert_eq!(listed[0].total_tokens, 14);
+    assert_eq!(listed[0].fingerprint, "turn:turn-1");
+    assert_eq!(listed[0].turn_id.as_deref(), Some("turn-1"));
     assert_eq!(listed[0].conversation_source, "lark");
 }
 
