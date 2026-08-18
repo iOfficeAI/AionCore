@@ -467,12 +467,136 @@ pub struct TeamResponse {
     pub assistants: Vec<TeamAgentResponse>,
     #[serde(skip_serializing_if = "Option::is_none", alias = "lead_agent_id")]
     pub leader_assistant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_conversation_id: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
 
 /// Type alias for team list responses.
 pub type TeamListResponse = Vec<TeamResponse>;
+
+/// Request body for `POST /api/teams/from-conversation`.
+///
+/// Creates an ad-hoc team from an existing conversation. The source conversation
+/// becomes the team's origin; its assistant is promoted to the team lead. A target
+/// assistant may be added as a teammate.
+#[derive(Debug, Deserialize)]
+pub struct CreateAdHocTeamFromConversationRequest {
+    pub conversation_id: String,
+    pub user_id: String,
+    #[serde(default)]
+    pub target_assistant_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub workspace_mode: Option<String>,
+}
+
+/// Response body for `POST /api/teams/from-conversation`.
+#[derive(Debug, Serialize)]
+pub struct AdHocTeamFromConversationResponse {
+    pub team_id: String,
+    pub origin_conversation_id: String,
+    pub leader_slot_id: String,
+    pub target_slot_id: Option<String>,
+    pub created: bool,
+}
+
+/// Association status of an ad-hoc team created from a conversation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdHocTeamAssociationStatus {
+    Active,
+    Disbanded,
+}
+
+/// Response body for `GET /api/teams/by-conversation`.
+#[derive(Debug, Serialize)]
+pub struct AdHocTeamAssociationResponse {
+    pub team_id: String,
+    pub origin_conversation_id: String,
+    pub status: AdHocTeamAssociationStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team: Option<TeamResponse>,
+}
+
+/// Single member entry within a team preset.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamPresetMember {
+    pub assistant_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub assistant_name: String,
+    pub role: String,
+    pub order: i64,
+}
+
+/// Request body for `POST /api/team-presets`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateTeamPresetRequest {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    pub description: String,
+    #[serde(default)]
+    pub expertise_tags: Vec<String>,
+    #[serde(default)]
+    pub example_prompts: Vec<String>,
+    pub leader: TeamPresetMember,
+    #[serde(default)]
+    pub members: Vec<TeamPresetMember>,
+}
+
+/// Request body for `PATCH /api/team-presets/:id`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateTeamPresetRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expertise_tags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub example_prompts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader: Option<TeamPresetMember>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<Vec<TeamPresetMember>>,
+}
+
+/// Full team preset response returned by create, get, list, and update endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamPresetResponse {
+    pub id: String,
+    pub user_id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    pub description: String,
+    pub expertise_tags: Vec<String>,
+    pub example_prompts: Vec<String>,
+    pub leader: TeamPresetMember,
+    pub members: Vec<TeamPresetMember>,
+    pub version: i64,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+/// Type alias for team preset list responses.
+pub type TeamPresetListResponse = Vec<TeamPresetResponse>;
 
 // ---------------------------------------------------------------------------
 // F. WebSocket event payloads
@@ -1157,6 +1281,7 @@ mod tests {
                 pending_confirmations: 0,
             }],
             leader_assistant_id: Some("slot-1".into()),
+            origin_conversation_id: None,
             created_at: 1700000000000,
             updated_at: 1700001000000,
         };
@@ -1179,6 +1304,7 @@ mod tests {
             workspace: String::new(),
             assistants: vec![],
             leader_assistant_id: None,
+            origin_conversation_id: None,
             created_at: 1700000000000,
             updated_at: 1700000000000,
         };
@@ -1313,6 +1439,7 @@ mod tests {
                 },
             ],
             leader_assistant_id: Some("s1".into()),
+            origin_conversation_id: None,
             created_at: 1000,
             updated_at: 2000,
         };

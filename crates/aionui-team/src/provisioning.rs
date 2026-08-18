@@ -104,6 +104,16 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 
     async fn delete_team_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), TeamError>;
 
+    /// Remove team-only metadata from a preserved conversation when it still
+    /// belongs to `expected_team_id`. Implementations must not clear a binding
+    /// that has already moved to a different team.
+    async fn unassign_team_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        expected_team_id: &str,
+    ) -> Result<(), TeamError>;
+
     async fn lookup_team_binding_by_conversation(
         &self,
         _conversation_id: &str,
@@ -182,8 +192,25 @@ impl TeamAgentProvisioner {
         let leader_backend = self
             .resolve_requested_backend(user_id, leader_input.backend.as_deref(), leader_assistant_id.as_deref())
             .await?;
-        let leader_conversation = self
-            .create_team_conversation_for_agent(
+        let leader_conversation = if let Some(ref existing_conversation_id) = leader_input
+            .conversation_id
+            .as_ref()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+        {
+            self.bind_existing_conversation_as_leader(
+                user_id,
+                team_id,
+                &leader_slot_id,
+                existing_conversation_id,
+                &leader_backend,
+                &leader_input.model,
+                leader_assistant_id.as_deref(),
+                shared_workspace,
+            )
+            .await?
+        } else {
+            self.create_team_conversation_for_agent(
                 user_id,
                 team_id,
                 &leader_slot_id,
@@ -195,7 +222,8 @@ impl TeamAgentProvisioner {
                 shared_workspace,
                 None,
             )
-            .await?;
+            .await?
+        };
 
         let team_workspace = match shared_workspace {
             Some(workspace) => workspace.to_owned(),
@@ -571,6 +599,7 @@ impl TeamAgentProvisioner {
             agent_type,
             cli_metadata.as_ref(),
             session_mode,
+            true,
         );
         let provider_id = if agent_type == AgentType::Aionrs {
             self.resolve_provider_for_model(user_id, model)
@@ -617,6 +646,56 @@ impl TeamAgentProvisioner {
         Ok(ProvisionedConversation {
             conversation_id: conv_id,
             workspace: Some(resolved_workspace),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bind_existing_conversation_as_leader(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        conversation_id: &str,
+        backend: &str,
+        model: &str,
+        assistant_id: Option<&str>,
+        workspace: Option<&str>,
+    ) -> Result<ProvisionedConversation, TeamError> {
+        let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, backend).await?;
+        let agent_type = agent_type_for_backend(cli_metadata.as_ref(), backend)?;
+        let mut extra = self.build_team_extra(
+            team_id,
+            slot_id,
+            TeammateRole::Lead,
+            backend,
+            model,
+            assistant_id,
+            workspace,
+            agent_type,
+            cli_metadata.as_ref(),
+            None,
+            false,
+        );
+        if agent_type != AgentType::Aionrs {
+            extra["current_model_id"] = serde_json::Value::String(model.to_owned());
+        }
+
+        self.conversation_port
+            .patch_runtime_config(conversation_id, extra)
+            .await?;
+
+        let resolved_workspace = self.conversation_port.conversation_workspace(conversation_id).await?;
+
+        info!(
+            team_id,
+            slot_id,
+            conversation_id = %conversation_id,
+            outcome = "bound",
+            "Team lead conversation reused from existing conversation"
+        );
+        Ok(ProvisionedConversation {
+            conversation_id: conversation_id.to_owned(),
+            workspace: resolved_workspace,
         })
     }
 
@@ -677,6 +756,7 @@ impl TeamAgentProvisioner {
         agent_type: AgentType,
         cli_metadata: Option<&AgentMetadataRow>,
         session_mode: Option<&str>,
+        include_team_id_marker: bool,
     ) -> serde_json::Value {
         let session_mode = session_mode
             .map(str::trim)
@@ -695,6 +775,9 @@ impl TeamAgentProvisioner {
         }
         if let Some(assistant_id) = assistant_id {
             extra["assistant_id"] = serde_json::Value::String(assistant_id.to_owned());
+        }
+        if role == TeammateRole::Teammate || (role == TeammateRole::Lead && include_team_id_marker) {
+            extra["team_id"] = serde_json::Value::String(team_id.to_owned());
         }
         if let Some(workspace) = workspace {
             inherit_team_workspace(&mut extra, workspace);
@@ -807,6 +890,15 @@ mod tests {
         }
 
         async fn delete_team_conversation(&self, _user_id: &str, _conversation_id: &str) -> Result<(), TeamError> {
+            Ok(())
+        }
+
+        async fn unassign_team_conversation(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _expected_team_id: &str,
+        ) -> Result<(), TeamError> {
             Ok(())
         }
     }
@@ -1143,6 +1235,66 @@ mod tests {
 
         let patches = patches.lock().unwrap();
         assert_eq!(patches[0]["team_mcp_stdio_config"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn build_team_extra_includes_team_id_marker_for_formal_leader() {
+        let provisioner = test_provisioner(Arc::new(Mutex::new(Vec::new())));
+        let extra = provisioner.build_team_extra(
+            "team-formal",
+            "slot-lead",
+            TeammateRole::Lead,
+            "acp",
+            "model-1",
+            Some("asst-1"),
+            Some("/tmp/ws"),
+            AgentType::Acp,
+            None,
+            None,
+            true,
+        );
+        assert_eq!(extra["teamId"], "team-formal");
+        assert_eq!(extra["team_id"], "team-formal");
+    }
+
+    #[test]
+    fn build_team_extra_omits_team_id_marker_for_ad_hoc_reused_leader() {
+        let provisioner = test_provisioner(Arc::new(Mutex::new(Vec::new())));
+        let extra = provisioner.build_team_extra(
+            "team-adhoc",
+            "slot-lead",
+            TeammateRole::Lead,
+            "acp",
+            "model-1",
+            Some("asst-1"),
+            Some("/tmp/ws"),
+            AgentType::Acp,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(extra["teamId"], "team-adhoc");
+        assert!(extra.get("team_id").is_none());
+    }
+
+    #[test]
+    fn build_team_extra_always_marks_teammate_with_team_id() {
+        let provisioner = test_provisioner(Arc::new(Mutex::new(Vec::new())));
+        let extra = provisioner.build_team_extra(
+            "team-1",
+            "slot-tm",
+            TeammateRole::Teammate,
+            "acp",
+            "model-1",
+            Some("asst-2"),
+            Some("/tmp/ws"),
+            AgentType::Acp,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(extra["teamId"], "team-1");
+        assert_eq!(extra["team_id"], "team-1");
     }
 
     #[tokio::test]

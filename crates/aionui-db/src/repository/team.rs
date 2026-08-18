@@ -1,5 +1,5 @@
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use crate::models::{MailboxMessageRow, TeamPresetRow, TeamRow, TeamTaskRow};
 
 /// Sort/paging direction for the activity feed cursor queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +30,7 @@ pub struct UpdateTeamParams {
     /// Project binding (project-bind side branch); `Some` sets the column.
     pub project_id: Option<String>,
     pub folder_id: Option<String>,
+    pub origin_conversation_id: Option<String>,
 }
 
 /// Parameters for updating a task record.
@@ -40,6 +41,19 @@ pub struct UpdateTaskParams {
     pub owner: Option<String>,
     pub blocked_by: Option<String>,
     pub metadata: Option<String>,
+}
+
+/// Parameters for updating a team preset record.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateTeamPresetParams {
+    pub name: Option<String>,
+    pub icon: Option<String>,
+    pub category: Option<String>,
+    pub description: Option<String>,
+    pub expertise_tags: Option<String>,
+    pub example_prompts: Option<String>,
+    pub leader: Option<String>,
+    pub members: Option<String>,
 }
 
 /// Data access abstraction for team collaboration tables.
@@ -72,6 +86,21 @@ pub trait ITeamRepository: Send + Sync {
 
     /// Deletes a team by id. Returns `DbError::NotFound` if absent.
     async fn delete_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError>;
+
+    /// Returns a single team by origin conversation id for `user_id`, or `None`.
+    async fn get_team_by_origin_conversation_id(
+        &self,
+        user_id: &str,
+        origin_conversation_id: &str,
+    ) -> Result<Option<TeamRow>, DbError>;
+
+    // ── Team Presets ─────────────────────────────────────────────────
+
+    async fn create_team_preset(&self, row: &TeamPresetRow) -> Result<(), DbError>;
+    async fn list_team_presets_by_user(&self, user_id: &str) -> Result<Vec<TeamPresetRow>, DbError>;
+    async fn get_team_preset(&self, preset_id: &str) -> Result<Option<TeamPresetRow>, DbError>;
+    async fn update_team_preset(&self, preset_id: &str, params: &UpdateTeamPresetParams) -> Result<(), DbError>;
+    async fn delete_team_preset(&self, preset_id: &str) -> Result<(), DbError>;
 
     // ── Mailbox ──────────────────────────────────────────────────────
 

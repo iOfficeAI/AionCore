@@ -9,11 +9,12 @@ use std::sync::{Arc, RwLock, Weak};
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
-    AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamActivityCursor, TeamActivityPageResponse,
-    TeamAgentResponse, TeamAgentRuntimeStatus, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse,
-    TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
-    TeamTaskResponse, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
-    TeamToolTransport, WebSocketMessage,
+    AdHocTeamAssociationResponse, AdHocTeamAssociationStatus, AdHocTeamFromConversationResponse, AddAgentRequest,
+    CreateAdHocTeamFromConversationRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamActivityCursor,
+    TeamActivityPageResponse, TeamAgentInput, TeamAgentResponse, TeamAgentRuntimeStatus, TeamMailboxMessageResponse,
+    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus,
+    TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode,
+    TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -636,6 +637,7 @@ impl TeamSessionService {
             lead_agent_id: lead_agent_id.clone(),
             session_mode: None,
             agents_version: "1.0.1".into(),
+            origin_conversation_id: None,
             created_at: now,
             updated_at: now,
             project_id,
@@ -649,6 +651,7 @@ impl TeamSessionService {
             workspace: team_workspace,
             agents,
             lead_agent_id,
+            origin_conversation_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -717,11 +720,34 @@ impl TeamSessionService {
         )
         .await;
 
+        let origin_conversation_id = team.origin_conversation_id();
         for agent in &team.agents {
+            let is_origin_conversation = origin_conversation_id
+                .as_deref()
+                .is_some_and(|origin_id| origin_id == agent.conversation_id);
+            if is_origin_conversation {
+                info!(
+                    team_id = %team_id,
+                    conversation_id = %agent.conversation_id,
+                    "Skipping deletion of origin conversation during team removal"
+                );
+                continue;
+            }
             let _ = self
                 .conversation_port
                 .delete_team_conversation(user_id, &agent.conversation_id)
                 .await;
+        }
+
+        if let Some(origin_conversation_id) = origin_conversation_id {
+            self.conversation_port
+                .unassign_team_conversation(user_id, &origin_conversation_id, team_id)
+                .await?;
+            info!(
+                team_id = %team_id,
+                conversation_id = %origin_conversation_id,
+                "Origin conversation unbound during team removal"
+            );
         }
 
         self.repo.delete_mailbox_by_team(user_id, team_id).await?;
@@ -2298,6 +2324,302 @@ impl TeamSessionService {
             .session
             .wake_leader_after_recovery_message(source_slot_id, source)
             .await
+    }
+
+    pub async fn create_ad_hoc_team_from_conversation(
+        &self,
+        user_id: &str,
+        req: CreateAdHocTeamFromConversationRequest,
+    ) -> Result<AdHocTeamFromConversationResponse, TeamError> {
+        let origin_conversation_id = req.conversation_id.clone();
+
+        let binding = self
+            .conversation_port
+            .lookup_team_binding_by_conversation(&origin_conversation_id)
+            .await?
+            .ok_or_else(|| TeamError::Forbidden(format!("conversation not found: {origin_conversation_id}")))?;
+        if binding.user_id != user_id {
+            return Err(TeamError::Forbidden(format!(
+                "conversation not owned by current user: {origin_conversation_id}"
+            )));
+        }
+
+        match self
+            .repo
+            .get_team_by_origin_conversation_id(user_id, &origin_conversation_id)
+            .await
+        {
+            Ok(Some(row)) => {
+                return self
+                    .ensure_ad_hoc_target_and_respond(user_id, &origin_conversation_id, row, &req)
+                    .await;
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        let leader_assistant_id = self
+            .conversation_port
+            .conversation_assistant_id(&origin_conversation_id)
+            .await?
+            .ok_or_else(|| {
+                TeamError::InvalidRequest(format!(
+                    "source conversation {origin_conversation_id} has no assistant_id"
+                ))
+            })?;
+        let leader_entry = self
+            .assistant_catalog
+            .resolve_team_selectable_assistant(user_id, &leader_assistant_id)
+            .await?
+            .ok_or_else(|| {
+                TeamError::InvalidRequest(format!("assistant {leader_assistant_id} is not team-selectable"))
+            })?;
+        let workspace = self
+            .conversation_port
+            .conversation_workspace(&origin_conversation_id)
+            .await?;
+
+        let (leader_backend, leader_model) = self
+            .resolve_spawn_backend_and_model(
+                user_id,
+                None,
+                leader_entry.preferred_model.as_deref(),
+                &leader_entry.backend,
+                "default",
+            )
+            .await?;
+        let mut agents = vec![TeamAgentInput {
+            name: leader_entry.name.clone(),
+            role: "lead".into(),
+            backend: Some(leader_backend),
+            model: leader_model,
+            assistant_id: Some(leader_assistant_id.clone()),
+            conversation_id: Some(origin_conversation_id.clone()),
+        }];
+
+        if let Some(target_assistant_id) = req
+            .target_assistant_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let target_entry = self
+                .assistant_catalog
+                .resolve_team_selectable_assistant(user_id, target_assistant_id)
+                .await?
+                .ok_or_else(|| {
+                    TeamError::InvalidRequest(format!("target assistant {target_assistant_id} is not team-selectable"))
+                })?;
+            let (target_backend, target_model) = self
+                .resolve_spawn_backend_and_model(
+                    user_id,
+                    None,
+                    target_entry.preferred_model.as_deref(),
+                    &target_entry.backend,
+                    "default",
+                )
+                .await?;
+            agents.push(TeamAgentInput {
+                name: target_entry.name,
+                role: "teammate".into(),
+                backend: Some(target_backend),
+                model: target_model,
+                assistant_id: Some(target_assistant_id.to_owned()),
+                conversation_id: None,
+            });
+        }
+
+        let team_name = req
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| "Ad-hoc Team".to_owned());
+
+        let team_id = generate_id();
+        let now = now_ms();
+        let provisioned = self
+            .provisioner()
+            .provision_initial_agents(user_id, &team_id, &agents, workspace.as_deref())
+            .await?;
+        let agents_json = serde_json::to_string(&provisioned.agents)?;
+        let (project_id, folder_id) = self
+            .resolve_binding_best_effort(user_id, &provisioned.team_workspace)
+            .await;
+
+        let row = TeamRow {
+            id: team_id.clone(),
+            user_id: user_id.to_owned(),
+            name: team_name,
+            workspace: provisioned.team_workspace.clone(),
+            workspace_mode: req.workspace_mode.as_deref().unwrap_or("shared").into(),
+            agents: agents_json,
+            lead_agent_id: provisioned.lead_agent_id.clone(),
+            session_mode: None,
+            agents_version: "1.0.1".into(),
+            origin_conversation_id: Some(origin_conversation_id.clone()),
+            created_at: now,
+            updated_at: now,
+            project_id,
+            folder_id,
+        };
+
+        match self.repo.create_team(&row).await {
+            Ok(()) => {}
+            Err(e) if e.is_unique_violation() || matches!(e, aionui_db::DbError::Conflict(_)) => {
+                if let Some(existing) = self
+                    .repo
+                    .get_team_by_origin_conversation_id(user_id, &origin_conversation_id)
+                    .await?
+                {
+                    return self
+                        .ensure_ad_hoc_target_and_respond(user_id, &origin_conversation_id, existing, &req)
+                        .await;
+                }
+                return Err(e.into());
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        let leader_slot_id = provisioned.lead_agent_id.clone().unwrap_or_default();
+        let target_slot_id = provisioned
+            .agents
+            .iter()
+            .find(|agent| agent.role == TeammateRole::Teammate)
+            .map(|agent| agent.slot_id.clone());
+
+        info!(
+            team_id = %team_id,
+            origin_conversation_id = %origin_conversation_id,
+            agent_count = provisioned.agents.len(),
+            "Ad-hoc team created from conversation (leader reuses origin)"
+        );
+        self.broadcast_team_created(user_id, &team_id, &row.name);
+
+        Ok(AdHocTeamFromConversationResponse {
+            team_id,
+            origin_conversation_id,
+            leader_slot_id,
+            target_slot_id,
+            created: true,
+        })
+    }
+
+    async fn ensure_ad_hoc_target_and_respond(
+        &self,
+        user_id: &str,
+        origin_conversation_id: &str,
+        row: TeamRow,
+        req: &CreateAdHocTeamFromConversationRequest,
+    ) -> Result<AdHocTeamFromConversationResponse, TeamError> {
+        let team = Team::from_row(&row)?;
+        let leader_slot_id = team.lead_agent_id.clone().unwrap_or_default();
+        let mut target_slot_id = team
+            .agents
+            .iter()
+            .find(|agent| agent.role == TeammateRole::Teammate)
+            .map(|agent| agent.slot_id.clone());
+
+        if let Some(target_assistant_id) = req
+            .target_assistant_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let already_present = team.agents.iter().any(|agent| {
+                agent.role == TeammateRole::Teammate && agent.assistant_id.as_deref() == Some(target_assistant_id)
+            });
+            if !already_present {
+                let target_entry = self
+                    .assistant_catalog
+                    .resolve_team_selectable_assistant(user_id, target_assistant_id)
+                    .await?
+                    .ok_or_else(|| {
+                        TeamError::InvalidRequest(format!(
+                            "target assistant {target_assistant_id} is not team-selectable"
+                        ))
+                    })?;
+                let (target_backend, target_model) = self
+                    .resolve_spawn_backend_and_model(
+                        user_id,
+                        None,
+                        target_entry.preferred_model.as_deref(),
+                        &target_entry.backend,
+                        "default",
+                    )
+                    .await?;
+                let added = self
+                    .add_agent(
+                        user_id,
+                        &team.id,
+                        AddAgentRequest {
+                            name: target_entry.name,
+                            role: "teammate".into(),
+                            backend: Some(target_backend),
+                            model: target_model,
+                            assistant_id: Some(target_assistant_id.to_owned()),
+                        },
+                    )
+                    .await?;
+                target_slot_id = Some(added.slot_id);
+            } else {
+                target_slot_id = team
+                    .agents
+                    .iter()
+                    .find(|agent| {
+                        agent.role == TeammateRole::Teammate
+                            && agent.assistant_id.as_deref() == Some(target_assistant_id)
+                    })
+                    .map(|agent| agent.slot_id.clone());
+            }
+        }
+
+        Ok(AdHocTeamFromConversationResponse {
+            team_id: team.id,
+            origin_conversation_id: origin_conversation_id.to_owned(),
+            leader_slot_id,
+            target_slot_id,
+            created: false,
+        })
+    }
+
+    pub async fn get_ad_hoc_team_by_conversation(
+        &self,
+        user_id: &str,
+        origin_conversation_id: &str,
+    ) -> Result<AdHocTeamAssociationResponse, TeamError> {
+        if let Some(binding) = self
+            .conversation_port
+            .lookup_team_binding_by_conversation(origin_conversation_id)
+            .await?
+            && binding.user_id != user_id
+        {
+            return Err(TeamError::Forbidden(format!(
+                "conversation not owned by current user: {origin_conversation_id}"
+            )));
+        }
+
+        let Some(row) = self
+            .repo
+            .get_team_by_origin_conversation_id(user_id, origin_conversation_id)
+            .await?
+        else {
+            return Ok(AdHocTeamAssociationResponse {
+                team_id: String::new(),
+                origin_conversation_id: origin_conversation_id.to_owned(),
+                status: AdHocTeamAssociationStatus::Disbanded,
+                team: None,
+            });
+        };
+        let team = Team::from_row(&row)?;
+        let response = self.build_team_response(user_id, &team).await?;
+        Ok(AdHocTeamAssociationResponse {
+            team_id: team.id,
+            origin_conversation_id: origin_conversation_id.to_owned(),
+            status: AdHocTeamAssociationStatus::Active,
+            team: Some(response),
+        })
     }
 }
 

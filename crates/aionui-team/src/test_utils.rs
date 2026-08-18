@@ -50,6 +50,7 @@ impl ITeamRepository for MockTeamRepo {
             lead_agent_id: None,
             session_mode: None,
             agents_version: "1.0.1".to_owned(),
+            origin_conversation_id: None,
             created_at: now_ms(),
             updated_at: now_ms(),
             project_id: None,
@@ -60,6 +61,35 @@ impl ITeamRepository for MockTeamRepo {
         Ok(())
     }
     async fn delete_team(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
+        Ok(())
+    }
+    async fn get_team_by_origin_conversation_id(
+        &self,
+        _user_id: &str,
+        _origin_conversation_id: &str,
+    ) -> Result<Option<TeamRow>, DbError> {
+        Ok(None)
+    }
+    async fn create_team_preset(&self, _row: &aionui_db::models::TeamPresetRow) -> Result<(), DbError> {
+        Ok(())
+    }
+    async fn list_team_presets_by_user(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<aionui_db::models::TeamPresetRow>, DbError> {
+        Ok(Vec::new())
+    }
+    async fn get_team_preset(&self, _preset_id: &str) -> Result<Option<aionui_db::models::TeamPresetRow>, DbError> {
+        Ok(None)
+    }
+    async fn update_team_preset(
+        &self,
+        _preset_id: &str,
+        _params: &aionui_db::UpdateTeamPresetParams,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+    async fn delete_team_preset(&self, _preset_id: &str) -> Result<(), DbError> {
         Ok(())
     }
 
@@ -630,6 +660,9 @@ pub(crate) mod workspace_harness {
             if let Some(ref session_mode) = params.session_mode {
                 team.session_mode = Some(session_mode.clone());
             }
+            if let Some(ref origin_conversation_id) = params.origin_conversation_id {
+                team.origin_conversation_id = Some(origin_conversation_id.clone());
+            }
             team.updated_at = now_ms();
             Ok(())
         }
@@ -639,6 +672,49 @@ pub(crate) mod workspace_harness {
                 .lock()
                 .unwrap()
                 .retain(|t| t.user_id != user_id || t.id != id);
+            Ok(())
+        }
+
+        async fn get_team_by_origin_conversation_id(
+            &self,
+            user_id: &str,
+            origin_conversation_id: &str,
+        ) -> Result<Option<TeamRow>, DbError> {
+            Ok(self
+                .teams
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|team| {
+                    team.user_id == user_id && team.origin_conversation_id.as_deref() == Some(origin_conversation_id)
+                })
+                .cloned())
+        }
+
+        async fn create_team_preset(&self, _row: &aionui_db::models::TeamPresetRow) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        async fn list_team_presets_by_user(
+            &self,
+            _user_id: &str,
+        ) -> Result<Vec<aionui_db::models::TeamPresetRow>, DbError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_team_preset(&self, _preset_id: &str) -> Result<Option<aionui_db::models::TeamPresetRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn update_team_preset(
+            &self,
+            _preset_id: &str,
+            _params: &aionui_db::UpdateTeamPresetParams,
+        ) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        async fn delete_team_preset(&self, _preset_id: &str) -> Result<(), DbError> {
             Ok(())
         }
 
@@ -969,6 +1045,53 @@ pub(crate) mod workspace_harness {
         async fn delete_team_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), TeamError> {
             self.repo.delete(user_id, conversation_id).await?;
             Ok(())
+        }
+
+        async fn unassign_team_conversation(
+            &self,
+            user_id: &str,
+            conversation_id: &str,
+            expected_team_id: &str,
+        ) -> Result<(), TeamError> {
+            let mut extra = self
+                .repo
+                .get_extra(conversation_id)
+                .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
+            let object = extra
+                .as_object_mut()
+                .ok_or_else(|| TeamError::InvalidRequest("conversation extra is not a JSON object".to_owned()))?;
+            for key in ["teamId", "team_id"] {
+                if let Some(actual_team_id) = object.get(key).and_then(serde_json::Value::as_str)
+                    && !actual_team_id.is_empty()
+                    && actual_team_id != expected_team_id
+                {
+                    return Err(TeamError::InvalidRequest(format!(
+                        "conversation {conversation_id} is bound to team {actual_team_id}, not {expected_team_id}"
+                    )));
+                }
+            }
+            for key in ["teamId", "team_id", "slot_id", "role", "team_mcp_stdio_config"] {
+                object.remove(key);
+            }
+            self.repo
+                .update(
+                    user_id,
+                    conversation_id,
+                    &ConversationRowUpdate {
+                        extra: Some(serde_json::to_string(&extra).unwrap()),
+                        updated_at: Some(now_ms()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+
+        async fn lookup_team_binding_by_conversation(
+            &self,
+            conversation_id: &str,
+        ) -> Result<Option<TeamConversationBindingLookup>, TeamError> {
+            <Self as TeamConversationLookupPort>::lookup_team_binding_by_conversation(self, conversation_id).await
         }
     }
 

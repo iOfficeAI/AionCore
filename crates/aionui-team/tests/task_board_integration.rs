@@ -28,6 +28,7 @@ async fn setup() -> (TaskBoard, aionui_db::Database) {
         lead_agent_id: None,
         session_mode: None,
         agents_version: "1.0.1".to_owned(),
+        origin_conversation_id: None,
         created_at: now_ms(),
         updated_at: now_ms(),
         project_id: None,

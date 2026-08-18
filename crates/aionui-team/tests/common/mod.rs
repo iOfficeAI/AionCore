@@ -44,6 +44,35 @@ impl ITeamRepository for MockTeamRepo {
     async fn delete_team(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
         Ok(())
     }
+    async fn get_team_by_origin_conversation_id(
+        &self,
+        _user_id: &str,
+        _origin_conversation_id: &str,
+    ) -> Result<Option<TeamRow>, DbError> {
+        Ok(None)
+    }
+    async fn create_team_preset(&self, _row: &aionui_db::models::TeamPresetRow) -> Result<(), DbError> {
+        Ok(())
+    }
+    async fn list_team_presets_by_user(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<aionui_db::models::TeamPresetRow>, DbError> {
+        Ok(Vec::new())
+    }
+    async fn get_team_preset(&self, _preset_id: &str) -> Result<Option<aionui_db::models::TeamPresetRow>, DbError> {
+        Ok(None)
+    }
+    async fn update_team_preset(
+        &self,
+        _preset_id: &str,
+        _params: &aionui_db::UpdateTeamPresetParams,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+    async fn delete_team_preset(&self, _preset_id: &str) -> Result<(), DbError> {
+        Ok(())
+    }
 
     async fn write_message(&self, _user_id: &str, row: &MailboxMessageRow) -> Result<(), DbError> {
         self.state.lock().unwrap().messages.push(row.clone());

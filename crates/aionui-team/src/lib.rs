@@ -12,6 +12,7 @@ pub mod mcp;
 mod member_runtime;
 pub mod message_projection;
 pub mod ports;
+pub mod preset_service;
 pub mod prompt_dump;
 pub mod prompts;
 pub mod provisioning;
@@ -48,6 +49,7 @@ pub use ports::{
     UnknownTeamToolCapabilityPort,
 };
 
+pub use preset_service::TeamPresetService;
 pub use prompt_dump::TeamPromptDumpConfig;
 pub use prompts::{build_lead_prompt, build_teammate_prompt, build_wake_payload};
 pub use provisioning::{

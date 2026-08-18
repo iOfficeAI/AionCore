@@ -655,6 +655,53 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         self.repo.delete(_user_id, conversation_id).await?;
         Ok(())
     }
+
+    async fn unassign_team_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        expected_team_id: &str,
+    ) -> Result<(), aionui_team::TeamError> {
+        let mut extra = self
+            .repo
+            .get_extra(conversation_id)
+            .ok_or_else(|| aionui_team::TeamError::AgentNotFound(conversation_id.to_owned()))?;
+        let object = extra.as_object_mut().ok_or_else(|| {
+            aionui_team::TeamError::InvalidRequest("conversation extra is not a JSON object".to_owned())
+        })?;
+        for key in ["teamId", "team_id"] {
+            if let Some(actual_team_id) = object.get(key).and_then(serde_json::Value::as_str)
+                && !actual_team_id.is_empty()
+                && actual_team_id != expected_team_id
+            {
+                return Err(aionui_team::TeamError::InvalidRequest(format!(
+                    "conversation {conversation_id} is bound to team {actual_team_id}, not {expected_team_id}"
+                )));
+            }
+        }
+        for key in ["teamId", "team_id", "slot_id", "role", "team_mcp_stdio_config"] {
+            object.remove(key);
+        }
+        self.repo
+            .update(
+                user_id,
+                conversation_id,
+                &ConversationRowUpdate {
+                    extra: Some(serde_json::to_string(&extra).unwrap()),
+                    updated_at: Some(aionui_common::now_ms()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn lookup_team_binding_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TeamConversationBindingLookup>, aionui_team::TeamError> {
+        <Self as TeamConversationLookupPort>::lookup_team_binding_by_conversation(self, conversation_id).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -840,6 +887,9 @@ impl ITeamRepository for FullMockTeamRepo {
         if let Some(ref lead_id) = params.lead_agent_id {
             team.lead_agent_id = Some(lead_id.clone());
         }
+        if let Some(ref origin_conversation_id) = params.origin_conversation_id {
+            team.origin_conversation_id = Some(origin_conversation_id.clone());
+        }
         team.updated_at = aionui_common::now_ms();
         Ok(())
     }
@@ -848,6 +898,49 @@ impl ITeamRepository for FullMockTeamRepo {
             .lock()
             .unwrap()
             .retain(|t| t.user_id != user_id || t.id != id);
+        Ok(())
+    }
+
+    async fn get_team_by_origin_conversation_id(
+        &self,
+        user_id: &str,
+        origin_conversation_id: &str,
+    ) -> Result<Option<aionui_db::models::TeamRow>, DbError> {
+        Ok(self
+            .teams
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|team| {
+                team.user_id == user_id && team.origin_conversation_id.as_deref() == Some(origin_conversation_id)
+            })
+            .cloned())
+    }
+
+    async fn create_team_preset(&self, _row: &aionui_db::models::TeamPresetRow) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn list_team_presets_by_user(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<aionui_db::models::TeamPresetRow>, DbError> {
+        Ok(Vec::new())
+    }
+
+    async fn get_team_preset(&self, _preset_id: &str) -> Result<Option<aionui_db::models::TeamPresetRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn update_team_preset(
+        &self,
+        _preset_id: &str,
+        _params: &aionui_db::UpdateTeamPresetParams,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn delete_team_preset(&self, _preset_id: &str) -> Result<(), DbError> {
         Ok(())
     }
 
@@ -1467,6 +1560,20 @@ impl TeamAssistantCatalogPort for EmptyTeamAssistantCatalog {
     }
 }
 
+struct StaticTeamAssistantCatalog {
+    entries: Vec<TeamAssistantCatalogEntry>,
+}
+
+#[async_trait::async_trait]
+impl TeamAssistantCatalogPort for StaticTeamAssistantCatalog {
+    async fn list_team_selectable_assistants(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError> {
+        Ok(self.entries.clone())
+    }
+}
+
 struct TestTeamAssistantCatalog {
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
@@ -1505,6 +1612,7 @@ impl TeamAssistantCatalogPort for TestTeamAssistantCatalog {
                 backend,
                 description: definition.description.unwrap_or_default(),
                 skills: Vec::new(),
+                preferred_model: None,
             });
         }
 
@@ -2035,8 +2143,219 @@ fn setup_with_recording_turn_port() -> (
     (svc, team_repo, turn_port, conv_repo)
 }
 
+fn setup_ad_hoc_service() -> (
+    Arc<TeamSessionService>,
+    Arc<FullMockTeamRepo>,
+    Arc<FakeConversationPorts>,
+    Arc<MockConversationRepo>,
+    Arc<RecordingBroadcaster>,
+) {
+    let team_repo = Arc::new(FullMockTeamRepo::new());
+    let conv_repo = Arc::new(MockConversationRepo::new());
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo.clone()));
+    let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(CountingTaskManager::new(success_factory()));
+    let assistant_catalog: Arc<dyn TeamAssistantCatalogPort> = Arc::new(StaticTeamAssistantCatalog {
+        entries: vec![
+            TeamAssistantCatalogEntry {
+                assistant_id: "assistant-lead".into(),
+                name: "Lead Assistant".into(),
+                backend: "acp".into(),
+                description: String::new(),
+                skills: Vec::new(),
+                preferred_model: Some("preferred-lead-model".into()),
+            },
+            TeamAssistantCatalogEntry {
+                assistant_id: "assistant-target".into(),
+                name: "Target Assistant".into(),
+                backend: "acp".into(),
+                description: String::new(),
+                skills: Vec::new(),
+                preferred_model: Some("preferred-target-model".into()),
+            },
+        ],
+    });
+    let broadcaster = Arc::new(RecordingBroadcaster::new());
+    let svc = TeamSessionService::new_with_capability_port(
+        team_repo.clone(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+        assistant_catalog,
+        Arc::new(EmptyAssistantDefinitionRepo),
+        Arc::new(EmptyAssistantOverlayRepo),
+        Arc::new(EmptyProviderRepo),
+        conversation_ports.clone(),
+        conversation_ports.clone(),
+        broadcaster.clone(),
+        task_manager,
+        noop_turn_port(),
+        noop_cancellation_port(),
+        Arc::new(TestTeamToolCapabilityPort),
+        Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
+    );
+    (svc, team_repo, conversation_ports, conv_repo, broadcaster)
+}
+
+async fn seed_ad_hoc_origin_conversation(conv_repo: &Arc<MockConversationRepo>, user_id: &str, id: &str) {
+    let workspace = std::env::temp_dir().join(format!("aionui-ad-hoc-origin-{id}"));
+    std::fs::create_dir_all(&workspace).unwrap();
+    conv_repo
+        .create(&ConversationRow {
+            id: id.into(),
+            user_id: user_id.into(),
+            name: "Origin".into(),
+            r#type: "acp".into(),
+            pinned: false,
+            pinned_at: None,
+            source: None,
+            channel_chat_id: None,
+            extra: serde_json::json!({
+                "assistant_id": "assistant-lead",
+                "workspace": workspace.to_string_lossy(),
+            })
+            .to_string(),
+            model: None,
+            status: Some("pending".into()),
+            created_at: aionui_common::now_ms(),
+            updated_at: aionui_common::now_ms(),
+            project_id: None,
+            folder_id: None,
+            name_source: None,
+        })
+        .await
+        .unwrap();
+}
+
+fn ad_hoc_request(conversation_id: &str) -> aionui_api_types::CreateAdHocTeamFromConversationRequest {
+    aionui_api_types::CreateAdHocTeamFromConversationRequest {
+        conversation_id: conversation_id.into(),
+        user_id: "user1".into(),
+        target_assistant_id: None,
+        name: Some("Ad-hoc Team".into()),
+        workspace_mode: Some("shared".into()),
+    }
+}
+
 fn setup() -> Arc<TeamSessionService> {
     setup_with_factory(success_factory()).0
+}
+
+#[tokio::test]
+async fn ad_hoc_create_reuses_origin_conversation_and_preserves_marker_semantics() {
+    let (svc, team_repo, _ports, conv_repo, broadcaster) = setup_ad_hoc_service();
+    seed_ad_hoc_origin_conversation(&conv_repo, "user1", "origin-1").await;
+
+    let created = svc
+        .create_ad_hoc_team_from_conversation("user1", ad_hoc_request("origin-1"))
+        .await
+        .unwrap();
+
+    assert!(created.created);
+    assert_eq!(created.origin_conversation_id, "origin-1");
+    assert_eq!(
+        conv_repo.conversation_count(),
+        1,
+        "origin lead must be reused, not duplicated"
+    );
+    let extra = conv_repo.get_extra("origin-1").unwrap();
+    assert_eq!(extra["teamId"], created.team_id);
+    assert!(
+        extra.get("team_id").is_none(),
+        "promoted source must remain visible in history"
+    );
+    assert_eq!(extra["assistant_id"], "assistant-lead");
+    assert_eq!(extra["current_model_id"], "preferred-lead-model");
+
+    let row = team_repo
+        .get_team_by_origin_conversation_id("user1", "origin-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.origin_conversation_id.as_deref(), Some("origin-1"));
+    let agents: Vec<aionui_team::types::TeamAgent> = serde_json::from_str(&row.agents).unwrap();
+    assert_eq!(agents[0].conversation_id, "origin-1");
+    assert_eq!(broadcaster.events_by_name("team.created").len(), 1);
+}
+
+#[tokio::test]
+async fn ad_hoc_create_is_idempotent_and_by_conversation_reports_active_team() {
+    let (svc, _team_repo, _ports, conv_repo, _broadcaster) = setup_ad_hoc_service();
+    seed_ad_hoc_origin_conversation(&conv_repo, "user1", "origin-2").await;
+
+    let first = svc
+        .create_ad_hoc_team_from_conversation("user1", ad_hoc_request("origin-2"))
+        .await
+        .unwrap();
+    let second = svc
+        .create_ad_hoc_team_from_conversation("user1", ad_hoc_request("origin-2"))
+        .await
+        .unwrap();
+
+    assert!(first.created);
+    assert!(!second.created);
+    assert_eq!(second.team_id, first.team_id);
+    assert_eq!(conv_repo.conversation_count(), 1);
+
+    let association = svc.get_ad_hoc_team_by_conversation("user1", "origin-2").await.unwrap();
+    assert_eq!(association.status, aionui_api_types::AdHocTeamAssociationStatus::Active);
+    assert_eq!(association.team_id, first.team_id);
+    assert_eq!(association.origin_conversation_id, "origin-2");
+    assert!(association.team.is_some());
+}
+
+#[tokio::test]
+async fn ad_hoc_create_uses_catalog_preferred_models_for_leader_and_target() {
+    let (svc, team_repo, _ports, conv_repo, _broadcaster) = setup_ad_hoc_service();
+    seed_ad_hoc_origin_conversation(&conv_repo, "user1", "origin-models").await;
+    let mut request = ad_hoc_request("origin-models");
+    request.target_assistant_id = Some("assistant-target".into());
+
+    let created = svc
+        .create_ad_hoc_team_from_conversation("user1", request)
+        .await
+        .unwrap();
+
+    let row = team_repo
+        .get_team("user1", &created.team_id)
+        .await
+        .unwrap()
+        .expect("team row");
+    let agents: Vec<aionui_team::types::TeamAgent> = serde_json::from_str(&row.agents).unwrap();
+    let lead = agents
+        .iter()
+        .find(|agent| agent.role == aionui_team::types::TeammateRole::Lead)
+        .unwrap();
+    let target = agents
+        .iter()
+        .find(|agent| agent.assistant_id.as_deref() == Some("assistant-target"))
+        .unwrap();
+    assert_eq!(lead.model, "preferred-lead-model");
+    assert_eq!(target.model, "preferred-target-model");
+}
+
+#[tokio::test]
+async fn removing_ad_hoc_team_keeps_origin_conversation() {
+    let (svc, team_repo, _ports, conv_repo, _broadcaster) = setup_ad_hoc_service();
+    seed_ad_hoc_origin_conversation(&conv_repo, "user1", "origin-3").await;
+    let created = svc
+        .create_ad_hoc_team_from_conversation("user1", ad_hoc_request("origin-3"))
+        .await
+        .unwrap();
+
+    svc.remove_team("user1", &created.team_id).await.unwrap();
+
+    let origin = conv_repo
+        .get("user1", "origin-3")
+        .await
+        .unwrap()
+        .expect("origin conversation");
+    let extra: serde_json::Value = serde_json::from_str(&origin.extra).unwrap();
+    for key in ["teamId", "team_id", "slot_id", "role", "team_mcp_stdio_config"] {
+        assert!(
+            extra.get(key).is_none(),
+            "{key} must be cleared when the team is removed"
+        );
+    }
+    assert_eq!(extra["assistant_id"], "assistant-lead");
+    assert!(team_repo.get_team("user1", &created.team_id).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -2552,6 +2871,7 @@ async fn renew_active_lease_allows_empty_team_without_unrelated_lease() {
             lead_agent_id: None,
             session_mode: None,
             agents_version: "1.0.1".into(),
+            origin_conversation_id: None,
             created_at: aionui_common::now_ms(),
             updated_at: aionui_common::now_ms(),
             project_id: None,
@@ -7421,6 +7741,7 @@ fn activity_team_row(id: &str, user_id: &str) -> aionui_db::models::TeamRow {
         lead_agent_id: None,
         session_mode: None,
         agents_version: "1.0.1".into(),
+        origin_conversation_id: None,
         created_at: aionui_common::now_ms(),
         updated_at: aionui_common::now_ms(),
         project_id: None,

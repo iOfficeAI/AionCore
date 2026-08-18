@@ -159,6 +159,9 @@ pub struct TeamAssistantCatalogEntry {
     pub backend: String,
     pub description: String,
     pub skills: Vec<String>,
+    /// Last model remembered for assistants whose model default is `auto`.
+    /// `None` means the caller should continue through fixed/backend fallbacks.
+    pub preferred_model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -44,6 +44,7 @@ fn make_team_for_user(id: &str, user_id: &str, name: &str) -> TeamRow {
         lead_agent_id: Some("a1".into()),
         session_mode: None,
         agents_version: "1.0.1".into(),
+        origin_conversation_id: None,
         created_at: now,
         updated_at: now,
         project_id: None,

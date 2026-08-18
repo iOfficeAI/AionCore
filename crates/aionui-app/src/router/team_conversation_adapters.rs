@@ -540,6 +540,18 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map_err(map_conversation_update_error)
     }
 
+    async fn unassign_team_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        expected_team_id: &str,
+    ) -> Result<(), TeamError> {
+        self.conversation_repo
+            .unassign_team_binding(user_id, conversation_id, expected_team_id, aionui_common::now_ms())
+            .await?;
+        Ok(())
+    }
+
     async fn lookup_team_binding_by_conversation(
         &self,
         conversation_id: &str,

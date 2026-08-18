@@ -411,6 +411,55 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(())
     }
 
+    async fn unassign_team_binding(
+        &self,
+        user_id: &str,
+        id: &str,
+        expected_team_id: &str,
+        updated_at: TimestampMs,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE conversations \
+             SET extra = json_remove(extra, '$.teamId', '$.team_id', '$.slot_id', '$.role', \
+                                     '$.team_mcp_stdio_config'), \
+                 updated_at = ? \
+             WHERE user_id = ? AND id = ? AND json_valid(extra) \
+               AND (NULLIF(json_extract(extra, '$.teamId'), '') IS NULL \
+                    OR json_extract(extra, '$.teamId') = ?) \
+               AND (NULLIF(json_extract(extra, '$.team_id'), '') IS NULL \
+                    OR json_extract(extra, '$.team_id') = ?) \
+               AND (json_extract(extra, '$.teamId') = ? OR json_extract(extra, '$.team_id') = ?)",
+        )
+        .bind(updated_at)
+        .bind(user_id)
+        .bind(id)
+        .bind(expected_team_id)
+        .bind(expected_team_id)
+        .bind(expected_team_id)
+        .bind(expected_team_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 1 {
+            return Ok(true);
+        }
+
+        let row = self
+            .get(user_id, id)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("Conversation '{id}' not found")))?;
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        let actual_team_id = ["teamId", "team_id"]
+            .into_iter()
+            .filter_map(|key| extra.get(key).and_then(serde_json::Value::as_str))
+            .find(|team_id| !team_id.is_empty());
+        match actual_team_id {
+            None => Ok(false),
+            Some(actual_team_id) => Err(DbError::Conflict(format!(
+                "Conversation '{id}' is bound to team '{actual_team_id}', not '{expected_team_id}'"
+            ))),
+        }
+    }
+
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
         let result = sqlx::query("DELETE FROM conversations WHERE user_id = ? AND id = ?")
             .bind(user_id)

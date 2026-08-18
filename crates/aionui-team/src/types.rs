@@ -150,6 +150,8 @@ pub struct Team {
     pub agents: Vec<TeamAgent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lead_agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_conversation_id: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -281,9 +283,14 @@ impl Team {
             workspace: row.workspace.clone(),
             agents,
             lead_agent_id: row.lead_agent_id.clone(),
+            origin_conversation_id: row.origin_conversation_id.clone(),
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
+    }
+
+    pub fn origin_conversation_id(&self) -> Option<String> {
+        self.origin_conversation_id.clone()
     }
 
     pub fn to_response(&self) -> TeamResponse {
@@ -293,6 +300,7 @@ impl Team {
             workspace: self.workspace.clone(),
             assistants: self.agents.iter().map(|a| a.to_response()).collect(),
             leader_assistant_id: self.lead_agent_id.clone(),
+            origin_conversation_id: self.origin_conversation_id.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -641,6 +649,7 @@ mod tests {
             lead_agent_id: Some("s1".into()),
             session_mode: None,
             agents_version: "1.0.1".into(),
+            origin_conversation_id: None,
             created_at: 1000,
             updated_at: 2000,
             project_id: None,
@@ -672,6 +681,7 @@ mod tests {
                 cli_path: None,
             }],
             lead_agent_id: Some("s1".into()),
+            origin_conversation_id: None,
             created_at: 1000,
             updated_at: 2000,
         };
@@ -697,6 +707,7 @@ mod tests {
             lead_agent_id: None,
             session_mode: None,
             agents_version: "1.0.1".into(),
+            origin_conversation_id: None,
             created_at: 0,
             updated_at: 0,
             project_id: None,

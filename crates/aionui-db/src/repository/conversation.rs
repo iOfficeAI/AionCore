@@ -30,6 +30,21 @@ pub trait IConversationRepository: Send + Sync {
     /// Partially updates a conversation. Returns `DbError::NotFound` if ID is missing for the user.
     async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError>;
 
+    /// Atomically removes team-only keys when every non-empty team marker
+    /// still points to `expected_team_id`. Returns `false` when no marker is
+    /// present and fails with a conflict when the conversation was rebound.
+    async fn unassign_team_binding(
+        &self,
+        _user_id: &str,
+        _id: &str,
+        _expected_team_id: &str,
+        _updated_at: TimestampMs,
+    ) -> Result<bool, DbError> {
+        Err(DbError::Init(
+            "unassign_team_binding is not supported by this repository".into(),
+        ))
+    }
+
     /// Deletes a conversation (messages cascade via FK).
     /// Returns `DbError::NotFound` if ID is missing for the user.
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError>;

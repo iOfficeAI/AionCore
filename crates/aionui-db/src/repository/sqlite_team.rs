@@ -2,8 +2,10 @@ use aionui_common::now_ms;
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
-use crate::repository::team::{ActivityCursor, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams};
+use crate::models::{MailboxMessageRow, TeamPresetRow, TeamRow, TeamTaskRow};
+use crate::repository::team::{
+    ActivityCursor, ITeamRepository, PageDirection, UpdateTaskParams, UpdateTeamParams, UpdateTeamPresetParams,
+};
 
 /// SQLite-backed implementation of [`ITeamRepository`].
 #[derive(Clone, Debug)]
@@ -23,8 +25,8 @@ impl ITeamRepository for SqliteTeamRepository {
 
     async fn create_team(&self, row: &TeamRow) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, created_at, updated_at, project_id, folder_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, origin_conversation_id, created_at, updated_at, project_id, folder_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(&row.user_id)
@@ -35,6 +37,7 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(&row.lead_agent_id)
         .bind(&row.session_mode)
         .bind(&row.agents_version)
+        .bind(&row.origin_conversation_id)
         .bind(row.created_at)
         .bind(row.updated_at)
         .bind(&row.project_id)
@@ -99,6 +102,9 @@ impl ITeamRepository for SqliteTeamRepository {
         if params.folder_id.is_some() {
             set_clauses.push("folder_id = ?");
         }
+        if params.origin_conversation_id.is_some() {
+            set_clauses.push("origin_conversation_id = ?");
+        }
 
         if set_clauses.is_empty() {
             return Ok(());
@@ -132,6 +138,9 @@ impl ITeamRepository for SqliteTeamRepository {
         if let Some(ref folder_id) = params.folder_id {
             query = query.bind(folder_id);
         }
+        if let Some(ref origin_conversation_id) = params.origin_conversation_id {
+            query = query.bind(origin_conversation_id);
+        }
         query = query.bind(now_ms());
         query = query.bind(user_id);
         query = query.bind(team_id);
@@ -151,6 +160,120 @@ impl ITeamRepository for SqliteTeamRepository {
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("team {team_id}")));
+        }
+        Ok(())
+    }
+
+    async fn get_team_by_origin_conversation_id(
+        &self,
+        user_id: &str,
+        origin_conversation_id: &str,
+    ) -> Result<Option<TeamRow>, DbError> {
+        let row = sqlx::query_as::<_, TeamRow>("SELECT * FROM teams WHERE user_id = ? AND origin_conversation_id = ?")
+            .bind(user_id)
+            .bind(origin_conversation_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row)
+    }
+
+    // ── Team Presets ─────────────────────────────────────────────────
+
+    async fn create_team_preset(&self, row: &TeamPresetRow) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO team_presets (id, user_id, name, icon, category, description, expertise_tags, example_prompts, leader, members, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id).bind(&row.user_id).bind(&row.name).bind(&row.icon).bind(&row.category)
+        .bind(&row.description).bind(&row.expertise_tags).bind(&row.example_prompts).bind(&row.leader)
+        .bind(&row.members).bind(row.version).bind(row.created_at).bind(row.updated_at)
+        .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn list_team_presets_by_user(&self, user_id: &str) -> Result<Vec<TeamPresetRow>, DbError> {
+        Ok(
+            sqlx::query_as::<_, TeamPresetRow>("SELECT * FROM team_presets WHERE user_id = ? ORDER BY updated_at DESC")
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn get_team_preset(&self, preset_id: &str) -> Result<Option<TeamPresetRow>, DbError> {
+        Ok(
+            sqlx::query_as::<_, TeamPresetRow>("SELECT * FROM team_presets WHERE id = ?")
+                .bind(preset_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn update_team_preset(&self, preset_id: &str, params: &UpdateTeamPresetParams) -> Result<(), DbError> {
+        let mut set_clauses = vec!["version = version + 1".to_string(), "updated_at = ?".to_string()];
+        if params.name.is_some() {
+            set_clauses.push("name = ?".into());
+        }
+        if params.icon.is_some() {
+            set_clauses.push("icon = ?".into());
+        }
+        if params.category.is_some() {
+            set_clauses.push("category = ?".into());
+        }
+        if params.description.is_some() {
+            set_clauses.push("description = ?".into());
+        }
+        if params.expertise_tags.is_some() {
+            set_clauses.push("expertise_tags = ?".into());
+        }
+        if params.example_prompts.is_some() {
+            set_clauses.push("example_prompts = ?".into());
+        }
+        if params.leader.is_some() {
+            set_clauses.push("leader = ?".into());
+        }
+        if params.members.is_some() {
+            set_clauses.push("members = ?".into());
+        }
+        let sql = format!("UPDATE team_presets SET {} WHERE id = ?", set_clauses.join(", "));
+        let mut query = sqlx::query(&sql).bind(now_ms());
+        if let Some(ref v) = params.name {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = params.icon {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = params.category {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = params.description {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = params.expertise_tags {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = params.example_prompts {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = params.leader {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = params.members {
+            query = query.bind(v);
+        }
+        let result = query.bind(preset_id).execute(&self.pool).await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("team preset '{preset_id}' not found")));
+        }
+        Ok(())
+    }
+
+    async fn delete_team_preset(&self, preset_id: &str) -> Result<(), DbError> {
+        let result = sqlx::query("DELETE FROM team_presets WHERE id = ?")
+            .bind(preset_id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("team preset '{preset_id}' not found")));
         }
         Ok(())
     }

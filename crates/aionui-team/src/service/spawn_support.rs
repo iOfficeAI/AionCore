@@ -128,9 +128,15 @@ impl TeamSessionService {
                 .flatten()
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty());
+            let preferred_model = (definition.default_model_mode == "auto")
+                .then_some(selectable.preferred_model)
+                .flatten()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
             let backend_default_model = self.default_model_for_backend(user_id, &backend).await;
             let model = requested_model
                 .or(fixed_model)
+                .or(preferred_model)
                 .or(backend_default_model)
                 .unwrap_or_else(|| fallback_model.to_owned());
             return Ok((backend, model));
@@ -839,6 +845,7 @@ mod tests {
             backend: backend.into(),
             description: String::new(),
             skills: Vec::new(),
+            preferred_model: None,
         }
     }
 

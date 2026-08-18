@@ -4,6 +4,8 @@ use serde_json::{Value, json};
 pub enum TeamError {
     #[error("Team not found: {0}")]
     TeamNotFound(String),
+    #[error("Team preset not found: {0}")]
+    PresetNotFound(String),
 
     #[error("Agent not found: {0}")]
     AgentNotFound(String),

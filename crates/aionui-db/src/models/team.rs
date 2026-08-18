@@ -1,6 +1,37 @@
 use aionui_common::TimestampMs;
 use serde::{Deserialize, Serialize};
 
+/// Single member entry inside a `team_presets` leader/members JSON array.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamPresetMemberRow {
+    pub assistant_backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub assistant_name: String,
+    pub role: String,
+    pub order: i64,
+}
+
+/// Row mapping for the `team_presets` table.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TeamPresetRow {
+    pub id: String,
+    pub user_id: String,
+    pub name: String,
+    pub icon: Option<String>,
+    pub category: Option<String>,
+    pub description: String,
+    pub expertise_tags: String,
+    pub example_prompts: String,
+    pub leader: String,
+    pub members: String,
+    pub version: i64,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
 /// Row mapping for the `teams` table.
 ///
 /// The `agents` column stores a JSON array of `TeamAgent` objects.
@@ -16,6 +47,7 @@ pub struct TeamRow {
     pub lead_agent_id: Option<String>,
     pub session_mode: Option<String>,
     pub agents_version: String,
+    pub origin_conversation_id: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
     /// Project binding (project-bind side branch); NULL until bound/backfilled.
@@ -84,6 +116,7 @@ mod tests {
             lead_agent_id: None,
             session_mode: None,
             agents_version: "1.0.1".into(),
+            origin_conversation_id: None,
             created_at: 0,
             updated_at: 0,
             project_id: None,

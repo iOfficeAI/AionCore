@@ -1051,6 +1051,44 @@ async fn update_extra_replaces_json() {
 }
 
 #[tokio::test]
+async fn unassign_team_binding_is_atomic_idempotent_and_preserves_other_extra() {
+    let (repo, _db) = setup().await;
+    let mut conv = make_conversation("team-unassign");
+    conv.extra = r#"{"teamId":"team-1","team_id":"team-1","slot_id":"slot-1","role":"lead","team_mcp_stdio_config":{"command":"core"},"workspace":"/keep"}"#.to_owned();
+    repo.create(&conv).await.unwrap();
+
+    assert!(
+        repo.unassign_team_binding(&conv.user_id, &conv.id, "team-1", aionui_common::now_ms())
+            .await
+            .unwrap()
+    );
+    let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
+    assert_eq!(found.extra, r#"{"workspace":"/keep"}"#);
+    assert!(
+        !repo
+            .unassign_team_binding(&conv.user_id, &conv.id, "team-1", aionui_common::now_ms())
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn unassign_team_binding_rejects_a_different_team() {
+    let (repo, _db) = setup().await;
+    let mut conv = make_conversation("team-unassign-conflict");
+    conv.extra = r#"{"teamId":"team-2","slot_id":"slot-2","workspace":"/keep"}"#.to_owned();
+    repo.create(&conv).await.unwrap();
+
+    let error = repo
+        .unassign_team_binding(&conv.user_id, &conv.id, "team-1", aionui_common::now_ms())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, aionui_db::DbError::Conflict(_)));
+    let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
+    assert_eq!(found.extra, conv.extra);
+}
+
+#[tokio::test]
 async fn get_messages_excludes_legacy_cron_and_skill_suggest_rows() {
     let (repo, _db) = setup().await;
     let conv = make_conversation("message-filter");

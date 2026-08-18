@@ -44,8 +44,8 @@ use aionui_system::{
 };
 use aionui_team::{
     AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, TeamAssistantCatalogEntry,
-    TeamAssistantCatalogPort, TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState,
-    TeamSessionService,
+    TeamAssistantCatalogPort, TeamConversationProvisioningPort, TeamPresetService, TeamProjectionMessageStore,
+    TeamRouterState, TeamSessionService,
 };
 
 use crate::config::{IdentityMode, derive_encryption_key};
@@ -717,9 +717,59 @@ pub fn build_team_state(
                             .into_iter()
                             .chain(assistant.custom_skill_names)
                             .collect(),
+                        preferred_model: None,
                     })
                 })
                 .collect())
+        }
+
+        async fn resolve_team_selectable_assistant(
+            &self,
+            user_id: &str,
+            assistant_id: &str,
+        ) -> Result<Option<TeamAssistantCatalogEntry>, aionui_team::TeamError> {
+            let detail = match self
+                .assistant_service
+                .get_detail_for_user(user_id, assistant_id, None)
+                .await
+            {
+                Ok(detail) => detail,
+                Err(aionui_assistant::AssistantError::NotFound(_)) => return Ok(None),
+                Err(error) => {
+                    return Err(aionui_team::TeamError::InvalidRequest(format!(
+                        "assistant catalog unavailable: {error}"
+                    )));
+                }
+            };
+            if !detail.team_selectable {
+                return Ok(None);
+            }
+            let Some(agent) = detail.engine.agent else {
+                return Ok(None);
+            };
+            let backend = agent
+                .acp_backend
+                .unwrap_or_else(|| agent.r#type.serde_name().to_owned());
+            let preferred_model = match detail.defaults.model.mode.as_str() {
+                "fixed" => detail.defaults.model.value,
+                "auto" => detail.preferences.last_model_id,
+                _ => None,
+            }
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+            Ok(Some(TeamAssistantCatalogEntry {
+                assistant_id: detail.id,
+                name: detail.profile.name,
+                backend,
+                description: detail.profile.description.unwrap_or_default(),
+                skills: detail
+                    .capabilities
+                    .default_skill_ids
+                    .into_iter()
+                    .chain(detail.capabilities.custom_skill_names)
+                    .collect(),
+                preferred_model,
+            }))
         }
     }
 
@@ -738,6 +788,7 @@ pub fn build_team_state(
     let turn_port: Arc<dyn AgentTurnExecutionPort> = adapters.clone();
     let slash_command_port: Arc<dyn NativeSlashCommandPort> = adapters.clone();
     let cancellation_port: Arc<dyn AgentTurnCancellationPort> = adapters;
+    let preset_service = Arc::new(TeamPresetService::new(team_repo.clone()));
     let capability_port: Arc<dyn aionui_team::TeamToolCapabilityPort> = Arc::new(TeamCapabilityResolver::new(
         Arc::new(SqliteAgentMetadataRepository::new(services.database.pool().clone())),
     ));
@@ -764,6 +815,7 @@ pub fn build_team_state(
     service.with_project_service(Arc::new(services.project_service.clone()));
     TeamRouterState {
         service,
+        preset_service,
         active_leases: services.active_lease_registry.clone(),
     }
 }
