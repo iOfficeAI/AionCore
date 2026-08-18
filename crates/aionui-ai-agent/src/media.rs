@@ -142,6 +142,25 @@ fn append_files_marker(content: &str, paths: &[String]) -> String {
     }
 }
 
+/// The agent-bound text with the `[[AION_FILES]]` block listing EVERY
+/// attachment — media included — regardless of what [`partition_media`] moved
+/// to a native block.
+///
+/// For callers whose only path-delivery channel is the text itself (the ACP
+/// `session/prompt` path emits no resource links: a non-media attachment rides
+/// solely as a marker line). A native media block carries bytes, not a path, so
+/// dropping the media path from the marker leaves such an agent able to see the
+/// image but unable to open the file.
+///
+/// Not the same as returning `content` untouched: when `content` carries no
+/// marker at all, this appends one for the full list, so a caller can never
+/// lose the non-media paths [`partition_media`] would have re-appended. When
+/// `content` does carry the exact marker for `files`, the result is
+/// byte-identical to `content`.
+pub fn content_with_all_paths(content: &str, files: &[String]) -> String {
+    append_files_marker(strip_files_marker(content, files), files)
+}
+
 /// Read a media attachment's bytes, degrading to `None` (caller falls back to
 /// the path form) when the file vanished or grew past the limit between
 /// classification and read.
@@ -242,6 +261,35 @@ mod tests {
         assert!(part.media.is_empty());
         assert_eq!(part.path_files, files);
         assert_eq!(part.content, content);
+    }
+
+    #[test]
+    fn all_paths_content_keeps_media_paths_in_the_marker() {
+        let img = temp_file("h.png", b"png");
+        let doc = temp_file("h.pdf", b"pdf");
+        let files = vec![img.clone(), doc.clone()];
+        let content = inline("mix", &[&img, &doc]);
+        // partition drops the image path from the marker...
+        let part = partition_media(&content, &files, CAPS_IMAGE);
+        assert_eq!(part.content, inline("mix", &[&doc]));
+        // ...while the all-paths form keeps both, byte-identical to the input.
+        assert_eq!(content_with_all_paths(&content, &files), content);
+    }
+
+    #[test]
+    fn all_paths_content_appends_a_marker_when_none_present() {
+        // The trap this helper exists for: with no marker in `content`, falling
+        // back to the raw text would lose EVERY path, and partition would have
+        // appended a marker for the non-media ones. Rebuild the full list.
+        let img = temp_file("i.png", b"png");
+        let doc = temp_file("i.pdf", b"pdf");
+        let files = vec![img.clone(), doc.clone()];
+        assert_eq!(content_with_all_paths("bare", &files), inline("bare", &[&img, &doc]));
+    }
+
+    #[test]
+    fn all_paths_content_is_a_noop_without_files() {
+        assert_eq!(content_with_all_paths("just text", &[]), "just text");
     }
 
     #[test]

@@ -494,6 +494,15 @@ impl AcpAgentManager {
 /// accept. Attachments the agent cannot take (or that fail to read) stay in
 /// the text block's `[[AION_FILES]]` path list, byte-identical to the
 /// pre-multimodal wire form.
+///
+/// The text keeps EVERY attachment path, media included. This path emits no
+/// resource links — a non-media attachment rides solely as a marker line — so
+/// the marker is its only path channel, and a native media block carries bytes
+/// with no path. The `uri` set on the image block below is not enough: observed
+/// live, one ACP agent asked the user for a path it had already been handed as
+/// `uri`, and another silently reported an invented file size. Dropping the
+/// media path from the text leaves such an agent able to see the image but
+/// unable to open the file.
 async fn build_prompt_blocks(data: &SendMessageData, caps: crate::types::PromptMediaCaps) -> Vec<ContentBlock> {
     use base64::Engine as _;
 
@@ -536,7 +545,10 @@ async fn build_prompt_blocks(data: &SendMessageData, caps: crate::types::PromptM
     );
 
     let mut blocks = Vec::with_capacity(media_blocks.len() + 1);
-    blocks.push(ContentBlock::from(partition.content));
+    blocks.push(ContentBlock::from(crate::media::content_with_all_paths(
+        &data.content,
+        &data.files,
+    )));
     blocks.extend(media_blocks);
     blocks
 }
@@ -1585,10 +1597,15 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         match &blocks[0] {
             ContentBlock::Text(text) => {
-                // Image path left the marker list; the pdf stays.
+                // BOTH paths stay in the marker list: the image rides as a native
+                // block AND keeps its path, since this path has no other way to
+                // hand the agent a file to open.
                 assert_eq!(
                     text.text,
-                    format!("look\n\n{}\n{pdf}", aionui_common::constants::AIONUI_FILES_MARKER)
+                    format!(
+                        "look\n\n{}\n{img}\n{pdf}",
+                        aionui_common::constants::AIONUI_FILES_MARKER
+                    )
                 );
             }
             other => panic!("expected text block, got {other:?}"),
@@ -1601,6 +1618,44 @@ mod tests {
             }
             other => panic!("expected image block, got {other:?}"),
         }
+    }
+
+    // Regression guard: this path emits NO resource links — a non-media
+    // attachment rides solely as an `[[AION_FILES]]` marker line — so the marker
+    // is the only path channel it has. A native image block carries bytes, not a
+    // path, and the `uri` field on it is not surfaced to the agents' file tools
+    // (observed live: one ACP agent asked for a path it had already been sent as
+    // `uri`, another invented a file size). Keep every media path in the text.
+    #[tokio::test]
+    async fn prompt_blocks_keep_media_paths_in_text() {
+        let dir = std::env::temp_dir().join("aionui-acp-prompt-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("keep-path.png");
+        std::fs::write(&img, b"fakepng").unwrap();
+        let img = img.to_string_lossy().into_owned();
+        let content = format!("read this\n\n{}\n{img}", aionui_common::constants::AIONUI_FILES_MARKER);
+        let data = SendMessageData {
+            content: content.clone(),
+            msg_id: "m4".into(),
+            turn_id: None,
+            files: vec![img.clone()],
+            inject_skills: vec![],
+        };
+        let caps = crate::types::PromptMediaCaps {
+            image: true,
+            audio: false,
+        };
+        let blocks = super::build_prompt_blocks(&data, caps).await;
+        assert_eq!(blocks.len(), 2, "text + native image block: {blocks:?}");
+        match &blocks[0] {
+            // Byte-identical to the pre-multimodal text: the path never left.
+            ContentBlock::Text(text) => assert_eq!(text.text, content),
+            other => panic!("expected text block, got {other:?}"),
+        }
+        assert!(
+            matches!(&blocks[1], ContentBlock::Image(_)),
+            "still sends the native image block: {blocks:?}"
+        );
     }
 
     #[tokio::test]
