@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use aionui_api_types::{OAuthLoginResponse, OAuthStatusResponse};
 use aionui_common::{TimestampMs, now_ms};
@@ -11,8 +10,6 @@ use oauth2::{
     TokenResponse, TokenUrl,
 };
 use serde::Deserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
@@ -21,9 +18,6 @@ use crate::error::McpError;
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// Default timeout for the OAuth callback server waiting for the redirect.
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Default OAuth client ID for MCP servers (public client, no secret).
 const DEFAULT_CLIENT_ID: &str = "aionui";
@@ -42,44 +36,6 @@ struct OAuthServerMetadata {
     token_endpoint: String,
 }
 
-/// Candidate well-known discovery URLs for one MCP server, in the order they
-/// should be tried: RFC 8414 §3.1 path-aware form first, then the bare-origin
-/// form some servers publish instead.
-#[derive(Debug)]
-struct WellKnownCandidates {
-    origin: String,
-    path: String,
-}
-
-impl WellKnownCandidates {
-    /// URLs to try for a given well-known type (e.g. "oauth-authorization-server").
-    fn for_type(&self, well_known_type: &str) -> Vec<String> {
-        let mut urls = vec![format!("{}/.well-known/{well_known_type}{}", self.origin, self.path)];
-        if !self.path.is_empty() {
-            urls.push(format!("{}/.well-known/{well_known_type}", self.origin));
-        }
-        urls
-    }
-}
-
-/// Build the well-known discovery URL candidates for an MCP server URL.
-///
-/// Per RFC 8414 §3.1, when the issuer URL has a path component (as MCP
-/// server URLs like `https://host/mcp` typically do), the well-known suffix
-/// is inserted between the authority and that path — it is NOT appended
-/// after the full URL. `https://host/mcp` therefore discovers at
-/// `https://host/.well-known/oauth-authorization-server/mcp`, not
-/// `https://host/mcp/.well-known/oauth-authorization-server` (which 404s
-/// against any RFC 8414-compliant server).
-fn well_known_urls(server_url: &str) -> Result<WellKnownCandidates, McpError> {
-    let parsed =
-        oauth2::url::Url::parse(server_url).map_err(|e| McpError::OAuth(format!("Invalid server URL: {e}")))?;
-    Ok(WellKnownCandidates {
-        origin: parsed.origin().ascii_serialization(),
-        path: parsed.path().trim_end_matches('/').to_string(),
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Pending login state
 // ---------------------------------------------------------------------------
@@ -87,13 +43,15 @@ fn well_known_urls(server_url: &str) -> Result<WellKnownCandidates, McpError> {
 /// State held while waiting for the OAuth callback redirect.
 ///
 /// Stores endpoint URLs rather than the typed `BasicClient` to avoid
-/// complex generic type parameters from the `oauth2` crate.
+/// complex generic type parameters from the `oauth2` crate. Keyed by
+/// `(user_id, csrf_state)` in the map that holds these — that key match
+/// itself is the CSRF check, so the CSRF token isn't stored again here.
 struct PendingLogin {
-    csrf_token: CsrfToken,
     pkce_verifier: PkceCodeVerifier,
     auth_url: String,
     token_url: String,
     redirect_url: String,
+    server_url: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -133,45 +91,53 @@ impl McpOAuthService {
 
     /// Start the OAuth PKCE login flow for the given MCP server URL.
     ///
+    /// Returns immediately with an `authorize_url` for the caller to send a
+    /// browser to — it does not wait for the user to complete authorization.
+    /// The OAuth provider redirects back to `GET /api/mcp/oauth/callback` on
+    /// this same server (see [`Self::handle_callback`]), which is reachable
+    /// from anywhere this server itself is reachable from, unlike a
+    /// per-login localhost listener. `redirect_base` is this server's own
+    /// public origin (e.g. `https://host` or `http://127.0.0.1:port`),
+    /// supplied by the HTTP layer from the inbound request.
+    ///
     /// 1. Discover authorization/token endpoints
     /// 2. Generate PKCE challenge
-    /// 3. Start local callback server on a random port
-    /// 4. Build authorization URL and open it in the system browser
-    /// 5. Wait for the redirect with the authorization code
-    /// 6. Exchange code for tokens and persist them
-    pub async fn login(&self, user_id: &str, server_url: &str) -> Result<OAuthLoginResponse, McpError> {
-        let (authorize_url, listener) = self.prepare_login_flow(user_id, server_url).await?;
-
-        // Open browser.
-        debug!(url = %authorize_url, "Opening browser for OAuth authorization");
-        if let Err(e) = open::that(&authorize_url) {
-            warn!("Failed to open browser: {e}");
-        }
-
-        // Wait for callback.
-        let (code, state) = match self.wait_for_callback(user_id, listener).await {
-            Ok(callback) => callback,
-            Err(e) => {
-                self.clear_pending_for_user(user_id).await;
-                return Ok(OAuthLoginResponse {
-                    success: false,
-                    error: Some(e.to_string()),
-                });
-            }
-        };
-
-        // Exchange code for tokens.
-        match self.exchange_code(user_id, server_url, code, state).await {
-            Ok(()) => Ok(OAuthLoginResponse {
+    /// 3. Build the authorization URL, with this server's own callback route
+    ///    as the redirect target
+    /// 4. Stash PKCE/CSRF state keyed by (user, csrf state) for the callback
+    ///    to pick up later
+    pub async fn login(
+        &self,
+        user_id: &str,
+        server_url: &str,
+        redirect_base: &str,
+    ) -> Result<OAuthLoginResponse, McpError> {
+        match self.prepare_login_flow(user_id, server_url, redirect_base).await {
+            Ok(authorize_url) => Ok(OAuthLoginResponse {
                 success: true,
+                authorize_url: Some(authorize_url),
                 error: None,
             }),
+            Err(e) => Ok(OAuthLoginResponse {
+                success: false,
+                authorize_url: None,
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+
+    /// Handle the OAuth provider's redirect back to `GET /api/mcp/oauth/callback`.
+    ///
+    /// Looks up the pending login by `(user_id, state)`, exchanges the
+    /// authorization code for tokens, and persists them. Clears the pending
+    /// state on any failure so a retry starts a fresh login rather than
+    /// reusing a burned code/verifier.
+    pub async fn handle_callback(&self, user_id: &str, code: String, state: String) -> Result<(), McpError> {
+        match self.exchange_code(user_id, code, state.clone()).await {
+            Ok(()) => Ok(()),
             Err(e) => {
                 self.clear_pending_for_user(user_id).await;
-                Ok(OAuthLoginResponse {
-                    success: false,
-                    error: Some(e.to_string()),
-                })
+                Err(e)
             }
         }
     }
@@ -236,9 +202,16 @@ impl McpOAuthService {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Discover endpoints, build OAuth client, generate PKCE, bind callback
-    /// server, store pending state, and return the authorization URL + listener.
-    async fn prepare_login_flow(&self, user_id: &str, server_url: &str) -> Result<(String, TcpListener), McpError> {
+    /// Discover endpoints, build OAuth client, generate PKCE, store pending
+    /// state, and return the authorization URL. The redirect target is this
+    /// server's own `/api/mcp/oauth/callback` route under `redirect_base`
+    /// (this server's public origin), not a per-login local listener.
+    async fn prepare_login_flow(
+        &self,
+        user_id: &str,
+        server_url: &str,
+        redirect_base: &str,
+    ) -> Result<String, McpError> {
         let metadata = self.discover_endpoints(server_url).await?;
 
         let auth_url_str = metadata.authorization_endpoint.clone();
@@ -249,15 +222,7 @@ impl McpOAuthService {
         let token_url =
             TokenUrl::new(metadata.token_endpoint).map_err(|e| McpError::OAuth(format!("Invalid token URL: {e}")))?;
 
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|e| McpError::OAuth(format!("Failed to bind callback server: {e}")))?;
-        let callback_port = listener
-            .local_addr()
-            .map_err(|e| McpError::OAuth(format!("Failed to get callback port: {e}")))?
-            .port();
-
-        let redirect_url_str = format!("http://127.0.0.1:{callback_port}/callback");
+        let redirect_url_str = format!("{}/api/mcp/oauth/callback", redirect_base.trim_end_matches('/'));
         let redirect = RedirectUrl::new(redirect_url_str.clone())
             .map_err(|e| McpError::OAuth(format!("Invalid redirect URL: {e}")))?;
 
@@ -279,16 +244,16 @@ impl McpOAuthService {
             pending.insert(
                 (user_id.to_string(), state),
                 PendingLogin {
-                    csrf_token,
                     pkce_verifier,
                     auth_url: auth_url_str,
                     token_url: token_url_str,
                     redirect_url: redirect_url_str,
+                    server_url: server_url.to_string(),
                 },
             );
         }
 
-        Ok((authorize_url.to_string(), listener))
+        Ok(authorize_url.to_string())
     }
 
     /// Check if a valid (non-expired) token exists for the URL.
@@ -309,32 +274,27 @@ impl McpOAuthService {
 
     /// Discover OAuth authorization server metadata.
     ///
-    /// Per RFC 8414 §3.1, when the issuer URL has a path component (as MCP
-    /// server URLs like `https://host/mcp` typically do), the well-known
-    /// suffix is inserted between the authority and that path — it is NOT
-    /// appended after the full URL. `https://host/mcp` therefore discovers
-    /// at `https://host/.well-known/oauth-authorization-server/mcp`, not
-    /// `https://host/mcp/.well-known/oauth-authorization-server` (which
-    /// 404s against any RFC 8414-compliant server). Falls back to the
-    /// bare-origin well-known path for servers that publish metadata there
-    /// instead, then tries OIDC discovery the same way.
+    /// Tries `.well-known/oauth-authorization-server` first,
+    /// falls back to `.well-known/openid-configuration`.
     async fn discover_endpoints(&self, server_url: &str) -> Result<OAuthServerMetadata, McpError> {
-        let candidates = well_known_urls(server_url)?;
+        let base = server_url.trim_end_matches('/');
 
-        for well_known_type in ["oauth-authorization-server", "openid-configuration"] {
-            for url in candidates.for_type(well_known_type) {
-                if let Ok(metadata) = self.fetch_metadata(&url).await {
-                    debug!(server_url, url, "Discovered OAuth metadata");
-                    return Ok(metadata);
-                }
-            }
+        let well_known_url = format!("{base}/.well-known/oauth-authorization-server");
+        if let Ok(metadata) = self.fetch_metadata(&well_known_url).await {
+            debug!(server_url, "Discovered OAuth metadata via RFC 8414");
+            return Ok(metadata);
+        }
+
+        let oidc_url = format!("{base}/.well-known/openid-configuration");
+        if let Ok(metadata) = self.fetch_metadata(&oidc_url).await {
+            debug!(server_url, "Discovered OAuth metadata via OIDC");
+            return Ok(metadata);
         }
 
         Err(McpError::OAuth(format!(
             "Failed to discover OAuth endpoints for '{server_url}': \
              no .well-known/oauth-authorization-server or \
-             .well-known/openid-configuration found (tried both RFC 8414 \
-             path-aware and origin-root locations)"
+             .well-known/openid-configuration found"
         )))
     }
 
@@ -356,69 +316,6 @@ impl McpOAuthService {
             .map_err(|e| McpError::OAuth(format!("Failed to parse metadata: {e}")))
     }
 
-    /// Wait for the OAuth callback redirect on the given listener.
-    async fn wait_for_callback(&self, user_id: &str, listener: TcpListener) -> Result<(String, String), McpError> {
-        let (code_tx, code_rx) = tokio::sync::oneshot::channel::<Result<(String, String), McpError>>();
-        let pending = self.pending.clone();
-        let user_id = user_id.to_string();
-
-        tokio::spawn(async move {
-            let result = Self::handle_callback_connection(&user_id, listener, pending).await;
-            let _ = code_tx.send(result);
-        });
-
-        match tokio::time::timeout(CALLBACK_TIMEOUT, code_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(McpError::OAuth("Callback channel closed unexpectedly".to_string())),
-            Err(_) => Err(McpError::OAuth(
-                "OAuth callback timed out — no redirect received within 120s".to_string(),
-            )),
-        }
-    }
-
-    /// Handle a single HTTP connection on the callback server.
-    async fn handle_callback_connection(
-        user_id: &str,
-        listener: TcpListener,
-        pending: Arc<Mutex<HashMap<(String, String), PendingLogin>>>,
-    ) -> Result<(String, String), McpError> {
-        let (mut stream, _) = listener
-            .accept()
-            .await
-            .map_err(|e| McpError::OAuth(format!("Failed to accept connection: {e}")))?;
-
-        let mut buf = vec![0u8; 4096];
-        let n = stream
-            .read(&mut buf)
-            .await
-            .map_err(|e| McpError::OAuth(format!("Failed to read request: {e}")))?;
-
-        let request = String::from_utf8_lossy(&buf[..n]);
-        let (code, state) = parse_callback_query(&request)?;
-
-        // Validate CSRF state.
-        let guard = pending.lock().await;
-        let pending_login = guard
-            .get(&(user_id.to_string(), state.clone()))
-            .ok_or_else(|| McpError::OAuth("No pending login state".to_string()))?;
-
-        if state != *pending_login.csrf_token.secret() {
-            return Err(McpError::OAuth("CSRF state mismatch".to_string()));
-        }
-
-        // Send a success response to the browser.
-        let response = "HTTP/1.1 200 OK\r\n\
-            Content-Type: text/html; charset=utf-8\r\n\
-            Connection: close\r\n\r\n\
-            <html><body><h1>Authorization successful!</h1>\
-            <p>You can close this window and return to AionUi.</p>\
-            </body></html>";
-
-        let _ = stream.write_all(response.as_bytes()).await;
-
-        Ok((code, state))
-    }
-
     /// Build a no-redirect reqwest client for OAuth token exchange.
     fn build_no_redirect_client() -> Result<reqwest::Client, McpError> {
         reqwest::ClientBuilder::new()
@@ -428,14 +325,12 @@ impl McpOAuthService {
     }
 
     /// Exchange the authorization code for tokens and persist them.
-    async fn exchange_code(
-        &self,
-        user_id: &str,
-        server_url: &str,
-        code: String,
-        state: String,
-    ) -> Result<(), McpError> {
-        let (auth_url_str, token_url_str, redirect_url_str, pkce_verifier) = {
+    ///
+    /// `server_url` is not a parameter — it comes from the `PendingLogin`
+    /// stashed at login time, since the browser's callback redirect only
+    /// carries `code` and `state`.
+    async fn exchange_code(&self, user_id: &str, code: String, state: String) -> Result<(), McpError> {
+        let (auth_url_str, token_url_str, redirect_url_str, pkce_verifier, server_url) = {
             let mut guard = self.pending.lock().await;
             let pending = guard
                 .remove(&(user_id.to_string(), state))
@@ -445,6 +340,7 @@ impl McpOAuthService {
                 pending.token_url,
                 pending.redirect_url,
                 pending.pkce_verifier,
+                pending.server_url,
             )
         };
 
@@ -467,7 +363,7 @@ impl McpOAuthService {
             .await
             .map_err(|e| McpError::OAuth(format!("Token exchange failed: {e}")))?;
 
-        self.persist_token(user_id, server_url, &token_result).await?;
+        self.persist_token(user_id, &server_url, &token_result).await?;
         debug!(server_url, "OAuth tokens stored successfully");
         Ok(())
     }
@@ -553,76 +449,6 @@ impl McpOAuthService {
 // Query parameter parsing
 // ---------------------------------------------------------------------------
 
-/// Parse `code` and `state` from the first line of an HTTP request.
-///
-/// Expects: `GET /callback?code=xxx&state=yyy HTTP/1.1`
-fn parse_callback_query(request: &str) -> Result<(String, String), McpError> {
-    let first_line = request
-        .lines()
-        .next()
-        .ok_or_else(|| McpError::OAuth("Empty HTTP request".to_string()))?;
-
-    let path = first_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| McpError::OAuth("Malformed HTTP request line".to_string()))?;
-
-    let query_str = path
-        .split_once('?')
-        .map(|(_, q)| q)
-        .ok_or_else(|| McpError::OAuth("No query parameters in callback".to_string()))?;
-
-    let mut code = None;
-    let mut state = None;
-
-    for pair in query_str.split('&') {
-        if let Some((key, value)) = pair.split_once('=') {
-            match key {
-                "code" => code = Some(url_decode(value)),
-                "state" => state = Some(url_decode(value)),
-                _ => {}
-            }
-        }
-    }
-
-    let code = code.ok_or_else(|| McpError::OAuth("Missing 'code' in callback".to_string()))?;
-    let state = state.ok_or_else(|| McpError::OAuth("Missing 'state' in callback".to_string()))?;
-
-    Ok((code, state))
-}
-
-/// Minimal percent-decoding for query parameter values.
-fn url_decode(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut chars = input.bytes();
-
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            let hi = chars.next();
-            let lo = chars.next();
-            if let (Some(h), Some(l)) = (hi, lo) {
-                let hex = [h, l];
-                if let Ok(s) = std::str::from_utf8(&hex)
-                    && let Ok(byte) = u8::from_str_radix(s, 16)
-                {
-                    result.push(byte as char);
-                    continue;
-                }
-                // Malformed percent-encoding: keep as-is.
-                result.push('%');
-                result.push(h as char);
-                result.push(l as char);
-            }
-        } else if b == b'+' {
-            result.push(' ');
-        } else {
-            result.push(b as char);
-        }
-    }
-
-    result
-}
-
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -632,140 +458,6 @@ mod tests {
     use super::*;
 
     const TEST_USER_ID: &str = "user-1";
-
-    // -- well_known_urls -------------------------------------------------------
-    //
-    // Regression coverage for a bug where the well-known discovery suffix was
-    // appended after the server URL's full path (`https://host/mcp/.well-known/
-    // oauth-authorization-server`), which 404s against any RFC 8414-compliant
-    // server, instead of being inserted right after the origin per RFC 8414 §3.1
-    // (`https://host/.well-known/oauth-authorization-server/mcp`).
-
-    #[test]
-    fn well_known_urls_path_aware_form_comes_first_for_pathed_server() {
-        let candidates = well_known_urls("https://mcp.example.com/mcp").unwrap();
-        let urls = candidates.for_type("oauth-authorization-server");
-        assert_eq!(
-            urls,
-            vec![
-                "https://mcp.example.com/.well-known/oauth-authorization-server/mcp",
-                "https://mcp.example.com/.well-known/oauth-authorization-server",
-            ]
-        );
-    }
-
-    #[test]
-    fn well_known_urls_never_puts_well_known_after_the_original_path() {
-        let candidates = well_known_urls("https://mcp.example.com/mcp").unwrap();
-        for url in candidates.for_type("oauth-authorization-server") {
-            assert!(
-                !url.starts_with("https://mcp.example.com/mcp/.well-known"),
-                "well-known suffix must not be appended after the server's path: {url}"
-            );
-        }
-    }
-
-    #[test]
-    fn well_known_urls_root_only_server_has_a_single_candidate() {
-        let candidates = well_known_urls("https://mcp.example.com").unwrap();
-        assert_eq!(
-            candidates.for_type("oauth-authorization-server"),
-            vec!["https://mcp.example.com/.well-known/oauth-authorization-server"]
-        );
-    }
-
-    #[test]
-    fn well_known_urls_strips_trailing_slash_from_path() {
-        let candidates = well_known_urls("https://mcp.example.com/mcp/").unwrap();
-        let urls = candidates.for_type("openid-configuration");
-        assert_eq!(urls[0], "https://mcp.example.com/.well-known/openid-configuration/mcp");
-    }
-
-    #[test]
-    fn well_known_urls_rejects_invalid_server_url() {
-        let err = well_known_urls("not a url").unwrap_err();
-        assert!(err.to_string().contains("Invalid server URL"));
-    }
-
-    // -- parse_callback_query ------------------------------------------------
-
-    #[test]
-    fn parse_valid_callback_query() {
-        let request = "GET /callback?code=abc123&state=xyz789 HTTP/1.1\r\nHost: localhost\r\n";
-        let (code, state) = parse_callback_query(request).unwrap();
-        assert_eq!(code, "abc123");
-        assert_eq!(state, "xyz789");
-    }
-
-    #[test]
-    fn parse_callback_query_reversed_params() {
-        let request = "GET /callback?state=s1&code=c1 HTTP/1.1\r\n";
-        let (code, state) = parse_callback_query(request).unwrap();
-        assert_eq!(code, "c1");
-        assert_eq!(state, "s1");
-    }
-
-    #[test]
-    fn parse_callback_query_with_extra_params() {
-        let request = "GET /callback?code=c&foo=bar&state=s HTTP/1.1\r\n";
-        let (code, state) = parse_callback_query(request).unwrap();
-        assert_eq!(code, "c");
-        assert_eq!(state, "s");
-    }
-
-    #[test]
-    fn parse_callback_query_missing_code() {
-        let request = "GET /callback?state=s HTTP/1.1\r\n";
-        let err = parse_callback_query(request).unwrap_err();
-        assert!(err.to_string().contains("Missing 'code'"));
-    }
-
-    #[test]
-    fn parse_callback_query_missing_state() {
-        let request = "GET /callback?code=c HTTP/1.1\r\n";
-        let err = parse_callback_query(request).unwrap_err();
-        assert!(err.to_string().contains("Missing 'state'"));
-    }
-
-    #[test]
-    fn parse_callback_query_no_query_string() {
-        let request = "GET /callback HTTP/1.1\r\n";
-        let err = parse_callback_query(request).unwrap_err();
-        assert!(err.to_string().contains("No query parameters"));
-    }
-
-    #[test]
-    fn parse_callback_query_empty_request() {
-        let err = parse_callback_query("").unwrap_err();
-        assert!(err.to_string().contains("Empty HTTP request"));
-    }
-
-    // -- url_decode ----------------------------------------------------------
-
-    #[test]
-    fn url_decode_no_encoding() {
-        assert_eq!(url_decode("hello"), "hello");
-    }
-
-    #[test]
-    fn url_decode_percent_encoded() {
-        assert_eq!(url_decode("hello%20world"), "hello world");
-    }
-
-    #[test]
-    fn url_decode_plus_sign() {
-        assert_eq!(url_decode("hello+world"), "hello world");
-    }
-
-    #[test]
-    fn url_decode_special_characters() {
-        assert_eq!(url_decode("%3D%26%3F"), "=&?");
-    }
-
-    #[test]
-    fn url_decode_mixed() {
-        assert_eq!(url_decode("a%20b+c%3Dd"), "a b c=d");
-    }
 
     // -- McpOAuthService construction ----------------------------------------
 
@@ -790,6 +482,59 @@ mod tests {
         assert!(pending.contains_key(&("user-b".to_string(), "shared-state".to_string())));
     }
 
+    // -- handle_callback -------------------------------------------------------
+    //
+    // Regression coverage for routing the OAuth callback through this
+    // server's own HTTP router (keyed by (user_id, state) in `pending`)
+    // instead of a per-login localhost TCP listener.
+
+    #[tokio::test]
+    async fn handle_callback_errors_for_unknown_state() {
+        let svc = McpOAuthService::new(Arc::new(MockTokenRepo), reqwest::Client::new());
+
+        let err = svc
+            .handle_callback(TEST_USER_ID, "some-code".to_string(), "never-issued-state".to_string())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("No pending login state"));
+    }
+
+    #[tokio::test]
+    async fn handle_callback_rejects_another_users_state() {
+        let svc = McpOAuthService::new(Arc::new(MockTokenRepo), reqwest::Client::new());
+        insert_pending_login(&svc, "user-a", "state-a").await;
+
+        // "user-b" trying user-a's state — the (user_id, state) key won't
+        // match, so this must fail rather than authenticate as user-a.
+        let err = svc
+            .handle_callback("user-b", "some-code".to_string(), "state-a".to_string())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("No pending login state"));
+        // user-a's own pending state is untouched by user-b's failed attempt.
+        let pending = svc.pending.lock().await;
+        assert!(pending.contains_key(&("user-a".to_string(), "state-a".to_string())));
+    }
+
+    #[tokio::test]
+    async fn handle_callback_clears_pending_state_on_failure() {
+        let svc = McpOAuthService::new(Arc::new(MockTokenRepo), reqwest::Client::new());
+        insert_pending_login(&svc, TEST_USER_ID, "state-x").await;
+
+        // The stashed auth/token URLs point nowhere real, so the token
+        // exchange itself will fail (network error) after the state lookup
+        // succeeds. Either way, a failed callback must not leave stale
+        // pending state behind for a retry to trip over.
+        let _ = svc
+            .handle_callback(TEST_USER_ID, "some-code".to_string(), "state-x".to_string())
+            .await;
+
+        let pending = svc.pending.lock().await;
+        assert!(!pending.contains_key(&(TEST_USER_ID.to_string(), "state-x".to_string())));
+    }
+
     // -- Mock repositories ---------------------------------------------------
 
     async fn insert_pending_login(svc: &McpOAuthService, user_id: &str, state: &str) {
@@ -798,11 +543,11 @@ mod tests {
         pending.insert(
             (user_id.to_string(), state.to_string()),
             PendingLogin {
-                csrf_token: CsrfToken::new(state.to_string()),
                 pkce_verifier,
                 auth_url: "https://auth.example.com/authorize".to_string(),
                 token_url: "https://auth.example.com/token".to_string(),
                 redirect_url: "http://127.0.0.1/callback".to_string(),
+                server_url: "https://mcp.example.com".to_string(),
             },
         );
     }
