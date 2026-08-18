@@ -145,10 +145,10 @@ redo_checksums=(
 )
 
 # Verify the SQLx metadata table exists and has the complete expected columns.
-table_exists="$(sqlite3 -readonly "$database" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_sqlx_migrations';")"
+table_exists="$(sqlite3 "$database" "PRAGMA query_only=ON; SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_sqlx_migrations';")"
 [[ "$table_exists" == '1' ]] || fail "_sqlx_migrations table is missing"
 
-schema_columns="$(sqlite3 -readonly -separator ',' "$database" "SELECT group_concat(name, ',') FROM pragma_table_info('_sqlx_migrations');")"
+schema_columns="$(sqlite3 -separator ',' "$database" "PRAGMA query_only=ON; SELECT group_concat(name, ',') FROM pragma_table_info('_sqlx_migrations');")"
 for required in version description installed_on success checksum execution_time; do
     case ",$schema_columns," in
         *",$required,"*) ;;
@@ -160,13 +160,13 @@ done
 # length for checksum so a text-encoded digest cannot be mistaken for the BLOB.
 read_row() {
     local version="$1"
-    sqlite3 -readonly -separator $'\t' "$database" \
-        "SELECT version,description,installed_on,success,hex(checksum),execution_time,typeof(checksum),length(checksum) FROM _sqlx_migrations WHERE version=$version;"
+    sqlite3 -separator $'\t' "$database" \
+        "PRAGMA query_only=ON; SELECT version,description,installed_on,success,hex(checksum),execution_time,typeof(checksum),length(checksum) FROM _sqlx_migrations WHERE version=$version;"
 }
 
 row_count() {
     local version="$1"
-    sqlite3 -readonly "$database" "SELECT COUNT(*) FROM _sqlx_migrations WHERE version=$version;"
+    sqlite3 "$database" "PRAGMA query_only=ON; SELECT COUNT(*) FROM _sqlx_migrations WHERE version=$version;"
 }
 
 print_row() {
@@ -396,7 +396,7 @@ sqlite3 "$database" "$sql"
 for i in "${!source_versions[@]}"; do
     source="${source_versions[$i]}"
     target="${target_versions[$i]}"
-    old_identity_count="$(sqlite3 -readonly "$database" "SELECT COUNT(*) FROM _sqlx_migrations WHERE version=$source AND description='${source_descriptions[$i]}' AND checksum=X'${source_checksums[$i]}';")"
+    old_identity_count="$(sqlite3 "$database" "PRAGMA query_only=ON; SELECT COUNT(*) FROM _sqlx_migrations WHERE version=$source AND description='${source_descriptions[$i]}' AND checksum=X'${source_checksums[$i]}';")"
     [[ "$old_identity_count" == '0' ]] || fail "Post-check failed: historical source metadata still exists at version $source"
     target_exact "$i" || {
         print_row "Post-check target" "$target" >&2
