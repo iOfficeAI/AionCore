@@ -37,7 +37,7 @@ use crate::event::{LocalizedText, NoticeLevel};
 /// the verified release stops at 0.146.0 until upstream fixes it.
 pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.234";
 pub const VERIFIED_CODEX_VERSION: &str = "0.146.0";
-pub const VERIFIED_AGY_VERSION: &str = "1.1.12";
+pub const VERIFIED_AGY_VERSION: &str = "1.1.14";
 
 /// The verified release for a direct-CLI backend, keyed by the program name the
 /// backend spawns. `None` for anything not version-gated here.
