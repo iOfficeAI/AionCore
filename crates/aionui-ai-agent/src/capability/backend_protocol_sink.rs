@@ -219,6 +219,7 @@ impl ProtocolEmitter for BackendProtocolSink {
                         })
                         .to_string(),
                     ),
+                    parent_call_id: None,
                 }));
             }
 

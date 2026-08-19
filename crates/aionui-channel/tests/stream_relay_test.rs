@@ -138,6 +138,7 @@ async fn weixin_flushes_pending_text_before_tool_call() {
             args: serde_json::Value::Null,
             status: ToolCallStatus::Running,
             description: None,
+            parent_call_id: None,
             input: None,
             output: None,
         }))
@@ -191,6 +192,7 @@ async fn telegram_does_not_flush_text_before_tool_call() {
             args: serde_json::Value::Null,
             status: ToolCallStatus::Running,
             description: None,
+            parent_call_id: None,
             input: None,
             output: None,
         }))
@@ -229,6 +231,7 @@ async fn weixin_skips_flush_when_buffer_is_empty() {
             args: serde_json::Value::Null,
             status: ToolCallStatus::Running,
             description: None,
+            parent_call_id: None,
             input: None,
             output: None,
         }))
