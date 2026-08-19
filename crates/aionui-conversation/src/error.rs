@@ -23,6 +23,9 @@ pub enum ConversationError {
     #[error("Conversation is archived: {reason}")]
     Archived { id: String, reason: String },
 
+    #[error("Conversation runtime has been retired: {backend}")]
+    RuntimeRetired { backend: String },
+
     #[error("Bad request: {reason}")]
     BadRequest { reason: String },
 
@@ -107,6 +110,9 @@ impl ConversationError {
             Self::ArtifactNotFound { id } => AgentError::not_found(format!("Artifact {id} not found")),
             Self::ActiveAgentNotFound { .. } => AgentError::not_found("No active agent for this conversation"),
             Self::Archived { reason, .. } => AgentError::conversation_archived(reason.clone()),
+            Self::RuntimeRetired { backend } => {
+                AgentError::bad_request(format!("Runtime '{backend}' has been retired"))
+            }
             Self::BadRequest { reason } => AgentError::bad_request(reason.clone()),
             Self::Busy { reason } => AgentError::conflict(reason.clone()),
             Self::Forbidden { reason } => AgentError::forbidden(reason.clone()),
@@ -157,6 +163,7 @@ impl ConversationError {
             Self::Unprocessable { .. } => "UNPROCESSABLE_ENTITY",
             Self::CapabilityUnsupported { .. } => "capability_unsupported",
             Self::Archived { .. } => "CONVERSATION_ARCHIVED",
+            Self::RuntimeRetired { .. } => "runtime_retired",
             Self::WorkspacePathUnavailable { .. } => "WORKSPACE_PATH_UNAVAILABLE",
             Self::WorkspacePathRuntimeUnavailable { .. } => "WORKSPACE_PATH_RUNTIME_UNAVAILABLE",
             Self::OpenClawGatewayUnreachable { .. } => "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE",

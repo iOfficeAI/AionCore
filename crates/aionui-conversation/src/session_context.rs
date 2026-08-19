@@ -550,7 +550,12 @@ fn extra_backend(row: &ConversationRow) -> Option<String> {
 
 fn reject_deprecated_runtime_kind(row: &ConversationRow, agent_type: &AgentType) -> Result<(), ConversationError> {
     let retired_preview = extra_backend(row).as_deref() == Some(RETIRED_DEEPSEEK_HARNESS_BACKEND);
-    if !agent_type.is_deprecated_runtime() && !retired_preview {
+    if retired_preview {
+        return Err(ConversationError::RuntimeRetired {
+            backend: RETIRED_DEEPSEEK_HARNESS_BACKEND.to_owned(),
+        });
+    }
+    if !agent_type.is_deprecated_runtime() {
         return Ok(());
     }
 
@@ -1410,6 +1415,24 @@ mod tests {
             let err = repos.builder().build(&row).await.unwrap_err();
             assert_archived(err, "conv-1");
         }
+    }
+
+    #[tokio::test]
+    async fn deepseek_harness_history_returns_stable_retired_error() {
+        let repos = setup().await;
+        let row = row(
+            "acp",
+            serde_json::json!({ "backend": RETIRED_DEEPSEEK_HARNESS_BACKEND }),
+            None,
+        );
+
+        let err = repos.builder().build(&row).await.unwrap_err();
+        assert!(matches!(
+            &err,
+            ConversationError::RuntimeRetired { backend }
+                if backend == RETIRED_DEEPSEEK_HARNESS_BACKEND
+        ));
+        assert_eq!(err.error_code(), "runtime_retired");
     }
 
     fn aionrs_seed(mode: &str, resolved: Option<&str>) -> AionrsRuntimePermissionSeed {

@@ -32,6 +32,12 @@ impl From<ConversationError> for ApiError {
                 ApiError::NotFound("No active agent for this conversation".into())
             }
             ConversationError::Archived { reason, .. } => ApiError::ConversationArchived(reason),
+            ConversationError::RuntimeRetired { backend } => ApiError::coded(
+                StatusCode::GONE,
+                "runtime_retired",
+                "This runtime has been retired. Open the conversation as history or start a new conversation.",
+                Some(serde_json::json!({ "backend": backend })),
+            ),
             ConversationError::BadRequest { reason } => ApiError::BadRequest(reason),
             ConversationError::Busy { reason } if reason.starts_with("CROSS_ACCOUNT_REFERENCE:") => {
                 ApiError::coded(StatusCode::CONFLICT, "CROSS_ACCOUNT_REFERENCE", reason, None)

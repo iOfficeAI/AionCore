@@ -373,7 +373,7 @@ async fn run_probe(
 fn probe_retired_deepseek_harness() -> (AgentSnapshotCheckStatus, Option<String>, Option<String>) {
     (
         AgentSnapshotCheckStatus::Offline,
-        Some("retired".to_owned()),
+        Some("runtime_retired".to_owned()),
         Some("DeepSeek Harness preview has been retired".to_owned()),
     )
 }

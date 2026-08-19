@@ -1,3 +1,6 @@
+use std::collections::BTreeSet;
+
+use aionui_api_types::ConversationInputStatus;
 use aionui_common::ErrorChain;
 use aionui_db::MessageRowUpdate;
 use aionui_db::models::MessageRow;
@@ -22,6 +25,7 @@ enum StartupRecoveryAction {
 
 impl ConversationService {
     pub async fn recover_stale_runtime_state_on_startup(&self) {
+        self.recover_conversation_inputs_on_startup().await;
         let rows = match self.conversation_repo().list_stale_runtime_messages().await {
             Ok(rows) => rows,
             Err(error) => {
@@ -82,6 +86,69 @@ impl ConversationService {
 
         if recovered > 0 {
             info!(recovered, "startup recovery completed for stale runtime messages");
+        }
+    }
+
+    async fn recover_conversation_inputs_on_startup(&self) {
+        let inputs = match self.conversation_repo().list_unfinished_conversation_inputs().await {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                warn!(error = %ErrorChain(&error), "startup recovery skipped durable conversation inputs");
+                return;
+            }
+        };
+        let mut scopes = BTreeSet::new();
+        for input in inputs {
+            scopes.insert((input.user_id.clone(), input.conversation_id.clone()));
+            let recovery = match input.status.as_str() {
+                "held" => None,
+                "accepted" | "dispatching" if input.msg_id.is_some() => {
+                    let message_exists = match self
+                        .conversation_repo()
+                        .get_message(
+                            &input.user_id,
+                            &input.conversation_id,
+                            input.msg_id.as_deref().unwrap_or_default(),
+                        )
+                        .await
+                    {
+                        Ok(message) => message.is_some(),
+                        Err(error) => {
+                            warn!(
+                                conversation_id = %input.conversation_id,
+                                input_id = %input.id,
+                                error = %ErrorChain(&error),
+                                "startup recovery could not verify dispatched input"
+                            );
+                            false
+                        }
+                    };
+                    Some(if message_exists {
+                        (ConversationInputStatus::Applied, None)
+                    } else {
+                        (ConversationInputStatus::Failed, Some("recovery_message_missing"))
+                    })
+                }
+                "accepted" => Some((ConversationInputStatus::Failed, Some("recovery_message_missing"))),
+                "dispatching" => Some((ConversationInputStatus::Failed, Some("recovery_dispatch_unconfirmed"))),
+                _ => None,
+            };
+            if let Some((status, error_code)) = recovery
+                && let Err(error) = self
+                    .recover_input_status(&input.user_id, &input.conversation_id, &input.id, status, error_code)
+                    .await
+            {
+                warn!(
+                    conversation_id = %input.conversation_id,
+                    input_id = %input.id,
+                    error = %error,
+                    "startup recovery failed to converge durable input"
+                );
+            }
+        }
+
+        for (user_id, conversation_id) in scopes {
+            self.dispatch_next_held_input(&user_id, &conversation_id).await;
         }
     }
 }

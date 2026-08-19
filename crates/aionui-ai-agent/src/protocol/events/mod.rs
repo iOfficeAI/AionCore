@@ -27,6 +27,9 @@ pub(crate) use translate::{permission_request_to_event_data, session_notificatio
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentStreamEvent {
     Start(StartEventData),
+    InputAccepted(InputLifecycleEventData),
+    InputApplied(InputLifecycleEventData),
+    InputRejected(InputLifecycleEventData),
     #[serde(rename = "content")]
     Text(TextEventData),
     Tips(TipsEventData),
@@ -175,6 +178,16 @@ pub struct FinishEventData {
     pub input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+}
+
+/// Correlates a host input receipt with the model step that consumed it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputLifecycleEventData {
+    pub input_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 /// Kind of CodeBuddy ACP dialect signal absorbed by the tolerant transport

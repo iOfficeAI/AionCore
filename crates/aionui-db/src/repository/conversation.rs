@@ -301,6 +301,11 @@ pub trait IConversationRepository: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Lists non-terminal inputs across all conversations for startup recovery.
+    async fn list_unfinished_conversation_inputs(&self) -> Result<Vec<ConversationInputRow>, DbError> {
+        Ok(Vec::new())
+    }
+
     async fn claim_next_conversation_input(
         &self,
         _user_id: &str,

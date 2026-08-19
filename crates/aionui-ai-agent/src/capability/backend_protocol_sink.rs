@@ -7,7 +7,9 @@ use serde_json::json;
 use tokio::sync::broadcast;
 use tracing::debug;
 
-use crate::protocol::events::{AcpPermissionEventData, AgentStreamEvent, ToolCallEventData, ToolCallStatus};
+use crate::protocol::events::{
+    AcpPermissionEventData, AgentStreamEvent, InputLifecycleEventData, ToolCallEventData, ToolCallStatus,
+};
 
 /// Implements `ProtocolEmitter` for the aioncore context.
 ///
@@ -64,6 +66,33 @@ impl BackendProtocolSink {
 impl ProtocolEmitter for BackendProtocolSink {
     fn emit(&self, event: &ProtocolEvent) -> std::io::Result<()> {
         match event {
+            ProtocolEvent::InputAccepted { input_id } => {
+                let _ = self
+                    .event_tx
+                    .send(AgentStreamEvent::InputAccepted(InputLifecycleEventData {
+                        input_id: input_id.clone(),
+                        turn_id: None,
+                        error_code: None,
+                    }));
+            }
+            ProtocolEvent::InputApplied { input_id, turn_id } => {
+                let _ = self
+                    .event_tx
+                    .send(AgentStreamEvent::InputApplied(InputLifecycleEventData {
+                        input_id: input_id.clone(),
+                        turn_id: turn_id.clone(),
+                        error_code: None,
+                    }));
+            }
+            ProtocolEvent::InputRejected { input_id, error_code } => {
+                let _ = self
+                    .event_tx
+                    .send(AgentStreamEvent::InputRejected(InputLifecycleEventData {
+                        input_id: input_id.clone(),
+                        turn_id: None,
+                        error_code: Some(error_code.clone()),
+                    }));
+            }
             ProtocolEvent::ToolRequest { call_id, tool, .. } => {
                 let confirmation = Self::build_confirmation(call_id, &tool.name, &tool.category, &tool.description);
 
@@ -150,6 +179,41 @@ mod tests {
         let stored = confs.read().unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].call_id, "c1");
+    }
+
+    #[test]
+    fn input_lifecycle_events_preserve_correlation() {
+        let (sink, mut rx, _) = make_sink();
+        sink.emit(&ProtocolEvent::InputAccepted {
+            input_id: "input-1".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentStreamEvent::InputAccepted(data) if data.input_id == "input-1"
+        ));
+
+        sink.emit(&ProtocolEvent::InputApplied {
+            input_id: "input-1".into(),
+            turn_id: Some("turn-1".into()),
+        })
+        .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentStreamEvent::InputApplied(data)
+                if data.input_id == "input-1" && data.turn_id.as_deref() == Some("turn-1")
+        ));
+
+        sink.emit(&ProtocolEvent::InputRejected {
+            input_id: "input-2".into(),
+            error_code: "too_late".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentStreamEvent::InputRejected(data)
+                if data.input_id == "input-2" && data.error_code.as_deref() == Some("too_late")
+        ));
     }
 
     #[test]

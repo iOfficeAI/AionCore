@@ -170,6 +170,9 @@ async fn wait_for_event(
 fn event_type_name(event: &AgentStreamEvent) -> &'static str {
     match event {
         AgentStreamEvent::Start(_) => "Start",
+        AgentStreamEvent::InputAccepted(_) => "InputAccepted",
+        AgentStreamEvent::InputApplied(_) => "InputApplied",
+        AgentStreamEvent::InputRejected(_) => "InputRejected",
         AgentStreamEvent::Text(_) => "Text",
         AgentStreamEvent::Tips(_) => "Tips",
         AgentStreamEvent::ToolCall(_) => "ToolCall",

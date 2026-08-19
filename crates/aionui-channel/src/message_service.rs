@@ -214,6 +214,9 @@ impl ChannelMessageService {
             }),
             // Events that don't produce user-facing messages
             AgentStreamEvent::Start(_)
+            | AgentStreamEvent::InputAccepted(_)
+            | AgentStreamEvent::InputApplied(_)
+            | AgentStreamEvent::InputRejected(_)
             | AgentStreamEvent::Tips(_)
             | AgentStreamEvent::ToolGroup(_)
             | AgentStreamEvent::AgentStatus(_)

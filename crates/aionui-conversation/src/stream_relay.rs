@@ -5,7 +5,7 @@ use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::Thinki
 
 use crate::response_middleware::{ISkillLoadService, MessageMiddleware, MiddlewareResult};
 use crate::skill_resolver::{LoadedAgentSkill, SkillResolver};
-use aionui_api_types::{AgentErrorCode, WebSocketMessage};
+use aionui_api_types::{AgentErrorCode, ConversationInputStatus, InputChangedEvent, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
 use crate::runtime_persistence::RuntimePersistenceCoordinator;
@@ -16,7 +16,7 @@ use crate::stream_persistence::{
     ThinkingSegmentState, canonical_event_id,
 };
 use crate::tool_event_pipeline::{ToolEventPipeline, ToolPreExecuteDisposition};
-use aionui_db::{IConversationRepository, IUsageEventRepository};
+use aionui_db::{ConversationInputUpdate, IConversationRepository, IUsageEventRepository};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::broadcast::error::TryRecvError;
@@ -432,6 +432,10 @@ impl StreamRelay {
                     }
 
                     self.maybe_record_usage(&event).await;
+
+                    if self.project_input_lifecycle(&event).await {
+                        continue;
+                    }
 
                     if !first_agent_event_logged {
                         first_agent_event_logged = true;
@@ -907,6 +911,80 @@ impl StreamRelay {
         }
     }
 
+    async fn project_input_lifecycle(&self, event: &AgentStreamEvent) -> bool {
+        let (data, status) = match event {
+            AgentStreamEvent::InputAccepted(data) => (data, ConversationInputStatus::Accepted),
+            AgentStreamEvent::InputApplied(data) => (data, ConversationInputStatus::Applied),
+            AgentStreamEvent::InputRejected(data) => (data, ConversationInputStatus::Failed),
+            _ => return false,
+        };
+        let repo = self.adapter.conversation_repo();
+        let current = match repo
+            .get_conversation_input(&self.user_id, &self.conversation_id, &data.input_id)
+            .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                warn!(input_id = data.input_id, "Ignoring lifecycle event for unknown input");
+                return true;
+            }
+            Err(error) => {
+                warn!(input_id = data.input_id, error = %error, "Failed to load input lifecycle projection");
+                return true;
+            }
+        };
+
+        if status == ConversationInputStatus::Applied
+            && let Some(journal) = &self.event_journal
+            && let Err(error) = journal
+                .append_user_prompt(&self.user_id, &self.conversation_id, &data.input_id, &current.content)
+                .await
+        {
+            warn!(input_id = data.input_id, error = %error, "Failed to journal applied injected input");
+            return true;
+        }
+
+        let status_name = match status {
+            ConversationInputStatus::Accepted => "accepted",
+            ConversationInputStatus::Applied => "applied",
+            ConversationInputStatus::Failed => "failed",
+            _ => unreachable!("input lifecycle event maps only to accepted/applied/failed"),
+        };
+        let updated = match repo
+            .update_conversation_input(
+                &self.user_id,
+                &self.conversation_id,
+                &data.input_id,
+                &ConversationInputUpdate {
+                    status: Some(status_name),
+                    turn_id: data.turn_id.as_deref().or(Some(&self.turn_id)),
+                    msg_id: (status == ConversationInputStatus::Applied).then_some(self.msg_id.as_str()),
+                    error_code: data.error_code.as_deref(),
+                    updated_at: now_ms(),
+                },
+            )
+            .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => return true,
+            Err(error) => {
+                warn!(input_id = data.input_id, error = %error, "Failed to update input lifecycle projection");
+                return true;
+            }
+        };
+        match crate::service_ops::input_row_response(updated) {
+            Ok(input) => self.broadcaster.broadcast(WebSocketMessage::new(
+                "conversation.inputChanged",
+                serde_json::json!(InputChangedEvent {
+                    user_id: self.user_id.clone(),
+                    input,
+                }),
+            )),
+            Err(error) => warn!(input_id = data.input_id, error = %error, "Invalid input lifecycle projection"),
+        }
+        true
+    }
+
     fn is_deleting(&self) -> bool {
         self.runtime_state
             .as_ref()
@@ -916,6 +994,9 @@ impl StreamRelay {
     fn event_kind(event: &AgentStreamEvent) -> &'static str {
         match event {
             AgentStreamEvent::Start(_) => "Start",
+            AgentStreamEvent::InputAccepted(_) => "InputAccepted",
+            AgentStreamEvent::InputApplied(_) => "InputApplied",
+            AgentStreamEvent::InputRejected(_) => "InputRejected",
             AgentStreamEvent::Text(_) => "Text",
             AgentStreamEvent::Tips(_) => "Tips",
             AgentStreamEvent::Thinking(_) => "Thinking",

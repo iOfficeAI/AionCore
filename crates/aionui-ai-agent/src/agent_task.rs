@@ -278,6 +278,16 @@ impl AgentInstance {
         self.as_task().send_message(data).await
     }
 
+    /// Inject host input into the next model step when the backend can enforce it.
+    pub fn inject(&self, input_id: String, content: String) -> Result<(), AgentError> {
+        match self {
+            Self::Aionrs(manager) => manager.inject(input_id, content),
+            Self::Acp(_) | Self::Session(_) => Err(AgentError::bad_request("inject is not supported by this agent")),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(_) => Err(AgentError::bad_request("inject is not supported by this agent")),
+        }
+    }
+
     /// Cancel the current streaming response without killing the agent.
     pub async fn cancel(&self) -> Result<(), AgentError> {
         self.as_task().cancel().await

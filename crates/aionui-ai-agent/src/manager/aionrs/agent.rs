@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use aion_agent::bootstrap::AgentBootstrap;
 use aion_agent::engine::AgentEngine;
+use aion_agent::injection::InjectionHandle;
 use aion_agent::output::OutputSink;
 use aion_agent::session::Session;
 use aion_config::compat::ProviderCompat;
@@ -108,6 +109,7 @@ fn build_aionrs_final_input_dump_value(
 pub struct AionrsAgentManager {
     runtime: AgentRuntime,
     engine: Mutex<AgentEngine>,
+    injection_handle: InjectionHandle,
     /// Static slash command metadata captured at bootstrap so UI lookups do
     /// not wait behind an active `engine.run()` turn.
     slash_commands: Vec<SlashCommandItem>,
@@ -269,6 +271,7 @@ impl AionrsAgentManager {
         let protocol_sink = BackendProtocolSink::new(runtime.event_sender(), confirmations.clone());
         engine.set_approval_manager(approval_manager.clone());
         engine.set_protocol_writer(Arc::new(protocol_sink));
+        let injection_handle = engine.injection_handle();
         let slash_commands = engine
             .slash_command_list()
             .into_iter()
@@ -286,6 +289,7 @@ impl AionrsAgentManager {
         Ok(Self {
             runtime,
             engine: Mutex::new(engine),
+            injection_handle,
             slash_commands,
             mcp_managers: result.mcp_managers,
             approval_manager,
@@ -295,6 +299,18 @@ impl AionrsAgentManager {
             turn_finished_notify: Arc::new(Notify::new()),
             last_total_usage: Mutex::new(last_total_usage),
         })
+    }
+
+    /// Queue host input for the next model boundary of the active turn.
+    pub fn inject(&self, input_id: String, content: String) -> Result<(), AgentError> {
+        if content.trim().is_empty() {
+            return Err(AgentError::bad_request("injected input must not be empty"));
+        }
+        if self.runtime.status() != Some(ConversationStatus::Running) {
+            return Err(AgentError::conflict("too_late"));
+        }
+        self.injection_handle.enqueue(input_id, content);
+        Ok(())
     }
 
     async fn complete_successful_turn(&self, cumulative_usage: TokenUsage) {

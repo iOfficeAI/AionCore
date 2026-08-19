@@ -262,6 +262,18 @@ pub struct CancelConversationRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelConversationResponse {
     pub runtime: ConversationRuntimeSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_state: Option<CancellationState>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationState {
+    Requested,
+    Cancelling,
+    ConvergedIdle,
+    ForceTerminated,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

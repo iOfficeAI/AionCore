@@ -1460,6 +1460,17 @@ impl IConversationRepository for SqliteConversationRepository {
         .await?)
     }
 
+    async fn list_unfinished_conversation_inputs(&self) -> Result<Vec<ConversationInputRow>, DbError> {
+        Ok(sqlx::query_as::<_, ConversationInputRow>(
+            "SELECT i.* FROM conversation_inputs i \
+             INNER JOIN conversations c ON c.id = i.conversation_id AND c.user_id = i.user_id \
+             WHERE i.status IN ('held', 'dispatching', 'accepted') \
+             ORDER BY i.user_id ASC, i.conversation_id ASC, i.created_at ASC, i.id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     async fn claim_next_conversation_input(
         &self,
         user_id: &str,
@@ -2564,6 +2575,40 @@ mod tests {
             .await;
 
         assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn unfinished_inputs_are_listed_for_startup_recovery_in_fifo_order() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+        for (id, status, created_at) in [
+            ("held", "held", 30),
+            ("accepted", "accepted", 20),
+            ("done", "applied", 10),
+        ] {
+            repo.insert_conversation_input(&ConversationInputInsert {
+                id,
+                user_id: SYSTEM_USER_ID,
+                conversation_id: &conv.id,
+                mode: "followup",
+                status,
+                content: id,
+                files: "[]",
+                inject_skills: "[]",
+                hidden: false,
+                client_key: id,
+                created_at,
+            })
+            .await
+            .unwrap();
+        }
+
+        let rows = repo.list_unfinished_conversation_inputs().await.unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["accepted", "held"]
+        );
     }
 
     #[test]

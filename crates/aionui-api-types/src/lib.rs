@@ -92,16 +92,17 @@ pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest
 pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::{
     ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,
-    CancelConversationRequest, CancelConversationResponse, CloneConversationRequest, ConversationArtifactKind,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
-    ConversationAssistantIdentityResponse, ConversationCapabilities, ConversationInputListResponse,
-    ConversationInputMode, ConversationInputReceipt, ConversationInputResponse, ConversationInputStatus,
-    ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind, ConversationNameUpdatedPayload,
-    ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest,
-    EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest, InputChangedEvent,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem,
-    MessageSearchResponse, PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    SubmitConversationInputRequest, ToolEnforcementLevel, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    CancelConversationRequest, CancelConversationResponse, CancellationState, CloneConversationRequest,
+    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ConversationArtifactStatus, ConversationAssistantIdentityResponse, ConversationCapabilities,
+    ConversationInputListResponse, ConversationInputMode, ConversationInputReceipt, ConversationInputResponse,
+    ConversationInputStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
+    ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
+    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
+    InputChangedEvent, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchItem, MessageSearchResponse, PromptCapabilityView, SearchMessagesQuery, SendMessageRequest,
+    SendMessageResponse, SubmitConversationInputRequest, ToolEnforcementLevel, UpdateConversationArtifactRequest,
+    UpdateConversationRequest,
 };
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,
