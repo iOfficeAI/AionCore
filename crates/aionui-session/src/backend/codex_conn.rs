@@ -496,7 +496,14 @@ fn initialize_params() -> HandshakeParams {
 /// Wave 0c: the session-init surface is injected here. codex reads MCP servers
 /// from its CONFIG (NOT a per-thread param), so they go into `config.mcp_servers`
 /// — a map keyed by name (verified live, 0.139.0: thread/start accepts it AND
-/// launches the servers). The preset/system prompt goes into `baseInstructions`.
+/// launches the servers). The preset/system prompt goes into
+/// `developerInstructions` — NOT `baseInstructions`, which REPLACES codex's
+/// built-in system prompt wholesale and silently strips its "### Preamble
+/// messages" guidance (live 2026-08-19: with a preset in baseInstructions the
+/// model stopped narrating between tool calls entirely). developerInstructions
+/// keeps the default prompt and rides codex's own developer message (live
+/// probe: samples/codex-cli/0.144.6/_all_developer_instructions.jsonl; field
+/// verified: samples/codex-cli/0.146.0/schema/codex_app_server_protocol.v2.schemas.json).
 /// Both are omitted when empty so the pre-0c handshake is byte-identical.
 fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
     // G1-A: data-drive the sandbox from SessionConfig (None ⇒ workspace-write,
@@ -521,7 +528,7 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
         params["config"] = json!({ "mcp_servers": build_codex_mcp_servers(&config.init.mcp_servers) });
     }
     if let Some(preset) = &config.init.preset_context {
-        params["baseInstructions"] = json!(preset);
+        params["developerInstructions"] = json!(preset);
     }
     HandshakeParams(params)
 }
@@ -534,9 +541,11 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
 /// (`on-request`; the thread was started with `never`). Re-sending the surface is
 /// consumed: `config.mcp_servers` relaunches the servers (startupStatus
 /// starting→ready + inventory restored) and `approvalPolicy` echoes back applied.
-/// `ThreadResumeParams` (schema-full 0.137.0) accepts the same field names as
-/// thread/start (`approvalPolicy`/`sandbox`/`cwd`/`config`/`baseInstructions`);
-/// sandbox/baseInstructions had no direct oracle in the probe — re-sending the
+/// `ThreadResumeParams` (schema-full 0.137.0; developerInstructions verified:
+/// samples/codex-cli/0.146.0/schema/codex_app_server_protocol.v2.schemas.json)
+/// accepts the same field names as thread/start
+/// (`approvalPolicy`/`sandbox`/`cwd`/`config`/`developerInstructions`);
+/// sandbox/instructions had no direct oracle in the probe — re-sending the
 /// start-time values is at worst a no-op, while dropping them is a confirmed loss
 /// on the probed axes.
 fn thread_resume_params(config: &SessionConfig, thread_id: &str) -> HandshakeParams {
@@ -7951,8 +7960,55 @@ mod tests {
             mcp.get("unsupported-sse").is_none(),
             "Codex does not declare an SSE MCP transport; the adapter must filter it instead of serializing it as HTTP"
         );
-        // preset → baseInstructions.
-        assert_eq!(frame["params"]["baseInstructions"], "You are a helpful assistant.");
+        // preset → developerInstructions (additive), never baseInstructions
+        // (replace) — see preset_context_rides_developer_instructions_not_base.
+        assert_eq!(frame["params"]["developerInstructions"], "You are a helpful assistant.");
+        assert!(frame["params"].get("baseInstructions").is_none());
+    }
+
+    /// The assistant preset must NOT replace codex's built-in system prompt.
+    ///
+    /// `baseInstructions` REPLACES the default prompt wholesale (live
+    /// 2026-08-19, rollout of AionUi conv 5e1a2a40: `base_instructions` became
+    /// the raw preset text, and the model stopped emitting between-tool
+    /// preamble/progress messages because the default prompt's "### Preamble
+    /// messages" guidance was gone — turns ran 20+ minutes of tools with zero
+    /// text). `developerInstructions` is the additive channel: the default
+    /// prompt survives and the preset is injected into codex's own developer
+    /// message (live probe: samples/codex-cli/0.144.6/
+    /// _all_developer_instructions.jsonl; the field exists on ThreadStart/
+    /// Resume/Fork params, verified: samples/codex-cli/0.146.0/schema/
+    /// codex_app_server_protocol.v2.schemas.json).
+    ///
+    /// The title generator (`codex_title.rs`) keeps `baseInstructions` — its
+    /// replace semantics are intentional there.
+    #[test]
+    fn preset_context_rides_developer_instructions_not_base() {
+        use crate::backend::SessionInit;
+        let config = SessionConfig {
+            init: SessionInit {
+                preset_context: Some("Assistant rules".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let start = thread_start_params(&config).into_frame(1, "thread/start");
+        assert_eq!(start["params"]["developerInstructions"], "Assistant rules");
+        assert!(
+            start["params"].get("baseInstructions").is_none(),
+            "the preset must not wipe codex's default system prompt"
+        );
+        // resume and fork reuse the start surface and must inherit the channel.
+        let resume = thread_resume_params(&config, "th-1").into_frame(2, "thread/resume");
+        assert_eq!(resume["params"]["developerInstructions"], "Assistant rules");
+        assert!(resume["params"].get("baseInstructions").is_none());
+        let fork = thread_fork_params(&config, "th-1", None).into_frame(3, "thread/fork");
+        assert_eq!(fork["params"]["developerInstructions"], "Assistant rules");
+        assert!(fork["params"].get("baseInstructions").is_none());
+        // No preset → neither key (byte-identical bare handshake).
+        let bare = thread_start_params(&SessionConfig::default()).into_frame(4, "thread/start");
+        assert!(bare["params"].get("developerInstructions").is_none());
+        assert!(bare["params"].get("baseInstructions").is_none());
     }
 
     /// thread/resume re-sends the FULL thread/start override surface + threadId.
@@ -7992,12 +8048,13 @@ mod tests {
             frame["params"]["config"]["mcp_servers"]["fs"]["command"],
             "/usr/bin/node"
         );
-        assert_eq!(frame["params"]["baseInstructions"], "preset");
+        assert_eq!(frame["params"]["developerInstructions"], "preset");
         // Empty init resume: still threadId + the policy defaults, no config /
-        // baseInstructions keys (mirrors the bare thread/start shape).
+        // instructions keys (mirrors the bare thread/start shape).
         let bare = thread_resume_params(&SessionConfig::default(), "th-2").into_frame(3, "thread/resume");
         assert_eq!(bare["params"]["threadId"], "th-2");
         assert!(bare["params"].get("config").is_none());
+        assert!(bare["params"].get("developerInstructions").is_none());
         assert!(bare["params"].get("baseInstructions").is_none());
     }
 
