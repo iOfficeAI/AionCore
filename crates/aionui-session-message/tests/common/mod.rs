@@ -492,11 +492,43 @@ impl Ctx {
         envelope["content"].as_str().unwrap_or_default().to_owned()
     }
 
-    pub async fn user_message_count(&self, id: &str) -> usize {
+    /// Every user message's text. Used instead of "the last one" wherever the
+    /// assertion would otherwise depend on how the DB breaks a timestamp tie.
+    pub async fn all_user_message_contents(&self, id: &str) -> Vec<String> {
         let page = self
             .conversation_repo
             .list_messages_page(
                 USER,
+                id,
+                &aionui_db::MessagePageParams {
+                    limit: 200,
+                    direction: aionui_db::MessagePageDirection::InitialLatest,
+                },
+            )
+            .await
+            .unwrap();
+        page.items
+            .iter()
+            .filter(|m| m.position.as_deref() == Some("right"))
+            .map(|row| {
+                let envelope: serde_json::Value =
+                    serde_json::from_str(&row.content).expect("message content is a JSON envelope");
+                envelope["content"].as_str().unwrap_or_default().to_owned()
+            })
+            .collect()
+    }
+
+    pub async fn user_message_count(&self, id: &str) -> usize {
+        self.user_message_count_for(USER, id).await
+    }
+
+    /// Same count, for a conversation owned by someone else — the repo scopes by
+    /// user, so the caller must name the owner.
+    pub async fn user_message_count_for(&self, user_id: &str, id: &str) -> usize {
+        let page = self
+            .conversation_repo
+            .list_messages_page(
+                user_id,
                 id,
                 &aionui_db::MessagePageParams {
                     limit: 200,
