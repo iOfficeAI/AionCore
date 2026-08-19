@@ -1116,7 +1116,6 @@ async fn run_direct_backend_team_mcp_and_runtime_env(backend: &str, agent_id: &s
         .chain(shell_tool_frames.iter())
         .copied()
         .collect::<Vec<_>>();
-    let mcp_tool_evidence = serde_json::to_string(&mcp_tool_frames).unwrap();
     let shell_tool_evidence = serde_json::to_string(&shell_tool_frames).unwrap();
     let tool_names = tool_frames
         .iter()
@@ -1126,10 +1125,36 @@ async fn run_direct_backend_team_mcp_and_runtime_env(backend: &str, agent_id: &s
                 .or_else(|| frame["data"]["data"]["update"]["name"].as_str())
         })
         .collect::<BTreeSet<_>>();
-    assert!(
-        mcp_tool_evidence.contains("team_members"),
-        "[{backend}] no streamed Team MCP tools/call evidence; tool names={tool_names:?}"
-    );
+    // agy is routed CliAssumed on purpose: we have no way to hand it an MCP
+    // server, because it reads `mcp_config.json` only from `~/.gemini/config/`
+    // and `plugins/<name>/`, never the per-workspace file this repo writes
+    // (measured 2026-08-19). Asserting an MCP tools/call for it would pin
+    // behaviour the product deliberately does not have.
+    //
+    // The old assertion was also weaker than it looked for the backends that DO
+    // take the MCP route: it searched every tool frame's JSON for the substring
+    // `team_members`, and this test's own prompt contains that string, so a
+    // shell command echoing the name satisfied it.
+    //
+    // The name field alone is not enough either: the two MCP backends shape it
+    // differently. claude names the frame after the tool (`team_members`);
+    // codex names every MCP call `mcpToolCall` and carries the tool name
+    // inside. Requiring one OR the other keeps a plain shell frame out — its
+    // name is the command line, which is neither.
+    let mcp_tool_frames_json = serde_json::to_string(&mcp_tool_frames).unwrap();
+    let called_team_members_over_mcp = tool_names.iter().any(|name| name.contains("team_members"))
+        || (tool_names.contains("mcpToolCall") && mcp_tool_frames_json.contains("team_members"));
+    if backend == "antigravity" {
+        assert!(
+            !called_team_members_over_mcp,
+            "[{backend}] routed CliAssumed, so no team_members MCP call should appear; tool names={tool_names:?}"
+        );
+    } else {
+        assert!(
+            called_team_members_over_mcp,
+            "[{backend}] no streamed Team MCP tools/call evidence; tool names={tool_names:?}"
+        );
+    }
     assert!(
         shell_tool_evidence.contains("AIONUI_HELPER_BIN")
             && (shell_tool_evidence.contains("AIONUI_E2E_SENTINEL") || shell_tool_evidence.contains("AIONUI_ENV_OK")),
@@ -1145,9 +1170,14 @@ async fn run_direct_backend_team_mcp_and_runtime_env(backend: &str, agent_id: &s
                 .or_else(|| frame["data"]["data"]["update"]["tool_call_id"].as_str())
         })
         .collect::<BTreeSet<_>>();
+    // Two calls are only expected where the two phases use different tools. A
+    // CliAssumed backend runs both over the shell, and the model may well do it
+    // in one command, so requiring two ids there asserts a shape the transport
+    // does not have.
+    let expected_distinct_calls = if backend == "antigravity" { 1 } else { 2 };
     assert!(
-        tool_call_ids.len() >= 2,
-        "[{backend}] expected distinct Team MCP and shell tool calls, got {tool_call_ids:?}; \
+        tool_call_ids.len() >= expected_distinct_calls,
+        "[{backend}] expected at least {expected_distinct_calls} tool call(s), got {tool_call_ids:?}; \
          tool names={tool_names:?}"
     );
     let mcp_reply = mcp_frames
