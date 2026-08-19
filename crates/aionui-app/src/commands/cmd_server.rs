@@ -5,7 +5,10 @@ use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{future::Future, pin::Pin};
+use std::{
+    future::{Future, IntoFuture},
+    pin::Pin,
+};
 
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -15,7 +18,7 @@ use aionui_app::{AppConfig, AppServices, RouterBuildError, create_router_with_ru
 use aionui_system::RuntimePrepareService;
 use aionui_team::TeamIdleCleanupCoordinator;
 
-use crate::bootstrap::{BootstrapError, BootstrapErrorCode, ParentExitSignal, ServerEnvironment};
+use crate::bootstrap::{BootstrapError, BootstrapErrorCode, ParentExitSignal, ServerEnvironment, ShutdownWatchdog};
 
 const LISTENING_EVENT_PREFIX: &str = "AIONCORE_LISTENING";
 // Bare, payload-less readiness marker emitted once `axum::serve` actually begins
@@ -26,6 +29,26 @@ const LISTENING_EVENT_PREFIX: &str = "AIONCORE_LISTENING";
 const READY_EVENT_MARKER: &str = "AIONCORE_READY";
 const DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS: usize = 50;
 const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Bounded graceful-shutdown tail (AIONUI-16). The data-dir instance flock is
+// only released when this process exits, so every await between the shutdown
+// signal and process exit must be bounded — otherwise a restarting AionUi
+// keeps hitting BOOTSTRAP_PEER_ALREADY_RUNNING against a zombie backend.
+//
+// Stage bounds below cover the awaits that are unbounded by design:
+// - axum's drain waits for every connection task with no timeout
+//   (axum-0.8.9 serve/mod.rs: `close_tx.closed().await`), and an in-flight
+//   HTTP/1 response keeps its connection task alive indefinitely.
+// - `sqlx::Pool::close()` waits for all checked-out connections to be
+//   returned; detached tasks (e.g. WebSocket handlers, which axum spawns
+//   detached and nothing cancels at shutdown) can hold one forever.
+// The watchdog is the last-resort bound covering everything else (including a
+// wedged runtime); it must exceed the sum of all stage bounds
+// (WORKER_TASK_SHUTDOWN_TIMEOUT + drain + scanner join + db close = 20s).
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_DB_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownReason {
@@ -310,9 +333,28 @@ pub(crate) async fn run_server(
     emit_ready_event();
     info!("startup: server ready, emitted AIONCORE_READY");
 
-    axum::serve(listener, router)
+    // Last-resort bound on the whole shutdown tail (AIONUI-16): armed when the
+    // shutdown signal fires, disarmed once the tail below completes. See
+    // `bootstrap::shutdown_watchdog` for rationale.
+    let shutdown_watchdog = ShutdownWatchdog::spawn(SHUTDOWN_WATCHDOG_TIMEOUT);
+    let watchdog_for_signal = shutdown_watchdog.clone();
+    // Observes `shutdown_tx.send(true)` at the end of the graceful-shutdown
+    // callback, i.e. the moment axum's connection drain becomes the only thing
+    // between us and process exit.
+    let drain_started = shutdown_tx.subscribe();
+
+    let serve_future = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            match shutdown_signal(parent_exit).await {
+            let signal_result = shutdown_signal(parent_exit).await;
+            // From here on the process must exit in bounded time so the
+            // data-dir instance flock is released for the next backend.
+            watchdog_for_signal.arm();
+            info!(
+                stage = "shutdown.watchdog",
+                timeout_secs = SHUTDOWN_WATCHDOG_TIMEOUT.as_secs(),
+                "shutdown watchdog armed"
+            );
+            match signal_result {
                 Err(error) => {
                     error.log_source();
                     tracing::error!(error = %error.stderr_line(), "shutdown signal handler failed");
@@ -347,30 +389,62 @@ pub(crate) async fn run_server(
             }
             let _ = shutdown_tx.send(true);
         })
-        .await
-        .map_err(|error| {
-            BootstrapError::new(
-                BootstrapErrorCode::ServerFailed,
-                "server.serve",
-                "server runtime failed",
-            )
-            .with_source(error)
-        })?;
+        .into_future();
+
+    match await_serve_with_bounded_drain(serve_future, drain_started, SHUTDOWN_DRAIN_TIMEOUT).await {
+        ServeOutcome::Completed(result) => {
+            result.map_err(|error| {
+                BootstrapError::new(
+                    BootstrapErrorCode::ServerFailed,
+                    "server.serve",
+                    "server runtime failed",
+                )
+                .with_source(error)
+            })?;
+            info!(stage = "shutdown.drain", "shutdown: http connections drained");
+        }
+        ServeOutcome::DrainAbandoned => warn!(
+            code = "BOOTSTRAP_SHUTDOWN_STAGE_TIMEOUT",
+            stage = "shutdown.drain",
+            timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+            "http connection drain timed out; abandoning open connections"
+        ),
+    }
 
     let shutdown_error = shutdown_error_rx.await.ok();
 
-    // Wait for the scanner to observe the shutdown watch value and
-    // return; at worst this blocks for the current 60 s tick.
-    if let Err(e) = idle_scanner_handle.await {
-        warn!(
+    // The scanner breaks out of its select loop as soon as it observes the
+    // shutdown watch value; the bound covers an in-progress scan_and_cleanup
+    // (which awaits agent kill operations) wedging the join.
+    match tokio::time::timeout(SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT, idle_scanner_handle).await {
+        Ok(Ok(())) => info!(stage = "shutdown.idle_scanner", "shutdown: idle scanner joined"),
+        Ok(Err(e)) => warn!(
             code = "BOOTSTRAP_DEGRADED_IDLE_SCANNER",
             stage = "idle_scanner.join",
             error = %e,
             "idle scanner join failed"
-        );
+        ),
+        Err(_) => warn!(
+            code = "BOOTSTRAP_SHUTDOWN_STAGE_TIMEOUT",
+            stage = "shutdown.idle_scanner_join",
+            timeout_secs = SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT.as_secs(),
+            "idle scanner join timed out; abandoning scanner task"
+        ),
     }
 
-    services.database.close().await;
+    // `sqlx::Pool::close()` waits for all checked-out connections to be
+    // returned, which is unbounded if a detached task still holds one.
+    match tokio::time::timeout(SHUTDOWN_DB_CLOSE_TIMEOUT, services.database.close()).await {
+        Ok(()) => info!(stage = "shutdown.database_close", "shutdown: database closed"),
+        Err(_) => warn!(
+            code = "BOOTSTRAP_SHUTDOWN_STAGE_TIMEOUT",
+            stage = "shutdown.database_close",
+            timeout_secs = SHUTDOWN_DB_CLOSE_TIMEOUT.as_secs(),
+            "database close timed out; abandoning checked-out connections"
+        ),
+    }
+
+    shutdown_watchdog.disarm();
     info!("Server shut down gracefully");
 
     // Prevent the log guard from being dropped before final log flush.
@@ -391,6 +465,49 @@ fn finish_server_shutdown(shutdown_error: Option<BootstrapError>) -> Result<Exit
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Debug)]
+enum ServeOutcome {
+    /// The serve future completed on its own (drain finished, or a runtime
+    /// error surfaced).
+    Completed(std::io::Result<()>),
+    /// The graceful-shutdown callback completed but the connection drain did
+    /// not finish within the bound; the serve future was dropped so shutdown
+    /// can proceed and the process can exit.
+    DrainAbandoned,
+}
+
+/// Await the serve future, bounding the post-signal connection drain.
+///
+/// axum's `with_graceful_shutdown` waits for every connection task with no
+/// upper bound (axum-0.8.9 serve/mod.rs: `close_tx.closed().await`); a hung
+/// in-flight response would otherwise block process exit — and therefore the
+/// data-dir instance flock release — forever (AIONUI-16). Once `drain_started`
+/// observes the graceful-shutdown callback completing, the remaining drain
+/// gets `drain_timeout` before being abandoned.
+async fn await_serve_with_bounded_drain<F>(
+    serve: F,
+    mut drain_started: tokio::sync::watch::Receiver<bool>,
+    drain_timeout: Duration,
+) -> ServeOutcome
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    tokio::pin!(serve);
+
+    tokio::select! {
+        result = serve.as_mut() => return ServeOutcome::Completed(result),
+        // Resolves when the graceful-shutdown callback sends the drain marker
+        // (or drops the sender); either way the drain phase is now the only
+        // remaining work inside `serve` and must be bounded.
+        _ = drain_started.changed() => {}
+    }
+
+    match tokio::time::timeout(drain_timeout, serve.as_mut()).await {
+        Ok(result) => ServeOutcome::Completed(result),
+        Err(_) => ServeOutcome::DrainAbandoned,
+    }
 }
 
 type ShutdownFuture = Pin<Box<dyn Future<Output = Result<ShutdownReason, BootstrapError>> + Send>>;
@@ -494,6 +611,69 @@ mod tests {
 
         assert!(config.port > 0);
         assert_eq!(config.port, bound.addr.port());
+    }
+
+    #[tokio::test]
+    async fn serve_completing_without_drain_signal_returns_its_result() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+
+        let outcome = await_serve_with_bounded_drain(
+            std::future::ready(Ok::<(), std::io::Error>(())),
+            rx,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(matches!(outcome, ServeOutcome::Completed(Ok(()))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_drain_is_abandoned_after_the_bound() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tx.send(true).expect("drain marker should be delivered");
+
+        // A serve future that never completes models axum waiting forever on a
+        // connection task that will not exit (the AIONUI-16 hang).
+        let outcome = await_serve_with_bounded_drain(
+            std::future::pending::<std::io::Result<()>>(),
+            rx,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(matches!(outcome, ServeOutcome::DrainAbandoned));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_completing_within_the_bound_returns_its_result() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tx.send(true).expect("drain marker should be delivered");
+
+        let serve = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok::<(), std::io::Error>(())
+        };
+
+        let outcome = await_serve_with_bounded_drain(serve, rx, Duration::from_secs(5)).await;
+
+        assert!(matches!(outcome, ServeOutcome::Completed(Ok(()))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_marker_sender_drop_still_bounds_the_drain() {
+        // If the graceful-shutdown callback is torn down without sending the
+        // marker, the drain bound must still engage rather than wait forever.
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        drop(tx);
+
+        let outcome = await_serve_with_bounded_drain(
+            std::future::pending::<std::io::Result<()>>(),
+            rx,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(matches!(outcome, ServeOutcome::DrainAbandoned));
     }
 
     #[tokio::test]
