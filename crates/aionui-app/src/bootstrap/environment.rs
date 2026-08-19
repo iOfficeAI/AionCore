@@ -26,8 +26,10 @@ pub struct ServerEnvironment {
 /// Cheap, synchronous, no IO beyond creating the log directory.
 /// All subcommands that need logging and config should call this first.
 pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironment, BootstrapError> {
-    let log_dir = cli.log_dir.clone().unwrap_or_else(|| cli.data_dir.join("logs"));
-    let log_guard = init_tracing(&log_dir, cli.log_level.as_deref())?;
+    // A custom --log-dir that cannot be created must not permanently brick
+    // bootstrap (AIONUI-231): init_tracing falls back to the default dir.
+    let default_log_dir = cli.data_dir.join("logs");
+    let log_guard = init_tracing(cli.log_dir.as_deref(), &default_log_dir, cli.log_level.as_deref())?;
 
     info!(
         path_segments = merged_path.split(if cfg!(windows) { ';' } else { ':' }).count(),
