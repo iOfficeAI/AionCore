@@ -37,6 +37,7 @@ impl SettingsService {
                 cron_notification_enabled: s.cron_notification_enabled,
                 command_queue_enabled: s.command_queue_enabled,
                 save_upload_to_workspace: s.save_upload_to_workspace,
+                cross_session_message_enabled: s.cross_session_message_enabled,
             }),
         )
     }
@@ -61,6 +62,9 @@ impl SettingsService {
             .unwrap_or(current.cron_notification_enabled);
         let command_queue_enabled = req.command_queue_enabled.unwrap_or(current.command_queue_enabled);
         let save_upload_to_workspace = req.save_upload_to_workspace.unwrap_or(current.save_upload_to_workspace);
+        let cross_session_message_enabled = req
+            .cross_session_message_enabled
+            .unwrap_or(current.cross_session_message_enabled);
 
         let row = self
             .repo
@@ -71,6 +75,7 @@ impl SettingsService {
                 cron_notification_enabled,
                 command_queue_enabled,
                 save_upload_to_workspace,
+                cross_session_message_enabled,
             )
             .await
             .map_err(|e| SystemError::Internal(format!("Failed to update settings: {e}")))?;
@@ -81,6 +86,7 @@ impl SettingsService {
             cron_notification_enabled: row.cron_notification_enabled,
             command_queue_enabled: row.command_queue_enabled,
             save_upload_to_workspace: row.save_upload_to_workspace,
+            cross_session_message_enabled: row.cross_session_message_enabled,
         })
     }
 }
@@ -204,5 +210,73 @@ mod tests {
         let settings = svc.get_settings(TEST_USER_ID).await.unwrap();
         assert_eq!(settings.language, "ja-JP");
         assert!(settings.save_upload_to_workspace);
+    }
+
+    // ── Cross-session messaging master switch (spec §6.9.2) ─────────
+
+    #[tokio::test]
+    async fn cross_session_messaging_defaults_to_enabled() {
+        // Positive wording, default on (spec §5.7). A user who never touched
+        // the setting must have the feature available.
+        let svc = setup().await;
+        let settings = svc.get_settings(TEST_USER_ID).await.unwrap();
+        assert!(settings.cross_session_message_enabled);
+    }
+
+    #[tokio::test]
+    async fn cross_session_messaging_can_be_turned_off_and_survives_a_reread() {
+        // The panic button must not quietly come back — spec §11 requires the
+        // state to persist. A re-read through a fresh get is the persistence
+        // assertion at this layer.
+        let svc = setup().await;
+        svc.update_settings(
+            TEST_USER_ID,
+            UpdateSettingsRequest {
+                cross_session_message_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let settings = svc.get_settings(TEST_USER_ID).await.unwrap();
+        assert!(!settings.cross_session_message_enabled);
+    }
+
+    #[tokio::test]
+    async fn updating_an_unrelated_setting_does_not_reset_the_cross_session_toggle() {
+        let svc = setup().await;
+        svc.update_settings(
+            TEST_USER_ID,
+            UpdateSettingsRequest {
+                cross_session_message_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        svc.update_settings(
+            TEST_USER_ID,
+            UpdateSettingsRequest {
+                language: Some("zh-CN".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let settings = svc.get_settings(TEST_USER_ID).await.unwrap();
+        assert!(!settings.cross_session_message_enabled, "merge must preserve it");
+    }
+
+    #[tokio::test]
+    async fn turning_the_cross_session_toggle_off_is_not_an_empty_update() {
+        // `is_empty()` short-circuits no-op PATCHes, so forgetting the new
+        // field there would make the panic button silently do nothing.
+        let request = UpdateSettingsRequest {
+            cross_session_message_enabled: Some(false),
+            ..Default::default()
+        };
+        assert!(!request.is_empty());
     }
 }
