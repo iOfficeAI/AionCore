@@ -7,11 +7,28 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{Row, SqlitePool};
 
 async fn create_raw_legacy_backend_missing_team_session_mode(path: &Path, user_id: &str) {
+    create_raw_legacy_backend(path, user_id, true).await;
+}
+
+/// Legacy database whose `messages` table predates AionUi JS-side v22, i.e. it
+/// has no `hidden` column at all (AIONUI-230). Migration 002 Part D.1 selects
+/// `hidden` from the old table, which fails at SQL prepare time unless the
+/// legacy handoff repair adds the column first.
+async fn create_raw_legacy_backend_missing_message_hidden(path: &Path, user_id: &str) {
+    create_raw_legacy_backend(path, user_id, false).await;
+}
+
+async fn create_raw_legacy_backend(path: &Path, user_id: &str, messages_have_hidden: bool) {
     let pool = open_raw_create(path).await;
+    let messages_ddl = if messages_have_hidden {
+        "CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, msg_id TEXT, type TEXT NOT NULL, content TEXT NOT NULL DEFAULT '{}', position TEXT, status TEXT, hidden INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)"
+    } else {
+        "CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, msg_id TEXT, type TEXT NOT NULL, content TEXT NOT NULL DEFAULT '{}', position TEXT, status TEXT, created_at INTEGER NOT NULL)"
+    };
     let statements = [
         "CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, username TEXT NOT NULL UNIQUE, email TEXT UNIQUE, password_hash TEXT NOT NULL, avatar_path TEXT, jwt_secret TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_login INTEGER)",
         "CREATE TABLE conversations (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, type TEXT NOT NULL, extra TEXT NOT NULL DEFAULT '{}', model TEXT, status TEXT NOT NULL DEFAULT 'pending', source TEXT, channel_chat_id TEXT, pinned INTEGER NOT NULL DEFAULT 0, pinned_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
-        "CREATE TABLE messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, msg_id TEXT, type TEXT NOT NULL, content TEXT NOT NULL DEFAULT '{}', position TEXT, status TEXT, hidden INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)",
+        messages_ddl,
         "CREATE TABLE assistant_sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, agent_type TEXT NOT NULL, conversation_id TEXT, workspace TEXT, chat_id TEXT, created_at INTEGER NOT NULL, last_activity INTEGER NOT NULL)",
         "CREATE TABLE teams (id TEXT PRIMARY KEY NOT NULL, user_id TEXT NOT NULL DEFAULT 'system_default_user', name TEXT NOT NULL, workspace TEXT NOT NULL DEFAULT '', workspace_mode TEXT NOT NULL DEFAULT 'shared', agents TEXT NOT NULL DEFAULT '[]', lead_agent_id TEXT, agents_version TEXT NOT NULL DEFAULT '1.0.0', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
         "CREATE TABLE mailbox (id TEXT PRIMARY KEY NOT NULL, team_id TEXT NOT NULL, to_agent_id TEXT NOT NULL, from_agent_id TEXT NOT NULL, type TEXT NOT NULL, content TEXT NOT NULL, summary TEXT, files TEXT, read INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)",
@@ -78,6 +95,49 @@ async fn advanced_legacy_db_missing_team_session_mode_still_initializes() {
         .unwrap();
     assert_eq!(row.get::<String, _>("name"), "Legacy Team");
     assert!(row.get::<Option<String>, _>("session_mode").is_none());
+    repaired.close().await;
+}
+
+#[tokio::test]
+async fn legacy_db_missing_message_hidden_column_still_initializes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aionui-backend.db");
+
+    create_raw_legacy_backend_missing_message_hidden(&path, "system_default_user").await;
+
+    // Seed rows so migration 002's rebuild actually copies data through the
+    // repaired `hidden` column instead of running against empty tables.
+    let raw = open_raw_create(&path).await;
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) VALUES ('conv_1', 'system_default_user', 'Legacy Conversation', 'gemini', 1, 1)",
+    )
+    .execute(&raw)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO messages (id, conversation_id, type, content, created_at) VALUES ('msg_1', 'conv_1', 'text', '{}', 1), ('msg_2', 'conv_1', 'text', '{}', 2)",
+    )
+    .execute(&raw)
+    .await
+    .unwrap();
+    raw.close().await;
+
+    let repaired = init_database_staged(&path).await.unwrap();
+    assert!(has_column(repaired.pool(), "messages", "hidden").await);
+
+    let rows = sqlx::query("SELECT id, hidden FROM messages ORDER BY id")
+        .fetch_all(repaired.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "legacy messages must survive the migration 002 rebuild");
+    for row in rows {
+        assert_eq!(
+            row.get::<i64, _>("hidden"),
+            0,
+            "repaired hidden column must default to 0 for message {}",
+            row.get::<String, _>("id")
+        );
+    }
     repaired.close().await;
 }
 
