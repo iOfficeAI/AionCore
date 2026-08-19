@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.79](https://github.com/suoak/AionCore/compare/v0.1.78...v0.1.79) (2026-08-19)
+
+### Features
+
+* **conversation:** recover durable input queues after restart and apply native aionrs injection
+* **conversation:** report typed input and cancellation lifecycle states
+
+### Bug Fixes
+
+* **agent:** preserve terminal usage and completion state across runtime paths
+
 ## [0.1.78](https://github.com/suoak/AionCore/compare/v0.1.77...v0.1.78) (2026-08-18)
 
 ### Features
