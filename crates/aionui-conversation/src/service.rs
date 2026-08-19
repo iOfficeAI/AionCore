@@ -30,7 +30,8 @@ use aionui_api_types::{
 use aionui_api_types::{ChatFileRef, SessionRef};
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    PaginatedResult, WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
+    OnConversationTurnCancelled, PaginatedResult, WorkspacePathValidationError, generate_short_id, now_ms,
+    validate_workspace_path_availability,
 };
 use aionui_db::models::{
     AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
@@ -320,6 +321,10 @@ pub struct ConversationService {
     /// per-conversation state. Wrapped in `Arc<RwLock<…>>` so registration
     /// can happen post-construction without breaking the `Clone` impl.
     delete_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationDelete>>>>,
+    /// Hooks invoked when `cancel()` actually cancelled a turn, so upper-layer
+    /// services can drop work aimed at this conversation. See
+    /// `OnConversationTurnCancelled` for why only some branches fire.
+    turn_cancelled_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationTurnCancelled>>>>,
     mcp_server_repo: Arc<RwLock<Option<Arc<dyn IMcpServerRepository>>>>,
     assistant_definition_repo: Arc<RwLock<Option<Arc<dyn IAssistantDefinitionRepository>>>>,
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
@@ -404,6 +409,7 @@ impl ConversationService {
             skill_resolver,
             task_manager,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
+            turn_cancelled_hooks: Arc::new(RwLock::new(Vec::new())),
             mcp_server_repo: Arc::new(RwLock::new(None)),
             assistant_definition_repo: Arc::new(RwLock::new(None)),
             assistant_state_repo: Arc::new(RwLock::new(None)),
@@ -622,6 +628,27 @@ impl ConversationService {
     pub fn with_delete_hook(&self, hook: Arc<dyn OnConversationDelete>) {
         if let Ok(mut guard) = self.delete_hooks.write() {
             guard.push(hook);
+        }
+    }
+
+    /// Register a hook notified when `cancel()` cancelled a turn.
+    pub fn with_turn_cancelled_hook(&self, hook: Arc<dyn OnConversationTurnCancelled>) {
+        if let Ok(mut guard) = self.turn_cancelled_hooks.write() {
+            guard.push(hook);
+        }
+    }
+
+    /// Snapshot the hook list, then drop the guard before awaiting:
+    /// `RwLockReadGuard` is not `Send`, so holding it across `.await` would
+    /// make the caller's future non-`Send`. Same pattern as `delete()`.
+    async fn notify_turn_cancelled(&self, user_id: &str, conversation_id: &str, turn_id: &str) {
+        let hooks: Vec<Arc<dyn OnConversationTurnCancelled>> = self
+            .turn_cancelled_hooks
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        for hook in hooks {
+            hook.on_turn_cancelled(user_id, conversation_id, turn_id).await;
         }
     }
 
@@ -4306,6 +4333,11 @@ impl ConversationService {
                 conversation_id,
                 turn_id, "Cancel arrived before the agent registered; deferring it to the build"
             );
+            // A deferred cancel IS a real cancel intent — the orchestrator
+            // applies it as soon as the task appears — so pending deliveries
+            // aimed here must go now, not after the turn we are cancelling
+            // finally starts.
+            self.notify_turn_cancelled(user_id, conversation_id, turn_id).await;
             return Ok(CancelConversationResponse {
                 runtime: self.runtime_summary_for(conversation_id).await,
             });
@@ -4347,6 +4379,7 @@ impl ConversationService {
         }
 
         info!(conversation_id, turn_id, "Stream cancel acknowledged");
+        self.notify_turn_cancelled(user_id, conversation_id, turn_id).await;
         Ok(CancelConversationResponse {
             runtime: self.runtime_summary_for(conversation_id).await,
         })
