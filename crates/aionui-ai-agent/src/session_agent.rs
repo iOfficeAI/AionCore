@@ -2846,6 +2846,7 @@ fn spawn_event_pump(
                     input: None,
                     output: Some(acc.clone()),
                     description: None,
+                    parent_call_id: None,
                 }));
                 continue;
             }
@@ -3054,6 +3055,7 @@ fn spawn_event_pump(
                                     input: None,
                                     output: None,
                                     description: None,
+                                    parent_call_id: None,
                                 }));
                             }
                             tool_output.clear();
@@ -3186,6 +3188,7 @@ fn spawn_event_pump(
                             input: None,
                             output: None,
                             description: None,
+                            parent_call_id: None,
                         }));
                     }
                     for (call_id, name) in kept_open {
@@ -3814,11 +3817,19 @@ fn update_workflow_cards(
                         .and_then(|v| v.as_str())
                         .or_else(|| args.get("command").and_then(|v| v.as_str()))
                         .map(str::to_string);
-                    let mut card = WorkflowCard::new_background(call_id.clone(), name, args, r#ref, desc, now_ms);
+                    // A Task subagent (`local_agent`) gets the "subagent" headline;
+                    // everything else (`local_bash`, unknown) stays "bg task".
+                    let is_agent = matches!(kind, Some(SubagentTaskKind::AgentContainer));
+                    let mut card = if is_agent {
+                        WorkflowCard::new_subagent(call_id.clone(), name, args, r#ref, desc, now_ms)
+                    } else {
+                        WorkflowCard::new_background(call_id.clone(), name, args, r#ref, desc, now_ms)
+                    };
                     tracing::info!(
                         conv_id = %conversation_id,
                         task_id = %r#ref,
                         %call_id,
+                        subagent = is_agent,
                         "session-pump: background task card opened"
                     );
                     // No roster will ever arrive to trigger a first emission, so
@@ -3871,6 +3882,7 @@ fn update_workflow_cards(
                                 input: None,
                                 output: None,
                                 description: None,
+                                parent_call_id: None,
                             },
                             agents: Vec::new(),
                             settle_only: true,
@@ -4140,6 +4152,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             tool_use_id,
             name,
             input,
+            parent_tool_use_id,
             ..
         } => {
             vec![AgentStreamEvent::ToolCall(ToolCallEventData {
@@ -4150,12 +4163,16 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 input: Some(input),
                 output: None,
                 description: None,
+                // Subagent attribution (009 H5): persisted onto the row so the
+                // frontend can group a subagent's steps under its Task call.
+                parent_call_id: parent_tool_use_id,
             })]
         }
         SessionEvent::ToolResult {
             tool_use_id,
             is_error,
             content,
+            parent_tool_use_id,
             ..
         } => {
             let output = tool_result_text(&content);
@@ -4171,6 +4188,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 input: None,
                 output,
                 description: None,
+                parent_call_id: parent_tool_use_id,
             })]
         }
         SessionEvent::TurnResult {
@@ -5350,6 +5368,7 @@ mod translate_tests {
             input: None,
             output: None,
             description: None,
+            parent_call_id: None,
         })
     }
 
@@ -8086,6 +8105,85 @@ mod pump_tests {
         assert!(
             settle > finish,
             "the card settles AFTER the turn's Finish — it survived the turn end"
+        );
+    }
+
+    /// A Task subagent (`task_type: local_agent`, kind `AgentContainer`) rides
+    /// the same card machinery as a background bash but must be LABELLED as a
+    /// subagent — with both saying "bg task" the step list could not tell
+    /// delegated agent work from a background shell (live 2026-08-19). Its
+    /// internal tool calls also carry the launching call's id so the frontend
+    /// can group them under the Task row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_subagent_card_is_labelled_subagent_and_children_carry_parent() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let script = vec![
+            // Shape mirrors claude_2.1.169_single_tool_turn.ndjson: Agent
+            // tool_use → task_started{local_agent} → the subagent's own tool_use
+            // frame carrying parent_tool_use_id.
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_task".into(),
+                name: "修复 AIONUI-151 桌面 401 恢复".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({
+                    "description": "修复 AIONUI-151 桌面 401 恢复",
+                    "subagent_type": "claude",
+                    "run_in_background": false
+                }),
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "ae859b22dc5afbdca".into(),
+                label: Some("claude".into()),
+                status: SubagentStatus::Running,
+                parent_ref: Some("toolu_task".into()),
+                kind: Some(SubagentTaskKind::AgentContainer),
+            }),
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_inner".into(),
+                name: "Read httpBridge.ts".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({"file_path": "/tmp/httpBridge.ts"}),
+                parent_tool_use_id: Some("toolu_task".into()),
+            }),
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "ae859b22dc5afbdca".into(),
+                label: None,
+                status: SubagentStatus::Completed,
+                parent_ref: Some("toolu_task".into()),
+                kind: None,
+            }),
+        ];
+        let frames = drain_script(script).await;
+
+        let progress = wf_frames(&frames);
+        assert!(!progress.is_empty(), "the subagent card must emit on open");
+        let desc = progress[0].card.description.as_deref().unwrap_or_default();
+        assert!(
+            desc.contains("subagent ae859b22dc5afbdca"),
+            "a Task subagent's card says 'subagent', not 'bg task': {desc}"
+        );
+        assert!(!desc.contains("bg task"), "not a bg task: {desc}");
+
+        // Attribution: the subagent's INTERNAL call carries the Task call's id;
+        // the Task launch itself (a main-agent call) carries none.
+        let parent_of = |id: &str| {
+            frames.iter().find_map(|f| match f {
+                AgentStreamEvent::ToolCall(d) if d.call_id == id && d.status == ToolCallStatus::Running => {
+                    Some(d.parent_call_id.clone())
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(
+            parent_of("toolu_inner"),
+            Some(Some("toolu_task".into())),
+            "a subagent-internal call must carry its Task call's id"
+        );
+        assert_eq!(
+            parent_of("toolu_task"),
+            Some(None),
+            "the main-agent launching call carries no parent"
         );
     }
 

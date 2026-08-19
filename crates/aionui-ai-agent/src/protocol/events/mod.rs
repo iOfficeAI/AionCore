@@ -315,6 +315,7 @@ mod tests {
             input: None,
             output: None,
             description: None,
+            parent_call_id: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "tool_call");
@@ -332,12 +333,14 @@ mod tests {
             input: Some(json!({ "pattern": "**/*.rs" })),
             output: Some("src/main.rs\nsrc/lib.rs".into()),
             description: Some("Search for Rust files".into()),
+            parent_call_id: Some("toolu_task".into()),
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "tool_call");
         assert_eq!(json["data"]["input"]["pattern"], "**/*.rs");
         assert_eq!(json["data"]["output"], "src/main.rs\nsrc/lib.rs");
         assert_eq!(json["data"]["description"], "Search for Rust files");
+        assert_eq!(json["data"]["parent_call_id"], "toolu_task");
     }
 
     #[test]
@@ -350,11 +353,15 @@ mod tests {
             input: None,
             output: None,
             description: None,
+            parent_call_id: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert!(json["data"].get("input").is_none());
         assert!(json["data"].get("output").is_none());
         assert!(json["data"].get("description").is_none());
+        // Absent, not null: a null would DELETE stored attribution under the
+        // DB's merge-patch upsert.
+        assert!(json["data"].get("parent_call_id").is_none());
     }
 
     #[test]
