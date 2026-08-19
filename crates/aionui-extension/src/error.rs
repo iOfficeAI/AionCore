@@ -71,6 +71,14 @@ pub enum ExtensionError {
     #[error("Cannot delete built-in skill: {0}")]
     BuiltinSkillDeletion(String),
 
+    /// The startup builtin-skills materialization lock was still held by
+    /// another process when the acquisition budget ran out. Distinct from a
+    /// plain IO failure so the caller (and the operator reading the boundary
+    /// line on stderr) can tell "a peer is materializing" apart from "the
+    /// filesystem rejected us".
+    #[error("Timed out after {waited_ms}ms waiting for the builtin skills materialize lock at {lock_path}")]
+    BuiltinSkillsLockTimeout { lock_path: String, waited_ms: u64 },
+
     #[error("Skill not found: {0}")]
     SkillNotFound(String),
 
