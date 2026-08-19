@@ -3,7 +3,7 @@
 //! Parses one inner frame, routes by `method`, and drives the runtime:
 //! `initialize` handshakes; `fs/subscribe`/`fs/unsubscribe` go through the shard
 //! (identity resolved via [`ProjectService::resolve_reference`]); the file
-//! commands (`fs/mkdir|remove|rename`) resolve + realpath-guard, then
+//! commands (`fs/mkdir|createFile|remove|rename`) resolve + realpath-guard, then
 //! hit the provider directly. Responses/notifications go out via the actor's
 //! push port. Errors map to protocol codes ([`wire`]) with `pe_id`/`relative_path`
 //! context in `error.data`.
@@ -21,8 +21,8 @@ use crate::types::{FileOp, ReferenceInput, ResolvedResource};
 use super::actor::FsMonitorActor;
 use super::search::{self, ActiveSearch, SearchRoot};
 use super::wire::{
-    self, InitializeParams, MkdirParams, RemoveParams, RenameParams, ResourceRef, SearchCancelParams, SearchParams,
-    SubscribeParams, TransferParams, UnsubscribeParams,
+    self, CreateFileParams, InitializeParams, MkdirParams, RemoveParams, RenameParams, ResourceRef, SearchCancelParams,
+    SearchParams, SubscribeParams, TransferParams, UnsubscribeParams,
 };
 
 /// Whether a transfer keeps the source (`Copy`) or removes it after it lands
@@ -57,6 +57,7 @@ impl FsMonitorActor {
             "fs/subscribe" => self.handle_subscribe(session, user_id, id, params).await,
             "fs/unsubscribe" => self.handle_unsubscribe(session, user_id, params).await,
             "fs/mkdir" => self.handle_mkdir(session, user_id, id, params).await,
+            "fs/createFile" => self.handle_create_file(session, user_id, id, params).await,
             "fs/remove" => self.handle_remove(session, user_id, id, params).await,
             "fs/rename" => self.handle_rename(session, user_id, id, params).await,
             "fs/copy" => self.handle_transfer(session, user_id, id, params, Transfer::Copy).await,
@@ -223,6 +224,26 @@ impl FsMonitorActor {
         };
         let outcome = self.runtime().provider().mkdir(&resolved.resource_uri).await;
         self.reply_unit(session, id, "mkdir", &p.dir, outcome);
+    }
+
+    /// `fs/createFile`: create an empty file at `file`. Mirrors [`Self::handle_mkdir`]
+    /// — same resolve + realpath guard, then the provider's `create_new` open, which
+    /// fails `AlreadyExists` rather than truncating an existing file. Neither this nor
+    /// `mkdir` creates missing parent directories; the client creates ancestors first.
+    async fn handle_create_file(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {
+        let Ok(p) = serde_json::from_value::<CreateFileParams>(params) else {
+            self.push(session, invalid_params(id));
+            return;
+        };
+        let resolved = match self.resolve_guarded(user_id, &p.file, FileOp::Write).await {
+            Ok(r) => r,
+            Err((code, message)) => {
+                self.push(session, wire::error(id, code, message, ref_data(&p.file)));
+                return;
+            }
+        };
+        let outcome = self.runtime().provider().create_file(&resolved.resource_uri).await;
+        self.reply_unit(session, id, "createFile", &p.file, outcome);
     }
 
     async fn handle_remove(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {

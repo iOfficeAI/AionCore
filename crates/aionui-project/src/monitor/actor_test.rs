@@ -246,6 +246,23 @@ async fn mkdir_then_remove_roundtrip() {
 }
 
 #[tokio::test]
+async fn create_file_makes_empty_file() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(10, "fs/createFile", json!({"file":dir_ref(&pe, "new.ts")})),
+        )
+        .await;
+    assert!(push.last_for("1").unwrap()["result"].is_object());
+    let path = dir.path().join("new.ts");
+    assert!(path.is_file());
+    // create_new opens without truncating existing content, but a fresh file is empty.
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn rename_moves_entry() {
     let (mut actor, _rx, push, pe, dir, _db) = setup().await;
     std::fs::write(dir.path().join("old.txt"), b"x").unwrap();
@@ -518,6 +535,27 @@ async fn mkdir_existing_dir_is_provider_unavailable() {
     assert_eq!(reply["error"]["code"], -32006);
     assert_eq!(reply["error"]["message"], "provider_unavailable");
     assert_eq!(reply["error"]["data"]["relative_path"], "sub");
+}
+
+#[tokio::test]
+async fn create_file_existing_is_provider_unavailable() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("keep.txt"), b"original").unwrap();
+
+    // createFile over an existing file → AlreadyExists → provider_unavailable
+    // (-32006), and it must NOT truncate the existing content.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(30, "fs/createFile", json!({"file":dir_ref(&pe, "keep.txt")})),
+        )
+        .await;
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["error"]["code"], -32006);
+    assert_eq!(reply["error"]["message"], "provider_unavailable");
+    assert_eq!(reply["error"]["data"]["relative_path"], "keep.txt");
+    assert_eq!(std::fs::read(dir.path().join("keep.txt")).unwrap(), b"original");
 }
 
 #[tokio::test]

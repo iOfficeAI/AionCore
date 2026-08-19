@@ -81,6 +81,11 @@ pub struct MkdirParams {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct CreateFileParams {
+    pub file: ResourceRef,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct RemoveParams {
     pub target: ResourceRef,
     #[serde(default)]
