@@ -142,8 +142,17 @@ impl FsMonitorActor {
         }
 
         // Phase 2: subscribe each; the subscribe reply carries every snapshot.
+        // Unlike phase 1 this is NOT atomic, on purpose: mounting arms an OS
+        // watch, so one target can fail for reasons that say nothing about the
+        // others (watch-descriptor limit exhausted on a large tree, a directory
+        // removed between resolve and mount). Failing the whole batch there left
+        // the client with an entirely blank explorer (AIONUI-236). Skip the
+        // failed target, keep every snapshot that did mount, and fall back to the
+        // error reply only when nothing mounted at all.
         let now = self.now();
         let mut snapshots: Vec<Value> = Vec::new();
+        let mut failed: usize = 0;
+        let mut first_failure: Option<(i64, &'static str, Value)> = None;
         for (target, canonical) in plan {
             let sub = Subscriber {
                 session: session.to_owned(),
@@ -159,18 +168,38 @@ impl FsMonitorActor {
                     }
                 }
                 Err(err) => {
+                    failed += 1;
                     let (code, message) = wire::fs_error_to_rpc(&err);
-                    tracing::warn!(session, code = message, pe_id = %target.pe_id, "fs subscribe rejected");
-                    self.push(session, wire::error(id.clone(), code, message, ref_data(&target)));
-                    return;
+                    // Degraded target — safely handled, but an operator needs the
+                    // cause: `code` is the stable protocol name the wire carries,
+                    // `reason` the provider/watcher detail that name hides.
+                    tracing::warn!(
+                        session,
+                        code = message,
+                        pe_id = %target.pe_id,
+                        rel = %target.relative_path,
+                        reason = wire::fs_error_detail(&err),
+                        "fs subscribe: target mount failed"
+                    );
+                    first_failure.get_or_insert_with(|| (code, message, ref_data(&target)));
                 }
             }
         }
+        // Nothing mounted → keep the request-level error (the first failure, as
+        // before) instead of replying with a silently empty batch.
+        if snapshots.is_empty()
+            && let Some((code, message, data)) = first_failure
+        {
+            self.push(session, wire::error(id, code, message, data));
+            return;
+        }
         // Subscription registration succeeded — lifecycle boundary (low volume).
+        // `failed` > 0 marks a degraded reply: some targets are not watched.
         tracing::info!(
             session,
             targets = target_count,
             snapshots = snapshots.len(),
+            failed,
             "fs subscribe"
         );
         self.push(session, wire::success(id, json!({ "snapshots": snapshots })));

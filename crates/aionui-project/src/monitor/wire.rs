@@ -355,6 +355,27 @@ pub fn fs_error_to_rpc(err: &FsError) -> (i64, &'static str) {
     }
 }
 
+/// The underlying provider failure detail behind an [`FsError`], for logs only.
+///
+/// [`fs_error_to_rpc`] deliberately collapses several variants onto one stable
+/// protocol name (`provider_unavailable`), which drops the real cause — notably
+/// the `notify` message behind [`FsError::Io`] (e.g. an exhausted inotify watch
+/// limit). Logging this next to the protocol code keeps the wire contract
+/// unchanged while making the failure diagnosable. The absolute `uri` is
+/// intentionally left out: callers log the pe-relative identity instead.
+pub fn fs_error_detail(err: &FsError) -> &str {
+    match err {
+        FsError::Io { message, .. } => message,
+        FsError::UnsupportedScheme { scheme } => scheme,
+        // The remaining variants carry nothing beyond their protocol code and
+        // the uri, so the static text is the whole detail.
+        FsError::NotFound { .. } => "resource not found",
+        FsError::AlreadyExists { .. } => "resource already exists",
+        FsError::PermissionDenied { .. } => "permission denied",
+        FsError::NotADirectory { .. } => "not a directory",
+    }
+}
+
 #[cfg(test)]
 #[path = "wire_test.rs"]
 mod wire_test;

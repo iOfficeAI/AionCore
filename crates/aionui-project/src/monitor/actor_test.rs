@@ -222,6 +222,80 @@ async fn subscribe_parent_escape_is_invalid_relative_path() {
     assert_eq!(reply["error"]["message"], "invalid_relative_path");
 }
 
+/// A target that resolves (phase 1) but cannot mount (phase 2) must not take the
+/// whole batch down. Mount = arm watch + read the baseline listing, so it can
+/// fail per-target for reasons that say nothing about the siblings — on a large
+/// tree, an exhausted OS watch-descriptor limit (AIONUI-236). A regular file
+/// stands in for that here: it passes lexical resolution, then fails the mount.
+#[tokio::test]
+async fn subscribe_keeps_mounted_targets_when_one_target_fails() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src").join("main.ts"), b"x").unwrap();
+    // Resolves fine, but is not a directory → mount fails for this target only.
+    std::fs::write(dir.path().join("notadir"), b"x").unwrap();
+
+    // Failing target first, so a leading failure cannot short-circuit the batch.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                4,
+                "fs/subscribe",
+                json!({"targets":[dir_ref(&pe, "notadir"), dir_ref(&pe, ""), dir_ref(&pe, "src")]}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert!(
+        reply.get("error").is_none(),
+        "a partially mountable batch must not fail the request: {reply}"
+    );
+    let snaps = reply["result"]["snapshots"].as_array().unwrap();
+    assert_eq!(snaps.len(), 2, "both mountable targets keep their snapshot: {reply}");
+    assert_eq!(snaps[0]["target"], dir_ref(&pe, ""));
+    assert_eq!(snaps[1]["target"], dir_ref(&pe, "src"));
+    let src_names: Vec<&str> = snaps[1]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(src_names, vec!["main.ts"]);
+}
+
+/// The degrade is only for partial success: when nothing mounts, the request
+/// still fails with the first target's error rather than replying with a
+/// silently empty snapshot list.
+#[tokio::test]
+async fn subscribe_all_targets_failing_to_mount_still_errors() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+    std::fs::write(dir.path().join("b.txt"), b"x").unwrap();
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                5,
+                "fs/subscribe",
+                json!({"targets":[dir_ref(&pe, "a.txt"), dir_ref(&pe, "b.txt")]}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert!(reply.get("result").is_none(), "no snapshots mounted: {reply}");
+    assert_eq!(reply["error"]["code"], -32006);
+    assert_eq!(reply["error"]["message"], "provider_unavailable");
+    // The first failure identifies the batch, as it did before the degrade.
+    assert_eq!(reply["error"]["data"]["pe_id"], pe);
+    assert_eq!(reply["error"]["data"]["relative_path"], "a.txt");
+}
+
 #[tokio::test]
 async fn mkdir_then_remove_roundtrip() {
     let (mut actor, _rx, push, pe, dir, _db) = setup().await;
