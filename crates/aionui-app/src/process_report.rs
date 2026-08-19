@@ -11,12 +11,20 @@ pub(crate) enum ExitKind {
 }
 
 impl ExitKind {
-    pub(crate) fn exit_code(self) -> ExitCode {
+    /// Numeric exit code for this kind. The single source of truth for the
+    /// process-exit contract; `const` so exit paths that bypass `ExitCode`
+    /// (e.g. the shutdown watchdog's `std::process::exit`) reuse the same
+    /// table instead of hardcoding a copy.
+    pub(crate) const fn raw_code(self) -> u8 {
         match self {
-            Self::Internal => ExitCode::from(1),
-            Self::Config => ExitCode::from(2),
-            Self::Unavailable => ExitCode::from(3),
+            Self::Internal => 1,
+            Self::Config => 2,
+            Self::Unavailable => 3,
         }
+    }
+
+    pub(crate) fn exit_code(self) -> ExitCode {
+        ExitCode::from(self.raw_code())
     }
 }
 
@@ -59,6 +67,11 @@ mod tests {
         assert_eq!(ExitKind::Internal.exit_code(), ExitCode::from(1));
         assert_eq!(ExitKind::Config.exit_code(), ExitCode::from(2));
         assert_eq!(ExitKind::Unavailable.exit_code(), ExitCode::from(3));
+        // raw_code is the same table exposed as a number; the values are an
+        // external supervisor contract and must not drift.
+        assert_eq!(ExitKind::Internal.raw_code(), 1);
+        assert_eq!(ExitKind::Config.raw_code(), 2);
+        assert_eq!(ExitKind::Unavailable.raw_code(), 3);
     }
 
     #[test]

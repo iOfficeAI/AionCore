@@ -42,13 +42,28 @@ const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 // - `sqlx::Pool::close()` waits for all checked-out connections to be
 //   returned; detached tasks (e.g. WebSocket handlers, which axum spawns
 //   detached and nothing cancels at shutdown) can hold one forever.
-// The watchdog is the last-resort bound covering everything else (including a
-// wedged runtime); it must exceed the sum of all stage bounds
-// (WORKER_TASK_SHUTDOWN_TIMEOUT + drain + scanner join + db close = 20s).
+// The watchdog is the last-resort bound for everything after it is armed,
+// including a runtime that wedges mid-tail. (It cannot cover a runtime that
+// wedges before the shutdown signal is observed — arming itself runs inside
+// the runtime; see `bootstrap::shutdown_watchdog`.)
+const SHUTDOWN_KEEP_AWAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_DB_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
+
+// The watchdog must outlast the sum of every bounded stage, otherwise it can
+// force-exit a shutdown that is still making progress within its per-stage
+// bounds. Checked by the compiler so a bumped stage bound cannot silently
+// invalidate it.
+const _: () = assert!(
+    SHUTDOWN_WATCHDOG_TIMEOUT.as_secs()
+        > WORKER_TASK_SHUTDOWN_TIMEOUT.as_secs()
+            + SHUTDOWN_KEEP_AWAKE_TIMEOUT.as_secs()
+            + SHUTDOWN_DRAIN_TIMEOUT.as_secs()
+            + SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT.as_secs()
+            + SHUTDOWN_DB_CLOSE_TIMEOUT.as_secs()
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownReason {
@@ -348,12 +363,21 @@ pub(crate) async fn run_server(
             let signal_result = shutdown_signal(parent_exit).await;
             // From here on the process must exit in bounded time so the
             // data-dir instance flock is released for the next backend.
-            watchdog_for_signal.arm();
-            info!(
-                stage = "shutdown.watchdog",
-                timeout_secs = SHUTDOWN_WATCHDOG_TIMEOUT.as_secs(),
-                "shutdown watchdog armed"
-            );
+            if watchdog_for_signal.arm() {
+                info!(
+                    stage = "shutdown.watchdog",
+                    timeout_secs = SHUTDOWN_WATCHDOG_TIMEOUT.as_secs(),
+                    "shutdown watchdog armed"
+                );
+            } else {
+                // Watchdog thread never spawned (logged at spawn time): the
+                // tail still has its per-stage bounds but no last-resort exit.
+                warn!(
+                    code = "BOOTSTRAP_DEGRADED_SHUTDOWN_WATCHDOG",
+                    stage = "shutdown.watchdog",
+                    "shutdown watchdog unavailable; shutdown tail has stage bounds only"
+                );
+            }
             match signal_result {
                 Err(error) => {
                     error.log_source();
@@ -374,18 +398,41 @@ pub(crate) async fn run_server(
                     );
                     let active_task_count = worker_task_manager.active_count();
                     match tokio::time::timeout(WORKER_TASK_SHUTDOWN_TIMEOUT, worker_task_manager.clear()).await {
-                        Ok(()) => info!(active_task_count, "worker task manager shutdown completed"),
-                        Err(_) => warn!(active_task_count, "worker task manager shutdown timed out"),
+                        Ok(()) => info!(
+                            stage = "shutdown.worker_tasks",
+                            active_task_count, "worker task manager shutdown completed"
+                        ),
+                        Err(_) => warn!(
+                            code = "BOOTSTRAP_SHUTDOWN_STAGE_TIMEOUT",
+                            stage = "shutdown.worker_tasks",
+                            timeout_secs = WORKER_TASK_SHUTDOWN_TIMEOUT.as_secs(),
+                            active_task_count,
+                            "worker task manager shutdown timed out"
+                        ),
                     }
                 }
             }
-            if let Err(error) = client_pref_service.release_keep_awake_for_shutdown().await {
-                warn!(
+            // Bounded: this await sits before the drain marker below, so if it
+            // wedged unbounded no stage bound could ever start and the only
+            // escape would be the watchdog force-exit.
+            match tokio::time::timeout(
+                SHUTDOWN_KEEP_AWAKE_TIMEOUT,
+                client_pref_service.release_keep_awake_for_shutdown(),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(
                     code = "BOOTSTRAP_DEGRADED_KEEP_AWAKE_RELEASE",
                     stage = "shutdown.keep_awake.release",
                     error = %error,
                     "keep-awake shutdown release failed"
-                );
+                ),
+                Err(_) => warn_stage_timeout(
+                    "shutdown.keep_awake.release",
+                    SHUTDOWN_KEEP_AWAKE_TIMEOUT,
+                    "keep-awake release timed out; abandoning keep-awake child reap",
+                ),
             }
             let _ = shutdown_tx.send(true);
         })
@@ -403,11 +450,10 @@ pub(crate) async fn run_server(
             })?;
             info!(stage = "shutdown.drain", "shutdown: http connections drained");
         }
-        ServeOutcome::DrainAbandoned => warn!(
-            code = "BOOTSTRAP_SHUTDOWN_STAGE_TIMEOUT",
-            stage = "shutdown.drain",
-            timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
-            "http connection drain timed out; abandoning open connections"
+        ServeOutcome::DrainAbandoned => warn_stage_timeout(
+            "shutdown.drain",
+            SHUTDOWN_DRAIN_TIMEOUT,
+            "http connection drain timed out; abandoning open connections",
         ),
     }
 
@@ -416,19 +462,20 @@ pub(crate) async fn run_server(
     // The scanner breaks out of its select loop as soon as it observes the
     // shutdown watch value; the bound covers an in-progress scan_and_cleanup
     // (which awaits agent kill operations) wedging the join.
+    // All three arms share one stage label so success/failure/timeout of the
+    // same stage correlate under a single stage= key in log queries.
     match tokio::time::timeout(SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT, idle_scanner_handle).await {
         Ok(Ok(())) => info!(stage = "shutdown.idle_scanner", "shutdown: idle scanner joined"),
         Ok(Err(e)) => warn!(
             code = "BOOTSTRAP_DEGRADED_IDLE_SCANNER",
-            stage = "idle_scanner.join",
+            stage = "shutdown.idle_scanner",
             error = %e,
             "idle scanner join failed"
         ),
-        Err(_) => warn!(
-            code = "BOOTSTRAP_SHUTDOWN_STAGE_TIMEOUT",
-            stage = "shutdown.idle_scanner_join",
-            timeout_secs = SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT.as_secs(),
-            "idle scanner join timed out; abandoning scanner task"
+        Err(_) => warn_stage_timeout(
+            "shutdown.idle_scanner",
+            SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT,
+            "idle scanner join timed out; abandoning scanner task",
         ),
     }
 
@@ -436,11 +483,10 @@ pub(crate) async fn run_server(
     // returned, which is unbounded if a detached task still holds one.
     match tokio::time::timeout(SHUTDOWN_DB_CLOSE_TIMEOUT, services.database.close()).await {
         Ok(()) => info!(stage = "shutdown.database_close", "shutdown: database closed"),
-        Err(_) => warn!(
-            code = "BOOTSTRAP_SHUTDOWN_STAGE_TIMEOUT",
-            stage = "shutdown.database_close",
-            timeout_secs = SHUTDOWN_DB_CLOSE_TIMEOUT.as_secs(),
-            "database close timed out; abandoning checked-out connections"
+        Err(_) => warn_stage_timeout(
+            "shutdown.database_close",
+            SHUTDOWN_DB_CLOSE_TIMEOUT,
+            "database close timed out; abandoning checked-out connections",
         ),
     }
 
@@ -457,6 +503,18 @@ fn router_build_error_to_bootstrap(error: RouterBuildError) -> BootstrapError {
     let stage = error.stage();
     let message = error.message();
     BootstrapError::new(BootstrapErrorCode::ServerFailed, stage, message).with_source(error)
+}
+
+/// One shared emitter for every bounded-shutdown-stage timeout so the
+/// code/stage/timeout_secs field set stays queryable across all stages.
+fn warn_stage_timeout(stage: &'static str, timeout: Duration, detail: &'static str) {
+    warn!(
+        code = "BOOTSTRAP_SHUTDOWN_STAGE_TIMEOUT",
+        stage,
+        timeout_secs = timeout.as_secs(),
+        "{}",
+        detail
+    );
 }
 
 fn finish_server_shutdown(shutdown_error: Option<BootstrapError>) -> Result<ExitCode, BootstrapError> {
