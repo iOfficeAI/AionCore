@@ -33,6 +33,7 @@ use aionui_session_message::drainer::Drainer;
 use aionui_session_message::queue::{DeliveryQueue, SystemClock, TestClock};
 use aionui_session_message::rate_limit::RateLimiter;
 use aionui_session_message::service::{SessionMessageDeps, SessionMessageService};
+use aionui_session_message::state::SessionMessageRouterState;
 use aionui_session_message::targets::MentionableTargets;
 use tokio::sync::{Notify, broadcast};
 
@@ -339,6 +340,15 @@ impl Ctx {
     /// delivery by hand.
     pub fn drainer(&self) -> Drainer {
         Drainer::new(self.queue.clone(), self.service.clone(), self.service.clone())
+    }
+
+    /// The state the routers are built from, sharing this harness's service.
+    pub fn router_state(&self) -> SessionMessageRouterState {
+        SessionMessageRouterState {
+            service: self.service.clone(),
+            targets: self.targets.clone(),
+            runtime_token_service: self.runtime_token_service.clone(),
+        }
     }
 
     pub async fn create_conversation(&self, id: &str, name: &str, workspace: &str) -> ConversationRow {
