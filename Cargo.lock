@@ -873,6 +873,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "aionui-session-message"
+version = "0.1.69"
+dependencies = [
+ "aionui-ai-agent",
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-conversation",
+ "aionui-db",
+ "aionui-project",
+ "aionui-realtime",
+ "async-trait",
+ "axum",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "aionui-shell"
 version = "0.1.69"
 dependencies = [
