@@ -944,6 +944,23 @@ impl StreamRelay {
             return true;
         }
 
+        if let Some(journal) = &self.event_journal
+            && let Err(error) = crate::service_ops::append_input_status_event(
+                journal,
+                &self.user_id,
+                &self.conversation_id,
+                &data.input_id,
+                status,
+                data.turn_id.as_deref().or(Some(&self.turn_id)),
+                (status == ConversationInputStatus::Applied).then_some(self.msg_id.as_str()),
+                data.error_code.as_deref(),
+            )
+            .await
+        {
+            warn!(input_id = data.input_id, error = %error, "Failed to journal input lifecycle event");
+            return true;
+        }
+
         let status_name = match status {
             ConversationInputStatus::Accepted => "accepted",
             ConversationInputStatus::Applied => "applied",

@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
-use aionui_api_types::{ConversationRuntimeStateKind, ConversationRuntimeSummary};
+use aionui_api_types::{CancellationState, ConversationRuntimeStateKind, ConversationRuntimeSummary};
 use aionui_common::ConversationStatus;
 use tokio::sync::Notify;
 use tracing::{info, warn};
@@ -24,6 +24,7 @@ struct ConversationRuntimeState {
     /// Cancels that arrived before the turn's agent registered, keyed by
     /// conversation and holding the turn they were meant for.
     deferred_cancels: HashMap<String, String>,
+    cancellation_outcomes: HashMap<String, (String, CancellationState)>,
     shutting_down: bool,
 }
 
@@ -240,6 +241,32 @@ impl ConversationRuntimeStateService {
             .unwrap_or(false)
     }
 
+    pub fn mark_force_terminated(&self, conversation_id: &str, turn_id: &str) {
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.cancellation_outcomes.insert(
+                    conversation_id.to_owned(),
+                    (turn_id.to_owned(), CancellationState::ForceTerminated),
+                );
+            }
+            Err(_) => warn!(
+                conversation_id,
+                turn_id, "conversation runtime state lock poisoned while marking forced cancellation"
+            ),
+        }
+    }
+
+    pub fn take_cancellation_outcome(&self, conversation_id: &str, turn_id: &str) -> Option<CancellationState> {
+        let mut state = self.state.lock().ok()?;
+        match state.cancellation_outcomes.get(conversation_id) {
+            Some((recorded_turn_id, _)) if recorded_turn_id == turn_id => state
+                .cancellation_outcomes
+                .remove(conversation_id)
+                .map(|(_, outcome)| outcome),
+            _ => None,
+        }
+    }
+
     pub fn clear_conversation(&self, conversation_id: &str) {
         match self.state.lock() {
             Ok(mut state) => {
@@ -375,7 +402,13 @@ impl ConversationRuntimeStateService {
                 }
 
                 let was_deleting = state.deleting_conversations.remove(conversation_id);
-                state.cancelling_conversations.remove(conversation_id);
+                let was_cancelling = state.cancelling_conversations.remove(conversation_id);
+                if was_cancelling {
+                    state
+                        .cancellation_outcomes
+                        .entry(conversation_id.to_owned())
+                        .or_insert_with(|| (turn_id.to_owned(), CancellationState::ConvergedIdle));
+                }
                 info!(
                     conversation_id,
                     turn_id,
@@ -593,6 +626,34 @@ mod tests {
         assert!(!claim.release());
 
         assert!(!state.is_cancelling("conv-1"));
+    }
+
+    #[test]
+    fn cancellation_release_records_terminal_outcome_once() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let mut claim = state.try_claim_turn("conv-1", "turn-a").unwrap();
+        state.mark_cancelling("conv-1");
+        claim.release();
+
+        assert_eq!(
+            state.take_cancellation_outcome("conv-1", "turn-a"),
+            Some(CancellationState::ConvergedIdle)
+        );
+        assert_eq!(state.take_cancellation_outcome("conv-1", "turn-a"), None);
+    }
+
+    #[test]
+    fn forced_cancellation_is_not_downgraded_when_claim_releases() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let mut claim = state.try_claim_turn("conv-1", "turn-a").unwrap();
+        state.mark_cancelling("conv-1");
+        state.mark_force_terminated("conv-1", "turn-a");
+        claim.release();
+
+        assert_eq!(
+            state.take_cancellation_outcome("conv-1", "turn-a"),
+            Some(CancellationState::ForceTerminated)
+        );
     }
 
     #[test]

@@ -221,6 +221,7 @@ mod tests {
     fn event(sequence: u64, kind: &str, payload: serde_json::Value) -> CanonicalJournalEvent {
         CanonicalJournalEvent {
             schema_version: 1,
+            runtime_epoch: "test-runtime".into(),
             event_id: format!("event-{sequence}"),
             conversation_id: "conv".into(),
             sequence,

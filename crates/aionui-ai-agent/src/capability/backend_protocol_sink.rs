@@ -1,6 +1,6 @@
 use std::sync::{Arc, RwLock};
 
-use aion_protocol::events::{ProtocolEvent, ToolCategory};
+use aion_protocol::events::{ProtocolEvent, ToolCategory, ToolStatus};
 use aion_protocol::writer::ProtocolEmitter;
 use aionui_common::{Confirmation, ConfirmationOption, generate_id};
 use serde_json::json;
@@ -14,9 +14,10 @@ use crate::protocol::events::{
 /// Implements `ProtocolEmitter` for the aioncore context.
 ///
 /// Bridges aionrs `ProtocolEvent` emissions to `AgentStreamEvent` on a
-/// broadcast channel. Only handles events relevant to the approval flow;
-/// other events (text, thinking, tool results) are already handled by
-/// `BackendOutputSink` via the `OutputSink` trait.
+/// broadcast channel. Approval events drive confirmations; tool lifecycle
+/// events add the stable execution id and phase that the legacy `OutputSink`
+/// callbacks cannot express. Text and thinking remain owned by
+/// `BackendOutputSink`.
 pub struct BackendProtocolSink {
     event_tx: broadcast::Sender<AgentStreamEvent>,
     confirmations: Arc<RwLock<Vec<Confirmation>>>,
@@ -60,6 +61,19 @@ impl BackendProtocolSink {
                 },
             ],
         }
+    }
+
+    fn internal_call_id(call_id: &str) -> String {
+        format!("aionrs-{call_id}")
+    }
+
+    fn execution_description(execution_id: &str, phase: &str) -> String {
+        json!({
+            "execution_id": execution_id,
+            "phase": phase,
+            "enforcement": "native",
+        })
+        .to_string()
     }
 }
 
@@ -113,19 +127,63 @@ impl ProtocolEmitter for BackendProtocolSink {
                 );
             }
 
-            ProtocolEvent::ToolCancelled { call_id, reason, .. } => {
+            ProtocolEvent::ToolRunning {
+                call_id,
+                execution_id,
+                tool_name,
+                ..
+            } => {
+                let _ = self.event_tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+                    call_id: Self::internal_call_id(call_id),
+                    name: tool_name.clone(),
+                    args: serde_json::Value::Null,
+                    status: ToolCallStatus::Running,
+                    input: None,
+                    output: None,
+                    description: Some(Self::execution_description(execution_id, "execute")),
+                }));
+            }
+
+            ProtocolEvent::ToolResult {
+                call_id,
+                execution_id,
+                tool_name,
+                status,
+                ..
+            } => {
+                let status = match status {
+                    ToolStatus::Success => ToolCallStatus::Completed,
+                    ToolStatus::Error => ToolCallStatus::Error,
+                };
+                let _ = self.event_tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+                    call_id: Self::internal_call_id(call_id),
+                    name: tool_name.clone(),
+                    args: serde_json::Value::Null,
+                    status,
+                    input: None,
+                    output: None,
+                    description: Some(Self::execution_description(execution_id, "finalize")),
+                }));
+            }
+
+            ProtocolEvent::ToolCancelled {
+                call_id,
+                execution_id,
+                reason,
+                ..
+            } => {
                 if let Ok(mut confs) = self.confirmations.write() {
                     confs.retain(|c| c.call_id != *call_id);
                 }
 
                 let _ = self.event_tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
-                    call_id: call_id.clone(),
+                    call_id: Self::internal_call_id(call_id),
                     name: format!("cancelled: {reason}"),
                     args: serde_json::Value::Null,
                     status: ToolCallStatus::Error,
                     input: None,
                     output: None,
-                    description: None,
+                    description: Some(Self::execution_description(execution_id, "cancelled")),
                 }));
             }
 
@@ -157,6 +215,7 @@ mod tests {
         let event = ProtocolEvent::ToolRequest {
             msg_id: "m1".into(),
             call_id: "c1".into(),
+            execution_id: "exec-1".into(),
             tool: ToolInfo {
                 name: "Write".into(),
                 category: ToolCategory::Edit,
@@ -217,16 +276,24 @@ mod tests {
     }
 
     #[test]
-    fn tool_running_is_ignored() {
+    fn tool_running_emits_correlated_execution_state() {
         let (sink, mut rx, _) = make_sink();
         let event = ProtocolEvent::ToolRunning {
             msg_id: "m1".into(),
             call_id: "c1".into(),
+            execution_id: "exec-1".into(),
             tool_name: "Write".into(),
         };
 
         sink.emit(&event).unwrap();
-        assert!(rx.try_recv().is_err());
+        match rx.try_recv().unwrap() {
+            AgentStreamEvent::ToolCall(data) => {
+                assert_eq!(data.call_id, "aionrs-c1");
+                assert_eq!(data.status, ToolCallStatus::Running);
+                assert!(data.description.as_deref().unwrap().contains("exec-1"));
+            }
+            other => panic!("Expected ToolCall running, got {:?}", other),
+        }
     }
 
     #[test]
@@ -236,6 +303,7 @@ mod tests {
         let req = ProtocolEvent::ToolRequest {
             msg_id: "m1".into(),
             call_id: "c1".into(),
+            execution_id: "exec-1".into(),
             tool: ToolInfo {
                 name: "Bash".into(),
                 category: ToolCategory::Exec,
@@ -251,6 +319,7 @@ mod tests {
         let cancel = ProtocolEvent::ToolCancelled {
             msg_id: "m1".into(),
             call_id: "c1".into(),
+            execution_id: "exec-1".into(),
             reason: "User denied".into(),
         };
         sink.emit(&cancel).unwrap();
@@ -258,13 +327,39 @@ mod tests {
         let received = rx.try_recv().unwrap();
         match received {
             AgentStreamEvent::ToolCall(data) => {
-                assert_eq!(data.call_id, "c1");
+                assert_eq!(data.call_id, "aionrs-c1");
                 assert_eq!(data.status, ToolCallStatus::Error);
+                assert!(data.description.as_deref().unwrap().contains("exec-1"));
             }
             other => panic!("Expected ToolCall error, got {:?}", other),
         }
 
         assert_eq!(confs.read().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn tool_result_emits_correlated_terminal_state() {
+        let (sink, mut rx, _) = make_sink();
+        sink.emit(&ProtocolEvent::ToolResult {
+            msg_id: "m1".into(),
+            call_id: "c1".into(),
+            execution_id: "exec-1".into(),
+            tool_name: "Read".into(),
+            status: ToolStatus::Success,
+            output: "ok".into(),
+            output_type: aion_protocol::events::OutputType::Text,
+            metadata: None,
+        })
+        .unwrap();
+
+        match rx.try_recv().unwrap() {
+            AgentStreamEvent::ToolCall(data) => {
+                assert_eq!(data.call_id, "aionrs-c1");
+                assert_eq!(data.status, ToolCallStatus::Completed);
+                assert!(data.description.as_deref().unwrap().contains("finalize"));
+            }
+            other => panic!("Expected ToolCall result, got {:?}", other),
+        }
     }
 
     #[test]
@@ -285,6 +380,7 @@ mod tests {
         let event = ProtocolEvent::ToolRequest {
             msg_id: "m1".into(),
             call_id: "c1".into(),
+            execution_id: "exec-1".into(),
             tool: ToolInfo {
                 name: "Read".into(),
                 category: ToolCategory::Info,

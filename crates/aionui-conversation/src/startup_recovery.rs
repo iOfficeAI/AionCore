@@ -1,13 +1,31 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aionui_api_types::ConversationInputStatus;
 use aionui_common::ErrorChain;
-use aionui_db::MessageRowUpdate;
 use aionui_db::models::MessageRow;
+use aionui_db::{ConversationInputInsert, ConversationInputUpdate, MessageRowUpdate};
 use tracing::{info, warn};
 
 use crate::runtime_persistence::RuntimeWriteKind;
 use crate::service::ConversationService;
+use crate::stream_persistence::CanonicalJournalEvent;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplayedConversationInput {
+    id: String,
+    mode: String,
+    status: String,
+    content: String,
+    files: String,
+    inject_skills: String,
+    hidden: bool,
+    client_key: String,
+    turn_id: Option<String>,
+    msg_id: Option<String>,
+    error_code: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupRecoveryAction {
@@ -90,6 +108,7 @@ impl ConversationService {
     }
 
     async fn recover_conversation_inputs_on_startup(&self) {
+        self.rebuild_conversation_input_projection().await;
         let inputs = match self.conversation_repo().list_unfinished_conversation_inputs().await {
             Ok(inputs) => inputs,
             Err(error) => {
@@ -151,6 +170,173 @@ impl ConversationService {
             self.dispatch_next_held_input(&user_id, &conversation_id).await;
         }
     }
+
+    /// Rebuild the query projection before recovering unfinished dispatches.
+    /// The canonical Journal is authoritative; the database can be empty or
+    /// lag behind after a crash between append and projection update.
+    async fn rebuild_conversation_input_projection(&self) {
+        let replays = match self.canonical_event_journal().replay_all().await {
+            Ok(replays) => replays,
+            Err(error) => {
+                warn!(error = %ErrorChain(&error), "startup recovery could not replay canonical journals");
+                return;
+            }
+        };
+        let mut repaired = 0usize;
+        for replay in replays {
+            let user_id = match self.conversation_repo().owner_user_id(&replay.conversation_id).await {
+                Ok(Some(user_id)) => user_id,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(
+                        conversation_id = %replay.conversation_id,
+                        error = %ErrorChain(&error),
+                        "startup recovery could not resolve journal owner"
+                    );
+                    continue;
+                }
+            };
+            for input in fold_conversation_inputs(&replay.events) {
+                let existing = match self
+                    .conversation_repo()
+                    .get_conversation_input(&user_id, &replay.conversation_id, &input.id)
+                    .await
+                {
+                    Ok(existing) => existing,
+                    Err(error) => {
+                        warn!(
+                            conversation_id = %replay.conversation_id,
+                            input_id = %input.id,
+                            error = %ErrorChain(&error),
+                            "startup recovery could not read input projection"
+                        );
+                        continue;
+                    }
+                };
+                let result = if existing.is_some() {
+                    self.conversation_repo()
+                        .update_conversation_input(
+                            &user_id,
+                            &replay.conversation_id,
+                            &input.id,
+                            &ConversationInputUpdate {
+                                status: Some(&input.status),
+                                turn_id: input.turn_id.as_deref(),
+                                msg_id: input.msg_id.as_deref(),
+                                error_code: input.error_code.as_deref(),
+                                updated_at: input.updated_at,
+                            },
+                        )
+                        .await
+                        .map(|_| ())
+                } else {
+                    self.conversation_repo()
+                        .insert_conversation_input(&ConversationInputInsert {
+                            id: &input.id,
+                            user_id: &user_id,
+                            conversation_id: &replay.conversation_id,
+                            mode: &input.mode,
+                            status: &input.status,
+                            content: &input.content,
+                            files: &input.files,
+                            inject_skills: &input.inject_skills,
+                            hidden: input.hidden,
+                            client_key: &input.client_key,
+                            created_at: input.created_at,
+                        })
+                        .await
+                        .map(|_| ())
+                };
+                match result {
+                    Ok(()) => repaired += 1,
+                    Err(error) => warn!(
+                        conversation_id = %replay.conversation_id,
+                        input_id = %input.id,
+                        error = %ErrorChain(&error),
+                        "startup recovery failed to rebuild input projection"
+                    ),
+                }
+            }
+        }
+        if repaired > 0 {
+            info!(
+                repaired,
+                "startup recovery rebuilt conversation input projection from Journal"
+            );
+        }
+    }
+}
+
+fn fold_conversation_inputs(events: &[CanonicalJournalEvent]) -> Vec<ReplayedConversationInput> {
+    let mut inputs = BTreeMap::<String, ReplayedConversationInput>::new();
+    for event in events {
+        let data = &event.payload["data"];
+        if event.kind == "InputHeld" {
+            let Some(id) = data["input_id"].as_str() else {
+                continue;
+            };
+            let Some(mode) = data["mode"].as_str() else {
+                continue;
+            };
+            let Some(content) = data["content"].as_str() else {
+                continue;
+            };
+            let Some(client_key) = data["client_key"].as_str() else {
+                continue;
+            };
+            inputs
+                .entry(id.to_owned())
+                .or_insert_with(|| ReplayedConversationInput {
+                    id: id.to_owned(),
+                    mode: mode.to_owned(),
+                    status: "held".to_owned(),
+                    content: content.to_owned(),
+                    files: serde_json::to_string(&data["files"]).unwrap_or_else(|_| "[]".to_owned()),
+                    inject_skills: serde_json::to_string(&data["inject_skills"]).unwrap_or_else(|_| "[]".to_owned()),
+                    hidden: data["hidden"].as_bool().unwrap_or(false),
+                    client_key: client_key.to_owned(),
+                    turn_id: None,
+                    msg_id: None,
+                    error_code: None,
+                    created_at: event.timestamp,
+                    updated_at: event.timestamp,
+                });
+            continue;
+        }
+
+        if event.kind == "UserPrompt" {
+            let Some(msg_id) = data["msg_id"].as_str() else {
+                continue;
+            };
+            if let Some(input) = inputs.get_mut(msg_id) {
+                input.status = "applied".to_owned();
+                input.msg_id = Some(msg_id.to_owned());
+                input.updated_at = event.timestamp;
+            }
+            continue;
+        }
+
+        let status = match event.kind.as_str() {
+            "InputDispatching" => "dispatching",
+            "InputAccepted" => "accepted",
+            "InputApplied" => "applied",
+            "InputCanceled" => "canceled",
+            "InputFailed" => "failed",
+            _ => continue,
+        };
+        let Some(id) = data["input_id"].as_str() else {
+            continue;
+        };
+        let Some(input) = inputs.get_mut(id) else {
+            continue;
+        };
+        input.status = status.to_owned();
+        input.turn_id = data["turn_id"].as_str().map(str::to_owned).or(input.turn_id.take());
+        input.msg_id = data["msg_id"].as_str().map(str::to_owned).or(input.msg_id.take());
+        input.error_code = data["error_code"].as_str().map(str::to_owned);
+        input.updated_at = event.timestamp;
+    }
+    inputs.into_values().collect()
 }
 
 fn classify_recovery_action(row: &MessageRow) -> StartupRecoveryAction {
@@ -219,6 +405,97 @@ mod tests {
     use aionui_db::models::MessageRow;
 
     use super::*;
+
+    fn journal_event(sequence: u64, timestamp: i64, kind: &str, data: serde_json::Value) -> CanonicalJournalEvent {
+        CanonicalJournalEvent {
+            schema_version: 1,
+            runtime_epoch: "test-runtime".into(),
+            event_id: format!("event-{sequence}"),
+            conversation_id: "conv-1".into(),
+            sequence,
+            timestamp,
+            kind: kind.into(),
+            payload: serde_json::json!({ "data": data }),
+        }
+    }
+
+    #[test]
+    fn journal_fold_rebuilds_input_and_applies_lifecycle_edges() {
+        let events = vec![
+            journal_event(
+                1,
+                10,
+                "InputHeld",
+                serde_json::json!({
+                    "input_id": "input-1",
+                    "mode": "followup",
+                    "content": "hello",
+                    "files": [{"name": "note.txt"}],
+                    "inject_skills": ["review"],
+                    "hidden": true,
+                    "client_key": "client-1"
+                }),
+            ),
+            journal_event(
+                2,
+                20,
+                "InputDispatching",
+                serde_json::json!({"input_id": "input-1", "status": "dispatching", "turn_id": "turn-1"}),
+            ),
+            journal_event(
+                3,
+                30,
+                "InputApplied",
+                serde_json::json!({"input_id": "input-1", "status": "applied", "msg_id": "msg-1"}),
+            ),
+        ];
+
+        let inputs = fold_conversation_inputs(&events);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].status, "applied");
+        assert_eq!(inputs[0].turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(inputs[0].msg_id.as_deref(), Some("msg-1"));
+        assert_eq!(inputs[0].created_at, 10);
+        assert_eq!(inputs[0].updated_at, 30);
+        assert!(inputs[0].hidden);
+        assert!(inputs[0].files.contains("note.txt"));
+    }
+
+    #[test]
+    fn journal_fold_recovers_legacy_user_prompt_and_ignores_orphan_status() {
+        let events = vec![
+            journal_event(
+                1,
+                10,
+                "InputFailed",
+                serde_json::json!({"input_id": "missing", "status": "failed"}),
+            ),
+            journal_event(
+                2,
+                20,
+                "InputHeld",
+                serde_json::json!({
+                    "input_id": "input-1",
+                    "mode": "inject",
+                    "content": "context",
+                    "files": [],
+                    "inject_skills": [],
+                    "client_key": "client-1"
+                }),
+            ),
+            journal_event(
+                3,
+                30,
+                "UserPrompt",
+                serde_json::json!({"msg_id": "input-1", "content": "context"}),
+            ),
+        ];
+
+        let inputs = fold_conversation_inputs(&events);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].status, "applied");
+        assert_eq!(inputs[0].msg_id.as_deref(), Some("input-1"));
+    }
 
     #[test]
     fn visible_text_finishes_as_visible_output() {

@@ -253,6 +253,8 @@ pub(crate) fn recorded_content(_kind: &str, payload: &serde_json::Value) -> Opti
         payload.pointer("/content"),
         payload.pointer("/data/output"),
         payload.pointer("/output"),
+        payload.pointer("/data/description"),
+        payload.pointer("/description"),
         payload.pointer("/data/text"),
         payload.pointer("/text"),
         payload.pointer("/data/update/title"),
@@ -306,6 +308,7 @@ mod tests {
     fn event(sequence: u64, kind: &str, payload: serde_json::Value) -> CanonicalJournalEvent {
         CanonicalJournalEvent {
             schema_version: 1,
+            runtime_epoch: "test-runtime".into(),
             event_id: format!("event-{sequence}"),
             conversation_id: "conv".into(),
             sequence,

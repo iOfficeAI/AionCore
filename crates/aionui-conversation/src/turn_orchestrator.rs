@@ -226,6 +226,7 @@ impl ConversationTurnOrchestrator {
         // error, and reporting one would surface a red bubble for something
         // they asked for.
         if runtime_state.take_deferred_cancel(&input.conv_id, &input.turn_id) {
+            runtime_state.mark_cancelling(&input.conv_id);
             info!(
                 conversation_id = %input.conv_id,
                 turn_id = %input.turn_id,

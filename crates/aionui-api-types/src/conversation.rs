@@ -277,6 +277,14 @@ pub enum CancellationState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CancellationChangedEvent {
+    pub user_id: String,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub state: CancellationState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationRuntimeStateKind {
     Idle,

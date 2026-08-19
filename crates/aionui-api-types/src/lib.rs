@@ -92,8 +92,8 @@ pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest
 pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::{
     ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,
-    CancelConversationRequest, CancelConversationResponse, CancellationState, CloneConversationRequest,
-    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    CancelConversationRequest, CancelConversationResponse, CancellationChangedEvent, CancellationState,
+    CloneConversationRequest, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
     ConversationArtifactStatus, ConversationAssistantIdentityResponse, ConversationCapabilities,
     ConversationInputListResponse, ConversationInputMode, ConversationInputReceipt, ConversationInputResponse,
     ConversationInputStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,

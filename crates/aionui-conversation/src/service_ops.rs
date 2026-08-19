@@ -35,6 +35,7 @@ use crate::service::{
 
 const MAX_DIR_DEPTH: usize = 10;
 
+#[derive(Clone, Copy)]
 struct InputStatusChange<'a> {
     status: ConversationInputStatus,
     turn_id: Option<&'a str>,
@@ -763,8 +764,12 @@ impl ConversationService {
                 user_id,
                 conversation_id,
                 &next.id,
-                ConversationInputStatus::Dispatching,
-                None,
+                InputStatusChange {
+                    status: ConversationInputStatus::Dispatching,
+                    turn_id: None,
+                    msg_id: None,
+                    error_code: None,
+                },
             )
             .await
         {
@@ -953,7 +958,7 @@ impl ConversationService {
         input_id: &str,
         change: InputStatusChange<'_>,
     ) -> Result<ConversationInputResponse, ConversationError> {
-        self.append_input_status_event(user_id, conversation_id, input_id, change.status, change.error_code)
+        self.append_input_status_event(user_id, conversation_id, input_id, change)
             .await?;
         let row = self
             .conversation_repo()
@@ -1005,41 +1010,19 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
         input_id: &str,
-        status: ConversationInputStatus,
-        error_code: Option<&str>,
+        change: InputStatusChange<'_>,
     ) -> Result<(), ConversationError> {
-        let payload = serde_json::json!({
-            "type": "conversation_input_status",
-            "visibility": "host",
-            "data": {
-                "input_id": input_id,
-                "status": input_status_name(status),
-                "error_code": error_code,
-            }
-        });
-        let event_id = crate::stream_persistence::canonical_event_id(
-            &format!("conversation_input:{input_id}:{}", input_status_name(status)),
-            &payload,
-        );
-        self.canonical_event_journal()
-            .append(
-                user_id,
-                conversation_id,
-                event_id,
-                match status {
-                    ConversationInputStatus::Held => "InputHeld",
-                    ConversationInputStatus::Dispatching => "InputDispatching",
-                    ConversationInputStatus::Accepted => "InputAccepted",
-                    ConversationInputStatus::Applied => "InputApplied",
-                    ConversationInputStatus::Canceled => "InputCanceled",
-                    ConversationInputStatus::Failed => "InputFailed",
-                }
-                .into(),
-                payload,
-            )
-            .await
-            .map_err(|error| ConversationError::internal(format!("Failed to journal input status: {error}")))?;
-        Ok(())
+        append_input_status_event(
+            &self.canonical_event_journal(),
+            user_id,
+            conversation_id,
+            input_id,
+            change.status,
+            change.turn_id,
+            change.msg_id,
+            change.error_code,
+        )
+        .await
     }
 
     fn broadcast_input_changed(&self, user_id: &str, input: ConversationInputResponse) {
@@ -1192,4 +1175,51 @@ impl ConversationService {
 
         Ok(entries)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn append_input_status_event(
+    journal: &crate::stream_persistence::CanonicalEventJournal,
+    user_id: &str,
+    conversation_id: &str,
+    input_id: &str,
+    status: ConversationInputStatus,
+    turn_id: Option<&str>,
+    msg_id: Option<&str>,
+    error_code: Option<&str>,
+) -> Result<(), ConversationError> {
+    let payload = serde_json::json!({
+        "type": "conversation_input_status",
+        "visibility": "host",
+        "data": {
+            "input_id": input_id,
+            "status": input_status_name(status),
+            "turn_id": turn_id,
+            "msg_id": msg_id,
+            "error_code": error_code,
+        }
+    });
+    let event_id = crate::stream_persistence::canonical_event_id(
+        &format!("conversation_input:{input_id}:{}", input_status_name(status)),
+        &payload,
+    );
+    journal
+        .append(
+            user_id,
+            conversation_id,
+            event_id,
+            match status {
+                ConversationInputStatus::Held => "InputHeld",
+                ConversationInputStatus::Dispatching => "InputDispatching",
+                ConversationInputStatus::Accepted => "InputAccepted",
+                ConversationInputStatus::Applied => "InputApplied",
+                ConversationInputStatus::Canceled => "InputCanceled",
+                ConversationInputStatus::Failed => "InputFailed",
+            }
+            .into(),
+            payload,
+        )
+        .await
+        .map_err(|error| ConversationError::internal(format!("Failed to journal input status: {error}")))?;
+    Ok(())
 }

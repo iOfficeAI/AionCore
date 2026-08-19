@@ -8,6 +8,7 @@ mod background_stream;
 mod convert;
 pub mod error;
 mod journal_compaction;
+mod journal_fork;
 mod journal_transcript;
 pub(crate) mod message_cursor;
 mod message_persistence;

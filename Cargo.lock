@@ -116,8 +116,8 @@ dependencies = [
 
 [[package]]
 name = "aion-agent"
-version = "0.2.16"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.16#c97c5dc66690a96519452bf5c2cabcd527821f65"
+version = "0.2.18"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.18#05cd77333b47b508ddb70662581c56f977164b29"
 dependencies = [
  "aion-compact",
  "aion-config",
@@ -140,6 +140,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
  "workspace-hack",
@@ -147,8 +148,8 @@ dependencies = [
 
 [[package]]
 name = "aion-compact"
-version = "0.2.16"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.16#c97c5dc66690a96519452bf5c2cabcd527821f65"
+version = "0.2.18"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.18#05cd77333b47b508ddb70662581c56f977164b29"
 dependencies = [
  "regex",
  "serde",
@@ -159,8 +160,8 @@ dependencies = [
 
 [[package]]
 name = "aion-config"
-version = "0.2.16"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.16#c97c5dc66690a96519452bf5c2cabcd527821f65"
+version = "0.2.18"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.18#05cd77333b47b508ddb70662581c56f977164b29"
 dependencies = [
  "aion-compact",
  "aion-process",
@@ -184,8 +185,8 @@ dependencies = [
 
 [[package]]
 name = "aion-mcp"
-version = "0.2.16"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.16#c97c5dc66690a96519452bf5c2cabcd527821f65"
+version = "0.2.18"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.18#05cd77333b47b508ddb70662581c56f977164b29"
 dependencies = [
  "aion-config",
  "aion-protocol",
@@ -205,8 +206,8 @@ dependencies = [
 
 [[package]]
 name = "aion-memory"
-version = "0.2.16"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.16#c97c5dc66690a96519452bf5c2cabcd527821f65"
+version = "0.2.18"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.18#05cd77333b47b508ddb70662581c56f977164b29"
 dependencies = [
  "aion-config",
  "chrono",
@@ -219,8 +220,8 @@ dependencies = [
 
 [[package]]
 name = "aion-process"
-version = "0.2.16"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.16#c97c5dc66690a96519452bf5c2cabcd527821f65"
+version = "0.2.18"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.18#05cd77333b47b508ddb70662581c56f977164b29"
 dependencies = [
  "libc",
  "tokio",
@@ -230,8 +231,8 @@ dependencies = [
 
 [[package]]
 name = "aion-protocol"
-version = "0.2.16"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.16#c97c5dc66690a96519452bf5c2cabcd527821f65"
+version = "0.2.18"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.18#05cd77333b47b508ddb70662581c56f977164b29"
 dependencies = [
  "aion-types",
  "serde",
@@ -243,8 +244,8 @@ dependencies = [
 
 [[package]]
 name = "aion-providers"
-version = "0.2.16"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.16#c97c5dc66690a96519452bf5c2cabcd527821f65"
+version = "0.2.18"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.18#05cd77333b47b508ddb70662581c56f977164b29"
 dependencies = [
  "aion-config",
  "aion-types",
@@ -273,8 +274,8 @@ dependencies = [
 
 [[package]]
 name = "aion-skills"
-version = "0.2.16"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.16#c97c5dc66690a96519452bf5c2cabcd527821f65"
+version = "0.2.18"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.18#05cd77333b47b508ddb70662581c56f977164b29"
 dependencies = [
  "aion-config",
  "aion-mcp",
@@ -300,8 +301,8 @@ dependencies = [
 
 [[package]]
 name = "aion-tools"
-version = "0.2.16"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.16#c97c5dc66690a96519452bf5c2cabcd527821f65"
+version = "0.2.18"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.18#05cd77333b47b508ddb70662581c56f977164b29"
 dependencies = [
  "aion-config",
  "aion-process",
@@ -322,8 +323,8 @@ dependencies = [
 
 [[package]]
 name = "aion-types"
-version = "0.2.16"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.16#c97c5dc66690a96519452bf5c2cabcd527821f65"
+version = "0.2.18"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.18#05cd77333b47b508ddb70662581c56f977164b29"
 dependencies = [
  "async-trait",
  "base64",
@@ -601,6 +602,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1312,9 +1314,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-bedrock"
-version = "1.150.0"
+version = "1.151.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81186bb96a4e98ff93f7b4336deec0afc1f90ca282099fc5395fcf5de6c0389d"
+checksum = "2cb8e2aff3ed7af0df6c54961d38a4526b581bb00f93bee6e6a12581d05b1de2"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1338,9 +1340,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-sso"
-version = "1.105.0"
+version = "1.106.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ffd0fbe7873cb548a7aa60f9573c268fff94155397fd4f14dc9f1ecaaab8516"
+checksum = "2d0efcee834347b6705eca3eea2defd88242f43774f55d7326604222e3c86260"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1364,9 +1366,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-ssooidc"
-version = "1.107.0"
+version = "1.108.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "175763eb222a46377df7aa257a3bca980ab3e96703fefc8f4d0b8da6ad2e254c"
+checksum = "a59312a04cf19c962cfee32b64ecfee758f8786407ff6da5b30fff46ae96f201"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1390,9 +1392,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-sts"
-version = "1.110.0"
+version = "1.111.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd8b14781dfbff48984017d57167b6ea0b6471c6920ec52b44a2677c7feb3c13"
+checksum = "120e7eb63457a9e547f9986fe3b273f77c43679da4d04f46359fa881c5e19b6e"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -2664,9 +2666,9 @@ dependencies = [
 
 [[package]]
 name = "error-code"
-version = "3.3.2"
+version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
+checksum = "0b5343afd4a8365a643ac588dab4cf234a190c7f6c88c9f6dd6ffe00837661b7"
 
 [[package]]
 name = "etcetera"
@@ -3369,7 +3371,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4579,9 +4581,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.16"
+version = "0.11.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
+checksum = "04759210543be93709136e28212294a659ef5001836ff4eab4d663e4529bba83"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -4759,18 +4761,18 @@ dependencies = [
 
 [[package]]
 name = "ref-cast"
-version = "1.0.26"
+version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "216e8f773d7923bcba9ceb86a86c93cabb3903a11872fc3f138c49630e50b96d"
+checksum = "7e440fb4e4b4147295338efb76001ab9e4efc0e5839df2c47fc5ac2381d365c3"
 dependencies = [
  "ref-cast-impl",
 ]
 
 [[package]]
 name = "ref-cast-impl"
-version = "1.0.26"
+version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c9283685feec7d69af75fb0e858d5e7378f33fe4fc699383b2916ab9273e03c"
+checksum = "92ecd8964f8453721699a1ed72037b0db49ce2f5a5138486ee89bed6f67cdf3a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5808,7 +5810,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -6005,6 +6007,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",
@@ -6656,7 +6659,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6671,7 +6674,7 @@ version = "0.56.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1de69df01bdf1ead2f4ac895dc77c9351aefff65b2f3db429a343f9cbf05e132"
 dependencies = [
- "windows-core",
+ "windows-core 0.56.0",
  "windows-targets 0.52.6",
 ]
 
@@ -6681,10 +6684,23 @@ version = "0.56.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4698e52ed2d08f8658ab0c39512a7c00ee5fe2688c65f8c0a4f06750d729f2a6"
 dependencies = [
- "windows-implement",
- "windows-interface",
- "windows-result",
+ "windows-implement 0.56.0",
+ "windows-interface 0.56.0",
+ "windows-result 0.1.2",
  "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-core"
+version = "0.62.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
+dependencies = [
+ "windows-implement 0.60.2",
+ "windows-interface 0.59.3",
+ "windows-link",
+ "windows-result 0.4.1",
+ "windows-strings",
 ]
 
 [[package]]
@@ -6699,10 +6715,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "windows-implement"
+version = "0.60.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "windows-interface"
 version = "0.56.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08990546bf4edef8f431fa6326e032865f27138718c587dc21bc0265bbcb57cc"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "windows-interface"
+version = "0.59.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6722,6 +6760,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e383302e8ec8515204254685643de10811af0ed97ea37210dc26fb0032647f8"
 dependencies = [
  "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-result"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
+dependencies = [
+ "windows-link",
+]
+
+[[package]]
+name = "windows-strings"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
+dependencies = [
+ "windows-link",
 ]
 
 [[package]]
@@ -7011,7 +7067,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "workspace-hack"
 version = "0.1.0"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.16#c97c5dc66690a96519452bf5c2cabcd527821f65"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.18#05cd77333b47b508ddb70662581c56f977164b29"
 dependencies = [
  "bitflags 2.13.1",
  "cc",
@@ -7214,9 +7270,9 @@ dependencies = [
 
 [[package]]
 name = "zerovec-derive"
-version = "0.11.4"
+version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47402523226a02bfe5230160dc3ccc089aa6f6f19e7fcbb4e6f824bbb1b4aa62"
+checksum = "9f212a141d820099d57ffafb9569be9617a6f27d3dc881fbee8fb56642f917a9"
 dependencies = [
  "proc-macro2",
  "quote",
