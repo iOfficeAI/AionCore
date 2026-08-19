@@ -9,6 +9,7 @@
 pub mod drainer;
 pub mod error;
 pub mod queue;
+pub mod rate_limit;
 pub mod targets;
 
 pub use error::SessionMessageError;
