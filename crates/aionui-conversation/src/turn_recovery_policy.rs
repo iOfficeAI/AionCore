@@ -36,8 +36,13 @@ impl TurnRecoveryPolicy {
         let safe_to_auto_replay = outcome.attempt.safe_to_auto_replay();
         let session_recovery_signal = classify_session_recovery_signal(outcome);
 
+        // Auto-replay is limited to agent types whose replay path is verified
+        // safe: ACP (task evicted + resume anchor refreshed before replay) and
+        // Aionrs (in-process engine kept alive — replay re-sends the prompt on
+        // the same session, exactly what a manual retry does today; see
+        // AIONUI-65). Other agent types stay manual-retry only.
         let decision = if lifecycle == RuntimeLifecycleState::Active
-            && agent_type == AgentType::Acp
+            && matches!(agent_type, AgentType::Acp | AgentType::Aionrs)
             && outcome.terminal.is_error()
             && retryable == Some(true)
             && error_code != Some(AgentErrorCode::UserLlmProviderModelNotFound)
@@ -364,8 +369,65 @@ mod tests {
     }
 
     #[test]
-    fn non_acp_agent_does_not_auto_replay() {
+    fn non_replayable_agent_types_do_not_auto_replay() {
         let outcome = retryable_clean_error();
+
+        for agent_type in [AgentType::Antigravity, AgentType::OpenclawGateway, AgentType::Nanobot] {
+            let decision = TurnRecoveryPolicy::decide(agent_type, None, &outcome, RuntimeLifecycleState::Active, false);
+
+            assert_eq!(
+                decision,
+                TurnRecoveryDecision::None,
+                "agent_type {agent_type:?} must not auto-replay"
+            );
+        }
+    }
+
+    #[test]
+    fn retryable_clean_aionrs_error_auto_replays_once() {
+        let outcome = retryable_clean_error();
+
+        let decision =
+            TurnRecoveryPolicy::decide(AgentType::Aionrs, None, &outcome, RuntimeLifecycleState::Active, false);
+
+        assert_eq!(
+            decision,
+            TurnRecoveryDecision::AutoReplayOnce {
+                reason: AgentKillReason::AgentErrorRecovery,
+                safe_to_auto_replay: true,
+                session_recovery_signal: None,
+            }
+        );
+    }
+
+    #[test]
+    fn aionrs_visible_output_blocks_auto_replay() {
+        let mut outcome = retryable_clean_error();
+        outcome.attempt.saw_visible_output = true;
+
+        let decision =
+            TurnRecoveryPolicy::decide(AgentType::Aionrs, None, &outcome, RuntimeLifecycleState::Active, false);
+
+        assert_eq!(decision, TurnRecoveryDecision::None);
+    }
+
+    #[test]
+    fn aionrs_already_replayed_error_does_not_replay_again() {
+        let outcome = retryable_clean_error();
+
+        let decision =
+            TurnRecoveryPolicy::decide(AgentType::Aionrs, None, &outcome, RuntimeLifecycleState::Active, true);
+
+        assert_eq!(decision, TurnRecoveryDecision::None);
+    }
+
+    #[test]
+    fn aionrs_non_retryable_error_does_not_auto_replay() {
+        let mut outcome = retryable_clean_error();
+        outcome.terminal = RelayTerminal::Error {
+            code: Some(AgentErrorCode::UnknownUpstreamError),
+            retryable: None,
+        };
 
         let decision =
             TurnRecoveryPolicy::decide(AgentType::Aionrs, None, &outcome, RuntimeLifecycleState::Active, false);
