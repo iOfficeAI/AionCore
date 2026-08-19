@@ -6,6 +6,7 @@
 //! path — so "cross-session delivery ≡ a human pressing send" is a structural
 //! guarantee rather than two code paths kept in sync by hand.
 
+pub mod drainer;
 pub mod error;
 pub mod queue;
 pub mod targets;
