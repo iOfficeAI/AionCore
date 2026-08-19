@@ -45,6 +45,7 @@ aion-config.workspace = true
 axum.workspace = true
 chrono.workspace = true
 dirs.workspace = true
+dunce.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 tower.workspace = true
