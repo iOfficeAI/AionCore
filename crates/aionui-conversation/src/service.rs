@@ -14,7 +14,6 @@ use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
-use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
     ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
     AssistantMcpBindingChanged, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
@@ -28,6 +27,7 @@ use aionui_api_types::{
     UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
+use aionui_api_types::{ChatFileRef, SessionRef};
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
     PaginatedResult, WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
@@ -58,6 +58,7 @@ use crate::convert::{
 };
 use crate::error::ConversationError;
 use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
+use crate::session_mentions;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
@@ -537,6 +538,49 @@ impl ConversationService {
             .map_err(|err| ConversationError::BadRequest {
                 reason: err.to_string(),
             })
+    }
+
+    /// Resolve `@@` conversation references into the `[[AION_SESSIONS]]` block
+    /// appended to the message content.
+    ///
+    /// Atomic like `[[AION_FILES]]`: any bad reference (missing, another
+    /// user's, or team-owned) fails the whole message. Name and workspace come
+    /// from the row — never from the client.
+    pub async fn resolve_session_mentions(
+        &self,
+        user_id: &str,
+        content: &str,
+        sessions: &[SessionRef],
+        sender_workspace: Option<&str>,
+    ) -> Result<String, ConversationError> {
+        if sessions.is_empty() {
+            return Ok(content.to_owned());
+        }
+
+        let mut targets = Vec::with_capacity(sessions.len());
+        for reference in sessions {
+            // Scoped by user_id, so another user's id yields NotFound rather
+            // than Forbidden — refuse without leaking existence (spec §9.1).
+            let row = self
+                .conversation_repo
+                .get(user_id, &reference.id)
+                .await?
+                .ok_or_else(|| ConversationError::NotFound {
+                    id: reference.id.clone(),
+                })?;
+            // Empty sender id: the picker already excludes the current
+            // conversation (spec §5.3), and the CLI side re-checks it as
+            // `target_is_self`.
+            session_mentions::reject_unusable_target("", &row.id, &row.extra)?;
+            targets.push(session_mentions::SessionMentionTargetInfo {
+                id: row.id.clone(),
+                name: row.name.clone(),
+                workspace: session_mentions::workspace_from_extra(&row.extra),
+            });
+        }
+
+        let block = session_mentions::build_sessions_block(sender_workspace, &targets);
+        Ok(format!("{content}\n\n{block}"))
     }
 
     pub fn with_assistant_definition_repo(&self, repo: Arc<dyn IAssistantDefinitionRepository>) {
@@ -3753,6 +3797,28 @@ impl ConversationService {
         let resolved = self
             .resolve_message_attachments(user_id, &req.content, &req.files)
             .await?;
+
+        // `@@` references resolve at the same boundary and with the same
+        // atomicity as file attachments. Sender workspace comes from the row so
+        // the block can state `workspace: same` without the model comparing
+        // path strings.
+        //
+        // ⚠️ This MUST stay above the mid-turn branch below: that branch
+        // consumes the same `resolved`, so appending the block after it would
+        // silently drop `@@` context whenever the message merged into a running
+        // turn — and every unit test would still pass.
+        let resolved = if req.sessions.is_empty() {
+            resolved
+        } else {
+            let sender_workspace = session_mentions::workspace_from_extra(&row.extra);
+            let content_with_sessions = self
+                .resolve_session_mentions(user_id, &resolved.content, &req.sessions, sender_workspace.as_deref())
+                .await?;
+            ResolvedChatMessage {
+                content: content_with_sessions,
+                files: resolved.files,
+            }
+        };
 
         // ── Mid-turn delivery (B5, spec §4.3) ────────────────────────────
         // An ACTIVE turn + a backend that supports mid-turn delivery → the
