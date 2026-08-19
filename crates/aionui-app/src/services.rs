@@ -110,7 +110,14 @@ impl AppServices {
         config: &AppConfig,
         backend_binary_path: PathBuf,
     ) -> anyhow::Result<Self> {
-        let backend_binary_path = backend_binary_path.canonicalize().unwrap_or(backend_binary_path);
+        // `dunce`, not `std::fs`: this path is embedded into agent-facing config
+        // files (e.g. antigravity's `.agents/hooks.json` command line, executed
+        // through cmd.exe on Windows), and `std::fs::canonicalize` on Windows
+        // returns a `\\?\`-prefixed verbatim path that cmd.exe cannot launch.
+        // `dunce::canonicalize` resolves symlinks the same way but keeps the
+        // plain drive-letter form whenever the path is representable without
+        // the prefix.
+        let backend_binary_path = dunce::canonicalize(&backend_binary_path).unwrap_or(backend_binary_path);
         let data_dir = config.data_dir.clone();
         let work_dir = config.work_dir.clone();
         let identity_mode = config.effective_identity_mode();
@@ -418,6 +425,34 @@ mod tests {
         let services = AppServices::from_config(db, &config).await.unwrap();
 
         assert_eq!(services.app_version, "9.9.9");
+
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn backend_binary_path_never_carries_a_windows_verbatim_prefix() {
+        // The resolved path is embedded into agent-facing config files —
+        // antigravity's `.agents/hooks.json` command line is executed through
+        // cmd.exe on Windows, which cannot launch `\\?\`-prefixed programs
+        // (iOfficeAI/AionUi#4095). `std::fs::canonicalize` returns exactly
+        // that form on Windows, so the constructor must keep the plain
+        // drive-letter form while still resolving symlinks.
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let services = AppServices::from_config_with_backend_binary_path(db, &AppConfig::default(), exe)
+            .await
+            .unwrap();
+
+        let resolved = services.backend_binary_path();
+        assert!(
+            resolved.is_absolute(),
+            "canonicalization must still yield an absolute path"
+        );
+        assert!(
+            !resolved.to_string_lossy().starts_with(r"\\?\"),
+            "backend binary path must stay cmd.exe-launchable, got {}",
+            resolved.display()
+        );
 
         services.database.close().await;
     }

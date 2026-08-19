@@ -429,6 +429,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "dunce",
  "futures-util",
  "git2",
  "http-body-util",
