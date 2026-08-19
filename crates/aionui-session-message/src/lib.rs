@@ -7,6 +7,7 @@
 //! guarantee rather than two code paths kept in sync by hand.
 
 pub mod error;
+pub mod queue;
 pub mod targets;
 
 pub use error::SessionMessageError;
