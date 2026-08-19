@@ -186,6 +186,14 @@ impl AgentRuntime {
     /// Atomic: set status ← Finished AND broadcast `Finish(session_id)`.
     /// Idempotent in the Finished absorbing state (no-op).
     pub fn emit_finish(&self, session_id: Option<String>) {
+        self.emit_finish_data(FinishEventData {
+            session_id,
+            ..Default::default()
+        });
+    }
+
+    /// Atomic finish variant for managers whose terminal carries extra data.
+    pub(crate) fn emit_finish_data(&self, data: FinishEventData) {
         let already_finished = {
             let mut guard = self.status.write().unwrap_or_else(|e| e.into_inner());
             let was_finished = matches!(*guard, Some(ConversationStatus::Finished));
@@ -197,9 +205,7 @@ impl AgentRuntime {
         if already_finished {
             return;
         }
-        let _ = self
-            .event_tx
-            .send(AgentStreamEvent::Finish(FinishEventData { session_id }));
+        let _ = self.event_tx.send(AgentStreamEvent::Finish(data));
     }
 
     /// Atomic: set status ← Finished AND broadcast `Error { message }`.

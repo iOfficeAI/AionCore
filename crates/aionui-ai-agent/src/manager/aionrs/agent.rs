@@ -14,6 +14,7 @@ use aion_config::config::{CliArgs, Config, McpServerConfig, ProviderType};
 use aion_mcp::manager::McpManager;
 use aion_protocol::commands::{ApprovalScope, SessionMode};
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
+use aion_types::message::TokenUsage;
 use aionui_api_types::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AgentModeResponse, ConfigOptionConfirmation,
     GetConfigOptionsResponse, SetConfigOptionResponse, SlashCommandItem,
@@ -34,6 +35,7 @@ use crate::capability::image_input::resolve_image_input_capability;
 use crate::dev_prompt_dump::{AgentFinalInputDump, dump_agent_final_input};
 use crate::error::AgentError;
 use crate::protocol::events::AgentStreamEvent;
+use crate::protocol::events::FinishEventData;
 use crate::protocol::send_error::AgentSendError;
 use crate::types::{AionrsResolvedConfig, SendMessageData};
 
@@ -124,6 +126,9 @@ pub struct AionrsAgentManager {
     cancel_notify: Arc<Notify>,
     /// Signalled after an in-flight turn emits its terminal event.
     turn_finished_notify: Arc<Notify>,
+    /// Last cumulative engine counters. `AgentResult.usage` is session-wide,
+    /// while the usage ledger must receive exactly one turn's spend.
+    last_total_usage: Mutex<TokenUsage>,
 }
 
 impl Drop for AionrsAgentManager {
@@ -217,6 +222,10 @@ impl AionrsAgentManager {
         }
 
         let is_resume = resume_session.is_some();
+        let last_total_usage = resume_session
+            .as_ref()
+            .map(|session| session.total_usage.clone())
+            .unwrap_or_default();
         let provider_label = config.provider_label.clone();
 
         let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
@@ -284,7 +293,60 @@ impl AionrsAgentManager {
             final_input_dump,
             cancel_notify: Arc::new(Notify::new()),
             turn_finished_notify: Arc::new(Notify::new()),
+            last_total_usage: Mutex::new(last_total_usage),
         })
+    }
+
+    async fn complete_successful_turn(&self, cumulative_usage: TokenUsage) {
+        let turn_usage = {
+            let mut previous = self.last_total_usage.lock().await;
+            let delta = TokenUsage {
+                input_tokens: cumulative_usage.input_tokens.saturating_sub(previous.input_tokens),
+                output_tokens: cumulative_usage.output_tokens.saturating_sub(previous.output_tokens),
+                cache_creation_tokens: cumulative_usage
+                    .cache_creation_tokens
+                    .saturating_sub(previous.cache_creation_tokens),
+                cache_read_tokens: cumulative_usage
+                    .cache_read_tokens
+                    .saturating_sub(previous.cache_read_tokens),
+            };
+            *previous = cumulative_usage;
+            delta
+        };
+
+        let total_tokens = turn_usage.input_tokens.saturating_add(turn_usage.output_tokens);
+        if total_tokens > 0 {
+            let mut meta = serde_json::json!({
+                "total_tokens": total_tokens,
+                "input_tokens": turn_usage.input_tokens,
+                "output_tokens": turn_usage.output_tokens,
+            });
+            if turn_usage.cache_read_tokens > 0 {
+                meta["cached_read_tokens"] = serde_json::json!(turn_usage.cache_read_tokens);
+            }
+            if turn_usage.cache_creation_tokens > 0 {
+                meta["cached_write_tokens"] = serde_json::json!(turn_usage.cache_creation_tokens);
+            }
+            self.runtime.emit(AgentStreamEvent::AcpContextUsage(serde_json::json!({
+                "used": total_tokens,
+                "size": 0,
+                "_meta": meta,
+            })));
+        }
+
+        info!(
+            conversation_id = %self.runtime.conversation_id(),
+            input_tokens = turn_usage.input_tokens,
+            output_tokens = turn_usage.output_tokens,
+            cached_read_tokens = turn_usage.cache_read_tokens,
+            cached_write_tokens = turn_usage.cache_creation_tokens,
+            "Aionrs turn usage finalized"
+        );
+        self.runtime.emit_finish_data(FinishEventData {
+            session_id: None,
+            input_tokens: (total_tokens > 0).then_some(turn_usage.input_tokens),
+            output_tokens: (total_tokens > 0).then_some(turn_usage.output_tokens),
+        });
     }
 
     fn request_stop(&self, reason: Option<AgentKillReason>, operation: &'static str) -> bool {
@@ -439,13 +501,13 @@ impl IAgentTask for AionrsAgentManager {
         self.runtime.bump_activity();
 
         let send_result = match result {
-            Some(Ok(_)) => {
+            Some(Ok(result)) => {
                 info!(
                     conversation_id = %self.runtime.conversation_id(),
                     elapsed_ms,
                     "Aionrs engine.run() completed, emitting Finish"
                 );
-                self.runtime.emit_finish(None);
+                self.complete_successful_turn(result.usage).await;
                 Ok(())
             }
             Some(Err(e)) => {

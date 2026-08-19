@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn finish_event_produces_finish() {
-        let event = AgentStreamEvent::Finish(FinishEventData { session_id: None });
+        let event = AgentStreamEvent::Finish(FinishEventData::default());
         let action = ChannelMessageService::process_stream_event(&event);
         assert!(matches!(action, Some(StreamAction::Finish)));
     }

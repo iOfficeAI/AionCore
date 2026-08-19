@@ -157,9 +157,10 @@ impl OutputSink for BackendOutputSink {
                 "_meta": meta,
             })));
         }
-        let _ = self
-            .event_tx
-            .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }));
+        let _ = self.event_tx.send(AgentStreamEvent::Finish(FinishEventData {
+            session_id: None,
+            ..Default::default()
+        }));
     }
 
     fn emit_error(&self, msg: &str) {

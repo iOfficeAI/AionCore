@@ -165,6 +165,16 @@ pub enum TipType {
 pub struct FinishEventData {
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Per-turn counters reported by the embedded aionrs engine.
+    ///
+    /// These remain optional because ACP and cancellation terminals do not
+    /// necessarily carry usage. The aionrs renderer consumes them from the
+    /// terminal frame while the preceding `AcpContextUsage` event feeds the
+    /// durable usage ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
 }
 
 /// Kind of CodeBuddy ACP dialect signal absorbed by the tolerant transport
@@ -336,10 +346,14 @@ mod tests {
     fn finish_event_roundtrip() {
         let event = AgentStreamEvent::Finish(FinishEventData {
             session_id: Some("sess-abc".into()),
+            input_tokens: Some(922),
+            output_tokens: Some(182),
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "finish");
         assert_eq!(json["data"]["session_id"], "sess-abc");
+        assert_eq!(json["data"]["input_tokens"], 922);
+        assert_eq!(json["data"]["output_tokens"], 182);
     }
 
     #[test]

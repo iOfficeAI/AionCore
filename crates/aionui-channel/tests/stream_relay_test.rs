@@ -64,7 +64,7 @@ async fn relay_sends_thinking_then_final_message() {
         }))
         .unwrap();
     event_tx
-        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }))
+        .send(AgentStreamEvent::Finish(FinishEventData::default()))
         .unwrap();
 
     relay.run(rx).await;
@@ -143,7 +143,7 @@ async fn weixin_flushes_pending_text_before_tool_call() {
         }))
         .unwrap();
     event_tx
-        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }))
+        .send(AgentStreamEvent::Finish(FinishEventData::default()))
         .unwrap();
 
     relay.run(rx).await;
@@ -196,7 +196,7 @@ async fn telegram_does_not_flush_text_before_tool_call() {
         }))
         .unwrap();
     event_tx
-        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }))
+        .send(AgentStreamEvent::Finish(FinishEventData::default()))
         .unwrap();
 
     relay.run(rx).await;
@@ -234,7 +234,7 @@ async fn weixin_skips_flush_when_buffer_is_empty() {
         }))
         .unwrap();
     event_tx
-        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }))
+        .send(AgentStreamEvent::Finish(FinishEventData::default()))
         .unwrap();
 
     relay.run(rx).await;

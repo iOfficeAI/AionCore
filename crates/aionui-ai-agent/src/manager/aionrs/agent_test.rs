@@ -330,9 +330,10 @@ async fn runtime_can_emit_error_and_finish() {
     agent.runtime.emit_error("test error");
     // emit_error sets status to Finished, so emit_finish is a no-op here.
     // We emit directly for the Finish broadcast path test:
-    agent
-        .runtime
-        .emit(AgentStreamEvent::Finish(FinishEventData { session_id: None }));
+    agent.runtime.emit(AgentStreamEvent::Finish(FinishEventData {
+        session_id: None,
+        ..Default::default()
+    }));
 
     match rx.try_recv().unwrap() {
         AgentStreamEvent::Error(data) => assert_eq!(data.message, "test error"),
@@ -342,4 +343,73 @@ async fn runtime_can_emit_error_and_finish() {
         AgentStreamEvent::Finish(_) => {}
         other => panic!("Expected Finish, got {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn successful_turn_emits_incremental_usage_before_finish() {
+    let agent = AionrsAgentManager::new("conv-usage".into(), "/project".into(), make_test_config(), None)
+        .await
+        .unwrap();
+    let mut rx = agent.subscribe();
+    agent.runtime.reset_for_new_turn(ConversationStatus::Running);
+
+    agent
+        .complete_successful_turn(TokenUsage {
+            input_tokens: 120,
+            output_tokens: 30,
+            cache_creation_tokens: 10,
+            cache_read_tokens: 80,
+        })
+        .await;
+
+    let usage = rx.recv().await.unwrap();
+    let AgentStreamEvent::AcpContextUsage(payload) = usage else {
+        panic!("Expected AcpContextUsage, got {usage:?}");
+    };
+    assert_eq!(payload["_meta"]["input_tokens"], 120);
+    assert_eq!(payload["_meta"]["output_tokens"], 30);
+    assert_eq!(payload["_meta"]["cached_read_tokens"], 80);
+
+    let finish = rx.recv().await.unwrap();
+    let AgentStreamEvent::Finish(data) = finish else {
+        panic!("Expected Finish, got {finish:?}");
+    };
+    assert_eq!(data.input_tokens, Some(120));
+    assert_eq!(data.output_tokens, Some(30));
+    assert_eq!(agent.status(), Some(ConversationStatus::Finished));
+
+    agent.runtime.reset_for_new_turn(ConversationStatus::Running);
+    agent
+        .complete_successful_turn(TokenUsage {
+            input_tokens: 150,
+            output_tokens: 42,
+            cache_creation_tokens: 10,
+            cache_read_tokens: 100,
+        })
+        .await;
+
+    let AgentStreamEvent::AcpContextUsage(payload) = rx.recv().await.unwrap() else {
+        panic!("Expected second-turn AcpContextUsage");
+    };
+    assert_eq!(payload["_meta"]["input_tokens"], 30);
+    assert_eq!(payload["_meta"]["output_tokens"], 12);
+    assert_eq!(payload["_meta"]["cached_read_tokens"], 20);
+}
+
+#[tokio::test]
+async fn successful_turn_without_new_provider_usage_emits_only_finish() {
+    let agent = AionrsAgentManager::new("conv-no-usage".into(), "/project".into(), make_test_config(), None)
+        .await
+        .unwrap();
+    let mut rx = agent.subscribe();
+    agent.runtime.reset_for_new_turn(ConversationStatus::Running);
+
+    agent.complete_successful_turn(TokenUsage::default()).await;
+
+    let AgentStreamEvent::Finish(data) = rx.recv().await.unwrap() else {
+        panic!("Expected Finish without a usage event");
+    };
+    assert_eq!(data.input_tokens, None);
+    assert_eq!(data.output_tokens, None);
+    assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
 }
