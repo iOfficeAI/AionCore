@@ -138,8 +138,12 @@ fn prepend_args(head: &[String], tail: &[String]) -> Vec<String> {
 /// - `init.mcp_servers` → `--mcp-config <json>` + `--strict-mcp-config` (the latter
 ///   ONLY alongside `--mcp-config`: it makes the session ignore the machine's
 ///   ambient `~/.claude` servers, which we must NOT do when we inject none).
-/// - `init.preset_context` → `--system-prompt` (composed `[Assistant Rules]` /
-///   skills index / team-guide text, already assembled by the app boundary).
+/// - `init.preset_context` → `--append-system-prompt` (composed `[Assistant Rules]` /
+///   skills index / team-guide text, already assembled by the app boundary). It MUST be
+///   the APPEND flag: `--system-prompt` REPLACES claude's built-in prompt wholesale
+///   ("System prompt to use for the session" vs "Append a system prompt to the default
+///   system prompt", verified: `claude --help`, 2.1.234), silently stripping the
+///   harness's own guidance — the same defect class as codex `baseInstructions`.
 /// - `model` → `--model`; `mode` → `--permission-mode` (claude has no in-band
 ///   switch at spawn; a UI switch persists + evicts so the rebuild re-applies here).
 ///
@@ -156,7 +160,7 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        args.push("--system-prompt".to_string());
+        args.push("--append-system-prompt".to_string());
         args.push(preset.to_string());
     }
 
@@ -3494,7 +3498,40 @@ mod tests {
         );
     }
 
-    /// preset_context → `--system-prompt`; model → `--model`; mode →
+    /// The assistant preset must NOT replace claude's default system prompt.
+    ///
+    /// `--system-prompt` REPLACES the built-in prompt wholesale (claude 2.1.234
+    /// `--help`: "System prompt to use for the session"), silently stripping
+    /// the harness's own guidance — the same defect class as codex
+    /// `baseInstructions` (#895). The additive flag is `--append-system-prompt`
+    /// ("Append a system prompt to the default system prompt", verified:
+    /// `claude --help`, 2.1.234).
+    #[test]
+    fn preset_context_appends_not_replaces_system_prompt() {
+        let config = SessionConfig {
+            init: SessionInit {
+                preset_context: Some("[Assistant Rules] be precise".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let args = build_claude_init_args(&config);
+        let pair = |flag: &str| -> Option<String> {
+            args.iter()
+                .position(|a| a == flag)
+                .and_then(|i| args.get(i + 1).cloned())
+        };
+        assert_eq!(
+            pair("--append-system-prompt").as_deref(),
+            Some("[Assistant Rules] be precise")
+        );
+        assert!(
+            !args.iter().any(|a| a == "--system-prompt"),
+            "the preset must not wipe claude's default system prompt"
+        );
+    }
+
+    /// preset_context → `--append-system-prompt`; model → `--model`; mode →
     /// `--permission-mode`; each omitted independently when its source is empty.
     #[test]
     fn build_claude_init_args_threads_preset_model_mode() {
@@ -3513,7 +3550,10 @@ mod tests {
                 .position(|a| a == flag)
                 .and_then(|i| args.get(i + 1).cloned())
         };
-        assert_eq!(pair("--system-prompt").as_deref(), Some("[Assistant Rules] be precise"));
+        assert_eq!(
+            pair("--append-system-prompt").as_deref(),
+            Some("[Assistant Rules] be precise")
+        );
         assert_eq!(pair("--model").as_deref(), Some("global.anthropic.claude-opus-4-8"));
         assert_eq!(pair("--permission-mode").as_deref(), Some("plan"));
 
@@ -3532,7 +3572,9 @@ mod tests {
         };
         let blank_args = build_claude_init_args(&blank);
         assert!(
-            !blank_args.iter().any(|a| a == "--model" || a == "--system-prompt"),
+            !blank_args
+                .iter()
+                .any(|a| a == "--model" || a == "--append-system-prompt"),
             "blank model/preset emit no flags"
         );
         assert_eq!(
