@@ -158,6 +158,24 @@ async fn send_message(
     (status, body)
 }
 
+/// Wait until the conversation's agent is registered with the task manager.
+///
+/// `send_message` returns 202 as soon as the turn is CLAIMED, but the agent
+/// itself is built lazily inside the detached turn task. The mid-turn branch
+/// needs `task_manager.get_task(...)` to be populated, so a second send issued
+/// before registration completes legitimately falls through to the claim and
+/// gets 409. Without this barrier the test races that spawn and fails
+/// intermittently under parallel load.
+async fn wait_for_agent_registered(services: &aionui_app::AppServices, conv_id: &str) {
+    for _ in 0..200 {
+        if services.worker_task_manager.get_task(conv_id).is_some() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("agent for {conv_id} never registered with the task manager");
+}
+
 /// Brief Step 1: during an active turn, a second message to a
 /// `supports_midturn_delivery` backend gets HTTP 200 (not 409) and the response
 /// `turn_id` equals the CURRENT active turn's id.
@@ -175,6 +193,9 @@ async fn midturn_send_returns_200_with_the_active_turn_id() {
     let (status1, body1) = send_message(&mut app, &conv_id, "first message", &token, &csrf).await;
     assert_eq!(status1, StatusCode::ACCEPTED, "first send scheduled a turn: {body1}");
     let turn1 = body1["data"]["turn_id"].as_str().unwrap().to_owned();
+    // The mid-turn branch reads the REGISTERED agent, which turn 1 builds
+    // asynchronously; wait for it rather than racing the spawn.
+    wait_for_agent_registered(&services, &conv_id).await;
 
     // Mid-turn second message: 200, folded into the SAME turn.
     let (status2, body2) = send_message(&mut app, &conv_id, "midturn interjection", &token, &csrf).await;
