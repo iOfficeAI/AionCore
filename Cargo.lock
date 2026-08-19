@@ -418,6 +418,7 @@ dependencies = [
  "aionui-realtime",
  "aionui-runtime",
  "aionui-session",
+ "aionui-session-message",
  "aionui-shell",
  "aionui-system",
  "aionui-team",
