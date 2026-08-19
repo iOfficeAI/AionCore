@@ -236,3 +236,69 @@ async fn an_empty_tick_is_harmless() {
     assert!(queue.is_empty());
     assert!(sink.delivered.lock().unwrap().is_empty());
 }
+
+struct TogglableGate {
+    enabled: std::sync::atomic::AtomicBool,
+}
+
+impl TogglableGate {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled: std::sync::atomic::AtomicBool::new(enabled),
+        }
+    }
+
+    fn set(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl DrainGate for TogglableGate {
+    async fn is_enabled_for(&self, _user_id: &str) -> bool {
+        self.enabled.load(Ordering::SeqCst)
+    }
+}
+
+#[tokio::test]
+async fn re_enabling_after_a_disable_does_not_flush_stale_messages() {
+    // spec §6.9.2's real requirement: nothing old may burst out on re-enable.
+    // Satisfied by the drainer clearing a disabled user's backlog each tick,
+    // so by the time the toggle comes back the queue is already empty.
+    let sink = Arc::new(RecordingSink::default());
+    let clock = Arc::new(TestClock::new(1_000));
+    let queue = Arc::new(DeliveryQueue::new(clock.clone()));
+    let gate = Arc::new(TogglableGate::new(false));
+    let drainer = Drainer::new(queue.clone(), sink.clone(), gate.clone());
+
+    queue.push(delivery("b", "stale")).unwrap();
+    drainer.tick_once().await;
+    assert!(queue.is_empty(), "disabled → backlog cleared");
+
+    gate.set(true);
+    drainer.tick_once().await;
+    assert!(
+        sink.delivered.lock().unwrap().is_empty(),
+        "re-enabling must not deliver anything queued before the disable"
+    );
+}
+
+#[tokio::test]
+async fn a_message_queued_after_re_enabling_is_delivered_normally() {
+    // The other half of the contract: clearing on disable must not leave the
+    // drainer permanently wedged for that target.
+    let sink = Arc::new(RecordingSink::default());
+    let clock = Arc::new(TestClock::new(1_000));
+    let queue = Arc::new(DeliveryQueue::new(clock.clone()));
+    let gate = Arc::new(TogglableGate::new(false));
+    let drainer = Drainer::new(queue.clone(), sink.clone(), gate.clone());
+
+    queue.push(delivery("b", "stale")).unwrap();
+    drainer.tick_once().await;
+
+    gate.set(true);
+    queue.push(delivery("b", "fresh")).unwrap();
+    drainer.tick_once().await;
+
+    assert_eq!(*sink.delivered.lock().unwrap(), vec!["fresh"]);
+}
