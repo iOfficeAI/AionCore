@@ -68,14 +68,6 @@ pub struct AppServices {
 }
 
 impl AppServices {
-    pub(crate) fn runtime_helper_bin(&self) -> String {
-        self.runtime_helper_bin.clone()
-    }
-
-    pub(crate) fn runtime_base_url(&self) -> String {
-        self.runtime_base_url.clone()
-    }
-
     pub(crate) fn backend_binary_path(&self) -> Arc<PathBuf> {
         self.backend_binary_path.clone()
     }
