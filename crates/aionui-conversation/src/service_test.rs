@@ -1693,9 +1693,10 @@ async fn agent_title_applies_to_default_named_conversation() {
 
     let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
     let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
-    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Fix login bug")
-        .await
-        .unwrap();
+    let applied =
+        crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Fix login bug", "test")
+            .await
+            .unwrap();
 
     assert!(applied);
     let row = get_row(&repo, "user_1", &id).await;
@@ -1720,9 +1721,10 @@ async fn agent_title_overwrites_previous_agent_title() {
 
     let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
     let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
-    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Newer agent title")
-        .await
-        .unwrap();
+    let applied =
+        crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Newer agent title", "test")
+            .await
+            .unwrap();
 
     assert!(applied);
     assert_eq!(get_row(&repo, "user_1", &id).await.name, "Newer agent title");
@@ -1736,7 +1738,7 @@ async fn agent_title_never_overwrites_user_rename() {
 
     let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
     let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
-    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Agent title")
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Agent title", "test")
         .await
         .unwrap();
 
@@ -1761,7 +1763,7 @@ async fn agent_title_unchanged_is_noop() {
 
     let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
     let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
-    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Same title")
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Same title", "test")
         .await
         .unwrap();
 
@@ -1781,7 +1783,7 @@ async fn agent_title_ignores_unknown_conversation() {
 
     let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
     let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
-    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", "missing", "Title")
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", "missing", "Title", "test")
         .await
         .unwrap();
 

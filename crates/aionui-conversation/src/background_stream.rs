@@ -154,6 +154,7 @@ impl BackgroundStreamWatcher {
                         &self.user_id,
                         &self.conversation_id,
                         title,
+                        "watcher",
                     )
                     .await
                     {

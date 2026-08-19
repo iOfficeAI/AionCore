@@ -5844,13 +5844,18 @@ pub(crate) async fn apply_agent_title(
     user_id: &str,
     conversation_id: &str,
     title: &str,
+    // Which consumer won the frame — "watcher" (between turns) or "relay"
+    // (inside a turn, incl. the orphan-turn window). Both are valid; logging it
+    // is what makes a lost title diagnosable: the two paths were previously
+    // indistinguishable in production logs, which is why this bug hid so long.
+    consumer: &str,
 ) -> Result<bool, ConversationError> {
     let Some(existing) = repo.get(user_id, conversation_id).await? else {
-        debug!(conversation_id, "agent title dropped: conversation not found");
+        debug!(conversation_id, consumer, "agent title dropped: conversation not found");
         return Ok(false);
     };
     if existing.name_source.as_deref() == Some("user") {
-        debug!(conversation_id, "agent title dropped: name is user-owned");
+        debug!(conversation_id, consumer, "agent title dropped: name is user-owned");
         return Ok(false);
     }
     if existing.name == title {
@@ -5896,6 +5901,7 @@ pub(crate) async fn apply_agent_title(
     info!(
         conversation_id,
         title_len = title.chars().count(),
+        consumer,
         "agent session title applied"
     );
     Ok(true)

@@ -691,6 +691,7 @@ impl StreamRelay {
                                     &self.user_id,
                                     &self.conversation_id,
                                     title,
+                                    "relay",
                                 )
                                 .await
                             {
