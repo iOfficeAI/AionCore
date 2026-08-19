@@ -98,6 +98,7 @@ fn tool_call(call_id: &str) -> AgentStreamEvent {
         args: json!({"path": "a.ts"}),
         status: ToolCallStatus::Running,
         description: None,
+        parent_call_id: None,
         input: None,
         output: None,
     })
