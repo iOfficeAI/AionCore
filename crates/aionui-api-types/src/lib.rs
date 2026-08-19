@@ -27,6 +27,7 @@ mod provider;
 mod remote_agent;
 mod response;
 mod runtime;
+mod session_tools;
 mod shell;
 mod skill;
 mod system;
@@ -151,6 +152,13 @@ pub use response::{ApiResponse, ErrorResponse};
 pub use runtime::{
     EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload,
     RuntimeStatusPhase, RuntimeStatusScope, RuntimeStatusScopeKind,
+};
+pub use session_tools::{
+    SESSION_TOOLS_SCHEMA_VERSION, SessionCliEnvelope, SessionCliMeta, SessionDeliveryStatus, SessionMentionTarget,
+    SessionMentionableQuery, SessionMentionableResponse, SessionMessageRateLimitedPayload, SessionRateGate,
+    SessionSendMessageRequest, SessionSendMessageResponse, SessionToolDescriptor, SessionToolErrorCode,
+    SessionToolErrorPayload, SessionToolName, session_tool_descriptor, session_tool_descriptors,
+    tool_name_for_session_cli_path,
 };
 pub use shell::{
     CheckToolInstalledRequest, CheckToolInstalledResponse, DeepgramSpeechToTextConfig, OpenAISpeechToTextConfig,
