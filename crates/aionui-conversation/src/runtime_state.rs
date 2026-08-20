@@ -19,6 +19,7 @@ pub struct ConversationRuntimeStateService {
 #[derive(Debug, Default)]
 struct ConversationRuntimeState {
     active_turns: HashMap<String, String>,
+    active_tool_executions: HashMap<String, HashSet<String>>,
     deleting_conversations: HashSet<String>,
     cancelling_conversations: HashSet<String>,
     /// Cancels that arrived before the turn's agent registered, keyed by
@@ -116,6 +117,59 @@ impl ConversationRuntimeStateService {
             .lock()
             .ok()
             .and_then(|state| state.active_turns.get(conversation_id).cloned())
+    }
+
+    pub fn update_tool_execution(&self, conversation_id: &str, execution_id: &str, active: bool) {
+        let Ok(mut state) = self.state.lock() else {
+            warn!(
+                conversation_id,
+                execution_id, "runtime state lock poisoned while tracking tool execution"
+            );
+            return;
+        };
+        if active {
+            state
+                .active_tool_executions
+                .entry(conversation_id.to_owned())
+                .or_default()
+                .insert(execution_id.to_owned());
+        } else if let Some(executions) = state.active_tool_executions.get_mut(conversation_id) {
+            executions.remove(execution_id);
+            if executions.is_empty() {
+                state.active_tool_executions.remove(conversation_id);
+            }
+        }
+    }
+
+    pub fn has_active_tool_executions(&self, conversation_id: &str) -> bool {
+        self.state
+            .lock()
+            .map(|state| {
+                state
+                    .active_tool_executions
+                    .get(conversation_id)
+                    .is_some_and(|ids| !ids.is_empty())
+            })
+            .unwrap_or(true)
+    }
+
+    pub fn mark_tools_force_terminated(&self, conversation_id: &str, turn_id: &str) {
+        match self.state.lock() {
+            Ok(mut state) => {
+                state.active_tool_executions.remove(conversation_id);
+                state.cancelling_conversations.remove(conversation_id);
+                state.cancellation_outcomes.insert(
+                    conversation_id.to_owned(),
+                    (turn_id.to_owned(), CancellationState::ForceTerminated),
+                );
+                drop(state);
+                self.release_notify.notify_waiters();
+            }
+            Err(_) => warn!(
+                conversation_id,
+                turn_id, "runtime state lock poisoned while terminating tools"
+            ),
+        }
     }
 
     pub async fn wait_until_unclaimed(&self, conversation_id: &str) {
@@ -271,12 +325,17 @@ impl ConversationRuntimeStateService {
         match self.state.lock() {
             Ok(mut state) => {
                 let had_active_turn = state.active_turns.remove(conversation_id).is_some();
+                let had_active_tools = state.active_tool_executions.remove(conversation_id).is_some();
                 let had_deleting = state.deleting_conversations.remove(conversation_id);
                 let had_cancelling = state.cancelling_conversations.remove(conversation_id);
-                if had_active_turn || had_deleting || had_cancelling {
+                if had_active_turn || had_active_tools || had_deleting || had_cancelling {
                     info!(
                         conversation_id,
-                        had_active_turn, had_deleting, had_cancelling, "conversation runtime state cleared"
+                        had_active_turn,
+                        had_active_tools,
+                        had_deleting,
+                        had_cancelling,
+                        "conversation runtime state cleared"
                     );
                     drop(state);
                     self.release_notify.notify_waiters();
@@ -403,11 +462,17 @@ impl ConversationRuntimeStateService {
 
                 let was_deleting = state.deleting_conversations.remove(conversation_id);
                 let was_cancelling = state.cancelling_conversations.remove(conversation_id);
-                if was_cancelling {
+                let tools_converged = state
+                    .active_tool_executions
+                    .get(conversation_id)
+                    .is_none_or(HashSet::is_empty);
+                if was_cancelling && tools_converged {
                     state
                         .cancellation_outcomes
                         .entry(conversation_id.to_owned())
                         .or_insert_with(|| (turn_id.to_owned(), CancellationState::ConvergedIdle));
+                } else if was_cancelling {
+                    state.cancelling_conversations.insert(conversation_id.to_owned());
                 }
                 info!(
                     conversation_id,
@@ -640,6 +705,24 @@ mod tests {
             Some(CancellationState::ConvergedIdle)
         );
         assert_eq!(state.take_cancellation_outcome("conv-1", "turn-a"), None);
+    }
+
+    #[test]
+    fn cancellation_does_not_converge_while_tool_execution_is_active() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let mut claim = state.try_claim_turn("conv-1", "turn-a").unwrap();
+        state.update_tool_execution("conv-1", "exec-1", true);
+        state.mark_cancelling("conv-1");
+        claim.release();
+
+        assert!(state.is_cancelling("conv-1"));
+        assert_eq!(state.take_cancellation_outcome("conv-1", "turn-a"), None);
+        state.mark_tools_force_terminated("conv-1", "turn-a");
+        assert!(!state.has_active_tool_executions("conv-1"));
+        assert_eq!(
+            state.take_cancellation_outcome("conv-1", "turn-a"),
+            Some(CancellationState::ForceTerminated)
+        );
     }
 
     #[test]
