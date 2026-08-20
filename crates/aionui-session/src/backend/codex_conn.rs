@@ -41,6 +41,9 @@ use crate::capability::{BlockSet, Capabilities, CapabilityTier, CommandSet, Prom
 use crate::event::{CancelReason, ProvisioningPhase, SessionEvent, StopReason, SubagentStatus, TurnOutcome};
 use futures_util::stream::{BoxStream, StreamExt};
 
+type PendingSteerResult = oneshot::Sender<Result<String, String>>;
+type PendingSteers = Arc<Mutex<HashMap<u64, PendingSteerResult>>>;
+
 const CODEX_CONFIG_FLAG: &str = "-c";
 const CODEX_ENV_POLICY_INHERIT_ALL: &str = "shell_environment_policy.inherit=all";
 const CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY: &str = "shell_environment_policy.include_only=[]";
@@ -805,7 +808,7 @@ pub struct CodexSessionBackend {
     /// left the turn hanging Running forever, ELECTRON-3Q0).
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     /// rpc id to completion channel for `turn/steer` responses.
-    pending_steers: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<String, String>>>>>,
+    pending_steers: PendingSteers,
     /// B-CODEX-MODEL-LIST (§9.10 discovery): rpc ids of the `model/list` +
     /// `collaborationMode/list` calls `open_session` issues at handshake, mapped to
     /// which list they fill. The reader claims the matching responses and writes
@@ -908,7 +911,7 @@ struct CodexReaderState {
     pending_auth_id: Arc<Mutex<Option<Value>>>,
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
-    pending_steers: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<String, String>>>>>,
+    pending_steers: PendingSteers,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
@@ -1435,7 +1438,7 @@ async fn reader_task(
     pending_auth_id: Arc<Mutex<Option<Value>>>,
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
-    pending_steers: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<String, String>>>>>,
+    pending_steers: PendingSteers,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
@@ -6840,9 +6843,15 @@ mod tests {
         let release = fake.stdout_releaser();
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let request_capture = Arc::clone(&captured);
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            release();
+            for _ in 0..200 {
+                if String::from_utf8_lossy(&request_capture.lock().await).contains(r#""method":"turn/steer""#) {
+                    release();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
         });
         let receipt = backend
             .dispatch(Command::Steer {
@@ -6899,10 +6908,17 @@ mod tests {
                 .to_vec();
         let fake = FakeAgentIo::new(prefix, None).with_gated_tail(tail);
         let release = fake.stdout_releaser();
+        let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let request_capture = Arc::clone(&captured);
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            release();
+            for _ in 0..200 {
+                if String::from_utf8_lossy(&request_capture.lock().await).contains(r#""method":"turn/steer""#) {
+                    release();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
         });
 
         let error = backend
