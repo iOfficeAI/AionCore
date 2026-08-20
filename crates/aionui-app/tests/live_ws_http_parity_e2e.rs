@@ -32,6 +32,28 @@ struct LiveApp {
     router: axum::Router,
     token: String,
     csrf: String,
+    /// Kept so a test can END this app the way a process exit would, instead of
+    /// letting the binding fall out of scope and hoping. Background tasks hold
+    /// their own Arcs into the services, so dropping `LiveApp` does NOT stop the
+    /// CLI subprocesses — the restart test proved it, by resuming while the
+    /// first app's codex was still running.
+    task_manager: std::sync::Arc<dyn aionui_ai_agent::IWorkerTaskManager>,
+}
+
+impl LiveApp {
+    /// Stop every agent this app started, and wait for the processes to go.
+    ///
+    /// The restart test needs this to mean anything: codex 0.148.0 refuses
+    /// `thread/resume` while another writer holds the thread, so resuming
+    /// against a still-live predecessor is not a restart — it is two apps
+    /// fighting over one conversation.
+    async fn shutdown(&self, conversation_ids: &[&str]) {
+        for id in conversation_ids {
+            self.task_manager
+                .kill_and_wait(id, Some(aionui_common::AgentKillReason::UserCancelTimeout))
+                .await;
+        }
+    }
 }
 
 async fn start_live_app() -> LiveApp {
@@ -75,6 +97,7 @@ async fn start_live_app_on(db: aionui_db::Database, create_user: bool) -> LiveAp
         router,
         token,
         csrf,
+        task_manager: services.worker_task_manager.clone(),
     }
 }
 
@@ -830,7 +853,7 @@ async fn run_backend_resume(backend: &str) {
     std::fs::create_dir_all(&ws_dir).unwrap();
 
     // ---- first app: tell the agent something only this conversation knows ----
-    let conv_id = {
+    let (conv_id, first_app) = {
         let app = start_live_app_on(db.clone(), true).await;
         let created = http_json(
             &app,
@@ -864,10 +887,15 @@ async fn run_backend_resume(backend: &str) {
             }
         }
         assert!(finished, "[{backend}] the first turn never finished");
-        conv_id
+        (conv_id, app)
     };
 
-    // The first app (and the CLI process it owned) is dropped here.
+    // End the first app the way a process exit would. Dropping the binding is
+    // NOT enough — background tasks hold their own Arcs into the services, so
+    // the CLI keeps running. Proven by codex 0.148.0, which refuses
+    // `thread/resume` while another writer holds the thread: the "restart" was
+    // resuming against a predecessor that had never stopped.
+    first_app.shutdown(&[&conv_id]).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // ---- second app, same database: the conversation must carry on ----
