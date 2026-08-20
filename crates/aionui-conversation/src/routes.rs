@@ -12,9 +12,9 @@ use aionui_api_types::{
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationCapabilities,
     ConversationInputListResponse, ConversationInputMode, ConversationInputReceipt, ConversationListResponse,
     ConversationResponse, CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
-    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SubmitConversationInputRequest,
-    UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ListConversationInputsQuery, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    SubmitConversationInputRequest, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -348,8 +348,13 @@ async fn list_inputs(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
+    Query(query): Query<ListConversationInputsQuery>,
 ) -> Result<Json<ApiResponse<ConversationInputListResponse>>, ApiError> {
-    let inputs = state.service.list_inputs(&user.id, &id).await.map_err(ApiError::from)?;
+    let inputs = state
+        .service
+        .list_inputs_with_terminal_limit(&user.id, &id, query.terminal_limit)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(inputs)))
 }
 

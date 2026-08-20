@@ -26,12 +26,12 @@ pub use error::{
 pub use instance_lock::{DataDirInstanceGuard, instance_lock_path};
 pub use models::{
     AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow,
-    AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationInputRow,
-    CreateAssistantParams, ExternalUserProjection, FolderRow, ProjectExplorerRow, ProjectKind, ProjectRow, Role,
-    SkillImportRecordRow, SkillRegistryInstallRow, SkillRow, UpdateAgentAvailabilitySnapshotParams,
+    AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationCapabilitySnapshotRow,
+    ConversationInputRow, CreateAssistantParams, ExternalUserProjection, FolderRow, ProjectExplorerRow, ProjectKind,
+    ProjectRow, Role, SkillImportRecordRow, SkillRegistryInstallRow, SkillRow, UpdateAgentAvailabilitySnapshotParams,
     UpdateAgentHandshakeParams, UpdateAssistantParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
     UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
-    UpsertOverrideParams, UsageEventRow, UserStatus, UserType,
+    UpsertConversationCapabilitySnapshotParams, UpsertOverrideParams, UsageEventRow, UserStatus, UserType,
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{

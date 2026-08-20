@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::DbError;
 use crate::models::{
-    ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationInputRow, ConversationRow, MessageRow,
-    UpsertConversationAssistantSnapshotParams,
+    ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationCapabilitySnapshotRow, ConversationInputRow,
+    ConversationRow, MessageRow, UpsertConversationAssistantSnapshotParams, UpsertConversationCapabilitySnapshotParams,
 };
 
 /// Conversation + message data access abstraction.
@@ -80,6 +80,23 @@ pub trait IConversationRepository: Send + Sync {
     /// Deletes the assistant snapshot bound to a conversation.
     async fn delete_assistant_snapshot(&self, _user_id: &str, _conversation_id: &str) -> Result<bool, DbError> {
         Ok(false)
+    }
+
+    async fn get_capability_snapshot(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+    ) -> Result<Option<ConversationCapabilitySnapshotRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn upsert_capability_snapshot(
+        &self,
+        _params: &UpsertConversationCapabilitySnapshotParams<'_>,
+    ) -> Result<ConversationCapabilitySnapshotRow, DbError> {
+        Err(DbError::Init(
+            "conversation capability snapshots are not supported by this repository".into(),
+        ))
     }
 
     // ── Message operations ──────────────────────────────────────────

@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aionui_process::Spawner;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, oneshot};
 
 use super::suspend::{ProcHandle, SuspendController, spawn_idle_timer};
 use super::types::{
@@ -40,6 +40,9 @@ use crate::adapter::AgentIo;
 use crate::capability::{BlockSet, Capabilities, CapabilityTier, CommandSet, PromptAcceptedSource, SignalSet};
 use crate::event::{CancelReason, ProvisioningPhase, SessionEvent, StopReason, SubagentStatus, TurnOutcome};
 use futures_util::stream::{BoxStream, StreamExt};
+
+type PendingSteerResult = oneshot::Sender<Result<String, String>>;
+type PendingSteers = Arc<Mutex<HashMap<u64, PendingSteerResult>>>;
 
 const CODEX_CONFIG_FLAG: &str = "-c";
 const CODEX_ENV_POLICY_INHERIT_ALL: &str = "shell_environment_policy.inherit=all";
@@ -804,6 +807,8 @@ pub struct CodexSessionBackend {
     /// or surfaces a Notice (NoTurn) — NEVER a silent drop (a dropped rejection
     /// left the turn hanging Running forever, ELECTRON-3Q0).
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
+    /// rpc id to completion channel for `turn/steer` responses.
+    pending_steers: PendingSteers,
     /// B-CODEX-MODEL-LIST (§9.10 discovery): rpc ids of the `model/list` +
     /// `collaborationMode/list` calls `open_session` issues at handshake, mapped to
     /// which list they fill. The reader claims the matching responses and writes
@@ -866,6 +871,13 @@ struct Discovered {
     modes: Vec<crate::capability::ModeInfo>,
 }
 
+fn codex_steer_is_too_late(error: &Value) -> bool {
+    let encoded = error.to_string();
+    encoded.contains("activeTurnNotSteerable")
+        || encoded.contains("active turn not steerable")
+        || encoded.contains("turn is no longer active")
+}
+
 /// What `CodexSessionBackend::wake_handle` needs to re-spawn the codex app-server
 /// after an idle suspend and replay the resume handshake. `inert()` (no spawner)
 /// is used for test-built backends, which never suspend, so it is never consulted.
@@ -899,6 +911,7 @@ struct CodexReaderState {
     pending_auth_id: Arc<Mutex<Option<Value>>>,
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
+    pending_steers: PendingSteers,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
@@ -932,6 +945,7 @@ fn start_codex_reader(
             state.pending_auth_id,
             state.pending_tool_approvals,
             state.pending_sends,
+            state.pending_steers,
             state.pending_discovery,
             state.pending_set,
             state.pending_resume,
@@ -1106,6 +1120,7 @@ impl CodexSessionBackend {
         let pending_tool_approvals = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let current_model = Arc::new(Mutex::new(None));
         let pending_sends = Arc::new(Mutex::new(HashMap::new()));
+        let pending_steers = Arc::new(Mutex::new(HashMap::new()));
         let pending_discovery = Arc::new(Mutex::new(HashMap::new()));
         let pending_set = Arc::new(Mutex::new(HashMap::new()));
         let pending_resume = Arc::new(Mutex::new(None));
@@ -1130,6 +1145,7 @@ impl CodexSessionBackend {
             pending_auth_id: pending_auth_id.clone(),
             pending_tool_approvals: pending_tool_approvals.clone(),
             pending_sends: pending_sends.clone(),
+            pending_steers: pending_steers.clone(),
             pending_discovery: pending_discovery.clone(),
             pending_set: pending_set.clone(),
             pending_resume: pending_resume.clone(),
@@ -1187,6 +1203,7 @@ impl CodexSessionBackend {
             pending_tool_approvals,
             current_model,
             pending_sends,
+            pending_steers,
             pending_discovery,
             pending_set,
             pending_resume,
@@ -1421,6 +1438,7 @@ async fn reader_task(
     pending_auth_id: Arc<Mutex<Option<Value>>>,
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
+    pending_steers: PendingSteers,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
@@ -1714,6 +1732,22 @@ async fn reader_task(
                                     .unwrap_or("request rejected (no error message)")
                                     .to_string()
                             });
+                            if let Some(completion) = pending_steers.lock().await.remove(&rid) {
+                                let result = match (
+                                    frame
+                                        .get("result")
+                                        .and_then(|result| result.get("turnId"))
+                                        .and_then(Value::as_str),
+                                    frame.get("error"),
+                                ) {
+                                    (Some(turn_id), _) => Ok(turn_id.to_owned()),
+                                    (_, Some(error)) if codex_steer_is_too_late(error) => Err("too_late".to_owned()),
+                                    (_, Some(error)) => Err(format!("steer_failed:{error}")),
+                                    _ => Err("steer_failed:missing turnId response".to_owned()),
+                                };
+                                let _ = completion.send(result);
+                                continue;
+                            }
                             // (ELECTRON-3Q0 fix A) Claim the thread/resume response.
                             // An ERROR ("no rollout found for thread id …", verified:
                             // samples/codex-cli/0.144.1/dead_resume.jsonl) means the
@@ -3832,7 +3866,10 @@ impl SessionBackend for CodexSessionBackend {
                     turn_gen: self.turn_gen.load(Ordering::SeqCst),
                 })
             }
-            Command::Steer { content } => {
+            Command::Steer {
+                content,
+                client_user_message_id,
+            } => {
                 // REAL codex: `turn/steer{threadId, expectedTurnId, input}` — a SOFT
                 // injection (queued to the active turn's input, NOT a hard cancel;
                 // contrast turn/interrupt). The optimistic `expectedTurnId` is the
@@ -3842,14 +3879,39 @@ impl SessionBackend for CodexSessionBackend {
                 let tid = self.bound_thread().await?;
                 let Some(turn_id) = self.active_turn_id.lock().await.clone() else {
                     // No active turn to steer into.
-                    return Err(BackendError::Transport("no active turn to steer".into()));
+                    return Err(BackendError::Transport("too_late".into()));
                 };
                 let id = self.next_rpc_id();
+                let (completion_tx, completion_rx) = oneshot::channel();
+                self.pending_steers.lock().await.insert(id, completion_tx);
                 let frame = json!({
                     "jsonrpc": "2.0", "id": id, "method": "turn/steer",
-                    "params": { "threadId": tid, "expectedTurnId": turn_id, "input": build_input(&content) }
+                    "params": {
+                        "threadId": tid,
+                        "expectedTurnId": turn_id,
+                        "input": build_input(&content),
+                        "clientUserMessageId": client_user_message_id,
+                    }
                 });
-                self.write_frame(frame).await?;
+                if let Err(error) = self.write_frame(frame).await {
+                    self.pending_steers.lock().await.remove(&id);
+                    return Err(error);
+                }
+                let response = tokio::time::timeout(std::time::Duration::from_secs(10), completion_rx).await;
+                match response {
+                    Ok(Ok(Ok(response_turn_id))) if response_turn_id == turn_id => {}
+                    Ok(Ok(Ok(response_turn_id))) => {
+                        return Err(BackendError::Transport(format!(
+                            "steer_failed:response turn mismatch ({response_turn_id})"
+                        )));
+                    }
+                    Ok(Ok(Err(code))) => return Err(BackendError::Transport(code)),
+                    Ok(Err(_)) => return Err(BackendError::Transport("steer_failed:response channel closed".into())),
+                    Err(_) => {
+                        self.pending_steers.lock().await.remove(&id);
+                        return Err(BackendError::Transport("steer_failed:response timeout".into()));
+                    }
+                }
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -6768,12 +6830,33 @@ mod tests {
     async fn dispatch_steer_writes_turn_steer_with_expected_turn_id() {
         // R6 Steer → `turn/steer{threadId, expectedTurnId, input}` (soft injection;
         // NoTurn admission — no new turn_gen). The expectedTurnId is the active turn.
-        let fake = fake_with_binding("th-3", Some("turn-X"));
+        let prefix = concat!(
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-3"}}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"th-3","turn":{"id":"turn-X"}}}"#,
+            "\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let tail = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"turnId\":\"turn-X\"}}\n".to_vec();
+        let fake = FakeAgentIo::new(prefix, None).with_gated_tail(tail);
+        let release = fake.stdout_releaser();
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let request_capture = Arc::clone(&captured);
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                if String::from_utf8_lossy(&request_capture.lock().await).contains(r#""method":"turn/steer""#) {
+                    release();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
         let receipt = backend
             .dispatch(Command::Steer {
                 content: vec![ContentBlock::Text("STEERED".into())],
+                client_user_message_id: Some("input-1".into()),
             })
             .await
             .expect("accepted");
@@ -6788,6 +6871,28 @@ mod tests {
             "gated by the active turn token, got: {written}"
         );
         assert!(written.contains("STEERED"), "carries the steer text, got: {written}");
+        assert!(
+            written.contains(r#""clientUserMessageId":"input-1""#),
+            "carries the host input correlation id, got: {written}"
+        );
+    }
+
+    #[test]
+    fn steer_wire_shape_matches_codex_0_146_generated_contract() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/codex_0.146.0_turn_steer_contract.json"
+        ))
+        .unwrap();
+        assert_eq!(fixture["method"], "turn/steer");
+        assert_eq!(
+            fixture["params"]["required"],
+            serde_json::json!(["expectedTurnId", "input", "threadId"])
+        );
+        assert_eq!(
+            fixture["params"]["properties"]["clientUserMessageId"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        assert_eq!(fixture["response"]["required"], serde_json::json!(["turnId"]));
     }
 
     #[tokio::test]
@@ -6799,10 +6904,50 @@ mod tests {
         let err = backend
             .dispatch(Command::Steer {
                 content: vec![ContentBlock::Text("late".into())],
+                client_user_message_id: None,
             })
             .await
             .expect_err("steer with no active turn must be rejected");
-        assert!(matches!(err, BackendError::Transport(m) if m.contains("no active turn")));
+        assert!(matches!(err, BackendError::Transport(m) if m == "too_late"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_steer_maps_active_turn_rejection_to_too_late() {
+        let prefix = concat!(
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-3"}}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"th-3","turn":{"id":"turn-X"}}}"#,
+            "\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let tail =
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602,\"message\":\"activeTurnNotSteerable\"}}\n"
+                .to_vec();
+        let fake = FakeAgentIo::new(prefix, None).with_gated_tail(tail);
+        let release = fake.stdout_releaser();
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let request_capture = Arc::clone(&captured);
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                if String::from_utf8_lossy(&request_capture.lock().await).contains(r#""method":"turn/steer""#) {
+                    release();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+
+        let error = backend
+            .dispatch(Command::Steer {
+                content: vec![ContentBlock::Text("late".into())],
+                client_user_message_id: Some("input-late".into()),
+            })
+            .await
+            .expect_err("the backend rejection must not be acknowledged");
+
+        assert!(matches!(error, BackendError::Transport(code) if code == "too_late"));
     }
 
     #[tokio::test]
@@ -8493,7 +8638,7 @@ mod tests {
     /// `active_turn_id=None` on turn/completed (codex_conn.rs:597-598) while
     /// dispatch(Steer) reads it (codex_conn.rs:1363). When a turn finishes at the
     /// instant the user steers, the CLEAR-WINS ordering makes Steer read `None` →
-    /// return Err("no active turn to steer"). Consumer symptom: a steer issued at
+    /// return the stable `too_late` error. Consumer symptom: a steer issued at
     /// end-of-turn is reported as a failure even though the user's intent (inject
     /// text into the turn) simply arrived a beat too late. This pins the clear-wins
     /// ordering (deterministic: the turn is fully completed before we steer).
@@ -8532,10 +8677,11 @@ mod tests {
         let res = backend
             .dispatch(Command::Steer {
                 content: vec![ContentBlock::Text("wait, also do X".into())],
+                client_user_message_id: None,
             })
             .await;
         assert!(
-            matches!(&res, Err(BackendError::Transport(m)) if m.contains("no active turn to steer")),
+            matches!(&res, Err(BackendError::Transport(m)) if m == "too_late"),
             "R4: a Steer after the turn completed (active_turn_id cleared) is rejected with \
              'no active turn to steer' (got {res:?}) — the user's end-of-turn steer text \
              vanishes as a failure. If a fix queues a just-missed steer as a fresh turn, \

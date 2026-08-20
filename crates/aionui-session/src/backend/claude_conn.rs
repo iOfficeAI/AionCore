@@ -4196,7 +4196,12 @@ mod tests {
             Err(BackendError::CommandNotSupported { command: "answer_auth" })
         ));
         assert!(matches!(
-            backend.dispatch(Command::Steer { content: Vec::new() }).await,
+            backend
+                .dispatch(Command::Steer {
+                    content: Vec::new(),
+                    client_user_message_id: None,
+                })
+                .await,
             Err(BackendError::CommandNotSupported { command: "steer" })
         ));
         assert!(matches!(
