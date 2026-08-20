@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use aionui_ai_agent::protocol::events::tool_call::{AcpToolCallStatus, ToolCallStatus};
 use aionui_ai_agent::protocol::events::{ErrorEventData, TipType, TipsEventData};
 use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
 
@@ -655,6 +656,13 @@ impl StreamRelay {
                             break outcome;
                         }
                         AgentStreamEvent::ToolCall(data) => {
+                            if let Some(runtime_state) = self.runtime_state.as_ref() {
+                                runtime_state.update_tool_execution(
+                                    &self.conversation_id,
+                                    &data.call_id,
+                                    matches!(data.status, ToolCallStatus::Running),
+                                );
+                            }
                             attempt.saw_tool_or_side_effect = true;
                             self.complete_active_thinking(&mut active_thinking).await;
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
@@ -663,6 +671,15 @@ impl StreamRelay {
                             self.adapter.persist_tool_call(data).await;
                         }
                         AgentStreamEvent::AcpToolCall(data) => {
+                            if let Some(runtime_state) = self.runtime_state.as_ref()
+                                && let Some(status) = data.update.status
+                            {
+                                runtime_state.update_tool_execution(
+                                    &self.conversation_id,
+                                    &data.update.tool_call_id,
+                                    matches!(status, AcpToolCallStatus::Pending | AcpToolCallStatus::InProgress),
+                                );
+                            }
                             attempt.saw_tool_or_side_effect = true;
                             self.complete_active_thinking(&mut active_thinking).await;
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")

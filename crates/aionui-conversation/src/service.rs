@@ -4104,45 +4104,44 @@ impl ConversationService {
         // still claimed and kills the task. agy cancels by killing its per-turn
         // child, but nothing guarantees the pump drains, and without this net a
         // stuck cancel leaves the conversation wedged with no way back.
-        if matches!(agent.agent_type(), AgentType::Acp | AgentType::Antigravity) {
-            let runtime_state = self.runtime_state();
-            let task_manager = Arc::clone(task_manager);
-            let service = self.clone();
-            let conv_id = conversation_id.to_owned();
-            let active_turn = turn_id.to_owned();
-            let owner_user_id = user_id.to_owned();
+        let runtime_state = self.runtime_state();
+        let task_manager = Arc::clone(task_manager);
+        let service = self.clone();
+        let conv_id = conversation_id.to_owned();
+        let active_turn = turn_id.to_owned();
+        let owner_user_id = user_id.to_owned();
 
-            tokio::spawn(async move {
-                tokio::time::sleep(ACP_CANCEL_DRAIN_TIMEOUT).await;
-                if runtime_state.active_turn_id_for(&conv_id).as_deref() == Some(active_turn.as_str())
-                    && runtime_state.is_cancelling(&conv_id)
+        tokio::spawn(async move {
+            tokio::time::sleep(ACP_CANCEL_DRAIN_TIMEOUT).await;
+            let turn_active = runtime_state.active_turn_id_for(&conv_id).as_deref() == Some(active_turn.as_str());
+            let tools_active = runtime_state.has_active_tool_executions(&conv_id);
+            if (turn_active || tools_active) && runtime_state.is_cancelling(&conv_id) {
+                warn!(
+                    conversation_id = %conv_id,
+                    turn_id = %active_turn,
+                    timeout_ms = ACP_CANCEL_DRAIN_TIMEOUT.as_millis() as u64,
+                    "Agent cancel did not converge before timeout; killing task"
+                );
+                runtime_state.mark_force_terminated(&conv_id, &active_turn);
+                task_manager
+                    .kill_and_wait(&conv_id, Some(AgentKillReason::UserCancelTimeout))
+                    .await;
+                runtime_state.mark_tools_force_terminated(&conv_id, &active_turn);
+                if runtime_state.active_turn_id_for(&conv_id).is_none()
+                    && let Some(outcome) = runtime_state.take_cancellation_outcome(&conv_id, &active_turn)
+                    && let Err(error) = service
+                        .publish_cancellation_state(&owner_user_id, &conv_id, &active_turn, outcome)
+                        .await
                 {
-                    warn!(
+                    error!(
                         conversation_id = %conv_id,
                         turn_id = %active_turn,
-                        timeout_ms = ACP_CANCEL_DRAIN_TIMEOUT.as_millis() as u64,
-                        "CLI agent cancel did not drain before timeout; killing task"
+                        error = %error,
+                        "Failed to publish forced cancellation state"
                     );
-                    runtime_state.mark_force_terminated(&conv_id, &active_turn);
-                    task_manager
-                        .kill_and_wait(&conv_id, Some(AgentKillReason::UserCancelTimeout))
-                        .await;
-                    if runtime_state.active_turn_id_for(&conv_id).is_none()
-                        && let Some(outcome) = runtime_state.take_cancellation_outcome(&conv_id, &active_turn)
-                        && let Err(error) = service
-                            .publish_cancellation_state(&owner_user_id, &conv_id, &active_turn, outcome)
-                            .await
-                    {
-                        error!(
-                            conversation_id = %conv_id,
-                            turn_id = %active_turn,
-                            error = %error,
-                            "Failed to publish forced cancellation state"
-                        );
-                    }
                 }
-            });
-        }
+            }
+        });
 
         info!(conversation_id, turn_id, "Stream cancel acknowledged");
         Ok(CancelConversationResponse {
