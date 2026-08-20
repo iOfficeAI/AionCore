@@ -2748,6 +2748,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn input_projection_and_checkpoint_commit_together() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+        let input = ConversationInputRow {
+            id: "input-projected".into(),
+            user_id: SYSTEM_USER_ID.into(),
+            conversation_id: conv.id.clone(),
+            mode: "followup".into(),
+            status: "applied".into(),
+            content: "durable".into(),
+            files: "[]".into(),
+            inject_skills: "[]".into(),
+            hidden: false,
+            client_key: "client-projected".into(),
+            turn_id: Some("turn-one".into()),
+            msg_id: Some("input-projected".into()),
+            error_code: None,
+            created_at: 100,
+            updated_at: 200,
+        };
+        repo.apply_conversation_input_projection(
+            &[input],
+            &UpsertJournalProjectionCheckpointParams {
+                user_id: SYSTEM_USER_ID,
+                conversation_id: &conv.id,
+                projector: "conversation-inputs-v1",
+                last_sequence: 3,
+                last_event_id: "event-three",
+                updated_at: 200,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.get_conversation_input(SYSTEM_USER_ID, &conv.id, "input-projected")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "applied"
+        );
+        assert_eq!(
+            repo.get_journal_projection_checkpoint(SYSTEM_USER_ID, &conv.id, "conversation-inputs-v1")
+                .await
+                .unwrap()
+                .unwrap()
+                .last_sequence,
+            3
+        );
+    }
+
+    #[tokio::test]
     async fn conversation_input_claims_one_fifo_head() {
         let (repo, _db) = setup().await;
         let conv = sample_conversation(SYSTEM_USER_ID);
