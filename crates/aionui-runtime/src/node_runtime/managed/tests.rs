@@ -701,3 +701,69 @@ fn windows_managed_runtime_fails_when_entrypoints_are_missing() {
         "unexpected error: {error}"
     );
 }
+
+#[test]
+fn directory_listing_sample_reports_unreadable_directory_without_failing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("never-created");
+
+    let listing = directory_listing_sample(&missing, MISSING_EXECUTABLE_SAMPLE_LIMIT);
+
+    assert_eq!(listing.entry_count, None);
+    assert_eq!(listing.sample, "<unreadable>");
+}
+
+#[test]
+fn directory_listing_sample_lists_entries_sorted() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_file(&tmp.path().join("npx"));
+    write_file(&tmp.path().join("npm"));
+
+    let listing = directory_listing_sample(tmp.path(), MISSING_EXECUTABLE_SAMPLE_LIMIT);
+
+    assert_eq!(listing.entry_count, Some(2));
+    assert_eq!(listing.sample, "npm, npx");
+}
+
+#[test]
+fn directory_listing_sample_caps_the_name_sample() {
+    let tmp = tempfile::tempdir().unwrap();
+    for index in 0..25 {
+        write_file(&tmp.path().join(format!("entry-{index:02}")));
+    }
+
+    let listing = directory_listing_sample(tmp.path(), MISSING_EXECUTABLE_SAMPLE_LIMIT);
+
+    assert_eq!(listing.entry_count, Some(25));
+    assert_eq!(listing.sample.split(", ").count(), MISSING_EXECUTABLE_SAMPLE_LIMIT + 1);
+    assert!(
+        listing.sample.ends_with("...(5 more)"),
+        "capped sample must report the remainder: {}",
+        listing.sample
+    );
+    assert!(
+        listing.sample.starts_with("entry-00, entry-01,"),
+        "capped sample must keep sorted order: {}",
+        listing.sample
+    );
+}
+
+#[test]
+fn missing_managed_node_executable_error_message_is_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("node-v24.11.0-linux-x64");
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    write_file(&root.join("bin").join("npm"));
+
+    let error = runtime_from_root_for_layout(&root, ResolvedNodeSource::Managed, ManagedNodeArchiveLayout::Unix)
+        .expect_err("missing node executable should fail");
+
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "managed node executable missing: {}",
+            root.join("bin").join("node").display()
+        ),
+        "the diagnostic snapshot must not alter the message classify_error matches on"
+    );
+}
