@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.81](https://github.com/suoak/AionCore/compare/v0.1.80...v0.1.81) (2026-08-20)
+
+### Features
+
+* **conversation:** persist negotiated capability snapshots and dispatch native Codex steer requests
+* **conversation:** converge cancellation only after turns, backends, and tool executions become idle
+* **journal:** recover stale tool executions from durable facts and checkpoint input projections incrementally
+* **tools:** consume cancellable structured tool events from aionrs v0.2.19
+
+### Bug Fixes
+
+* **journal:** rebuild invalid projection cursors without advancing factless database state
+* **session:** correlate steer responses and map closed turn races to stable errors
+
 ## [0.1.80](https://github.com/suoak/AionCore/compare/v0.1.79...v0.1.80) (2026-08-20)
 
 ### Features
