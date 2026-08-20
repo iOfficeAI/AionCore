@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::DbError;
 use crate::models::{
     ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationCapabilitySnapshotRow, ConversationInputRow,
-    ConversationRow, MessageRow, UpsertConversationAssistantSnapshotParams, UpsertConversationCapabilitySnapshotParams,
+    ConversationRow, JournalProjectionCheckpointRow, MessageRow, UpsertConversationAssistantSnapshotParams,
+    UpsertConversationCapabilitySnapshotParams, UpsertJournalProjectionCheckpointParams,
 };
 
 /// Conversation + message data access abstraction.
@@ -96,6 +97,36 @@ pub trait IConversationRepository: Send + Sync {
     ) -> Result<ConversationCapabilitySnapshotRow, DbError> {
         Err(DbError::Init(
             "conversation capability snapshots are not supported by this repository".into(),
+        ))
+    }
+
+    async fn get_journal_projection_checkpoint(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _projector: &str,
+    ) -> Result<Option<JournalProjectionCheckpointRow>, DbError> {
+        Ok(None)
+    }
+
+    async fn upsert_journal_projection_checkpoint(
+        &self,
+        _params: &UpsertJournalProjectionCheckpointParams<'_>,
+    ) -> Result<(), DbError> {
+        Err(DbError::Init(
+            "journal projection checkpoints are not supported by this repository".into(),
+        ))
+    }
+
+    /// Atomically applies an input projection and advances its Journal cursor.
+    async fn apply_conversation_input_projection(
+        &self,
+        _inputs: &[ConversationInputRow],
+        _checkpoint: &UpsertJournalProjectionCheckpointParams<'_>,
+        _replace_existing: bool,
+    ) -> Result<(), DbError> {
+        Err(DbError::Init(
+            "atomic conversation input projection is not supported by this repository".into(),
         ))
     }
 
