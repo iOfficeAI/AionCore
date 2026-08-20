@@ -569,7 +569,6 @@ impl CanonicalEventJournal {
     /// cursor index. A cursor beyond the journal tail is rejected so callers
     /// can fall back to a full projection rebuild instead of silently skipping
     /// facts.
-    #[cfg(test)]
     pub async fn replay_after(
         &self,
         user_id: &str,
