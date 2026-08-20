@@ -325,6 +325,7 @@ impl ConversationService {
                         last_event_id: &last_event.event_id,
                         updated_at: now_ms(),
                     },
+                    full_rebuild,
                 )
                 .await
             {

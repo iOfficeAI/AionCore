@@ -779,10 +779,18 @@ impl IConversationRepository for SqliteConversationRepository {
         &self,
         inputs: &[ConversationInputRow],
         checkpoint: &UpsertJournalProjectionCheckpointParams<'_>,
+        replace_existing: bool,
     ) -> Result<(), DbError> {
         self.ensure_conversation_for_user(checkpoint.user_id, checkpoint.conversation_id)
             .await?;
         let mut transaction = self.pool.begin().await?;
+        if replace_existing {
+            sqlx::query("DELETE FROM conversation_inputs WHERE user_id = ? AND conversation_id = ?")
+                .bind(checkpoint.user_id)
+                .bind(checkpoint.conversation_id)
+                .execute(&mut *transaction)
+                .await?;
+        }
         for input in inputs {
             sqlx::query(
                 "INSERT INTO conversation_inputs (
@@ -2779,6 +2787,7 @@ mod tests {
                 last_event_id: "event-three",
                 updated_at: 200,
             },
+            false,
         )
         .await
         .unwrap();

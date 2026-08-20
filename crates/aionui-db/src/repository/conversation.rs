@@ -123,6 +123,7 @@ pub trait IConversationRepository: Send + Sync {
         &self,
         _inputs: &[ConversationInputRow],
         _checkpoint: &UpsertJournalProjectionCheckpointParams<'_>,
+        _replace_existing: bool,
     ) -> Result<(), DbError> {
         Err(DbError::Init(
             "atomic conversation input projection is not supported by this repository".into(),
