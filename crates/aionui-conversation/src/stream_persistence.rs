@@ -563,7 +563,7 @@ impl CanonicalEventJournal {
     /// cursor index. A cursor beyond the journal tail is rejected so callers
     /// can fall back to a full projection rebuild instead of silently skipping
     /// facts.
-    #[cfg(test)]`r`n    pub async fn replay_after(
+    pub async fn replay_after(
         &self,
         user_id: &str,
         conversation_id: &str,
@@ -803,7 +803,7 @@ pub(crate) struct StreamPersistenceAdapter {
     repo: Arc<dyn IConversationRepository>,
     persistence: Option<RuntimePersistenceCoordinator>,
     /// The backend's own id for the in-flight turn (codex `Turn.id`), stamped
-    /// onto every message row this adapter persists â€?the lookup key for
+    /// onto every message row this adapter persists â€” the lookup key for
     /// `thread/fork`'s `lastTurnId`. Set by the relay on the internal
     /// `BackendTurnBound` frame; `None` for backends without one (claude/ACP).
     /// Shared across clones (the relay and its helpers clone the adapter).
@@ -1145,7 +1145,7 @@ impl StreamPersistenceAdapter {
     pub async fn persist_thinking_segment(&self, segment: ThinkingSegmentState, duration_ms: u64) {
         // An empty segment should no longer be reachable: StreamRelay drops a
         // thinking chunk that has no text before it can open one (see the POLICY
-        // note there). This stays as the second line of defense â€?persisting a
+        // note there). This stays as the second line of defense â€” persisting a
         // contentless row is what put a column of blank "thinking done Â· 0s" cards
         // into the reloaded view, so the storage layer refuses it too rather than
         // trusting every future caller to have filtered upstream.
@@ -1276,7 +1276,7 @@ impl StreamPersistenceAdapter {
     /// Returns whether the row existed. Never inserts: a `settle_only` frame is
     /// the pump settling a card it has no memory of (post-resume), and the same
     /// unknown-terminal shape also fires for workflow-internal refs that never
-    /// had a row â€?inserting for those would conjure junk cards.
+    /// had a row â€” inserting for those would conjure junk cards.
     #[tracing::instrument(skip_all)]
     pub async fn settle_tool_call_if_present(
         &self,
