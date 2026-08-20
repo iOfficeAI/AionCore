@@ -70,6 +70,42 @@ impl ConversationService {
                 StartupRecoveryAction::SettleToolRow => settle_tool_row_content(&row.r#type, &row.content),
                 _ => None,
             };
+            if matches!(action, StartupRecoveryAction::SettleToolRow) {
+                let identifiers = recovered_tool_identifiers(&row);
+                let payload = serde_json::json!({
+                    "type": "tool_execution_recovery",
+                    "visibility": "host",
+                    "data": {
+                        "execution_id": identifiers.execution_id,
+                        "call_id": identifiers.call_id,
+                        "turn_id": identifiers.turn_id,
+                        "message_id": row.id,
+                        "reason": "runtime_epoch_ended",
+                        "terminal_state": "canceled",
+                    }
+                });
+                let event_id =
+                    crate::stream_persistence::canonical_event_id(&format!("tool_recovery:{}", row.id), &payload);
+                if let Err(error) = self
+                    .canonical_event_journal()
+                    .append(
+                        &stale.user_id,
+                        &row.conversation_id,
+                        event_id,
+                        "ToolExecutionRecovered".into(),
+                        payload,
+                    )
+                    .await
+                {
+                    warn!(
+                        conversation_id = %row.conversation_id,
+                        message_id = %row.id,
+                        error = %ErrorChain(&error),
+                        "startup recovery kept stale tool projection because Journal append failed"
+                    );
+                    continue;
+                }
+            }
             let update = MessageRowUpdate {
                 content,
                 status: Some(Some("finish".to_owned())),
@@ -267,6 +303,33 @@ impl ConversationService {
     }
 }
 
+#[derive(Debug, Default)]
+struct RecoveredToolIdentifiers {
+    execution_id: Option<String>,
+    call_id: Option<String>,
+    turn_id: Option<String>,
+}
+
+fn recovered_tool_identifiers(row: &MessageRow) -> RecoveredToolIdentifiers {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&row.content) else {
+        return RecoveredToolIdentifiers {
+            call_id: row.msg_id.clone(),
+            ..Default::default()
+        };
+    };
+    let first = value.as_array().and_then(|entries| entries.first()).unwrap_or(&value);
+    let string = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| first.get(*key).and_then(serde_json::Value::as_str))
+            .map(str::to_owned)
+    };
+    RecoveredToolIdentifiers {
+        execution_id: string(&["execution_id", "executionId"]),
+        call_id: string(&["tool_call_id", "toolCallId", "id"]).or_else(|| row.msg_id.clone()),
+        turn_id: string(&["turn_id", "turnId"]),
+    }
+}
+
 fn fold_conversation_inputs(events: &[CanonicalJournalEvent]) -> Vec<ReplayedConversationInput> {
     let mut inputs = BTreeMap::<String, ReplayedConversationInput>::new();
     for event in events {
@@ -417,6 +480,34 @@ mod tests {
             kind: kind.into(),
             payload: serde_json::json!({ "data": data }),
         }
+    }
+
+    #[test]
+    fn recovered_tool_identifiers_excludes_tool_payload() {
+        let row = MessageRow {
+            id: "message-1".into(),
+            conversation_id: "conv-1".into(),
+            msg_id: Some("call-fallback".into()),
+            r#type: "tool_call".into(),
+            content: serde_json::json!({
+                "execution_id": "exec-1",
+                "tool_call_id": "call-1",
+                "turn_id": "turn-1",
+                "input": { "secret": "must-not-be-journaled" },
+                "output": "must-not-be-journaled",
+            })
+            .to_string(),
+            position: None,
+            status: Some("work".into()),
+            hidden: false,
+            created_at: 1,
+            backend_turn_id: None,
+        };
+
+        let identifiers = recovered_tool_identifiers(&row);
+        assert_eq!(identifiers.execution_id.as_deref(), Some("exec-1"));
+        assert_eq!(identifiers.call_id.as_deref(), Some("call-1"));
+        assert_eq!(identifiers.turn_id.as_deref(), Some("turn-1"));
     }
 
     #[test]
