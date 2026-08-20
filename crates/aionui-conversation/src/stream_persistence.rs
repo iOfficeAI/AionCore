@@ -183,6 +183,7 @@ pub(crate) struct CanonicalReplayProjection {
     pub journal_sha256: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct DiscoveredJournalReplay {
     pub conversation_id: String,
@@ -615,6 +616,7 @@ impl CanonicalEventJournal {
     /// startup repair cannot derive database ownership from filenames. The
     /// conversation id carried by every event is returned for an ownership
     /// lookup against the database before any projection is changed.
+    #[cfg(test)]
     pub(crate) async fn replay_all(&self) -> Result<Vec<DiscoveredJournalReplay>, std::io::Error> {
         let mut user_dirs = match tokio::fs::read_dir(&self.root).await {
             Ok(entries) => entries,

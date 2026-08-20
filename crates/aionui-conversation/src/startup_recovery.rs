@@ -367,6 +367,7 @@ fn recovered_tool_identifiers(row: &MessageRow) -> RecoveredToolIdentifiers {
     }
 }
 
+#[cfg(test)]
 fn fold_conversation_inputs(events: &[CanonicalJournalEvent]) -> Vec<ReplayedConversationInput> {
     fold_conversation_inputs_with_seed(BTreeMap::new(), events)
 }
