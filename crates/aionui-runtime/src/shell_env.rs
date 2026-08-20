@@ -4,16 +4,83 @@
 //! is spawned** (including the tokio runtime). It rewrites
 //! `std::env::var("PATH")` to include:
 //!
-//! 1. The interactive login-shell `PATH` (Unix only, 3s timeout) — fixes
-//!    launchd / Finder / systemd-service starts.
+//! 1. The interactive login-shell `PATH` (Unix only, bounded by a 3s
+//!    end-to-end budget) — fixes launchd / Finder / systemd-service starts.
 //! 2. The current `PATH` (inherited from the launching process).
 //! 3. Platform extra bins (`~/.cargo/bin`, `~/.local/bin`, etc.) as fallbacks.
 //!
 //! After this runs, all downstream `which::which(...)` and
 //! `Command::new(...)` calls see the enhanced PATH with zero further
 //! wiring.
+//!
+//! All of this runs *before* `init_tracing`, so nothing logged from this
+//! module reaches a log sink. The probe therefore records a
+//! [`ShellProbeReport`], which the bootstrap layer reads back through
+//! [`login_shell_probe_report`] and emits once a subscriber exists.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+
+/// Total wall-clock budget for the login-shell PATH probe, covering both
+/// draining the shell's stdout and reaping the process.
+#[cfg(unix)]
+const LOGIN_SHELL_PROBE_BUDGET: Duration = Duration::from_secs(3);
+
+/// How the startup login-shell PATH probe ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellProbeStatus {
+    /// The probe produced a usable PATH.
+    Ok,
+    /// Not attempted: non-Unix, `$SHELL` unset, or `$SHELL` not absolute.
+    Skipped,
+    /// The login shell could not be spawned.
+    SpawnFailed,
+    /// The probe exceeded its budget and was killed.
+    TimedOut,
+    /// The shell ran but yielded no usable PATH: non-zero exit, empty
+    /// output, or stdout could not be read.
+    Unusable,
+}
+
+impl ShellProbeStatus {
+    /// Stable, log-safe discriminant. Never carries PATH contents.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Skipped => "skipped",
+            Self::SpawnFailed => "spawn_failed",
+            Self::TimedOut => "timed_out",
+            Self::Unusable => "unusable",
+        }
+    }
+}
+
+/// Log-safe outcome of the startup login-shell PATH probe.
+///
+/// Deliberately carries no PATH contents — only a status discriminant and
+/// how long the probe took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShellProbeReport {
+    pub status: ShellProbeStatus,
+    pub elapsed_ms: u64,
+}
+
+/// Written exactly once, by [`enhance_process_path`], under the same
+/// single-threaded precondition that already governs that function.
+static LOGIN_SHELL_PROBE_REPORT: OnceLock<ShellProbeReport> = OnceLock::new();
+
+/// Outcome of the login-shell PATH probe run by [`enhance_process_path`].
+///
+/// That function runs before `init_tracing`, so it cannot log its own
+/// result. The bootstrap layer calls this once a tracing subscriber exists
+/// and emits the report there; a probe that times out would otherwise leave
+/// no trace on any log sink. `None` means the probe has not run yet.
+pub fn login_shell_probe_report() -> Option<ShellProbeReport> {
+    LOGIN_SHELL_PROBE_REPORT.get().copied()
+}
 
 /// Enhance the current process's `PATH`. Returns the merged PATH string
 /// for logging/debugging.
@@ -25,7 +92,10 @@ use std::path::{Path, PathBuf};
 /// `unsafe` on Rust 2024.
 pub unsafe fn enhance_process_path() -> String {
     let current = std::env::var("PATH").unwrap_or_default();
-    let login = login_shell_path();
+    let (login, probe) = login_shell_path();
+    // Nothing here can be logged yet; stash the outcome for the bootstrap
+    // layer to emit once `init_tracing` has installed a subscriber.
+    let _ = LOGIN_SHELL_PROBE_REPORT.set(probe);
     let extras = platform_extra_bins();
 
     let merged = merge_paths(&extras, &current, login.as_deref());
@@ -170,20 +240,44 @@ fn nvm_version_bins(home: &Path) -> Vec<PathBuf> {
 }
 
 #[cfg(unix)]
-fn login_shell_path() -> Option<String> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::time::Duration;
-    use wait_timeout::ChildExt;
+fn login_shell_path() -> (Option<String>, ShellProbeReport) {
+    let started = Instant::now();
+    let report = |status: ShellProbeStatus| ShellProbeReport {
+        status,
+        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    };
 
-    let shell = std::env::var("SHELL").ok()?;
+    let Ok(shell) = std::env::var("SHELL") else {
+        return (None, report(ShellProbeStatus::Skipped));
+    };
     if !Path::new(&shell).is_absolute() {
         tracing::debug!(%shell, "SHELL is not absolute, skipping login shell probe");
-        return None;
+        return (None, report(ShellProbeStatus::Skipped));
     }
 
-    let mut child = match Command::new(&shell)
-        .args(["-l", "-i", "-c", "printf %s \"$PATH\""])
+    let mut command = std::process::Command::new(&shell);
+    command.args(["-l", "-i", "-c", "printf %s \"$PATH\""]);
+
+    let (path, status) = probe_path_with_command(command, LOGIN_SHELL_PROBE_BUDGET);
+    (path, report(status))
+}
+
+/// Run `command` and read a PATH string from its stdout, bounded end-to-end
+/// by `budget`.
+///
+/// Split out from [`login_shell_path`] so tests can drive the exact process
+/// shapes that break the probe without depending on the developer's own
+/// `$SHELL` and rc files.
+#[cfg(unix)]
+fn probe_path_with_command(mut command: std::process::Command, budget: Duration) -> (Option<String>, ShellProbeStatus) {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use wait_timeout::ChildExt;
+
+    let deadline = Instant::now() + budget;
+
+    let mut child = match command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -191,49 +285,120 @@ fn login_shell_path() -> Option<String> {
     {
         Ok(c) => c,
         Err(e) => {
-            tracing::debug!(%shell, error = %e, "login shell spawn failed");
-            return None;
+            tracing::debug!(error = %e, "login shell spawn failed");
+            return (None, ShellProbeStatus::SpawnFailed);
         }
     };
 
-    // Take stdout handle before waiting to prevent pipe-buffer deadlock.
-    // If the PATH string is long enough to fill the pipe buffer, the child
-    // will block on write while we block on wait — causing a deadlock and
-    // the 3s timeout to fire. Reading stdout first drains the buffer.
-    let mut stdout_handle = child.stdout.take()?;
-    let mut stdout = String::new();
-    stdout_handle.read_to_string(&mut stdout).ok()?;
+    // Every exit path below reaps the child explicitly: `Child::drop` does
+    // not wait, and leaving a zombie behind is not acceptable in a process
+    // that is only starting up.
+    let Some(mut stdout_handle) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return (None, ShellProbeStatus::Unusable);
+    };
 
-    let status = match child.wait_timeout(Duration::from_secs(3)) {
-        Ok(Some(s)) => s,
+    // Drain stdout on a dedicated thread rather than inline.
+    //
+    // The read cannot simply move back after the wait: a PATH longer than the
+    // pipe buffer would block the child's write while the parent blocks on
+    // the wait. But reading inline is exactly what hung startup (AIONUI-150).
+    // `read_to_string` returns only at EOF, and EOF requires *every* process
+    // holding the pipe's write end to close it. An interactive login shell
+    // (`-l -i`) sources the user's rc files, and any long-lived background
+    // process those start (ssh-agent, gpg-agent, mise/direnv daemons, shell
+    // update checks, ...) inherits this pipe and holds it open indefinitely.
+    // The inline read then blocked forever, ahead of the `wait_timeout` that
+    // was supposed to bound the probe — and before `init_tracing` had run, so
+    // the process went silent on both log sinks until the client gave up.
+    //
+    // Reading off-thread keeps the pipe draining, so the write-side deadlock
+    // stays fixed, while `recv_timeout` bounds the caller.
+    let (tx, rx) = mpsc::channel();
+    if let Err(e) = std::thread::Builder::new()
+        .name("login-shell-path-probe".to_string())
+        .spawn(move || {
+            let mut buf = String::new();
+            let _ = tx.send(stdout_handle.read_to_string(&mut buf).map(|_| buf));
+        })
+    {
+        tracing::debug!(error = %e, "login shell probe reader thread spawn failed");
+        let _ = child.kill();
+        let _ = child.wait();
+        return (None, ShellProbeStatus::SpawnFailed);
+    }
+
+    // On timeout the reader thread stays parked on the orphaned fd until
+    // whatever holds the write end lets go. Leaking one parked thread is the
+    // deliberate trade against hanging the whole process: a blocked `read(2)`
+    // cannot be forced to return, so we do not try. The thread owns both its
+    // `ChildStdout` and the channel sender, so it tears itself down once the
+    // read finally completes.
+    let stdout = match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Ok(stdout)) => stdout,
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "login shell stdout read failed");
+            let _ = child.kill();
+            let _ = child.wait();
+            return (None, ShellProbeStatus::Unusable);
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            tracing::warn!("login shell PATH probe timed out while reading stdout");
+            return (None, ShellProbeStatus::TimedOut);
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            tracing::debug!("login shell probe reader thread ended without a result");
+            let _ = child.kill();
+            let _ = child.wait();
+            return (None, ShellProbeStatus::Unusable);
+        }
+    };
+
+    // Whatever the read left of the budget also has to cover reaping: a shell
+    // that closes stdout but keeps running must not extend the probe either.
+    let status = match child.wait_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Some(status)) => status,
         Ok(None) => {
             let _ = child.kill();
             let _ = child.wait();
-            tracing::warn!("login shell PATH probe timed out after 3s");
-            return None;
+            tracing::warn!("login shell PATH probe timed out while waiting for exit");
+            return (None, ShellProbeStatus::TimedOut);
         }
         Err(e) => {
             tracing::debug!(error = %e, "login shell wait_timeout errored");
-            return None;
+            let _ = child.kill();
+            let _ = child.wait();
+            return (None, ShellProbeStatus::Unusable);
         }
     };
 
     if !status.success() {
         tracing::debug!(?status, "login shell exited non-zero");
-        return None;
+        return (None, ShellProbeStatus::Unusable);
     }
 
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
-        None
+        (None, ShellProbeStatus::Unusable)
     } else {
-        Some(trimmed.to_string())
+        (Some(trimmed.to_string()), ShellProbeStatus::Ok)
     }
 }
 
 #[cfg(not(unix))]
-fn login_shell_path() -> Option<String> {
-    None
+fn login_shell_path() -> (Option<String>, ShellProbeReport) {
+    // There is no login-shell probe on Windows: `platform_extra_bins` plus the
+    // inherited PATH is the whole search space there.
+    (
+        None,
+        ShellProbeReport {
+            status: ShellProbeStatus::Skipped,
+            elapsed_ms: 0,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -392,8 +557,9 @@ mod tests {
         ) {
             return;
         }
-        let result = login_shell_path();
+        let (result, report) = login_shell_path();
         assert!(result.is_none());
+        assert_eq!(report.status, ShellProbeStatus::Skipped);
     }
 
     #[cfg(unix)]
@@ -406,8 +572,9 @@ mod tests {
         ) {
             return;
         }
-        let result = login_shell_path();
+        let (result, report) = login_shell_path();
         assert!(result.is_none());
+        assert_eq!(report.status, ShellProbeStatus::Skipped);
     }
 
     #[cfg(unix)]
@@ -420,10 +587,141 @@ mod tests {
         ) {
             return;
         }
-        let result = login_shell_path();
+        let (result, report) = login_shell_path();
         assert!(result.is_some(), "login shell probe should return Some");
         let path = result.unwrap();
         assert!(!path.is_empty(), "login shell PATH should not be empty");
+        assert_eq!(report.status, ShellProbeStatus::Ok);
+    }
+
+    /// AIONUI-150 regression. The child prints its PATH and exits at once, but
+    /// a long-lived grandchild inherits the stdout pipe and keeps the write end
+    /// open, so the pipe never reaches EOF. The pre-fix inline `read_to_string`
+    /// blocked there indefinitely — ahead of the `wait_timeout` that was meant
+    /// to bound the probe, and before `init_tracing`, which is why production
+    /// startups went silent on both log sinks until the 60s client deadline.
+    ///
+    /// The probe must now come back inside its own budget and report why.
+    #[cfg(unix)]
+    #[test]
+    fn probe_is_bounded_when_a_grandchild_holds_stdout_open() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "sleep 20 & printf %s /opt/aionui/probe-bin"]);
+
+        let started = Instant::now();
+        let (path, status) = probe_path_with_command(command, Duration::from_millis(500));
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "probe must return within its budget, took {elapsed:?}"
+        );
+        assert_eq!(status, ShellProbeStatus::TimedOut);
+        assert!(path.is_none(), "a timed-out probe must not contribute a PATH");
+    }
+
+    /// The single budget covers reaping as well as reading: a shell that closes
+    /// stdout but keeps running must not extend the probe. This is the case the
+    /// original `wait_timeout` was written for, and it has to keep holding now
+    /// that the read has moved off-thread.
+    #[cfg(unix)]
+    #[test]
+    fn probe_is_bounded_when_the_child_lingers_after_closing_stdout() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "printf %s /opt/aionui/probe-bin; exec 1>&-; exec sleep 20"]);
+
+        let started = Instant::now();
+        let (path, status) = probe_path_with_command(command, Duration::from_millis(500));
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "probe must return within its budget, took {elapsed:?}"
+        );
+        assert_eq!(status, ShellProbeStatus::TimedOut);
+        assert!(path.is_none(), "a timed-out probe must not contribute a PATH");
+    }
+
+    /// The read runs before the wait so the pipe keeps draining: a PATH larger
+    /// than the pipe buffer (64 KiB on Linux, 16 KiB on macOS) would otherwise
+    /// block the child's write while the parent blocked on the wait. Moving the
+    /// read onto a thread must not give that protection up.
+    #[cfg(unix)]
+    #[test]
+    fn probe_reads_output_larger_than_the_pipe_buffer() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "i=0; while [ $i -lt 4096 ]; do printf '/opt/aionui/probe/padding/segment-%s:' \"$i\"; i=$((i+1)); done",
+        ]);
+
+        let (path, status) = probe_path_with_command(command, Duration::from_secs(10));
+
+        assert_eq!(status, ShellProbeStatus::Ok, "large output must still succeed");
+        let path = path.expect("a large PATH should still be returned");
+        assert!(
+            path.len() > 128 * 1024,
+            "expected output well past the pipe buffer, got {} bytes",
+            path.len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_returns_trimmed_stdout_from_a_well_behaved_command() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "printf '  /opt/aionui/bin:/usr/bin  \\n'"]);
+
+        let (path, status) = probe_path_with_command(command, Duration::from_secs(3));
+
+        assert_eq!(status, ShellProbeStatus::Ok);
+        assert_eq!(path.as_deref(), Some("/opt/aionui/bin:/usr/bin"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_rejects_output_from_a_command_that_exits_non_zero() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "printf %s /opt/aionui/bin; exit 3"]);
+
+        let (path, status) = probe_path_with_command(command, Duration::from_secs(3));
+
+        assert_eq!(status, ShellProbeStatus::Unusable);
+        assert!(path.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_rejects_empty_output() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "printf ''"]);
+
+        let (path, status) = probe_path_with_command(command, Duration::from_secs(3));
+
+        assert_eq!(status, ShellProbeStatus::Unusable);
+        assert!(path.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_reports_spawn_failure_for_a_missing_binary() {
+        let command = std::process::Command::new("/nonexistent/aionui-login-shell-probe");
+
+        let (path, status) = probe_path_with_command(command, Duration::from_secs(3));
+
+        assert_eq!(status, ShellProbeStatus::SpawnFailed);
+        assert!(path.is_none());
+    }
+
+    /// These strings are a log contract read by whoever triages the next
+    /// occurrence, and none of them may carry PATH data.
+    #[test]
+    fn probe_status_strings_are_stable() {
+        assert_eq!(ShellProbeStatus::Ok.as_str(), "ok");
+        assert_eq!(ShellProbeStatus::Skipped.as_str(), "skipped");
+        assert_eq!(ShellProbeStatus::SpawnFailed.as_str(), "spawn_failed");
+        assert_eq!(ShellProbeStatus::TimedOut.as_str(), "timed_out");
+        assert_eq!(ShellProbeStatus::Unusable.as_str(), "unusable");
     }
 
     #[cfg(unix)]
