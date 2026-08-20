@@ -41,6 +41,29 @@ pub trait IConversationRepository: Send + Sync {
         filters: &ConversationFilters,
     ) -> Result<PaginatedResult<ConversationRow>, DbError>;
 
+    /// One page of `@@` mention candidates, ranked inside the query.
+    ///
+    /// The ranking MUST happen in SQL rather than over an already-truncated
+    /// page: re-sorting a recency-ordered page in memory can only reorder the
+    /// newest N rows, so a name match or a same-project conversation outside
+    /// that window stays invisible no matter how highly it would rank.
+    ///
+    /// Team-owned rows and the caller's own conversation are NOT filtered here.
+    /// `extra` is opaque JSON at this layer, and "is this team-owned" is owned
+    /// by `TeamSessionBinding::team_id_marker_from_extra_str` — duplicating that
+    /// predicate as SQL is exactly the drift that helper exists to prevent.
+    /// Callers filter the holes and re-page around them.
+    ///
+    /// Defaults to no candidates: only the sqlite repository implements the
+    /// ranking query, and the mock repositories in tests do not need it.
+    async fn list_mentionable_candidates(
+        &self,
+        _user_id: &str,
+        _params: &MentionableCandidatesParams,
+    ) -> Result<Vec<ConversationRow>, DbError> {
+        Ok(Vec::new())
+    }
+
     // ── Extended queries ────────────────────────────────────────────
 
     /// Finds a conversation by source, channel chat ID, and agent type.
@@ -340,6 +363,25 @@ impl ConversationFilters {
     pub fn effective_limit(&self) -> u32 {
         if self.limit == 0 { 20 } else { self.limit }
     }
+}
+
+/// Query for one ranked page of `@@` mention candidates.
+///
+/// Deliberately separate from [`ConversationFilters`]: the name filter and the
+/// project-first ordering are specific to the mention picker, and folding them
+/// into the general list query would leak picker semantics into every other
+/// caller of `list_paginated` (cross-session-messaging design §5.3).
+#[derive(Debug, Clone, Default)]
+pub struct MentionableCandidatesParams {
+    /// Conversations bound to this project sort above all others.
+    pub project_id: Option<String>,
+    /// Case-insensitive substring filter on the name; prefix matches sort above
+    /// mid-string matches. `None` keeps every row.
+    pub name_query: Option<String>,
+    /// Rows to return. Clamped by the caller; a 0 is read as 1.
+    pub limit: u32,
+    /// Rows to skip, counted in the ranked order.
+    pub offset: u32,
 }
 
 /// Partial update payload for a conversation row.

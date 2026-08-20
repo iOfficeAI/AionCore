@@ -8,8 +8,9 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 use crate::repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
+    ConversationFilters, ConversationRowUpdate, IConversationRepository, MentionableCandidatesParams,
+    MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    StaleRuntimeMessageRow,
 };
 
 /// Bump `conversations.updated_at` so the conversation-list sort
@@ -484,6 +485,64 @@ impl IConversationRepository for SqliteConversationRepository {
             total,
             has_more,
         })
+    }
+
+    async fn list_mentionable_candidates(
+        &self,
+        user_id: &str,
+        params: &MentionableCandidatesParams,
+    ) -> Result<Vec<ConversationRow>, DbError> {
+        // Lowercased here and compared against `lower(c.name)`. SQLite's `lower`
+        // is ASCII-only, which is the same fold the picker applied when it
+        // ranked in Rust — neither side attempts non-ASCII case folding.
+        let needle = params
+            .name_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|term| !term.is_empty())
+            .map(|term| escape_like_pattern(&term.to_lowercase()));
+
+        let mut where_clause = String::from("c.user_id = ?");
+        let mut binds: Vec<BindValue> = vec![BindValue::Str(user_id.to_owned())];
+        if let Some(ref needle) = needle {
+            where_clause.push_str(r" AND lower(c.name) LIKE ? ESCAPE '\'");
+            binds.push(BindValue::Str(format!("%{needle}%")));
+        }
+
+        // Sort keys in design §5.3 order. Binds are pushed in the order their
+        // placeholders appear in the final statement: WHERE first, then ORDER BY.
+        let mut order_parts: Vec<&str> = Vec::with_capacity(4);
+        // Prefix matches above mid-string ones. Omitted rather than collapsed to
+        // a constant when there is no search term: a bare integer in ORDER BY is
+        // a column ordinal to SQLite, not a value.
+        if let Some(ref needle) = needle {
+            binds.push(BindValue::Str(format!("{needle}%")));
+            order_parts.push(r"CASE WHEN lower(c.name) LIKE ? ESCAPE '\' THEN 0 ELSE 1 END");
+        }
+        // A NULL bind makes the equality NULL, which falls through to 1 for
+        // every row — no project means no grouping, so no branch is needed.
+        binds.push(BindValue::OptStr(params.project_id.clone()));
+        order_parts.push("CASE WHEN c.project_id = ? THEN 0 ELSE 1 END");
+        order_parts.push("c.updated_at DESC");
+        order_parts.push("c.id DESC");
+        let order_clause = order_parts.join(", ");
+
+        let sql = format!(
+            "SELECT c.* FROM conversations c \
+             WHERE {where_clause} \
+             ORDER BY {order_clause} \
+             LIMIT ? OFFSET ?"
+        );
+        // A 0 limit would return nothing while still reporting progress to a
+        // caller that pages until the rows run out; read it as 1 instead.
+        binds.push(BindValue::I64(i64::from(params.limit.max(1))));
+        binds.push(BindValue::I64(i64::from(params.offset)));
+
+        let mut query = sqlx::query_as::<_, ConversationRow>(&sql);
+        for bind in &binds {
+            query = bind_value_as(query, bind);
+        }
+        Ok(query.fetch_all(&self.pool).await?)
     }
 
     // ── Extended queries ────────────────────────────────────────────
@@ -1396,6 +1455,23 @@ enum BindValue {
     Bool(bool),
     I64(i64),
     OptI64(Option<i64>),
+}
+
+/// Escape LIKE metacharacters so a search term matches literally.
+///
+/// Without this a user typing `%` into the mention picker would match every
+/// conversation, and `_` would match any single character — silently different
+/// from the plain substring test the picker used before the filter moved into
+/// SQL. Pairs with `ESCAPE '\'` on every `LIKE` that consumes the result.
+fn escape_like_pattern(term: &str) -> String {
+    let mut escaped = String::with_capacity(term.len());
+    for character in term.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 /// Binds a `BindValue` to a raw `sqlx::query::Query`.

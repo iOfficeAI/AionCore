@@ -11,7 +11,7 @@ use std::sync::Arc;
 use aionui_api_types::{SessionMentionTarget, SessionMentionableQuery, SessionMentionableResponse};
 use aionui_common::TimestampMs;
 use aionui_conversation::session_mentions::team_id_from_extra_str;
-use aionui_db::{ConversationFilters, IConversationRepository};
+use aionui_db::{IConversationRepository, MentionableCandidatesParams};
 use aionui_project::ProjectService;
 use tracing::warn;
 
@@ -20,6 +20,12 @@ use crate::error::SessionMessageError;
 /// Hard cap on a single page, so a caller cannot ask for the whole table.
 const MAX_LIMIT: u32 = 50;
 const DEFAULT_LIMIT: u32 = 20;
+/// Rows read beyond the requested page size per round trip, so a few
+/// hard-filtered rows inside the window do not cost a second query.
+const SCAN_SLACK: u32 = 10;
+/// Round-trip ceiling for one request. Without it, a user whose highest-ranked
+/// conversations are all team-owned would walk the entire table in one call.
+const MAX_SCANS: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetCandidate {
@@ -29,51 +35,27 @@ pub struct TargetCandidate {
     pub modified_at: TimestampMs,
 }
 
-/// Match tier for a search term. Lower sorts first.
-fn match_tier(name: &str, q: &str) -> Option<u8> {
-    let name = name.to_lowercase();
-    let q = q.to_lowercase();
-    if name.starts_with(&q) {
-        Some(0)
-    } else if name.contains(&q) {
-        Some(1)
-    } else {
-        None
-    }
-}
-
-/// Rank per spec §5.3.
+/// Read a page cursor.
 ///
-/// No search term → same project, then `modified_at` desc.
-/// With a search term → prefix before contains; within a tier, same project,
-/// then `modified_at` desc.
+/// The cursor is an offset into the ranked order rather than a row id: the
+/// ranking keys (search tier, same-project) are request-scoped, so no single
+/// row id identifies a stable resume point.
 ///
-/// `pinned` deliberately does not participate and is not even carried on
-/// `TargetCandidate`: cross-session collaboration almost always happens inside
-/// one project, and pinned expresses "I look at this often", not "this is
-/// related to the thing at hand".
-pub fn rank_targets(
-    current_project_id: Option<&str>,
-    q: Option<&str>,
-    rows: Vec<TargetCandidate>,
-) -> Vec<TargetCandidate> {
-    let query = q.map(str::trim).filter(|value| !value.is_empty());
-    let mut scored: Vec<(u8, u8, i64, TargetCandidate)> = rows
-        .into_iter()
-        .filter_map(|candidate| {
-            let tier = match query {
-                Some(q) => match_tier(&candidate.name, q)?,
-                None => 0,
-            };
-            let same_project = match (current_project_id, candidate.project_id.as_deref()) {
-                (Some(current), Some(candidate_project)) if current == candidate_project => 0,
-                _ => 1,
-            };
-            Some((tier, same_project, -candidate.modified_at, candidate))
-        })
-        .collect();
-    scored.sort_by_key(|(tier, same_project, negated_modified_at, _)| (*tier, *same_project, *negated_modified_at));
-    scored.into_iter().map(|(_, _, _, candidate)| candidate).collect()
+/// Unparsable input restarts from the top instead of failing the request. A
+/// picker that returns nothing is worse than one that repeats its first page,
+/// and the only ways to get here are a client bug or a cursor minted by a build
+/// that handed back conversation ids.
+fn parse_cursor(cursor: Option<&str>) -> u32 {
+    let Some(raw) = cursor.map(str::trim).filter(|value| !value.is_empty()) else {
+        return 0;
+    };
+    raw.parse().unwrap_or_else(|_| {
+        warn!(
+            cursor = raw,
+            "mentionable list: unparsable cursor, restarting from the first page"
+        );
+        0
+    })
 }
 
 pub struct MentionableTargets {
@@ -89,43 +71,39 @@ impl MentionableTargets {
         }
     }
 
-    /// Hard filters (spec §5.3): exclude the current conversation, exclude
-    /// team-owned conversations, exclude deleted ones (the repo already scopes
-    /// by user and skips deleted rows).
+    /// One ranked page of mentionable conversations.
+    ///
+    /// Ranking (design §5.3) happens in the DB query, not here: sorting an
+    /// already-truncated recency page can only reorder the newest N rows, so a
+    /// name match or a same-project conversation outside that window would stay
+    /// invisible however highly it ranks. What remains for this layer is the
+    /// pair of hard filters whose predicates live in Rust — the caller's own
+    /// conversation, and team-owned rows (via the shared
+    /// `team_id_from_extra_str`, so this cannot drift from the send boundary's
+    /// check). Deleted rows need no filter: conversations are hard-deleted.
+    ///
+    /// Those filters punch holes in the DB page, so the scan reads past them
+    /// (`SCAN_SLACK`, repeated up to `MAX_SCANS` times) and the returned cursor
+    /// counts SCANNED rows. A page that would otherwise shrink to a couple of
+    /// rows — or to none — still comes back full.
     pub async fn list(
         &self,
         user_id: &str,
         current_conversation_id: &str,
         query: &SessionMentionableQuery,
     ) -> Result<SessionMentionableResponse, SessionMessageError> {
-        let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-        let filters = ConversationFilters {
-            cursor: query.cursor.clone(),
-            limit,
-            source: None,
-            cron_job_id: None,
-            pinned: None,
-        };
-        let page = self
-            .conversation_repo
-            .list_paginated(user_id, &filters)
-            .await
-            .map_err(|error| SessionMessageError::TransportUnavailable {
-                reason: error.to_string(),
-            })?;
+        let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT) as usize;
+        // A blank search term is "no search term", not "match nothing".
+        let name_query = query
+            .q
+            .as_deref()
+            .map(str::trim)
+            .filter(|term| !term.is_empty())
+            .map(str::to_owned);
 
-        // `PaginatedResult` is `{ items, total, has_more }` — there is NO
-        // cursor field. The cursor IS the last row's id (see
-        // `ConversationFilters::cursor`: "the ID of the last conversation from
-        // the previous page"). Take it from the DB page order, BEFORE the
-        // filtering and ranking below: a page whose last row happens to be a
-        // team conversation (hard-filtered) would otherwise lose its cursor and
-        // the picker would page over the same rows forever.
-        let next_cursor = page
-            .has_more
-            .then(|| page.items.last().map(|row| row.id.clone()))
-            .flatten();
-
+        // The project of the conversation the picker sits in decides the
+        // same-project grouping, so it must be known BEFORE the scan — it is a
+        // sort key of the query now.
         let current_project_id = self
             .conversation_repo
             .get(user_id, current_conversation_id)
@@ -134,24 +112,67 @@ impl MentionableTargets {
             .flatten()
             .and_then(|row| row.project_id);
 
-        let candidates: Vec<TargetCandidate> = page
-            .items
-            .into_iter()
-            .filter(|row| row.id != current_conversation_id)
-            .filter(|row| team_id_from_extra_str(&row.extra).is_none())
-            .map(|row| TargetCandidate {
-                id: row.id,
-                name: row.name,
-                project_id: row.project_id,
-                modified_at: row.updated_at,
-            })
-            .collect();
+        let scan_limit = limit as u32 + SCAN_SLACK;
+        let mut offset = parse_cursor(query.cursor.as_deref());
+        let mut kept: Vec<TargetCandidate> = Vec::with_capacity(limit);
+        let mut exhausted = false;
 
-        let ranked = rank_targets(current_project_id.as_deref(), query.q.as_deref(), candidates);
-        let project_names = self.resolve_project_names(user_id, &ranked).await;
+        for _ in 0..MAX_SCANS {
+            let rows = self
+                .conversation_repo
+                .list_mentionable_candidates(
+                    user_id,
+                    &MentionableCandidatesParams {
+                        project_id: current_project_id.clone(),
+                        name_query: name_query.clone(),
+                        limit: scan_limit,
+                        offset,
+                    },
+                )
+                .await
+                .map_err(|error| SessionMessageError::TransportUnavailable {
+                    reason: error.to_string(),
+                })?;
+            let scanned = rows.len() as u32;
+
+            for row in rows {
+                // Counts scanned rows, not kept ones, so the next page resumes
+                // past the holes the hard filters just punched.
+                offset += 1;
+                if row.id == current_conversation_id {
+                    continue;
+                }
+                if team_id_from_extra_str(&row.extra).is_some() {
+                    continue;
+                }
+                kept.push(TargetCandidate {
+                    id: row.id,
+                    name: row.name,
+                    project_id: row.project_id,
+                    modified_at: row.updated_at,
+                });
+                if kept.len() == limit {
+                    break;
+                }
+            }
+
+            if kept.len() == limit {
+                break;
+            }
+            // A short read is the only proof the table ran out.
+            if scanned < scan_limit {
+                exhausted = true;
+                break;
+            }
+        }
+
+        // Anything short of a proven-exhausted scan may have more behind it,
+        // whether the page filled or `MAX_SCANS` cut it short.
+        let next_cursor = (!exhausted).then(|| offset.to_string());
+        let project_names = self.resolve_project_names(user_id, &kept).await;
 
         Ok(SessionMentionableResponse {
-            items: ranked
+            items: kept
                 .into_iter()
                 .map(|candidate| SessionMentionTarget {
                     project: candidate
