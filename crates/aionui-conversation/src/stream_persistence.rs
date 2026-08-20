@@ -559,6 +559,52 @@ impl CanonicalEventJournal {
         self.replay_unlocked(&path).await
     }
 
+    /// Replay committed events strictly after `sequence` using the durable
+    /// cursor index. A cursor beyond the journal tail is rejected so callers
+    /// can fall back to a full projection rebuild instead of silently skipping
+    /// facts.
+    #[cfg(test)]
+    pub async fn replay_after(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        sequence: u64,
+    ) -> Result<Vec<CanonicalJournalEvent>, std::io::Error> {
+        let path = self.path(user_id, conversation_id)?;
+        self.repair_incomplete_tail(&path).await?;
+        let current_len = match tokio::fs::metadata(&path).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        let entries = match self.load_index(&path, conversation_id, current_len).await? {
+            Some(entries) => entries,
+            None => {
+                let events = self.replay_unlocked(&path).await?;
+                self.rebuild_index(&path, &events).await?
+            }
+        };
+        let last_sequence = entries.last().map_or(0, |entry| entry.sequence);
+        if sequence > last_sequence {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "journal replay cursor is beyond the committed tail",
+            ));
+        }
+        let mut events = Vec::new();
+        for entry in entries.iter().filter(|entry| entry.sequence > sequence) {
+            let event = self.read_indexed_event(&path, entry).await?;
+            if event.conversation_id != conversation_id || event.sequence != entry.sequence {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "journal cursor index does not match the requested scope",
+                ));
+            }
+            events.push(event);
+        }
+        Ok(events)
+    }
+
     /// Discover and replay every canonical journal below the configured root.
     ///
     /// Journal paths deliberately contain hashed user/conversation scopes, so
@@ -1381,6 +1427,31 @@ mod output_retention_tests {
         let index = tokio::fs::read_to_string(index_path).await.unwrap();
         assert_eq!(index.lines().count(), 2);
         assert_eq!(journal.replay("user", "conv").await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn canonical_journal_replays_only_events_after_checkpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = CanonicalEventJournal::new(root.path().to_path_buf());
+        for sequence in 1..=3 {
+            journal
+                .append(
+                    "user",
+                    "conv",
+                    format!("event-{sequence}"),
+                    "Text".into(),
+                    serde_json::json!({ "sequence": sequence }),
+                )
+                .await
+                .unwrap();
+        }
+
+        let incremental = journal.replay_after("user", "conv", 1).await.unwrap();
+        assert_eq!(
+            incremental.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert!(journal.replay_after("user", "conv", 4).await.is_err());
     }
 
     #[tokio::test]
