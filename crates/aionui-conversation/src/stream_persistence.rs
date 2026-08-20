@@ -15,7 +15,7 @@ use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
 
 use crate::runtime_completion::RuntimeCompletionPublisher;
@@ -187,6 +187,11 @@ pub(crate) struct CanonicalReplayProjection {
 pub(crate) struct DiscoveredJournalReplay {
     pub conversation_id: String,
     pub events: Vec<CanonicalJournalEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DiscoveredJournal {
+    pub conversation_id: String,
 }
 
 impl CanonicalReplayProjection {
@@ -651,6 +656,53 @@ impl CanonicalEventJournal {
         }
         replays.sort_by(|left, right| left.conversation_id.cmp(&right.conversation_id));
         Ok(replays)
+    }
+
+    /// Discover journal scopes by reading only their first committed event.
+    /// Projection recovery can then use the durable cursor index instead of
+    /// parsing every historical event during a normal startup.
+    pub(crate) async fn discover(&self) -> Result<Vec<DiscoveredJournal>, std::io::Error> {
+        let mut user_dirs = match tokio::fs::read_dir(&self.root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut journals = Vec::new();
+        while let Some(user_dir) = user_dirs.next_entry().await? {
+            if !user_dir.file_type().await?.is_dir() {
+                continue;
+            }
+            let mut entries = tokio::fs::read_dir(user_dir.path()).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                if !entry.file_type().await?.is_file()
+                    || path.extension().and_then(|value| value.to_str()) != Some("ndjson")
+                {
+                    continue;
+                }
+                self.repair_incomplete_tail(&path).await?;
+                let mut line = String::new();
+                BufReader::new(tokio::fs::File::open(&path).await?)
+                    .read_line(&mut line)
+                    .await?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let first: CanonicalJournalEvent = serde_json::from_str(&line)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                if first.sequence != 1 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "canonical event journal does not start at sequence one",
+                    ));
+                }
+                journals.push(DiscoveredJournal {
+                    conversation_id: first.conversation_id,
+                });
+            }
+        }
+        journals.sort_by(|left, right| left.conversation_id.cmp(&right.conversation_id));
+        Ok(journals)
     }
 
     pub async fn replay_projection(

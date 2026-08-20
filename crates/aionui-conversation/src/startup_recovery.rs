@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use aionui_api_types::ConversationInputStatus;
-use aionui_common::ErrorChain;
-use aionui_db::models::MessageRow;
-use aionui_db::{ConversationInputInsert, ConversationInputUpdate, MessageRowUpdate};
+use aionui_common::{ErrorChain, now_ms};
+use aionui_db::models::{ConversationInputRow, MessageRow};
+use aionui_db::{MessageRowUpdate, UpsertJournalProjectionCheckpointParams};
 use tracing::{info, warn};
 
 use crate::runtime_persistence::RuntimeWriteKind;
@@ -211,95 +211,132 @@ impl ConversationService {
     /// The canonical Journal is authoritative; the database can be empty or
     /// lag behind after a crash between append and projection update.
     async fn rebuild_conversation_input_projection(&self) {
-        let replays = match self.canonical_event_journal().replay_all().await {
-            Ok(replays) => replays,
+        const PROJECTOR: &str = "conversation-inputs-v1";
+        let journals = match self.canonical_event_journal().discover().await {
+            Ok(journals) => journals,
             Err(error) => {
-                warn!(error = %ErrorChain(&error), "startup recovery could not replay canonical journals");
+                warn!(error = %ErrorChain(&error), "startup recovery could not discover canonical journals");
                 return;
             }
         };
         let mut repaired = 0usize;
-        for replay in replays {
-            let user_id = match self.conversation_repo().owner_user_id(&replay.conversation_id).await {
+        let mut incremental_events = 0usize;
+        let mut full_rebuilds = 0usize;
+        for journal in journals {
+            let conversation_id = journal.conversation_id;
+            let user_id = match self.conversation_repo().owner_user_id(&conversation_id).await {
                 Ok(Some(user_id)) => user_id,
                 Ok(None) => continue,
                 Err(error) => {
                     warn!(
-                        conversation_id = %replay.conversation_id,
+                        conversation_id = %conversation_id,
                         error = %ErrorChain(&error),
                         "startup recovery could not resolve journal owner"
                     );
                     continue;
                 }
             };
-            for input in fold_conversation_inputs(&replay.events) {
-                let existing = match self
-                    .conversation_repo()
-                    .get_conversation_input(&user_id, &replay.conversation_id, &input.id)
+            let checkpoint = self
+                .conversation_repo()
+                .get_journal_projection_checkpoint(&user_id, &conversation_id, PROJECTOR)
+                .await
+                .ok()
+                .flatten();
+            let mut seed = BTreeMap::new();
+            let (events, full_rebuild) = if let Some(checkpoint) = checkpoint.filter(|value| value.last_sequence > 0) {
+                match self
+                    .canonical_event_journal()
+                    .replay_after(
+                        &user_id,
+                        &conversation_id,
+                        checkpoint.last_sequence.saturating_sub(1) as u64,
+                    )
                     .await
                 {
-                    Ok(existing) => existing,
+                    Ok(mut events)
+                        if events.first().is_some_and(|event| {
+                            event.sequence == checkpoint.last_sequence as u64
+                                && event.event_id == checkpoint.last_event_id
+                        }) =>
+                    {
+                        events.remove(0);
+                        match self
+                            .conversation_repo()
+                            .list_conversation_inputs(&user_id, &conversation_id)
+                            .await
+                        {
+                            Ok(rows) => {
+                                seed.extend(rows.into_iter().map(|row| {
+                                    let id = row.id.clone();
+                                    (id, ReplayedConversationInput::from(row))
+                                }));
+                                incremental_events += events.len();
+                                (events, false)
+                            }
+                            Err(error) => {
+                                warn!(conversation_id = %conversation_id, error = %ErrorChain(&error), "could not load input projection seed");
+                                match self.canonical_event_journal().replay(&user_id, &conversation_id).await {
+                                    Ok(events) => (events, true),
+                                    Err(error) => {
+                                        warn!(conversation_id = %conversation_id, error = %ErrorChain(&error), "could not rebuild journal after projection seed failure");
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => match self.canonical_event_journal().replay(&user_id, &conversation_id).await {
+                        Ok(events) => (events, true),
+                        Err(error) => {
+                            warn!(conversation_id = %conversation_id, error = %ErrorChain(&error), "could not rebuild invalid journal checkpoint");
+                            continue;
+                        }
+                    },
+                }
+            } else {
+                match self.canonical_event_journal().replay(&user_id, &conversation_id).await {
+                    Ok(events) => (events, true),
                     Err(error) => {
-                        warn!(
-                            conversation_id = %replay.conversation_id,
-                            input_id = %input.id,
-                            error = %ErrorChain(&error),
-                            "startup recovery could not read input projection"
-                        );
+                        warn!(conversation_id = %conversation_id, error = %ErrorChain(&error), "could not perform initial journal projection");
                         continue;
                     }
-                };
-                let result = if existing.is_some() {
-                    self.conversation_repo()
-                        .update_conversation_input(
-                            &user_id,
-                            &replay.conversation_id,
-                            &input.id,
-                            &ConversationInputUpdate {
-                                status: Some(&input.status),
-                                turn_id: input.turn_id.as_deref(),
-                                msg_id: input.msg_id.as_deref(),
-                                error_code: input.error_code.as_deref(),
-                                updated_at: input.updated_at,
-                            },
-                        )
-                        .await
-                        .map(|_| ())
-                } else {
-                    self.conversation_repo()
-                        .insert_conversation_input(&ConversationInputInsert {
-                            id: &input.id,
-                            user_id: &user_id,
-                            conversation_id: &replay.conversation_id,
-                            mode: &input.mode,
-                            status: &input.status,
-                            content: &input.content,
-                            files: &input.files,
-                            inject_skills: &input.inject_skills,
-                            hidden: input.hidden,
-                            client_key: &input.client_key,
-                            created_at: input.created_at,
-                        })
-                        .await
-                        .map(|_| ())
-                };
-                match result {
-                    Ok(()) => repaired += 1,
-                    Err(error) => warn!(
-                        conversation_id = %replay.conversation_id,
-                        input_id = %input.id,
-                        error = %ErrorChain(&error),
-                        "startup recovery failed to rebuild input projection"
-                    ),
                 }
+            };
+            if full_rebuild {
+                full_rebuilds += 1;
+            }
+            let Some(last_event) = events.last() else {
+                continue;
+            };
+            let inputs: Vec<_> = fold_conversation_inputs_with_seed(seed, &events)
+                .into_iter()
+                .map(|input| input.into_row(&user_id, &conversation_id))
+                .collect();
+            let projected = inputs.len();
+            if let Err(error) = self
+                .conversation_repo()
+                .apply_conversation_input_projection(
+                    &inputs,
+                    &UpsertJournalProjectionCheckpointParams {
+                        user_id: &user_id,
+                        conversation_id: &conversation_id,
+                        projector: PROJECTOR,
+                        last_sequence: last_event.sequence as i64,
+                        last_event_id: &last_event.event_id,
+                        updated_at: now_ms(),
+                    },
+                )
+                .await
+            {
+                warn!(conversation_id = %conversation_id, error = %ErrorChain(&error), "could not atomically apply journal projection and checkpoint");
+            } else {
+                repaired += projected;
             }
         }
-        if repaired > 0 {
-            info!(
-                repaired,
-                "startup recovery rebuilt conversation input projection from Journal"
-            );
-        }
+        info!(
+            repaired,
+            incremental_events, full_rebuilds, "startup journal projection recovery completed"
+        );
     }
 }
 
@@ -331,7 +368,55 @@ fn recovered_tool_identifiers(row: &MessageRow) -> RecoveredToolIdentifiers {
 }
 
 fn fold_conversation_inputs(events: &[CanonicalJournalEvent]) -> Vec<ReplayedConversationInput> {
-    let mut inputs = BTreeMap::<String, ReplayedConversationInput>::new();
+    fold_conversation_inputs_with_seed(BTreeMap::new(), events)
+}
+
+impl From<aionui_db::models::ConversationInputRow> for ReplayedConversationInput {
+    fn from(row: aionui_db::models::ConversationInputRow) -> Self {
+        Self {
+            id: row.id,
+            mode: row.mode,
+            status: row.status,
+            content: row.content,
+            files: row.files,
+            inject_skills: row.inject_skills,
+            hidden: row.hidden,
+            client_key: row.client_key,
+            turn_id: row.turn_id,
+            msg_id: row.msg_id,
+            error_code: row.error_code,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+impl ReplayedConversationInput {
+    fn into_row(self, user_id: &str, conversation_id: &str) -> ConversationInputRow {
+        ConversationInputRow {
+            id: self.id,
+            user_id: user_id.to_owned(),
+            conversation_id: conversation_id.to_owned(),
+            mode: self.mode,
+            status: self.status,
+            content: self.content,
+            files: self.files,
+            inject_skills: self.inject_skills,
+            hidden: self.hidden,
+            client_key: self.client_key,
+            turn_id: self.turn_id,
+            msg_id: self.msg_id,
+            error_code: self.error_code,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+fn fold_conversation_inputs_with_seed(
+    mut inputs: BTreeMap<String, ReplayedConversationInput>,
+    events: &[CanonicalJournalEvent],
+) -> Vec<ReplayedConversationInput> {
     for event in events {
         let data = &event.payload["data"];
         if event.kind == "InputHeld" {

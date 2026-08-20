@@ -129,3 +129,23 @@ pub struct UpsertConversationCapabilitySnapshotParams<'a> {
     pub negotiated_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct JournalProjectionCheckpointRow {
+    pub user_id: String,
+    pub conversation_id: String,
+    pub projector: String,
+    pub last_sequence: i64,
+    pub last_event_id: String,
+    pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertJournalProjectionCheckpointParams<'a> {
+    pub user_id: &'a str,
+    pub conversation_id: &'a str,
+    pub projector: &'a str,
+    pub last_sequence: i64,
+    pub last_event_id: &'a str,
+    pub updated_at: TimestampMs,
+}

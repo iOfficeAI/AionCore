@@ -5,7 +5,8 @@ use aionui_common::{PaginatedResult, TimestampMs};
 use crate::error::DbError;
 use crate::models::{
     ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationCapabilitySnapshotRow, ConversationInputRow,
-    ConversationRow, MessageRow, UpsertConversationAssistantSnapshotParams, UpsertConversationCapabilitySnapshotParams,
+    ConversationRow, JournalProjectionCheckpointRow, MessageRow, UpsertConversationAssistantSnapshotParams,
+    UpsertConversationCapabilitySnapshotParams, UpsertJournalProjectionCheckpointParams,
 };
 use crate::repository::conversation::{
     ConversationFilters, ConversationInputInsert, ConversationInputUpdate, ConversationRowUpdate,
@@ -728,6 +729,117 @@ impl IConversationRepository for SqliteConversationRepository {
         self.get_capability_snapshot(params.user_id, params.conversation_id)
             .await?
             .ok_or_else(|| DbError::NotFound("capability snapshot disappeared after upsert".into()))
+    }
+
+    async fn get_journal_projection_checkpoint(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        projector: &str,
+    ) -> Result<Option<JournalProjectionCheckpointRow>, DbError> {
+        self.ensure_conversation_for_user(user_id, conversation_id).await?;
+        Ok(sqlx::query_as::<_, JournalProjectionCheckpointRow>(
+            "SELECT * FROM journal_projection_checkpoints
+             WHERE user_id = ? AND conversation_id = ? AND projector = ?",
+        )
+        .bind(user_id)
+        .bind(conversation_id)
+        .bind(projector)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn upsert_journal_projection_checkpoint(
+        &self,
+        params: &UpsertJournalProjectionCheckpointParams<'_>,
+    ) -> Result<(), DbError> {
+        self.ensure_conversation_for_user(params.user_id, params.conversation_id)
+            .await?;
+        sqlx::query(
+            "INSERT INTO journal_projection_checkpoints (
+                user_id, conversation_id, projector, last_sequence, last_event_id, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, conversation_id, projector) DO UPDATE SET
+                last_sequence = excluded.last_sequence,
+                last_event_id = excluded.last_event_id,
+                updated_at = excluded.updated_at",
+        )
+        .bind(params.user_id)
+        .bind(params.conversation_id)
+        .bind(params.projector)
+        .bind(params.last_sequence)
+        .bind(params.last_event_id)
+        .bind(params.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn apply_conversation_input_projection(
+        &self,
+        inputs: &[ConversationInputRow],
+        checkpoint: &UpsertJournalProjectionCheckpointParams<'_>,
+    ) -> Result<(), DbError> {
+        self.ensure_conversation_for_user(checkpoint.user_id, checkpoint.conversation_id)
+            .await?;
+        let mut transaction = self.pool.begin().await?;
+        for input in inputs {
+            sqlx::query(
+                "INSERT INTO conversation_inputs (
+                    id, user_id, conversation_id, mode, status, content, files,
+                    inject_skills, hidden, client_key, turn_id, msg_id, error_code,
+                    created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                    mode = excluded.mode,
+                    status = excluded.status,
+                    content = excluded.content,
+                    files = excluded.files,
+                    inject_skills = excluded.inject_skills,
+                    hidden = excluded.hidden,
+                    client_key = excluded.client_key,
+                    turn_id = excluded.turn_id,
+                    msg_id = excluded.msg_id,
+                    error_code = excluded.error_code,
+                    updated_at = excluded.updated_at",
+            )
+            .bind(&input.id)
+            .bind(&input.user_id)
+            .bind(&input.conversation_id)
+            .bind(&input.mode)
+            .bind(&input.status)
+            .bind(&input.content)
+            .bind(&input.files)
+            .bind(&input.inject_skills)
+            .bind(input.hidden)
+            .bind(&input.client_key)
+            .bind(&input.turn_id)
+            .bind(&input.msg_id)
+            .bind(&input.error_code)
+            .bind(input.created_at)
+            .bind(input.updated_at)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO journal_projection_checkpoints (
+                user_id, conversation_id, projector, last_sequence, last_event_id, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, conversation_id, projector) DO UPDATE SET
+                last_sequence = excluded.last_sequence,
+                last_event_id = excluded.last_event_id,
+                updated_at = excluded.updated_at",
+        )
+        .bind(checkpoint.user_id)
+        .bind(checkpoint.conversation_id)
+        .bind(checkpoint.projector)
+        .bind(checkpoint.last_sequence)
+        .bind(checkpoint.last_event_id)
+        .bind(checkpoint.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     async fn list_messages_page(
@@ -2606,6 +2718,33 @@ mod tests {
             .unwrap();
         assert_eq!(updated.revision, 2);
         assert_eq!(updated.negotiated_at, 200);
+    }
+
+    #[tokio::test]
+    async fn journal_projection_checkpoint_upsert_advances_cursor() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+        for (sequence, event_id) in [(4, "event-four"), (7, "event-seven")] {
+            repo.upsert_journal_projection_checkpoint(&UpsertJournalProjectionCheckpointParams {
+                user_id: SYSTEM_USER_ID,
+                conversation_id: &conv.id,
+                projector: "conversation-inputs-v1",
+                last_sequence: sequence,
+                last_event_id: event_id,
+                updated_at: sequence * 100,
+            })
+            .await
+            .unwrap();
+        }
+
+        let checkpoint = repo
+            .get_journal_projection_checkpoint(SYSTEM_USER_ID, &conv.id, "conversation-inputs-v1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.last_sequence, 7);
+        assert_eq!(checkpoint.last_event_id, "event-seven");
     }
 
     #[tokio::test]

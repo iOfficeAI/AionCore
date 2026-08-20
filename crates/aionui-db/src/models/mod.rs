@@ -31,7 +31,8 @@ pub use channel::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, Pairi
 pub use client_preference::ClientPreference;
 pub use conversation::{
     ConversationAssistantSnapshotRow, ConversationCapabilitySnapshotRow, ConversationInputRow, ConversationRow,
-    UpsertConversationAssistantSnapshotParams, UpsertConversationCapabilitySnapshotParams,
+    JournalProjectionCheckpointRow, UpsertConversationAssistantSnapshotParams,
+    UpsertConversationCapabilitySnapshotParams, UpsertJournalProjectionCheckpointParams,
 };
 pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
