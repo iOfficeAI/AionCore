@@ -288,6 +288,26 @@ impl AgentInstance {
         }
     }
 
+    /// Whether this concrete running backend supports native mid-turn steer.
+    pub fn supports_steer(&self) -> bool {
+        match self {
+            Self::Session(manager) => manager.supports_steer(),
+            Self::Acp(_) | Self::Aionrs(_) => false,
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(_) => false,
+        }
+    }
+
+    /// Dispatch native steer with a stable host input correlation id.
+    pub async fn steer(&self, input_id: String, content: String) -> Result<(), AgentError> {
+        match self {
+            Self::Session(manager) => manager.steer(input_id, content).await,
+            Self::Acp(_) | Self::Aionrs(_) => Err(AgentError::bad_request("capability_unsupported")),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(_) => Err(AgentError::bad_request("capability_unsupported")),
+        }
+    }
+
     /// Cancel the current streaming response without killing the agent.
     pub async fn cancel(&self) -> Result<(), AgentError> {
         self.as_task().cancel().await

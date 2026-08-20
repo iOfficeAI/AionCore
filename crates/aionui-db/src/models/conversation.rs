@@ -107,3 +107,25 @@ pub struct ConversationInputRow {
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ConversationCapabilitySnapshotRow {
+    pub conversation_id: String,
+    pub user_id: String,
+    pub revision: i64,
+    pub capabilities_json: String,
+    pub backend_identity: String,
+    pub negotiated_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertConversationCapabilitySnapshotParams<'a> {
+    pub conversation_id: &'a str,
+    pub user_id: &'a str,
+    pub revision: i64,
+    pub capabilities_json: &'a str,
+    pub backend_identity: &'a str,
+    pub negotiated_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}

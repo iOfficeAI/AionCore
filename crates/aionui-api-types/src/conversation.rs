@@ -204,6 +204,10 @@ pub struct ConversationCapabilities {
     pub steer: bool,
     pub inject: bool,
     pub tool_enforcement: ToolEnforcementLevel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negotiated_at: Option<TimestampMs>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -239,6 +243,11 @@ pub struct ConversationInputResponse {
 
 pub type ConversationInputListResponse = Vec<ConversationInputResponse>;
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ListConversationInputsQuery {
+    pub terminal_limit: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConversationInputReceipt {
     pub input: ConversationInputResponse,
@@ -250,6 +259,13 @@ pub struct ConversationInputReceipt {
 pub struct InputChangedEvent {
     pub user_id: String,
     pub input: ConversationInputResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilitiesChangedEvent {
+    pub user_id: String,
+    pub conversation_id: String,
+    pub capabilities: ConversationCapabilities,
 }
 
 /// Body for `POST /api/conversations/:id/cancel`.

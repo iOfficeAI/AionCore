@@ -1165,6 +1165,29 @@ impl SessionAgentTask {
             })
             .collect())
     }
+
+    /// Whether the live backend has an authenticated, native steer wire.
+    pub fn supports_steer(&self) -> bool {
+        self.backend.capabilities().supported_commands.steer
+    }
+
+    /// Apply host input to the current turn and wait for the backend receipt.
+    pub async fn steer(&self, input_id: String, content: String) -> Result<(), AgentError> {
+        if !self.supports_steer() {
+            return Err(AgentError::bad_request("capability_unsupported"));
+        }
+        self.backend
+            .dispatch(Command::Steer {
+                content: vec![ContentBlock::Text(content)],
+                client_user_message_id: Some(input_id),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| match &error {
+                BackendError::Transport(code) if code == "too_late" => AgentError::bad_request("too_late"),
+                _ => AgentError::bad_gateway(error.to_string()),
+            })
+    }
 }
 
 #[async_trait::async_trait]

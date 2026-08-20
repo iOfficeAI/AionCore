@@ -1202,6 +1202,7 @@ mod tests {
         let err = backend
             .dispatch(Command::Steer {
                 content: vec![ContentBlock::Text("stop".into())],
+                client_user_message_id: None,
             })
             .await
             .expect_err("steer must not be silently accepted");

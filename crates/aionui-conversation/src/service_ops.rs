@@ -11,21 +11,22 @@ use std::path::Component;
 
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
-    CanonicalReplayProjectionResponse, ConfigOptionConfirmation, GetConfigOptionsResponse, HostPolicyResponse,
-    InputChangedEvent, JournalTranscriptResponse, RETIRED_DEEPSEEK_HARNESS_BACKEND, RetainedOutputResponse,
-    SetConfigOptionRequest, SetConfigOptionResponse, SetHostPolicyRequest, SideQuestionRequest, SideQuestionResponse,
-    SlashCommandItem, SubmitConversationInputRequest, ToolEnforcementLevel, WorkspaceBrowseQuery, WorkspaceEntry,
+    CanonicalReplayProjectionResponse, CapabilitiesChangedEvent, ConfigOptionConfirmation, GetConfigOptionsResponse,
+    HostPolicyResponse, InputChangedEvent, JournalTranscriptResponse, RETIRED_DEEPSEEK_HARNESS_BACKEND,
+    RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse, SetHostPolicyRequest, SideQuestionRequest,
+    SideQuestionResponse, SlashCommandItem, SubmitConversationInputRequest, ToolEnforcementLevel, WorkspaceBrowseQuery,
+    WorkspaceEntry,
 };
 use aionui_api_types::{
     ConversationCapabilities, ConversationInputMode, ConversationInputReceipt, ConversationInputResponse,
     ConversationInputStatus, SendMessageRequest, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ErrorChain, now_ms};
-use aionui_db::models::ConversationInputRow;
+use aionui_db::models::{ConversationInputRow, UpsertConversationCapabilitySnapshotParams};
 use aionui_db::{ConversationInputInsert, ConversationInputUpdate};
 use sha2::{Digest, Sha256};
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::ConversationError;
 use crate::journal_transcript::{RequestedVisibility, derive_transcript};
@@ -527,16 +528,138 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
-        Ok(ConversationCapabilities {
+        let active_task = self.task(conversation_id).ok();
+        let mut capabilities = ConversationCapabilities {
             followup: true,
-            steer: false,
+            steer: active_task
+                .as_ref()
+                .is_some_and(aionui_ai_agent::AgentInstance::supports_steer),
             inject: row.r#type == "aionrs",
             tool_enforcement: if row.r#type == "aionrs" {
                 ToolEnforcementLevel::Native
             } else {
                 ToolEnforcementLevel::ObserveOnly
             },
-        })
+            revision: None,
+            negotiated_at: None,
+        };
+        let backend_identity = serde_json::from_str::<serde_json::Value>(&row.extra)
+            .ok()
+            .and_then(|extra| {
+                extra
+                    .get("backend")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|backend| !backend.trim().is_empty())
+            .unwrap_or_else(|| row.r#type.clone());
+        let existing = self
+            .conversation_repo()
+            .get_capability_snapshot(user_id, conversation_id)
+            .await?;
+
+        if active_task.is_none() {
+            if let Some(snapshot) = existing
+                && let Ok(mut persisted) = serde_json::from_str::<ConversationCapabilities>(&snapshot.capabilities_json)
+            {
+                persisted.revision = u64::try_from(snapshot.revision).ok();
+                persisted.negotiated_at = Some(snapshot.negotiated_at);
+                return Ok(persisted);
+            }
+            return Ok(capabilities);
+        }
+
+        if let Some(snapshot) = existing.as_ref()
+            && snapshot.backend_identity == backend_identity
+            && let Ok(mut persisted) = serde_json::from_str::<ConversationCapabilities>(&snapshot.capabilities_json)
+        {
+            persisted.revision = None;
+            persisted.negotiated_at = None;
+            if persisted == capabilities {
+                capabilities.revision = u64::try_from(snapshot.revision).ok();
+                capabilities.negotiated_at = Some(snapshot.negotiated_at);
+                return Ok(capabilities);
+            }
+        }
+
+        let capability_lock = self.input_queue_lock(conversation_id);
+        let _guard = capability_lock.lock().await;
+        let latest = self
+            .conversation_repo()
+            .get_capability_snapshot(user_id, conversation_id)
+            .await?;
+        if let Some(snapshot) = latest.as_ref()
+            && snapshot.backend_identity == backend_identity
+            && let Ok(mut persisted) = serde_json::from_str::<ConversationCapabilities>(&snapshot.capabilities_json)
+        {
+            persisted.revision = None;
+            persisted.negotiated_at = None;
+            if persisted == capabilities {
+                capabilities.revision = u64::try_from(snapshot.revision).ok();
+                capabilities.negotiated_at = Some(snapshot.negotiated_at);
+                return Ok(capabilities);
+            }
+        }
+
+        let revision = latest
+            .as_ref()
+            .map_or(1, |snapshot| snapshot.revision.saturating_add(1));
+        let negotiated_at = now_ms();
+        capabilities.revision = u64::try_from(revision).ok();
+        capabilities.negotiated_at = Some(negotiated_at);
+        let capabilities_json = serde_json::to_string(&capabilities)
+            .map_err(|error| ConversationError::internal(format!("Failed to encode capability snapshot: {error}")))?;
+        let payload = serde_json::json!({
+            "type": "capability_snapshot",
+            "visibility": "host",
+            "data": {
+                "revision": revision,
+                "capabilities": capabilities,
+                "backend_identity": backend_identity,
+            }
+        });
+        let event_id = crate::stream_persistence::canonical_event_id(
+            &format!("conversation_capabilities:{conversation_id}:{revision}"),
+            &payload,
+        );
+        self.canonical_event_journal()
+            .append(
+                user_id,
+                conversation_id,
+                event_id,
+                "CapabilitySnapshotChanged".into(),
+                payload,
+            )
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to journal capability snapshot: {error}")))?;
+        self.conversation_repo()
+            .upsert_capability_snapshot(&UpsertConversationCapabilitySnapshotParams {
+                conversation_id,
+                user_id,
+                revision,
+                capabilities_json: &capabilities_json,
+                backend_identity: &backend_identity,
+                negotiated_at,
+                updated_at: negotiated_at,
+            })
+            .await?;
+        info!(
+            conversation_id,
+            revision,
+            followup = capabilities.followup,
+            steer = capabilities.steer,
+            inject = capabilities.inject,
+            "Conversation capability snapshot changed"
+        );
+        self.broadcaster().broadcast(WebSocketMessage::new(
+            "conversation.capabilitiesChanged",
+            serde_json::json!(CapabilitiesChangedEvent {
+                user_id: user_id.to_owned(),
+                conversation_id: conversation_id.to_owned(),
+                capabilities: capabilities.clone(),
+            }),
+        ));
+        Ok(capabilities)
     }
 
     pub async fn submit_input(
@@ -684,10 +807,37 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
     ) -> Result<Vec<ConversationInputResponse>, ConversationError> {
-        self.conversation_repo()
+        self.list_inputs_with_terminal_limit(user_id, conversation_id, None)
+            .await
+    }
+
+    pub async fn list_inputs_with_terminal_limit(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        terminal_limit: Option<u32>,
+    ) -> Result<Vec<ConversationInputResponse>, ConversationError> {
+        let terminal_limit = terminal_limit.unwrap_or(20).min(100) as usize;
+        let rows = self
+            .conversation_repo()
             .list_conversation_inputs(user_id, conversation_id)
-            .await?
-            .into_iter()
+            .await?;
+        let terminal_count = rows
+            .iter()
+            .filter(|row| matches!(row.status.as_str(), "applied" | "canceled" | "failed"))
+            .count();
+        let skip_terminal = terminal_count.saturating_sub(terminal_limit);
+        let mut seen_terminal = 0usize;
+        rows.into_iter()
+            .filter(|row| {
+                if matches!(row.status.as_str(), "applied" | "canceled" | "failed") {
+                    let include = seen_terminal >= skip_terminal;
+                    seen_terminal += 1;
+                    include
+                } else {
+                    true
+                }
+            })
             .map(input_row_response)
             .collect()
     }
@@ -848,21 +998,95 @@ impl ConversationService {
             return;
         }
         if claimed_response.mode == ConversationInputMode::Steer {
-            if let Err(error) = self
-                .persist_input_status(
-                    user_id,
-                    conversation_id,
-                    &next.id,
-                    InputStatusChange {
-                        status: ConversationInputStatus::Failed,
-                        turn_id: runtime.turn_id.as_deref(),
-                        msg_id: None,
-                        error_code: Some("capability_unsupported"),
-                    },
-                )
-                .await
-            {
-                warn!(conversation_id, input_id = next.id, error = %error, "Failed to reject unsupported steer");
+            let result = match self.task(conversation_id) {
+                Ok(task) => task
+                    .steer(next.id.clone(), claimed_response.content.clone())
+                    .await
+                    .map_err(ConversationError::from),
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => {
+                    if let Err(error) = self
+                        .persist_input_status(
+                            user_id,
+                            conversation_id,
+                            &next.id,
+                            InputStatusChange {
+                                status: ConversationInputStatus::Accepted,
+                                turn_id: runtime.turn_id.as_deref(),
+                                msg_id: None,
+                                error_code: None,
+                            },
+                        )
+                        .await
+                    {
+                        warn!(conversation_id, input_id = next.id, error = %error, "Failed to persist accepted steer");
+                        return;
+                    }
+                    let payload = serde_json::json!({
+                        "type": "conversation_steer",
+                        "visibility": "model",
+                        "data": {
+                            "input_id": next.id.clone(),
+                            "turn_id": runtime.turn_id.clone(),
+                            "content": claimed_response.content,
+                        }
+                    });
+                    let event_id = crate::stream_persistence::canonical_event_id(
+                        &format!("conversation_input:{}:model_applied", next.id),
+                        &payload,
+                    );
+                    if let Err(error) = self
+                        .canonical_event_journal()
+                        .append(user_id, conversation_id, event_id, "SteerApplied".into(), payload)
+                        .await
+                    {
+                        warn!(conversation_id, input_id = next.id, error = %error, "Failed to journal model-visible steer");
+                        return;
+                    }
+                    if let Err(error) = self
+                        .persist_input_status(
+                            user_id,
+                            conversation_id,
+                            &next.id,
+                            InputStatusChange {
+                                status: ConversationInputStatus::Applied,
+                                turn_id: runtime.turn_id.as_deref(),
+                                msg_id: None,
+                                error_code: None,
+                            },
+                        )
+                        .await
+                    {
+                        warn!(conversation_id, input_id = next.id, error = %error, "Failed to project applied steer");
+                    }
+                }
+                Err(error) => {
+                    let error_code = match &error {
+                        ConversationError::BadRequest { reason } if reason == "too_late" => "too_late",
+                        ConversationError::BadRequest { reason } if reason == "capability_unsupported" => {
+                            "capability_unsupported"
+                        }
+                        _ => error.error_code(),
+                    };
+                    if let Err(persist_error) = self
+                        .persist_input_status(
+                            user_id,
+                            conversation_id,
+                            &next.id,
+                            InputStatusChange {
+                                status: ConversationInputStatus::Failed,
+                                turn_id: runtime.turn_id.as_deref(),
+                                msg_id: None,
+                                error_code: Some(error_code),
+                            },
+                        )
+                        .await
+                    {
+                        warn!(conversation_id, input_id = next.id, error = %persist_error, "Failed to project rejected steer");
+                    }
+                }
             }
             return;
         }

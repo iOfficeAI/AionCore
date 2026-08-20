@@ -33,7 +33,11 @@ pub enum Command {
     Cancel { target: CancelTarget },
     /// Inject content into the in-flight turn (adapter-private gated steering;
     /// the b-side FSM never sees Steer). Gated by `supported_commands.steer`.
-    Steer { content: Vec<ContentBlock> },
+    Steer {
+        content: Vec<ContentBlock>,
+        /// Stable host input id forwarded to backends that support request correlation.
+        client_user_message_id: Option<String>,
+    },
     /// Answer a `Permission{request_id}` the backend raised. `decision` is the
     /// coarse allow/deny (sound for every generic tool approval).
     ///

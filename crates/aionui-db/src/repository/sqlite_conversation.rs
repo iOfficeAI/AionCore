@@ -4,8 +4,8 @@ use aionui_common::{PaginatedResult, TimestampMs};
 
 use crate::error::DbError;
 use crate::models::{
-    ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationInputRow, ConversationRow, MessageRow,
-    UpsertConversationAssistantSnapshotParams,
+    ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationCapabilitySnapshotRow, ConversationInputRow,
+    ConversationRow, MessageRow, UpsertConversationAssistantSnapshotParams, UpsertConversationCapabilitySnapshotParams,
 };
 use crate::repository::conversation::{
     ConversationFilters, ConversationInputInsert, ConversationInputUpdate, ConversationRowUpdate,
@@ -678,6 +678,57 @@ impl IConversationRepository for SqliteConversationRepository {
     }
 
     // ── Message operations ──────────────────────────────────────────
+
+    async fn get_capability_snapshot(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationCapabilitySnapshotRow>, DbError> {
+        Ok(sqlx::query_as::<_, ConversationCapabilitySnapshotRow>(
+            "SELECT s.* FROM conversation_capability_snapshots s \
+             INNER JOIN conversations c ON c.id = s.conversation_id \
+             WHERE s.user_id = ? AND c.user_id = ? AND s.conversation_id = ?",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn upsert_capability_snapshot(
+        &self,
+        params: &UpsertConversationCapabilitySnapshotParams<'_>,
+    ) -> Result<ConversationCapabilitySnapshotRow, DbError> {
+        self.ensure_conversation_for_user(params.user_id, params.conversation_id)
+            .await?;
+        sqlx::query(
+            "INSERT INTO conversation_capability_snapshots (
+                conversation_id, user_id, revision, capabilities_json,
+                backend_identity, negotiated_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                user_id = excluded.user_id,
+                revision = excluded.revision,
+                capabilities_json = excluded.capabilities_json,
+                backend_identity = excluded.backend_identity,
+                negotiated_at = excluded.negotiated_at,
+                updated_at = excluded.updated_at",
+        )
+        .bind(params.conversation_id)
+        .bind(params.user_id)
+        .bind(params.revision)
+        .bind(params.capabilities_json)
+        .bind(params.backend_identity)
+        .bind(params.negotiated_at)
+        .bind(params.updated_at)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_capability_snapshot(params.user_id, params.conversation_id)
+            .await?
+            .ok_or_else(|| DbError::NotFound("capability snapshot disappeared after upsert".into()))
+    }
 
     async fn list_messages_page(
         &self,
@@ -2514,6 +2565,47 @@ mod tests {
         assert_eq!(first.id, "input_one");
         assert_eq!(duplicate.id, first.id);
         assert_eq!(duplicate.content, "first");
+    }
+
+    #[tokio::test]
+    async fn capability_snapshot_upsert_is_user_scoped_and_revisioned() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+        let created = repo
+            .upsert_capability_snapshot(&UpsertConversationCapabilitySnapshotParams {
+                conversation_id: &conv.id,
+                user_id: SYSTEM_USER_ID,
+                revision: 1,
+                capabilities_json: r#"{"followup":true,"steer":false,"inject":false,"tool_enforcement":"observe-only"}"#,
+                backend_identity: "codex",
+                negotiated_at: 100,
+                updated_at: 100,
+            })
+            .await
+            .unwrap();
+        assert_eq!(created.revision, 1);
+        assert!(
+            repo.get_capability_snapshot("other-user", &conv.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let updated = repo
+            .upsert_capability_snapshot(&UpsertConversationCapabilitySnapshotParams {
+                conversation_id: &conv.id,
+                user_id: SYSTEM_USER_ID,
+                revision: 2,
+                capabilities_json: r#"{"followup":true,"steer":true,"inject":false,"tool_enforcement":"observe-only"}"#,
+                backend_identity: "codex",
+                negotiated_at: 200,
+                updated_at: 200,
+            })
+            .await
+            .unwrap();
+        assert_eq!(updated.revision, 2);
+        assert_eq!(updated.negotiated_at, 200);
     }
 
     #[tokio::test]
