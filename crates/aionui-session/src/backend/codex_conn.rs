@@ -6877,6 +6877,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn steer_wire_shape_matches_codex_0_146_generated_contract() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/codex_0.146.0_turn_steer_contract.json"
+        ))
+        .unwrap();
+        assert_eq!(fixture["method"], "turn/steer");
+        assert_eq!(
+            fixture["params"]["required"],
+            serde_json::json!(["expectedTurnId", "input", "threadId"])
+        );
+        assert_eq!(
+            fixture["params"]["properties"]["clientUserMessageId"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        assert_eq!(fixture["response"]["required"], serde_json::json!(["turnId"]));
+    }
+
     #[tokio::test]
     async fn dispatch_steer_without_active_turn_is_rejected() {
         // No active turn → nothing to inject into → reject (matches codex's
