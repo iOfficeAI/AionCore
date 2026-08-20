@@ -6447,7 +6447,7 @@ async fn cancel_timeout_kills_acp_task_when_turn_still_claimed() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn cancel_timeout_does_not_kill_non_acp_task() {
+async fn cancel_timeout_kills_non_acp_task_when_runtime_does_not_converge() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let task_mgr = Arc::new(MockTaskManager::new());
     let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
@@ -6469,7 +6469,10 @@ async fn cancel_timeout_does_not_kill_non_acp_task() {
     tokio::time::advance(Duration::from_secs(15) + Duration::from_millis(1)).await;
     tokio::task::yield_now().await;
 
-    assert!(task_mgr.kill_records().is_empty());
+    assert_eq!(
+        task_mgr.kill_records(),
+        vec![(conv.id.clone(), Some(AgentKillReason::UserCancelTimeout))]
+    );
 }
 
 #[tokio::test]
