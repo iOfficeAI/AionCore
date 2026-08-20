@@ -2,10 +2,11 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Path, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::extract::{Extension, Json, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
+use serde::Deserialize;
 
 use aionui_api_types::{
     ApiResponse, BatchImportMcpServersRequest, CreateMcpServerRequest, DetectedMcpServerResponse, ErrorResponse,
@@ -76,6 +77,7 @@ pub fn mcp_routes(state: McpRouterState) -> Router {
         // OAuth routes
         .route("/api/mcp/oauth/check-status", post(oauth_check_status))
         .route("/api/mcp/oauth/login", post(oauth_login))
+        .route("/api/mcp/oauth/callback", get(oauth_callback))
         .route("/api/mcp/oauth/logout", post(oauth_logout))
         .route("/api/mcp/oauth/authenticated", get(oauth_authenticated))
         .with_state(state)
@@ -292,20 +294,77 @@ async fn oauth_check_status(
 
 /// `POST /api/mcp/oauth/login` — start OAuth PKCE login flow.
 ///
-/// Discovers endpoints, opens the browser for authorization, waits for
-/// the callback, and exchanges the code for tokens.
+/// Discovers endpoints and returns an `authorize_url` for the caller to send
+/// a browser to; it does not wait for login to complete. `redirect_base` is
+/// derived from the inbound request so the callback lands back on this same
+/// server, reachable from wherever this server itself is reachable from.
 async fn oauth_login(
     State(state): State<McpRouterState>,
     Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
     body: Result<Json<OAuthLoginRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<OAuthLoginResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let redirect_base = request_origin(&headers);
     let result = state
         .oauth_service
-        .login(&user.id, &req.server_url)
+        .login(&user.id, &req.server_url, &redirect_base)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
+}
+
+/// Derive this server's own public origin from the inbound request, for use
+/// as the OAuth redirect base. Prefers `Origin` (sent by browser `fetch()`
+/// calls); falls back to `X-Forwarded-Proto` + `Host` for requests without
+/// one (e.g. `curl`, or browsers omitting `Origin` on some requests).
+fn request_origin(headers: &HeaderMap) -> String {
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        return origin.trim_end_matches('/').to_string();
+    }
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("127.0.0.1");
+    format!("{scheme}://{host}")
+}
+
+/// Query params on the OAuth provider's redirect to `GET /api/mcp/oauth/callback`.
+#[derive(Debug, Deserialize)]
+struct OAuthCallbackQuery {
+    code: String,
+    state: String,
+}
+
+/// `GET /api/mcp/oauth/callback` — OAuth provider redirects the user's
+/// browser here after they authorize (or deny) access. Exchanges the code
+/// for tokens and shows a plain result page; the caller is expected to
+/// re-check `/api/mcp/oauth/check-status` (e.g. on navigating back) rather
+/// than parse this page.
+async fn oauth_callback(
+    State(state): State<McpRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Query(params): Query<OAuthCallbackQuery>,
+) -> Html<&'static str> {
+    match state
+        .oauth_service
+        .handle_callback(&user.id, params.code, params.state)
+        .await
+    {
+        Ok(()) => Html(
+            "<html><head><meta http-equiv=\"refresh\" content=\"2;url=/\"></head><body>\
+             <h1>Authorization successful</h1>\
+             <p>Redirecting you back — you can also close this tab.</p></body></html>",
+        ),
+        Err(_) => Html(
+            "<html><body><h1>Authorization failed</h1>\
+             <p>Something went wrong completing sign-in. Close this tab and try again.</p></body></html>",
+        ),
+    }
 }
 
 /// `POST /api/mcp/oauth/logout` — delete stored OAuth token.

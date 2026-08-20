@@ -167,9 +167,15 @@ async fn get_authenticated_servers_empty_when_no_tokens() {
 async fn login_invalid_url_returns_error() {
     let (svc, _repo) = make_service().await;
     // This URL won't have .well-known endpoints.
-    let result = svc.login(TEST_USER_ID, "https://127.0.0.1:1").await;
-    // Should return an McpError::OAuth about discovery failure.
-    assert!(result.is_err());
+    let result = svc
+        .login(TEST_USER_ID, "https://127.0.0.1:1", "http://127.0.0.1:8080")
+        .await
+        .unwrap();
+    // login() itself never hard-fails — discovery failure surfaces as a
+    // structured `success: false` response, same as any other login error.
+    assert!(!result.success);
+    assert!(result.authorize_url.is_none());
+    assert!(result.error.is_some());
 }
 
 // ---------------------------------------------------------------------------

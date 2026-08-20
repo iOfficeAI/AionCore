@@ -243,9 +243,16 @@ pub struct OAuthLoginRequest {
 }
 
 /// Response for OAuth login initiation.
+///
+/// `authorize_url` is the authorization endpoint the caller must navigate a
+/// browser to. Login does not complete synchronously: the OAuth provider
+/// redirects the browser back to `GET /api/mcp/oauth/callback` on this same
+/// server once the user finishes authorizing there.
 #[derive(Debug, Serialize)]
 pub struct OAuthLoginResponse {
     pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorize_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -562,6 +569,7 @@ mod tests {
     fn test_oauth_login_response() {
         let resp = OAuthLoginResponse {
             success: false,
+            authorize_url: None,
             error: Some("discovery failed".into()),
         };
         let json = serde_json::to_value(&resp).unwrap();

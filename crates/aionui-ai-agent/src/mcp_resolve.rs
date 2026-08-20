@@ -15,8 +15,8 @@
 use std::sync::Arc;
 
 use aionui_api_types::{SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME};
-use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
+use aionui_db::{IMcpServerRepository, IOAuthTokenRepository};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::ensure_runtime_command;
 use tracing::{info, warn};
@@ -39,6 +39,7 @@ pub async fn resolve_session_mcp_servers(
     selected_ids: Option<&[String]>,
     conversation_id: &str,
     _broadcaster: Arc<dyn EventBroadcaster>,
+    oauth_token_repo: Option<&dyn IOAuthTokenRepository>,
 ) -> Vec<SessionMcpServer> {
     let rows_result = match selected_ids {
         Some(ids) => repo.list_by_ids_any(user_id, ids).await,
@@ -63,7 +64,7 @@ pub async fn resolve_session_mcp_servers(
         if !selected || row.builtin || row.name == TEAM_MCP_SERVER_NAME {
             continue;
         }
-        match row_to_session_mcp_server(&row).await {
+        match row_to_session_mcp_server(&row, user_id, oauth_token_repo).await {
             Ok(server) => servers.push(server),
             Err(err) => {
                 warn!(
@@ -95,7 +96,11 @@ pub async fn resolve_session_mcp_servers(
 /// snapshot refresh) and the session stack reuse it so the stdio command is
 /// always normalized exactly once, the same way the direct claude/codex path
 /// consumes it.
-pub async fn row_to_session_mcp_server(row: &McpServerRow) -> Result<SessionMcpServer, String> {
+pub async fn row_to_session_mcp_server(
+    row: &McpServerRow,
+    user_id: &str,
+    oauth_token_repo: Option<&dyn IOAuthTokenRepository>,
+) -> Result<SessionMcpServer, String> {
     let value: serde_json::Value =
         serde_json::from_str(&row.transport_config).map_err(|e| format!("invalid transport_config JSON: {e}"))?;
 
@@ -145,10 +150,9 @@ pub async fn row_to_session_mcp_server(row: &McpServerRow) -> Result<SessionMcpS
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "http: missing url".to_owned())?
                 .to_owned();
-            SessionMcpTransport::StreamableHttp {
-                url,
-                headers: parse_headers(value.get("headers")),
-            }
+            let mut headers = parse_headers(value.get("headers"));
+            inject_oauth_bearer_header(&mut headers, user_id, &url, oauth_token_repo).await;
+            SessionMcpTransport::StreamableHttp { url, headers }
         }
         "sse" => {
             let url = value
@@ -156,10 +160,9 @@ pub async fn row_to_session_mcp_server(row: &McpServerRow) -> Result<SessionMcpS
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "sse: missing url".to_owned())?
                 .to_owned();
-            SessionMcpTransport::Sse {
-                url,
-                headers: parse_headers(value.get("headers")),
-            }
+            let mut headers = parse_headers(value.get("headers"));
+            inject_oauth_bearer_header(&mut headers, user_id, &url, oauth_token_repo).await;
+            SessionMcpTransport::Sse { url, headers }
         }
         other => return Err(format!("unknown transport type: {other}")),
     };
@@ -169,6 +172,48 @@ pub async fn row_to_session_mcp_server(row: &McpServerRow) -> Result<SessionMcpS
         name: row.name.clone(),
         transport,
     })
+}
+
+/// Attach a stored OAuth access token as `Authorization: Bearer <token>` for
+/// an HTTP/SSE MCP server, if one exists for this user and URL.
+///
+/// A server-configured `Authorization` header (case-insensitive) always
+/// wins — a user who set one explicitly presumably knows what they're
+/// doing, and OAuth login is opt-in on top of that, not a silent override.
+/// Best-effort: an expired token or a repo error just means the server
+/// won't have a token attached and the tool call fails with a normal
+/// auth-required error downstream, exactly as if OAuth had never run.
+pub(crate) async fn inject_oauth_bearer_header(
+    headers: &mut std::collections::HashMap<String, String>,
+    user_id: &str,
+    server_url: &str,
+    oauth_token_repo: Option<&dyn IOAuthTokenRepository>,
+) {
+    let Some(repo) = oauth_token_repo else { return };
+    if headers.keys().any(|k| k.eq_ignore_ascii_case("authorization")) {
+        return;
+    }
+
+    let token = match repo.get_by_url(user_id, server_url).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return,
+        Err(err) => {
+            warn!(server_url, error = %err, "mcp_resolve: OAuth token lookup failed; continuing without it");
+            return;
+        }
+    };
+
+    if let Some(expires_at) = token.expires_at
+        && aionui_common::now_ms() >= expires_at
+    {
+        // Expired and unrefreshed here (refresh happens lazily via the
+        // check-status/get-token API paths, not this session-build path) —
+        // an expired token would just fail auth anyway, so omit it rather
+        // than send a token known to be rejected.
+        return;
+    }
+
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token.access_token));
 }
 
 /// Parse a JSON headers object into a `HashMap` (string values only).
@@ -290,7 +335,7 @@ mod tests {
             rows: vec![make_row("docs", true), make_row(TEAM_MCP_SERVER_NAME, true)],
             fail: false,
         };
-        let servers = resolve_session_mcp_servers(&repo, TEST_USER_ID, None, "conv-1", test_broadcaster()).await;
+        let servers = resolve_session_mcp_servers(&repo, TEST_USER_ID, None, "conv-1", test_broadcaster(), None).await;
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "docs");
     }
@@ -321,8 +366,149 @@ mod tests {
             ],
             fail: false,
         };
-        let servers = resolve_session_mcp_servers(&repo, TEST_USER_ID, None, "conv-1", test_broadcaster()).await;
+        let servers = resolve_session_mcp_servers(&repo, TEST_USER_ID, None, "conv-1", test_broadcaster(), None).await;
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "docs");
+    }
+
+    // -- inject_oauth_bearer_header ------------------------------------------
+    //
+    // Regression coverage: OAuth login alone never made a stored token reach
+    // an actual MCP tool call — nothing attached it as an Authorization
+    // header when building the session's HTTP/SSE transport. Login worked,
+    // the token was stored, and every tool call still failed as
+    // unauthenticated.
+
+    struct MockOAuthRepo {
+        row: Option<aionui_db::models::OAuthTokenRow>,
+    }
+
+    #[async_trait::async_trait]
+    impl IOAuthTokenRepository for MockOAuthRepo {
+        async fn get_by_url(
+            &self,
+            _user_id: &str,
+            _server_url: &str,
+        ) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
+            Ok(self.row.clone())
+        }
+        async fn upsert(
+            &self,
+            _params: aionui_db::UpsertOAuthTokenParams<'_>,
+        ) -> Result<aionui_db::models::OAuthTokenRow, aionui_db::DbError> {
+            unimplemented!("not needed")
+        }
+        async fn delete(&self, _user_id: &str, _server_url: &str) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed")
+        }
+        async fn list_authenticated_urls(&self, _user_id: &str) -> Result<Vec<String>, aionui_db::DbError> {
+            unimplemented!("not needed")
+        }
+    }
+
+    fn token_row(
+        access_token: &str,
+        expires_at: Option<aionui_common::TimestampMs>,
+    ) -> aionui_db::models::OAuthTokenRow {
+        aionui_db::models::OAuthTokenRow {
+            user_id: TEST_USER_ID.to_owned(),
+            server_url: "http://127.0.0.1:9999/mcp".to_owned(),
+            access_token: access_token.to_owned(),
+            refresh_token: None,
+            token_type: "bearer".to_owned(),
+            expires_at,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn attaches_bearer_header_when_valid_token_exists() {
+        let oauth_repo = MockOAuthRepo {
+            row: Some(token_row("tok-abc", None)),
+        };
+        let row = make_row("higgsfield", true);
+
+        let server = row_to_session_mcp_server(&row, TEST_USER_ID, Some(&oauth_repo))
+            .await
+            .unwrap();
+
+        match server.transport {
+            SessionMcpTransport::StreamableHttp { headers, .. } => {
+                assert_eq!(headers.get("Authorization"), Some(&"Bearer tok-abc".to_string()));
+            }
+            _ => panic!("expected StreamableHttp transport"),
+        }
+    }
+
+    #[tokio::test]
+    async fn omits_header_when_token_is_expired() {
+        let oauth_repo = MockOAuthRepo {
+            row: Some(token_row("tok-abc", Some(1))), // 1ms since epoch: always expired
+        };
+        let row = make_row("higgsfield", true);
+
+        let server = row_to_session_mcp_server(&row, TEST_USER_ID, Some(&oauth_repo))
+            .await
+            .unwrap();
+
+        match server.transport {
+            SessionMcpTransport::StreamableHttp { headers, .. } => {
+                assert!(!headers.contains_key("Authorization"));
+            }
+            _ => panic!("expected StreamableHttp transport"),
+        }
+    }
+
+    #[tokio::test]
+    async fn omits_header_when_no_oauth_repo_given() {
+        let row = make_row("higgsfield", true);
+
+        let server = row_to_session_mcp_server(&row, TEST_USER_ID, None).await.unwrap();
+
+        match server.transport {
+            SessionMcpTransport::StreamableHttp { headers, .. } => {
+                assert!(!headers.contains_key("Authorization"));
+            }
+            _ => panic!("expected StreamableHttp transport"),
+        }
+    }
+
+    #[tokio::test]
+    async fn omits_header_when_no_token_stored() {
+        let oauth_repo = MockOAuthRepo { row: None };
+        let row = make_row("higgsfield", true);
+
+        let server = row_to_session_mcp_server(&row, TEST_USER_ID, Some(&oauth_repo))
+            .await
+            .unwrap();
+
+        match server.transport {
+            SessionMcpTransport::StreamableHttp { headers, .. } => {
+                assert!(!headers.contains_key("Authorization"));
+            }
+            _ => panic!("expected StreamableHttp transport"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_configured_authorization_header_wins_over_oauth() {
+        let oauth_repo = MockOAuthRepo {
+            row: Some(token_row("tok-from-oauth", None)),
+        };
+        let mut row = make_row("higgsfield", true);
+        row.transport_config =
+            r#"{"url":"http://127.0.0.1:9999/mcp","headers":{"Authorization":"Bearer static-key"}}"#.to_owned();
+
+        let server = row_to_session_mcp_server(&row, TEST_USER_ID, Some(&oauth_repo))
+            .await
+            .unwrap();
+
+        match server.transport {
+            SessionMcpTransport::StreamableHttp { headers, .. } => {
+                assert_eq!(headers.get("Authorization"), Some(&"Bearer static-key".to_string()));
+            }
+            _ => panic!("expected StreamableHttp transport"),
+        }
     }
 }
