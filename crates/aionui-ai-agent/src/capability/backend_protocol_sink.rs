@@ -321,6 +321,7 @@ mod tests {
             call_id: "c1".into(),
             execution_id: "exec-1".into(),
             reason: "User denied".into(),
+            error_code: None,
         };
         sink.emit(&cancel).unwrap();
 
@@ -349,6 +350,10 @@ mod tests {
             output: "ok".into(),
             output_type: aion_protocol::events::OutputType::Text,
             metadata: None,
+            content_blocks: None,
+            structured_content: None,
+            error_code: None,
+            truncation: None,
         })
         .unwrap();
 
