@@ -599,6 +599,125 @@ async fn project_scoping_still_excludes_team_conversations() {
     assert_eq!(ids, vec!["c_ok"]);
 }
 
+// ── `id` scoping ────────────────────────────────────────────────────
+//
+// Answers "is this id still a legal mention target?" for the UI, which asks
+// before mentioning a conversation off an old message: a `@@` reference is
+// atomic, so a target that has since been deleted or joined a team would fail
+// the whole message at send time, after the user already wrote it.
+//
+// The value of routing that question through here rather than a bespoke check is
+// that the answer cannot disagree with what the picker would have shown — so
+// these tests are mostly about the OTHER filters still applying.
+
+fn with_id(id: &str) -> SessionMentionableQuery {
+    SessionMentionableQuery {
+        id: Some(id.to_owned()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn an_id_narrows_the_page_to_that_one_conversation() {
+    let ctx = setup_targets_ctx().await;
+    ctx.insert_plain("c_current", "me").await;
+    ctx.insert_plain("c_wanted", "wanted").await;
+    ctx.insert_plain("c_other", "other").await;
+
+    let ids = ctx.list("c_current", with_id("c_wanted")).await;
+
+    assert_eq!(ids, vec!["c_wanted"]);
+}
+
+#[tokio::test]
+async fn an_unknown_id_returns_nothing() {
+    // How the UI learns a chip has gone stale.
+    let ctx = setup_targets_ctx().await;
+    ctx.insert_plain("c_current", "me").await;
+    ctx.insert_plain("c_other", "other").await;
+
+    let ids = ctx.list("c_current", with_id("c_deleted")).await;
+
+    assert!(ids.is_empty(), "{ids:?}");
+}
+
+#[tokio::test]
+async fn an_id_that_became_team_owned_returns_nothing() {
+    // The case the check exists for: a conversation was mentionable when the old
+    // message was sent and has since joined a team, which the send path refuses.
+    let ctx = setup_targets_ctx().await;
+    ctx.insert_plain("c_current", "me").await;
+    ctx.insert(NewConversation {
+        id: "c_team",
+        name: "team one",
+        extra: r#"{"teamId":"team_1"}"#,
+        ..Default::default()
+    })
+    .await;
+
+    let ids = ctx.list("c_current", with_id("c_team")).await;
+
+    assert!(
+        ids.is_empty(),
+        "a team-owned target must not be reported as mentionable: {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_id_belonging_to_another_user_returns_nothing() {
+    let ctx = setup_targets_ctx().await;
+    ctx.insert_plain("c_current", "me").await;
+    ctx.insert(NewConversation {
+        user_id: "user_2",
+        id: "c_theirs",
+        name: "theirs",
+        ..Default::default()
+    })
+    .await;
+
+    let ids = ctx.list("c_current", with_id("c_theirs")).await;
+
+    assert!(ids.is_empty(), "{ids:?}");
+}
+
+#[tokio::test]
+async fn the_current_conversations_own_id_returns_nothing() {
+    // You cannot `@@` yourself, so clicking a chip that points at the
+    // conversation you are already in must report unavailable rather than
+    // inserting a reference the send path would reject as `target_is_self`.
+    let ctx = setup_targets_ctx().await;
+    ctx.insert_plain("c_current", "me").await;
+
+    let ids = ctx.list("c_current", with_id("c_current")).await;
+
+    assert!(ids.is_empty(), "{ids:?}");
+}
+
+#[tokio::test]
+async fn an_id_lookup_returns_the_current_name_not_a_stale_one() {
+    // The second reason the check goes through this route: an agent may have
+    // renamed the conversation since the old message was written, and the chip
+    // carries the name it had then. The lookup hands back today's name so the
+    // inserted token is not stale.
+    let ctx = setup_targets_ctx().await;
+    ctx.insert_plain("c_current", "me").await;
+    ctx.insert(NewConversation {
+        id: "c_renamed",
+        name: "the new name",
+        ..Default::default()
+    })
+    .await;
+
+    let page = ctx
+        .targets
+        .list("user_1", "c_current", &with_id("c_renamed"))
+        .await
+        .unwrap();
+
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].name, "the new name");
+}
+
 // ── Paging ──────────────────────────────────────────────────────────
 
 #[tokio::test]

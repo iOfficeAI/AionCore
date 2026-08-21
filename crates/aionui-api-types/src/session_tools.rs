@@ -240,6 +240,20 @@ pub struct SessionMentionableQuery {
     /// user-facing `mentionable` route needs it; the runtime `targets` route
     /// takes the caller's conversation from its token-bound header instead.
     pub current_conversation_id: Option<String>,
+    /// Restrict the result to this one conversation, to answer "is this id still
+    /// deliverable?".
+    ///
+    /// The UI needs that when a user clicks a conversation chip on an OLD
+    /// message: `@@` references are atomic, so a target that has since been
+    /// deleted or joined a team would fail the entire message at send time,
+    /// after the user has already written it. Answering through this route
+    /// rather than a bespoke check means the answer comes from exactly the same
+    /// filtering the picker uses, and it returns the CURRENT name — so a
+    /// conversation an agent has renamed since is mentioned under its new name.
+    ///
+    /// Deliberately absent from the `session list` tool descriptor: agents
+    /// address conversations by id already and have no use for it.
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

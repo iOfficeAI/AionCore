@@ -515,6 +515,14 @@ impl IConversationRepository for SqliteConversationRepository {
             where_clause.push_str(" AND c.project_id = ?");
             binds.push(BindValue::Str(project_id.clone()));
         }
+        // Narrowing to a single row still goes through every other filter and
+        // through the caller's hard filters, which is the point: the answer to
+        // "may I mention this id?" must be the picker's answer, not a second
+        // opinion.
+        if let Some(ref id) = params.id {
+            where_clause.push_str(" AND c.id = ?");
+            binds.push(BindValue::Str(id.clone()));
+        }
 
         // Sort keys in design §5.3 order. Binds are pushed in the order their
         // placeholders appear in the final statement: WHERE first, then ORDER BY.

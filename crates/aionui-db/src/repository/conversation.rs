@@ -387,6 +387,12 @@ pub struct MentionableCandidatesParams {
     /// Conversations bound to this project sort above all others. A SORT key
     /// only — it never removes rows. Distinct from [`Self::filter_project_id`].
     pub project_id: Option<String>,
+    /// Restrict the result to this one conversation. `None` keeps every row.
+    ///
+    /// Used to answer "is this id still a legal mention target?" through the same
+    /// filters the picker applies, so the answer cannot drift from what the
+    /// picker would have shown.
+    pub id: Option<String>,
     /// Restrict the result to this project. `None` keeps every project.
     ///
     /// Separate from [`Self::project_id`] because the two answer different

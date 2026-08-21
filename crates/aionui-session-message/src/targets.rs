@@ -112,6 +112,18 @@ impl MentionableTargets {
             .filter(|id| !id.is_empty())
             .map(str::to_owned);
 
+        // Narrowing to one id answers "is this still a legal target?" — the UI
+        // asks before mentioning a conversation off an old message, since a `@@`
+        // reference is atomic and a stale one fails the whole send. It runs
+        // through the same filters as any other page, so the answer is the
+        // picker's own.
+        let id_scope = query
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+
         // The project of the conversation the picker sits in decides the
         // same-project grouping, so it must be known BEFORE the scan — it is a
         // sort key of the query now.
@@ -136,6 +148,7 @@ impl MentionableTargets {
                     &MentionableCandidatesParams {
                         project_id: current_project_id.clone(),
                         filter_project_id: project_scope.clone(),
+                        id: id_scope.clone(),
                         name_query: name_query.clone(),
                         limit: scan_limit,
                         offset,
