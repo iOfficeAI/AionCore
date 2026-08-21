@@ -12,7 +12,9 @@ pub const WS_CLOSE_POLICY_VIOLATION: u16 = 1008;
 
 // --- Authentication ---
 
-pub const SESSION_EXPIRY: &str = "24h";
+/// Human-readable session lifetime label. Currently unused; kept consistent
+/// with the real JWT/cookie lifetime (30 days).
+pub const SESSION_EXPIRY: &str = "30d";
 pub const COOKIE_NAME: &str = "aionui-session";
 pub const COOKIE_MAX_AGE_DAYS: u32 = 30;
 pub const CSRF_COOKIE_NAME: &str = "aionui-csrf-token";

@@ -10,8 +10,14 @@ use sha2::{Digest, Sha256};
 
 use crate::error::AuthError;
 
-/// JWT token lifetime: 24 hours.
-const TOKEN_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+/// JWT token lifetime: 30 days.
+///
+/// Stop-gap value aligned with the session cookie's `Max-Age`
+/// (`COOKIE_MAX_AGE_DAYS`). The cookie shell used to outlive this JWT, so after
+/// the previous 24h expiry every request carried a dead token, producing the
+/// 401/reconnect loop seen on remote WebUI. This stays long until token refresh
+/// lands, after which it returns to a short access-token lifetime.
+const TOKEN_EXPIRY: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// JWT issuer claim value.
 const JWT_ISSUER: &str = "aionui";
@@ -60,7 +66,7 @@ impl JwtService {
         }
     }
 
-    /// Sign a new JWT for the given user. The token expires after 24 hours.
+    /// Sign a new JWT for the given user. The token expires after 30 days.
     pub fn sign(&self, user_id: &str, username: &str) -> Result<String, AuthError> {
         self.sign_with_session_generation(user_id, username, 0)
     }
@@ -249,6 +255,19 @@ mod tests {
     }
 
     #[test]
+    fn token_lifetime_is_30_days() {
+        // Stop-gap: the JWT lifetime is aligned with the session cookie's
+        // 30-day Max-Age so the cookie no longer outlives the token. Returns to
+        // a short lifetime once token refresh lands; updating it then is an
+        // intentional contract change, not a regression.
+        let service = test_service();
+        let token = service.sign("user_1", "admin").unwrap();
+        let payload = service.verify(&token).unwrap();
+        assert_eq!(TOKEN_EXPIRY.as_secs(), 30 * 24 * 60 * 60);
+        assert_eq!(payload.exp - payload.iat, 30 * 24 * 60 * 60);
+    }
+
+    #[test]
     fn sign_with_session_generation_roundtrip() {
         let service = test_service();
         let token = service.sign_with_session_generation("user_1", "admin", 7).unwrap();
@@ -392,7 +411,7 @@ mod tests {
         assert_eq!(service.blacklist_size(), 1);
 
         service.cleanup_blacklist();
-        // Token just signed with 24h expiry should still be in blacklist
+        // Token just signed with 30d expiry should still be in blacklist
         assert_eq!(service.blacklist_size(), 1);
     }
 
