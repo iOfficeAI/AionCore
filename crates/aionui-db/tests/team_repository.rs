@@ -149,6 +149,32 @@ async fn list_teams_by_user_filters_to_owner() {
 }
 
 #[tokio::test]
+async fn list_teams_by_user_excludes_archived() {
+    let (repo, db) = repo().await;
+    repo.create_team(&make_team_for_user("t1", "user-a", "Active"))
+        .await
+        .unwrap();
+    repo.create_team(&make_team_for_user("t2", "user-a", "Archived"))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE teams SET archived_at = ? WHERE id = ?")
+        .bind(1_700_000_000_000_i64)
+        .bind("t2")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    // The active list hides the archived team...
+    let active = repo.list_teams_by_user("user-a").await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].id, "t1");
+
+    // ...but the restore path is unaffected and still sees it.
+    let all = repo.list_teams_for_restore().await.unwrap();
+    assert_eq!(all.len(), 2);
+}
+
+#[tokio::test]
 async fn scoped_team_crud_rejects_wrong_user() {
     let (repo, _db) = repo().await;
     repo.create_team(&make_team_for_user("t1", "user-a", "Alpha"))

@@ -52,10 +52,14 @@ impl ITeamRepository for SqliteTeamRepository {
     }
 
     async fn list_teams_by_user(&self, user_id: &str) -> Result<Vec<TeamRow>, DbError> {
-        let rows = sqlx::query_as::<_, TeamRow>("SELECT * FROM teams WHERE user_id = ? ORDER BY created_at ASC")
-            .bind(user_id)
-            .fetch_all(&self.pool)
-            .await?;
+        // Archived teams are hidden from the active list; they surface only in the
+        // sidebar archive read model. Restore paths use the `_for_restore` variants.
+        let rows = sqlx::query_as::<_, TeamRow>(
+            "SELECT * FROM teams WHERE user_id = ? AND archived_at IS NULL ORDER BY created_at ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows)
     }
 

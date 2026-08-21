@@ -28,6 +28,7 @@ mod remote_agent;
 mod response;
 mod runtime;
 mod shell;
+mod sidebar;
 mod skill;
 mod system;
 mod team;
@@ -166,6 +167,11 @@ pub use shell::{
     CheckToolInstalledRequest, CheckToolInstalledResponse, DeepgramSpeechToTextConfig, OpenAISpeechToTextConfig,
     OpenExternalRequest, OpenFileRequest, OpenFolderWithRequest, ShowItemInFolderRequest, SpeechToTextConfig,
     SpeechToTextProvider, SpeechToTextResult, SttStreamClientMessage, SttStreamServerMessage, ToolType,
+};
+pub use sidebar::{
+    ArchiveDeleteResult, MoveOrderRequest, OrderItemRefDto, RemoveProjectItem, RemoveProjectItemKind,
+    RemoveProjectResult, SidebarGroup, SidebarItem, SidebarItemsResponse, SidebarResponse, SidebarScope,
+    SidebarTeamItem,
 };
 pub use skill::{
     AddExternalPathRequest, DeleteSkillRequest, ExportSkillRequest, ExternalSkillSourceResponse,
