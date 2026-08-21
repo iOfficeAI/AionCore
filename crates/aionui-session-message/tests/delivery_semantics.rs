@@ -571,3 +571,61 @@ async fn listing_is_allowed_for_an_ordinary_caller_with_the_feature_on() {
     let from = ctx.create_conversation("conv_from", "A", "/w/a").await;
     assert!(ctx.service.guard_list_access(USER, &from.id).await.is_ok());
 }
+
+/// A restart window must not eat queued work.
+///
+/// Regression from a live run: the user restarted a conversation's runtime while
+/// two cross-session messages were queued for it. The cancel hook correctly KEPT
+/// them (`TurnCancelCause::RuntimeRestart`), and 300ms later the drainer dropped
+/// both with "hard delivery error, reason=Conversation runtime is restarting" —
+/// silent message loss, and it made the hook's cause distinction pointless.
+///
+/// Goes through the REAL `send_message` rather than a fake sink, because the
+/// defect lived in how its error was classified.
+#[tokio::test]
+async fn a_restarting_target_keeps_its_queue_and_is_drained_once_the_restart_finishes() {
+    let ctx = setup().await;
+    let from = ctx.create_conversation("conv_from", "A", "/w/a").await;
+    ctx.create_conversation("conv_target", "B", "/w/a").await;
+
+    // Queue one the ordinary way: target busy on a backend that cannot take a
+    // mid-turn message.
+    let (claim, _agent) = ctx.make_busy("conv_target", false);
+    let response = ctx
+        .service
+        .send(USER, &from.id, &request("conv_target", "survive the restart"))
+        .await
+        .expect("busy must not be an error");
+    assert_eq!(response.status, SessionDeliveryStatus::Queued);
+
+    // The turn ends (as a restart cancels it) and the runtime enters its restart
+    // window — the state the drainer used to treat as fatal.
+    drop(claim);
+    ctx.conversation_service
+        .runtime_state()
+        .begin_restart("conv_target")
+        .expect("no other restart is in flight");
+
+    let drainer = ctx.drainer();
+    drainer.tick_once().await;
+    assert_eq!(
+        ctx.queue.len_for("conv_target"),
+        1,
+        "a restart is a ~1s window, not a rejection: the message must stay queued"
+    );
+    assert_eq!(
+        ctx.user_message_count("conv_target").await,
+        0,
+        "nothing is delivered while the runtime is restarting"
+    );
+
+    // Restart done: the conversation is now idle, which is exactly what the
+    // queued item was waiting for.
+    ctx.conversation_service.runtime_state().clear_restarting("conv_target");
+    drainer.tick_once().await;
+
+    assert!(ctx.queue.is_empty(), "the item must leave the queue once delivered");
+    assert_eq!(ctx.user_message_count("conv_target").await, 1);
+    let content = ctx.last_user_message_content("conv_target").await;
+    assert!(content.contains("survive the restart"), "{content}");
+}

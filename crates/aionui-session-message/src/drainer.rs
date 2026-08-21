@@ -24,9 +24,17 @@ pub const TICK: Duration = Duration::from_secs(1);
 #[derive(Debug)]
 pub enum DeliveryOutcome {
     Delivered,
-    /// The target is busy and its backend cannot take a mid-turn message (or
-    /// that turn is blocked on a confirmation card). Stays queued; retried next
-    /// tick.
+    /// Not deliverable YET. Stays queued, retried next tick. Three sources, all
+    /// transient:
+    ///
+    /// 1. the target is busy and its backend cannot take a mid-turn message;
+    /// 2. it can, but that turn is blocked on a confirmation card;
+    /// 3. its runtime is mid-restart — a ~1s window after which the
+    ///    conversation is idle, which is what the item is waiting for.
+    ///
+    /// (3) used to be classified as a hard error, which discarded queued work
+    /// the cancel hook had deliberately preserved. See
+    /// `service::classify_delivery_failure`.
     Busy,
     HardError(String),
 }

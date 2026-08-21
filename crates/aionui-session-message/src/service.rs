@@ -240,7 +240,7 @@ impl SessionMessageService {
                 })
             }
             // 7
-            Err(DeliverAttemptError::Busy) => {
+            Err(DeliverAttemptError::Transient(reason)) => {
                 // `content` already carries the recipient block, composed above
                 // while both rows were in hand — the drainer re-sends these
                 // bytes verbatim rather than rebuilding anything.
@@ -256,7 +256,12 @@ impl SessionMessageService {
                     from_conversation_id,
                     to_conversation_id = to,
                     outcome = "queued",
-                    "cross-session delivery queued; target busy"
+                    // Which transient condition it was — a busy turn, a pending
+                    // confirmation card, or a runtime restart. Logged once per
+                    // enqueue (never per retry, which would be one line a
+                    // second), and it is an error string, never a payload.
+                    reason = %reason,
+                    "cross-session delivery queued; target not ready"
                 );
                 Ok(SessionSendMessageResponse {
                     status: SessionDeliveryStatus::Queued,
@@ -352,8 +357,7 @@ impl SessionMessageService {
             .await
         {
             Ok(response) => Ok(response),
-            Err(ConversationError::Busy { .. }) => Err(DeliverAttemptError::Busy),
-            Err(error) => Err(DeliverAttemptError::Hard(error.to_string())),
+            Err(error) => Err(classify_delivery_failure(error)),
         }
     }
 
@@ -393,9 +397,38 @@ impl SessionMessageService {
     }
 }
 
+#[derive(Debug)]
 enum DeliverAttemptError {
-    Busy,
+    /// Try again on the next tick. Carries the rendered cause for logging only.
+    Transient(String),
+    /// A real answer: drop the item and `warn`.
     Hard(String),
+}
+
+/// Which `send_message` failures deserve another tick.
+///
+/// TRANSIENT is not just "busy". The second arm is a fixed regression: a user
+/// restarting a conversation's runtime while messages were queued for it saw
+/// them vanish, because `RuntimeRestarting` fell into the catch-all and the
+/// drainer dropped the head. The cancel hook had deliberately KEPT that queue
+/// (`TurnCancelCause::RuntimeRestart`) and was undone one tick later — silent
+/// message loss, the worst failure mode this feature has, plus it made the
+/// hook's cause distinction meaningless.
+///
+/// A restart is a ~1s window after which the conversation is IDLE — precisely
+/// what a pending delivery is waiting for — so it is retried, not discarded.
+/// The 10-minute TTL still bounds it: a restart that never finishes ends in an
+/// expiry `warn`, not an unbounded retry loop.
+///
+/// Everything else is a real answer (gone, refused, archived) and must still be
+/// dropped, or a bad reference would be retried until its TTL for no reason.
+fn classify_delivery_failure(error: ConversationError) -> DeliverAttemptError {
+    match &error {
+        ConversationError::Busy { .. } | ConversationError::RuntimeRestarting { .. } => {
+            DeliverAttemptError::Transient(error.to_string())
+        }
+        _ => DeliverAttemptError::Hard(error.to_string()),
+    }
 }
 
 #[async_trait]
@@ -403,7 +436,7 @@ impl DeliverySink for SessionMessageService {
     async fn deliver(&self, item: &PendingDelivery) -> DeliveryOutcome {
         match self.deliver_now(&item.user_id, &item.to, item.message.clone()).await {
             Ok(_) => DeliveryOutcome::Delivered,
-            Err(DeliverAttemptError::Busy) => DeliveryOutcome::Busy,
+            Err(DeliverAttemptError::Transient(_)) => DeliveryOutcome::Busy,
             Err(DeliverAttemptError::Hard(reason)) => DeliveryOutcome::HardError(reason),
         }
     }

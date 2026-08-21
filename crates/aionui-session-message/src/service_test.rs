@@ -76,3 +76,57 @@ fn a_known_sender_workspace_with_an_unknown_target_is_reported_as_different() {
     let value = recipient_workspace_field(Some("/w/a"), None);
     assert_eq!(value, "/w/a（与你不同，勿用相对路径，勿假设可读）");
 }
+
+// ---------------------------------------------------------------------------
+// Which delivery failures deserve another tick
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_busy_target_is_retried_rather_than_dropped() {
+    let verdict = classify_delivery_failure(ConversationError::Busy {
+        reason: "a turn is already running".to_owned(),
+    });
+    assert!(matches!(verdict, DeliverAttemptError::Transient(_)), "{verdict:?}");
+}
+
+/// Regression, observed live: the user restarted a conversation's runtime while
+/// two messages were queued for it. The cancel hook deliberately KEPT them
+/// (`cause = RuntimeRestart`), and 300ms later the drainer threw them away with
+/// "dropped after a hard delivery error, reason=Conversation runtime is
+/// restarting" — silent message loss, which is this feature's worst failure
+/// mode, and it made the hook's whole cause distinction pointless.
+///
+/// A restart is a ~1s window, not a rejection: the conversation comes back
+/// IDLE, which is exactly the state a pending delivery is waiting for.
+#[test]
+fn a_restarting_runtime_is_retried_rather_than_dropped() {
+    let verdict = classify_delivery_failure(ConversationError::RuntimeRestarting {
+        conversation_id: "conv_b".to_owned(),
+    });
+    assert!(
+        matches!(verdict, DeliverAttemptError::Transient(_)),
+        "a restart window must not discard queued work: {verdict:?}"
+    );
+}
+
+/// The other half of the contract: retrying must not become "never drop
+/// anything". A target that no longer exists, or refuses the send, is a real
+/// answer and the item goes.
+#[test]
+fn a_real_rejection_is_still_dropped() {
+    for error in [
+        ConversationError::NotFound {
+            id: "conv_gone".to_owned(),
+        },
+        ConversationError::Forbidden {
+            reason: "Team-owned conversations must be sent through Team API".to_owned(),
+        },
+    ] {
+        let rendered = error.to_string();
+        let verdict = classify_delivery_failure(error);
+        assert!(
+            matches!(verdict, DeliverAttemptError::Hard(_)),
+            "{rendered} must not be retried forever: {verdict:?}"
+        );
+    }
+}

@@ -31,7 +31,7 @@ pub(crate) fn data() -> Value {
         },
         "delivery_status": {
             "delivered": "turn claim taken, message persisted, prompt dispatched (or merged into the target's running turn)",
-            "queued": "target busy and unable to take a mid-turn message; queued in memory and retried until it frees up"
+            "queued": "target not ready yet — busy and unable to take a mid-turn message, waiting on a confirmation card, or restarting its runtime; queued in memory and retried until it frees up"
         },
         "tools": tools,
         "errors": [
