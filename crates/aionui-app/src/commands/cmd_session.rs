@@ -53,7 +53,7 @@ async fn list() -> Result<(), ExitCode> {
     );
     let response = reqwest::Client::new()
         .get(url)
-        .headers(env.headers())
+        .headers(env.headers(command)?)
         .send()
         .await
         .map_err(|error| runtime_error(command, "SESSION_CLI_HTTP_BRIDGE_FAILED", error.to_string()))?;
@@ -70,7 +70,7 @@ async fn send_message() -> Result<(), ExitCode> {
     );
     let response = reqwest::Client::new()
         .post(url)
-        .headers(env.headers())
+        .headers(env.headers(command)?)
         .json(&body)
         .send()
         .await
@@ -125,12 +125,30 @@ struct RuntimeEnv {
 }
 
 impl RuntimeEnv {
-    fn headers(&self) -> reqwest::header::HeaderMap {
+    /// Fallible on purpose. A header value rejects control characters and
+    /// non-ASCII bytes, so a malformed `AIONUI_*` variable would panic here —
+    /// and a panicking CLI prints no envelope at all, leaving the agent with a
+    /// stack trace instead of the `transport_unavailable` it knows how to
+    /// report. Every other failure in this file goes out as an envelope; this
+    /// was the one exception.
+    fn headers(&self, command: &str) -> Result<reqwest::header::HeaderMap, ExitCode> {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("x-aionui-user-id", self.user_id.parse().unwrap());
-        headers.insert("x-aionui-conversation-id", self.conversation_id.parse().unwrap());
-        headers.insert("x-aionui-runtime-token", self.runtime_token.parse().unwrap());
-        headers
+        for (name, value) in [
+            ("x-aionui-user-id", &self.user_id),
+            ("x-aionui-conversation-id", &self.conversation_id),
+            ("x-aionui-runtime-token", &self.runtime_token),
+        ] {
+            let parsed = value.parse().map_err(|_| {
+                // The NAME only — a token must never reach stdout or stderr.
+                runtime_error(
+                    command,
+                    "SESSION_CLI_HEADER_INVALID",
+                    format!("environment variable for {name} is not a valid header value"),
+                )
+            })?;
+            headers.insert(name, parsed);
+        }
+        Ok(headers)
     }
 }
 
@@ -292,6 +310,39 @@ mod tests {
     use aionui_api_types::tool_name_for_session_cli_path;
 
     use super::*;
+
+    fn env(user_id: &str, conversation_id: &str, runtime_token: &str) -> RuntimeEnv {
+        RuntimeEnv {
+            base_url: "http://127.0.0.1:1".to_owned(),
+            user_id: user_id.to_owned(),
+            conversation_id: conversation_id.to_owned(),
+            runtime_token: runtime_token.to_owned(),
+        }
+    }
+
+    #[test]
+    fn well_formed_runtime_env_produces_all_three_headers() {
+        let headers = env("user_1", "conv_1", "tok_1")
+            .headers("session list")
+            .expect("ordinary ids and tokens are valid header values");
+        assert_eq!(headers.get("x-aionui-user-id").unwrap(), "user_1");
+        assert_eq!(headers.get("x-aionui-conversation-id").unwrap(), "conv_1");
+        assert_eq!(headers.get("x-aionui-runtime-token").unwrap(), "tok_1");
+    }
+
+    /// A header value rejects control characters, so this used to panic and the
+    /// agent got a stack trace instead of an envelope it could report.
+    #[test]
+    fn a_malformed_env_value_yields_an_exit_code_instead_of_panicking() {
+        for broken in ["bad\nvalue", "bad\rvalue", "bad\0value"] {
+            assert!(
+                env(broken, "conv_1", "tok_1").headers("session list").is_err(),
+                "{broken:?} must be rejected, not panic"
+            );
+            assert!(env("user_1", broken, "tok_1").headers("session list").is_err());
+            assert!(env("user_1", "conv_1", broken).headers("session list").is_err());
+        }
+    }
 
     #[test]
     fn an_empty_stdin_object_produces_no_query_string() {

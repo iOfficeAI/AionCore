@@ -450,6 +450,155 @@ async fn a_limit_above_the_cap_is_clamped_rather_than_returning_the_whole_table(
     assert_eq!(page.items.len(), MAX_LIMIT as usize);
 }
 
+// ── `project_id` scoping ────────────────────────────────────────────
+//
+// `project_id` is advertised on both outlets — the `@@` picker's query string
+// and `session list`'s descriptor schema, which calls it "Optional project
+// scope." It was accepted and then ignored, so a caller that scoped by project
+// silently received the unscoped list.
+
+fn with_project(project_id: &str) -> SessionMentionableQuery {
+    SessionMentionableQuery {
+        project_id: Some(project_id.to_owned()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn project_id_restricts_the_result_to_that_project() {
+    let ctx = setup_targets_ctx().await;
+    ctx.insert_plain("c_current", "me").await;
+    ctx.insert(NewConversation {
+        id: "c_in_scope",
+        name: "in scope",
+        project_id: Some("proj_a"),
+        ..Default::default()
+    })
+    .await;
+    ctx.insert(NewConversation {
+        id: "c_other_project",
+        name: "other project",
+        project_id: Some("proj_b"),
+        updated_at: 99,
+        ..Default::default()
+    })
+    .await;
+
+    let ids = ctx.list("c_current", with_project("proj_a")).await;
+
+    assert_eq!(ids, vec!["c_in_scope"]);
+}
+
+#[tokio::test]
+async fn project_id_excludes_conversations_bound_to_no_project() {
+    // Scoping must EXCLUDE unbound rows rather than treat NULL as a match —
+    // the NULL-tolerant comparison used for the same-project SORT key would.
+    let ctx = setup_targets_ctx().await;
+    ctx.insert_plain("c_current", "me").await;
+    ctx.insert_plain("c_unbound", "unbound").await;
+    ctx.insert(NewConversation {
+        id: "c_in_scope",
+        name: "in scope",
+        project_id: Some("proj_a"),
+        ..Default::default()
+    })
+    .await;
+
+    let ids = ctx.list("c_current", with_project("proj_a")).await;
+
+    assert_eq!(ids, vec!["c_in_scope"]);
+}
+
+#[tokio::test]
+async fn a_blank_project_id_is_treated_as_no_scope_rather_than_matching_nothing() {
+    let ctx = setup_targets_ctx().await;
+    ctx.insert_plain("c_current", "me").await;
+    ctx.insert_plain("c_unbound", "unbound").await;
+
+    let ids = ctx.list("c_current", with_project("   ")).await;
+
+    assert_eq!(ids, vec!["c_unbound"]);
+}
+
+#[tokio::test]
+async fn an_unknown_project_id_returns_nothing_instead_of_everything() {
+    // The exact failure the ignored parameter produced: an agent scoping to a
+    // project it made up got the full list back and could not tell.
+    let ctx = setup_targets_ctx().await;
+    ctx.insert_plain("c_current", "me").await;
+    ctx.insert_plain("c_a", "a").await;
+    ctx.insert_plain("c_b", "b").await;
+
+    let ids = ctx.list("c_current", with_project("proj_missing")).await;
+
+    assert!(ids.is_empty(), "{ids:?}");
+}
+
+#[tokio::test]
+async fn project_id_composes_with_the_name_query() {
+    let ctx = setup_targets_ctx().await;
+    ctx.insert_plain("c_current", "me").await;
+    ctx.insert(NewConversation {
+        id: "c_match",
+        name: "auth rewrite",
+        project_id: Some("proj_a"),
+        ..Default::default()
+    })
+    .await;
+    ctx.insert(NewConversation {
+        id: "c_name_match_other_project",
+        name: "auth docs",
+        project_id: Some("proj_b"),
+        ..Default::default()
+    })
+    .await;
+    ctx.insert(NewConversation {
+        id: "c_same_project_no_name_match",
+        name: "unrelated",
+        project_id: Some("proj_a"),
+        ..Default::default()
+    })
+    .await;
+
+    let ids = ctx
+        .list(
+            "c_current",
+            SessionMentionableQuery {
+                q: Some("auth".to_owned()),
+                project_id: Some("proj_a".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+    assert_eq!(ids, vec!["c_match"]);
+}
+
+#[tokio::test]
+async fn project_scoping_still_excludes_team_conversations() {
+    let ctx = setup_targets_ctx().await;
+    ctx.insert_plain("c_current", "me").await;
+    ctx.insert(NewConversation {
+        id: "c_team",
+        name: "team one",
+        extra: r#"{"teamId":"team_1"}"#,
+        project_id: Some("proj_a"),
+        ..Default::default()
+    })
+    .await;
+    ctx.insert(NewConversation {
+        id: "c_ok",
+        name: "ordinary",
+        project_id: Some("proj_a"),
+        ..Default::default()
+    })
+    .await;
+
+    let ids = ctx.list("c_current", with_project("proj_a")).await;
+
+    assert_eq!(ids, vec!["c_ok"]);
+}
+
 // ── Paging ──────────────────────────────────────────────────────────
 
 #[tokio::test]

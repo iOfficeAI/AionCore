@@ -9,9 +9,9 @@
 
 use std::sync::Arc;
 
-use aionui_common::OnConversationTurnCancelled;
+use aionui_common::{OnConversationTurnCancelled, TurnCancelCause};
 use async_trait::async_trait;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::queue::DeliveryQueue;
 
@@ -27,7 +27,22 @@ impl QueueClearingCancelHook {
 
 #[async_trait]
 impl OnConversationTurnCancelled for QueueClearingCancelHook {
-    async fn on_turn_cancelled(&self, _user_id: &str, conversation_id: &str, turn_id: &str) {
+    async fn on_turn_cancelled(&self, _user_id: &str, conversation_id: &str, turn_id: &str, cause: TurnCancelCause) {
+        // A runtime restart is NOT a request to abandon work aimed here. It
+        // cancels the active turn only so the agent process can be killed and
+        // rebuilt, and it leaves the conversation idle — the exact state a
+        // pending delivery has been waiting for. Clearing at that moment would
+        // discard a message one tick before it became deliverable, and silent
+        // message loss is the worst failure mode this feature has.
+        if cause != TurnCancelCause::UserRequested {
+            debug!(
+                conversation_id,
+                turn_id,
+                cause = ?cause,
+                "turn cancelled without a user stop; pending cross-session deliveries kept"
+            );
+            return;
+        }
         let cleared = self.queue.clear_for(conversation_id);
         if cleared > 0 {
             info!(
@@ -50,8 +65,6 @@ mod tests {
             to: to.to_owned(),
             user_id: "user_1".to_owned(),
             from_conversation_id: "conv_from".to_owned(),
-            from_name: "A".to_owned(),
-            from_workspace: None,
             message: "m".to_owned(),
             expires_at_ms: 10_000_000,
         }
@@ -65,7 +78,8 @@ mod tests {
         queue.push(delivery("c")).unwrap();
 
         let hook = QueueClearingCancelHook::new(queue.clone());
-        hook.on_turn_cancelled("user_1", "b", "turn_1").await;
+        hook.on_turn_cancelled("user_1", "b", "turn_1", TurnCancelCause::UserRequested)
+            .await;
 
         assert_eq!(queue.len_for("b"), 0, "the cancelled target's backlog must be gone");
         assert_eq!(queue.len_for("c"), 1, "an unrelated target must be untouched");
@@ -75,7 +89,8 @@ mod tests {
     async fn clearing_an_empty_backlog_is_a_no_op() {
         let queue = Arc::new(DeliveryQueue::new(Arc::new(TestClock::new(0))));
         let hook = QueueClearingCancelHook::new(queue.clone());
-        hook.on_turn_cancelled("user_1", "b", "turn_1").await;
+        hook.on_turn_cancelled("user_1", "b", "turn_1", TurnCancelCause::UserRequested)
+            .await;
         assert!(queue.is_empty());
     }
 
@@ -87,8 +102,30 @@ mod tests {
         queue.push(delivery("b")).unwrap();
 
         let hook = QueueClearingCancelHook::new(queue.clone());
-        hook.on_turn_cancelled("user_1", "conv_from", "turn_1").await;
+        hook.on_turn_cancelled("user_1", "conv_from", "turn_1", TurnCancelCause::UserRequested)
+            .await;
 
         assert_eq!(queue.len_for("b"), 1);
+    }
+
+    /// A runtime restart cancels the active turn only to recycle the agent
+    /// process, and leaves the conversation IDLE — the state a queued delivery
+    /// has been waiting for. Clearing there would drop a message one tick before
+    /// it became deliverable, silently.
+    #[tokio::test]
+    async fn a_runtime_restart_keeps_the_backlog() {
+        let queue = Arc::new(DeliveryQueue::new(Arc::new(TestClock::new(0))));
+        queue.push(delivery("b")).unwrap();
+        queue.push(delivery("b")).unwrap();
+
+        let hook = QueueClearingCancelHook::new(queue.clone());
+        hook.on_turn_cancelled("user_1", "b", "turn_1", TurnCancelCause::RuntimeRestart)
+            .await;
+
+        assert_eq!(
+            queue.len_for("b"),
+            2,
+            "a process recycle must not discard work aimed at the conversation"
+        );
     }
 }

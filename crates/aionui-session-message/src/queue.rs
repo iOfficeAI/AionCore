@@ -61,15 +61,21 @@ impl Clock for TestClock {
     }
 }
 
-/// One queued delivery. Carries everything needed to rebuild the recipient
-/// block at drain time, so draining never needs another DB read for the sender.
+/// One queued delivery.
+///
+/// `message` is the FINISHED content — the recipient block was composed at
+/// enqueue time, when both conversations' rows were already in hand. Draining
+/// therefore re-sends these bytes verbatim and never rebuilds anything, which is
+/// why the sender's name and workspace are deliberately NOT carried here: a
+/// queued copy of them could only go stale, and nothing would read it.
+///
+/// `from_conversation_id` and `user_id` DO stay, because the drainer needs them
+/// for the per-user feature gate and for logging which pair a drop belonged to.
 #[derive(Debug, Clone)]
 pub struct PendingDelivery {
     pub to: String,
     pub user_id: String,
     pub from_conversation_id: String,
-    pub from_name: String,
-    pub from_workspace: Option<String>,
     /// The FULL delivery content, recipient block already prepended. Never
     /// logged (spec §10).
     pub message: String,

@@ -9632,4 +9632,80 @@ mod session_mentions_integration {
             delivered[0].content
         );
     }
+
+    /// `[[AION_FILES]]` MUST remain the last block in the content.
+    ///
+    /// The front-end's file-chip parser reads every non-empty line after the
+    /// `[[AION_FILES]]` marker as a path and abandons the whole parse if any of
+    /// them is not one (`MessageText.tsx`, `parseFileMarker`). While the
+    /// sessions block was appended after the files block, a message carrying
+    /// BOTH `@` and `@@` lost its file chips and rendered the raw marker plus
+    /// the absolute path as plain text. Only a message with both kinds of
+    /// reference reproduces it, which is why no earlier test caught it.
+    #[tokio::test]
+    async fn the_files_block_stays_last_when_a_message_carries_both_a_file_and_a_session() {
+        let work_root = tempfile::tempdir().unwrap();
+        let (svc, _bc, repo, task_mgr) = make_service_with_workspace_root(work_root.path().to_path_buf());
+        svc.with_project_service(make_injected_project_service(work_root.path()).await);
+
+        let sender = svc.create("user_1", make_create_req()).await.unwrap();
+        insert_conv(
+            &repo,
+            "user_1",
+            "conv_target",
+            "重构-鉴权模块",
+            json!({"workspace": "/w/a"}),
+        )
+        .await;
+
+        // A `Local` ref only has to be an existing regular file, so it needs no
+        // upload root and no project binding.
+        let attachment = work_root.path().join("auth.rs");
+        std::fs::write(&attachment, "fn main() {}").unwrap();
+
+        let request: SendMessageRequest = serde_json::from_value(json!({
+            "content": "看下这个文件，然后问下他",
+            "files": [{ "kind": "local", "path": attachment.to_string_lossy() }],
+            "sessions": [{ "id": "conv_target" }]
+        }))
+        .unwrap();
+
+        let response = svc
+            .send_message("user_1", &sender.id, request, &task_mgr)
+            .await
+            .expect("send succeeds");
+
+        let rows: Vec<_> = repo
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.msg_id.as_deref() == Some(response.msg_id.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(rows.len(), 1);
+        let envelope: serde_json::Value = serde_json::from_str(&rows[0].content).expect("content is a JSON envelope");
+        let persisted = envelope["content"].as_str().expect("content text");
+
+        let sessions_at = persisted
+            .find("[[AION_SESSIONS]]")
+            .unwrap_or_else(|| panic!("sessions block missing: {persisted}"));
+        let files_at = persisted
+            .find("[[AION_FILES]]")
+            .unwrap_or_else(|| panic!("files block missing: {persisted}"));
+        assert!(
+            sessions_at < files_at,
+            "the files block must come last so every line after its marker is a path: {persisted}"
+        );
+
+        // The concrete property the front-end depends on: nothing but paths
+        // follows the marker.
+        let after_marker = &persisted[files_at + "[[AION_FILES]]".len()..];
+        for line in after_marker.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            assert!(
+                line.starts_with('/') || line.starts_with('\\') || line.contains(":\\"),
+                "only absolute paths may follow the files marker, found {line:?} in {persisted}"
+            );
+        }
+    }
 }

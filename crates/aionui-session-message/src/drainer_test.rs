@@ -58,8 +58,6 @@ fn delivery(to: &str, message: &str) -> PendingDelivery {
         to: to.to_owned(),
         user_id: "user_1".to_owned(),
         from_conversation_id: "conv_from".to_owned(),
-        from_name: "A".to_owned(),
-        from_workspace: None,
         message: message.to_owned(),
         expires_at_ms: 10_000_000,
     }

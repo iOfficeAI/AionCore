@@ -403,6 +403,139 @@ async fn tripping_one_pair_still_allows_a_different_target() {
     assert_eq!(response.status, SessionDeliveryStatus::Delivered);
 }
 
+/// The OUTBOUND gate, distinct from the pair gate above: it bounds one sender's
+/// total fan-out, so it has to trip even when no single pair is over its own
+/// limit. Asserted through the service rather than only over the limiter, so the
+/// error code and status the CLI sees are pinned too.
+#[tokio::test]
+async fn the_outbound_gate_trips_across_many_different_targets() {
+    let ctx = setup().await;
+    let from = ctx.create_conversation("conv_from", "A", "/w/a").await;
+
+    let pair_limit = aionui_session_message::rate_limit::PAIR_LIMIT;
+    let outbound_limit = aionui_session_message::rate_limit::OUTBOUND_LIMIT;
+    // Spread over enough targets that the per-pair budget is never the binding
+    // constraint.
+    let targets: Vec<String> = (0..outbound_limit + 1).map(|index| format!("conv_t{index}")).collect();
+    for id in &targets {
+        ctx.create_conversation(id, "T", "/w/a").await;
+    }
+
+    let mut last = None;
+    for id in &targets {
+        last = Some(ctx.service.send(USER, &from.id, &request(id, "hi")).await);
+    }
+
+    let error = last
+        .unwrap()
+        .expect_err("the send past the outbound budget must be refused");
+    assert_eq!(error.code(), SessionToolErrorCode::RateLimited, "{error}");
+    assert_eq!(error.http_status(), 429, "{error}");
+    // Proves the OUTBOUND gate tripped, not the pair gate: every target here got
+    // exactly one message, far below the pair limit.
+    assert!(
+        outbound_limit > pair_limit,
+        "this test only isolates the outbound gate while it is the looser of the two"
+    );
+
+    let event = ctx
+        .broadcaster
+        .find("sessionMessage.rateLimited")
+        .expect("the gate must broadcast");
+    assert_eq!(event.data["gate"], serde_json::json!("outbound"));
+    assert_eq!(event.data["user_id"], serde_json::json!(USER));
+}
+
+// ── Queue capacity ──────────────────────────────────────────────────
+
+/// A single sender can never see `queue_full`, and that is worth pinning:
+/// `PER_TARGET_LIMIT` is 20 while the pair gate allows 10 per (from, to) window,
+/// so the eleventh send to the same target comes back `rate_limited` with the
+/// backlog only half full. Anyone reading the error table would expect
+/// `queue_full` here.
+#[tokio::test]
+async fn one_sender_hits_the_pair_gate_long_before_the_backlog_fills() {
+    let ctx = setup().await;
+    let from = ctx.create_conversation("conv_from", "A", "/w/a").await;
+    ctx.create_conversation("conv_target", "B", "/w/a").await;
+    let (_claim, _agent) = ctx.make_busy("conv_target", false);
+
+    let pair_limit = aionui_session_message::rate_limit::PAIR_LIMIT as usize;
+    for index in 0..pair_limit {
+        let response = ctx
+            .service
+            .send(USER, &from.id, &request("conv_target", "hi"))
+            .await
+            .unwrap_or_else(|error| panic!("send {index} should queue, got {error}"));
+        assert_eq!(response.status, SessionDeliveryStatus::Queued);
+    }
+
+    let error = ctx
+        .service
+        .send(USER, &from.id, &request("conv_target", "hi"))
+        .await
+        .expect_err("the pair gate must refuse the next one");
+    assert_eq!(error.code(), SessionToolErrorCode::RateLimited, "{error}");
+    assert!(
+        pair_limit < aionui_session_message::queue::PER_TARGET_LIMIT,
+        "if the pair budget ever reaches the queue cap this test stops isolating the gates"
+    );
+    assert_eq!(ctx.queue.len_for("conv_target"), pair_limit);
+}
+
+/// `queue_full` was only ever asserted over the queue in isolation. This pins
+/// what a CALLER sees — the code and status the CLI contract promises — and it
+/// takes THREE senders to get there: the per-target cap is 20 while each sender
+/// is capped at 10 per pair, so filling the backlog needs two senders and a
+/// third to be refused.
+#[tokio::test]
+async fn a_full_per_target_backlog_is_refused_as_queue_full() {
+    let ctx = setup().await;
+    let pair_limit = aionui_session_message::rate_limit::PAIR_LIMIT as usize;
+    let per_target = aionui_session_message::queue::PER_TARGET_LIMIT;
+    let senders_needed = per_target.div_ceil(pair_limit);
+
+    let mut senders = Vec::new();
+    for index in 0..=senders_needed {
+        senders.push(ctx.create_conversation(&format!("conv_from{index}"), "A", "/w/a").await);
+    }
+    ctx.create_conversation("conv_target", "B", "/w/a").await;
+    // Busy without mid-turn support → every send queues instead of delivering.
+    let (_claim, _agent) = ctx.make_busy("conv_target", false);
+
+    let mut queued = 0;
+    for sender in &senders[..senders_needed] {
+        for _ in 0..pair_limit {
+            if queued == per_target {
+                break;
+            }
+            let response = ctx
+                .service
+                .send(USER, &sender.id, &request("conv_target", "hi"))
+                .await
+                .expect("a send within both budgets must queue");
+            assert_eq!(response.status, SessionDeliveryStatus::Queued);
+            queued += 1;
+        }
+    }
+    assert_eq!(ctx.queue.len_for("conv_target"), per_target, "the backlog must be full");
+
+    // A fresh sender: its own pair and outbound windows are empty, so the only
+    // thing left to refuse it is the backlog cap.
+    let error = ctx
+        .service
+        .send(USER, &senders[senders_needed].id, &request("conv_target", "hi"))
+        .await
+        .expect_err("the send past the per-target cap must be refused");
+    assert_eq!(error.code(), SessionToolErrorCode::QueueFull, "{error}");
+    assert_eq!(error.http_status(), 409, "{error}");
+    assert_eq!(
+        ctx.queue.len_for("conv_target"),
+        per_target,
+        "a refused send must not grow the backlog"
+    );
+}
+
 // ── guard_list_access ───────────────────────────────────────────────
 
 #[tokio::test]

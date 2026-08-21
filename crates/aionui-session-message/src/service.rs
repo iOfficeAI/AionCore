@@ -241,12 +241,13 @@ impl SessionMessageService {
             }
             // 7
             Err(DeliverAttemptError::Busy) => {
+                // `content` already carries the recipient block, composed above
+                // while both rows were in hand — the drainer re-sends these
+                // bytes verbatim rather than rebuilding anything.
                 self.deps.queue.push(PendingDelivery {
                     to: to.to_owned(),
                     user_id: user_id.to_owned(),
                     from_conversation_id: from_conversation_id.to_owned(),
-                    from_name: sender.name.clone(),
-                    from_workspace: sender_workspace,
                     message: content,
                     expires_at_ms: self.deps.queue.clock().now_ms() + TTL_MS,
                 })?;
@@ -266,10 +267,16 @@ impl SessionMessageService {
         }
     }
 
-    /// `list` / `targets` share the send path's two most global checks: the
-    /// feature toggle and the team-sender rule. `capabilities` does NOT go
-    /// through this — it is a static contract that touches no conversation
-    /// data, so it stays available even when the feature is off.
+    /// `list` / `targets` / `mentionable` share the send path's two most global
+    /// checks: the feature toggle and the team-sender rule. `capabilities` does
+    /// NOT go through this — it is a static contract that touches no
+    /// conversation data, so it stays available even when the feature is off.
+    ///
+    /// An EMPTY `from_conversation_id` skips the team-sender check rather than
+    /// failing. The runtime route always has a token-bound caller, but the
+    /// `@@` picker's `current_conversation_id` is optional (a picker opened
+    /// outside a conversation has no sender to validate). Treating "no sender"
+    /// as a missing row would turn the toggle check into a 409.
     pub async fn guard_list_access(
         &self,
         user_id: &str,
@@ -277,6 +284,9 @@ impl SessionMessageService {
     ) -> Result<(), SessionMessageError> {
         if !self.is_enabled_for(user_id).await {
             return Err(SessionMessageError::FeatureDisabled);
+        }
+        if from_conversation_id.is_empty() {
+            return Ok(());
         }
         let sender = self.load_sender(user_id, from_conversation_id).await?;
         if team_id_from_extra_str(&sender.extra).is_some() {

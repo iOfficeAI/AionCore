@@ -508,6 +508,13 @@ impl IConversationRepository for SqliteConversationRepository {
             where_clause.push_str(r" AND lower(c.name) LIKE ? ESCAPE '\'");
             binds.push(BindValue::Str(format!("%{needle}%")));
         }
+        // A real filter, unlike `project_id` below which is only a sort key. An
+        // explicit `=` rather than the NULL-tolerant trick used for the sort:
+        // scoping to a project must EXCLUDE unbound rows, not match them.
+        if let Some(ref project_id) = params.filter_project_id {
+            where_clause.push_str(" AND c.project_id = ?");
+            binds.push(BindValue::Str(project_id.clone()));
+        }
 
         // Sort keys in design §5.3 order. Binds are pushed in the order their
         // placeholders appear in the final statement: WHERE first, then ORDER BY.

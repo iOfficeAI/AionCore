@@ -226,6 +226,111 @@ async fn send_returns_403_when_the_feature_is_disabled() {
     );
 }
 
+// ── The `@@` picker's outlet shares the gate ────────────────────────
+//
+// `mentionable` and `targets` are one service function behind two auth
+// channels. The front-end hides `@@` while the switch is off, but if the two
+// routes' POLICY diverges then a direct call still answers a question the
+// master switch was supposed to have closed.
+
+fn mentionable_request(current: Option<&str>) -> Request<Body> {
+    let uri = match current {
+        Some(id) => format!("/api/session-messages/mentionable?current_conversation_id={id}"),
+        None => "/api/session-messages/mentionable".to_owned(),
+    };
+    Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
+}
+
+/// The user-auth router expects `CurrentUser` from the auth middleware, which
+/// is not in front of the router under test — inject it directly.
+fn user_router(ctx: &Ctx) -> Router {
+    aionui_session_message::session_message_user_routes(ctx.router_state()).layer(axum::Extension(
+        aionui_auth::CurrentUser {
+            id: USER.to_owned(),
+            username: USER.to_owned(),
+            user_type: aionui_db::UserType::Local,
+            status: aionui_db::UserStatus::Active,
+        },
+    ))
+}
+
+#[tokio::test]
+async fn mentionable_lists_targets_while_the_feature_is_on() {
+    let ctx = setup().await;
+    ctx.create_conversation("conv_a", "A", "/w/a").await;
+    ctx.create_conversation("conv_plain", "plain", "/w/a").await;
+
+    let response = user_router(&ctx)
+        .oneshot(mentionable_request(Some("conv_a")))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let ids: Vec<&str> = body["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["conv_plain"]);
+}
+
+#[tokio::test]
+async fn mentionable_is_refused_when_the_feature_is_disabled() {
+    let ctx = setup().await;
+    ctx.create_conversation("conv_a", "A", "/w/a").await;
+    ctx.create_conversation("conv_plain", "plain", "/w/a").await;
+    ctx.disable_feature(USER).await;
+
+    let response = user_router(&ctx)
+        .oneshot(mentionable_request(Some("conv_a")))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn mentionable_is_refused_for_a_team_caller() {
+    let ctx = setup().await;
+    ctx.create_team_conversation("conv_team", "team_1").await;
+    ctx.create_conversation("conv_plain", "plain", "/w/a").await;
+
+    let response = user_router(&ctx)
+        .oneshot(mentionable_request(Some("conv_team")))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// The picker's `current_conversation_id` is optional, so an absent one must
+/// still reach the list rather than being read as a missing sender row (which
+/// would surface as a 409 and make the picker look broken).
+#[tokio::test]
+async fn mentionable_without_a_current_conversation_still_lists() {
+    let ctx = setup().await;
+    ctx.create_conversation("conv_plain", "plain", "/w/a").await;
+
+    let response = user_router(&ctx).oneshot(mentionable_request(None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["data"]["items"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn mentionable_without_a_current_conversation_is_still_gated_by_the_switch() {
+    let ctx = setup().await;
+    ctx.create_conversation("conv_plain", "plain", "/w/a").await;
+    ctx.disable_feature(USER).await;
+
+    let response = user_router(&ctx).oneshot(mentionable_request(None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
 // ── targets filtering ───────────────────────────────────────────────
 
 #[tokio::test]

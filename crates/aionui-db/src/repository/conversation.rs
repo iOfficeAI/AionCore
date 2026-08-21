@@ -54,13 +54,24 @@ pub trait IConversationRepository: Send + Sync {
     /// predicate as SQL is exactly the drift that helper exists to prevent.
     /// Callers filter the holes and re-page around them.
     ///
-    /// Defaults to no candidates: only the sqlite repository implements the
-    /// ranking query, and the mock repositories in tests do not need it.
+    /// Defaults to no candidates, because the eight mock repositories in tests
+    /// have no use for the ranking query and only the sqlite one implements it.
+    ///
+    /// The default WARNS rather than returning quietly. An empty page is a
+    /// perfectly valid answer here, so a real implementation that forgets this
+    /// method would produce "the `@@` picker is always empty" with nothing
+    /// anywhere to explain it — the same silent-failure shape this feature keeps
+    /// running into. The log is the only signal that separates "no matches" from
+    /// "nobody implemented the query".
     async fn list_mentionable_candidates(
         &self,
         _user_id: &str,
         _params: &MentionableCandidatesParams,
     ) -> Result<Vec<ConversationRow>, DbError> {
+        tracing::warn!(
+            repository = std::any::type_name::<Self>(),
+            "list_mentionable_candidates is not implemented; the @@ mention picker will look empty"
+        );
         Ok(Vec::new())
     }
 
@@ -373,8 +384,16 @@ impl ConversationFilters {
 /// caller of `list_paginated` (cross-session-messaging design §5.3).
 #[derive(Debug, Clone, Default)]
 pub struct MentionableCandidatesParams {
-    /// Conversations bound to this project sort above all others.
+    /// Conversations bound to this project sort above all others. A SORT key
+    /// only — it never removes rows. Distinct from [`Self::filter_project_id`].
     pub project_id: Option<String>,
+    /// Restrict the result to this project. `None` keeps every project.
+    ///
+    /// Separate from [`Self::project_id`] because the two answer different
+    /// questions: the picker always groups by the CALLER's project, while a
+    /// caller may independently ask to be scoped to one project. Collapsing
+    /// them would make "scope to project X" silently mean "sort X first".
+    pub filter_project_id: Option<String>,
     /// Case-insensitive substring filter on the name; prefix matches sort above
     /// mid-string matches. `None` keeps every row.
     pub name_query: Option<String>,

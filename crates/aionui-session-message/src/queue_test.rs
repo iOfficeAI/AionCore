@@ -12,8 +12,6 @@ fn delivery(to: &str, message: &str, expires_at_ms: i64) -> PendingDelivery {
         to: to.to_owned(),
         user_id: "user_1".to_owned(),
         from_conversation_id: "conv_from".to_owned(),
-        from_name: "A".to_owned(),
-        from_workspace: Some("/w/a".to_owned()),
         message: message.to_owned(),
         expires_at_ms,
     }

@@ -155,6 +155,15 @@ async fn mentionable(
     // The picker is per-conversation; the current conversation arrives as a
     // query param rather than a path segment so the route stays flat.
     let current = query.current_conversation_id.clone().unwrap_or_default();
+    // Same gate as `targets`. The front-end already hides `@@` when the feature
+    // is off, but these two routes are one service function behind two auth
+    // channels, and letting their POLICY diverge means a direct call answers a
+    // question the master switch was supposed to have closed.
+    state
+        .service
+        .guard_list_access(&user.id, &current)
+        .await
+        .map_err(to_api_error)?;
     let data = state
         .targets
         .list(&user.id, &current, &query)

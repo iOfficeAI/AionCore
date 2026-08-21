@@ -101,6 +101,17 @@ impl MentionableTargets {
             .filter(|term| !term.is_empty())
             .map(str::to_owned);
 
+        // `project_id` narrows the result set. It is advertised on both outlets
+        // (the `@@` picker and `session list`'s descriptor schema), so ignoring
+        // it would hand a caller that scoped by project the unscoped list with
+        // no way to tell.
+        let project_scope = query
+            .project_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+
         // The project of the conversation the picker sits in decides the
         // same-project grouping, so it must be known BEFORE the scan — it is a
         // sort key of the query now.
@@ -124,6 +135,7 @@ impl MentionableTargets {
                     user_id,
                     &MentionableCandidatesParams {
                         project_id: current_project_id.clone(),
+                        filter_project_id: project_scope.clone(),
                         name_query: name_query.clone(),
                         limit: scan_limit,
                         offset,

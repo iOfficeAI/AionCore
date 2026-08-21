@@ -8,9 +8,10 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aionui_api_types::{SessionDeliveryStatus, SessionSendMessageRequest};
+use aionui_common::{OnConversationTurnCancelled, TurnCancelCause};
 use aionui_session_message::QueueClearingCancelHook;
 use common::{USER, setup};
 
@@ -18,6 +19,21 @@ fn request(to: &str, message: &str) -> SessionSendMessageRequest {
     SessionSendMessageRequest {
         to: to.to_owned(),
         message: message.to_owned(),
+    }
+}
+
+/// Records the `cause` each notification carried, so the wiring between
+/// `restart_runtime` and the hook can be asserted directly rather than inferred
+/// from the queue's end state.
+#[derive(Default)]
+struct RecordingCancelHook {
+    causes: Mutex<Vec<TurnCancelCause>>,
+}
+
+#[async_trait::async_trait]
+impl OnConversationTurnCancelled for RecordingCancelHook {
+    async fn on_turn_cancelled(&self, _user_id: &str, _conversation_id: &str, _turn_id: &str, cause: TurnCancelCause) {
+        self.causes.lock().unwrap().push(cause);
     }
 }
 
@@ -109,8 +125,6 @@ async fn a_cancel_that_arrives_before_the_agent_registers_still_clears_the_queue
             to: "conv_target".to_owned(),
             user_id: USER.to_owned(),
             from_conversation_id: "conv_from".to_owned(),
-            from_name: "A".to_owned(),
-            from_workspace: None,
             message: "queued".to_owned(),
             expires_at_ms: 10_000_000,
         })
@@ -184,5 +198,82 @@ async fn without_the_hook_registered_a_cancel_leaves_the_queue_alone() {
         ctx.queue.len_for("conv_target"),
         1,
         "clearing must come from the hook, not from cancel itself"
+    );
+}
+
+// ── Runtime restart is not a stop ────────────────────────────────────
+//
+// `restart_runtime` cancels the active turn purely so the agent process can be
+// killed and rebuilt, and it leaves the conversation IDLE — the state a queued
+// delivery has been waiting for. Discarding the backlog there would drop a
+// message one tick before it became deliverable, with only a log to show for it.
+
+#[tokio::test]
+async fn the_user_cancel_route_reports_a_user_requested_cause() {
+    let ctx = setup().await;
+    let recorder = Arc::new(RecordingCancelHook::default());
+    ctx.conversation_service.with_turn_cancelled_hook(recorder.clone());
+    ctx.create_conversation("conv_target", "B", "/w/a").await;
+    let (_claim, _agent) = ctx.make_busy("conv_target", false);
+    let turn_id = ctx.active_turn_id("conv_target").unwrap();
+
+    ctx.conversation_service
+        .cancel(USER, "conv_target", &turn_id, &ctx.task_manager)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        recorder.causes.lock().unwrap().as_slice(),
+        [TurnCancelCause::UserRequested]
+    );
+}
+
+#[tokio::test]
+async fn restarting_the_runtime_reports_a_runtime_restart_cause() {
+    let ctx = setup().await;
+    let recorder = Arc::new(RecordingCancelHook::default());
+    ctx.conversation_service.with_turn_cancelled_hook(recorder.clone());
+    ctx.create_conversation("conv_target", "B", "/w/a").await;
+    let (_claim, _agent) = ctx.make_busy("conv_target", false);
+
+    // The rebuild that follows the cancel cannot succeed against a stub task
+    // manager, and does not need to: the hook fires before it, so the recorded
+    // cause is what this test is about.
+    let _ = ctx
+        .conversation_service
+        .restart_runtime(USER, "conv_target", &ctx.task_manager)
+        .await;
+
+    assert_eq!(
+        recorder.causes.lock().unwrap().as_slice(),
+        [TurnCancelCause::RuntimeRestart],
+        "a process recycle must be distinguishable from a user stop"
+    );
+}
+
+#[tokio::test]
+async fn restarting_the_runtime_keeps_the_pending_deliveries() {
+    let ctx = setup().await;
+    ctx.conversation_service
+        .with_turn_cancelled_hook(Arc::new(QueueClearingCancelHook::new(ctx.queue.clone())));
+    let from = ctx.create_conversation("conv_from", "A", "/w/a").await;
+    ctx.create_conversation("conv_target", "B", "/w/a").await;
+    let (_claim, _agent) = ctx.make_busy("conv_target", false);
+
+    ctx.service
+        .send(USER, &from.id, &request("conv_target", "hi"))
+        .await
+        .unwrap();
+    assert_eq!(ctx.queue.len_for("conv_target"), 1);
+
+    let _ = ctx
+        .conversation_service
+        .restart_runtime(USER, "conv_target", &ctx.task_manager)
+        .await;
+
+    assert_eq!(
+        ctx.queue.len_for("conv_target"),
+        1,
+        "a runtime restart must not silently discard work aimed at the conversation"
     );
 }
