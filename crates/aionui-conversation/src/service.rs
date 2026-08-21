@@ -3869,12 +3869,21 @@ impl ConversationService {
             // gate. Same authoritative source the runtime summary's
             // `pending_confirmations` reads (`get_confirmations`).
             if !agent.get_confirmations().is_empty() {
-                info!(
-                    conversation_id = %conversation_id,
-                    route = "rejected_requires_action",
-                    active_turn_id = %active_turn_id,
-                    "mid-turn delivery refused: a confirmation is pending (spec §4.6)"
-                );
+                // Once per turn, not once per attempt: the cross-session
+                // drainer retries a queued delivery every second and each
+                // retry is refused identically, which turned one unanswered
+                // card into 600 identical lines over a 10-minute TTL.
+                if self
+                    .runtime_state
+                    .should_log_midturn_refusal(conversation_id, &active_turn_id)
+                {
+                    info!(
+                        conversation_id = %conversation_id,
+                        route = "rejected_requires_action",
+                        active_turn_id = %active_turn_id,
+                        "mid-turn delivery refused: a confirmation is pending (spec §4.6)"
+                    );
+                }
             } else {
                 match self
                     .deliver_midturn_message(

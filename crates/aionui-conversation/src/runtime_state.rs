@@ -25,6 +25,10 @@ struct ConversationRuntimeState {
     /// Cancels that arrived before the turn's agent registered, keyed by
     /// conversation and holding the turn they were meant for.
     deferred_cancels: HashMap<String, String>,
+    /// The turn each conversation has already reported a mid-turn refusal for.
+    /// One entry per conversation, overwritten as turns advance, so it cannot
+    /// grow with time. See [`ConversationRuntimeStateService::should_log_midturn_refusal`].
+    logged_midturn_refusals: HashMap<String, String>,
     shutting_down: bool,
 }
 
@@ -289,6 +293,35 @@ impl ConversationRuntimeStateService {
         Ok(())
     }
 
+    /// Whether a mid-turn refusal for this turn is still worth an `info` line.
+    ///
+    /// True once per turn, then false. The refusal itself is a per-occasion
+    /// fact, but the cross-session drainer retries a queued delivery every
+    /// second, and each retry is refused identically while the target's turn
+    /// sits on a confirmation card: measured live, one unanswered card produced
+    /// exactly 600 identical lines over a 10-minute TTL. Repeats carry no
+    /// information — the first line already says which conversation and turn —
+    /// so they are dropped here rather than downgraded to `debug`, which would
+    /// merely move the flood into development.
+    ///
+    /// A poisoned lock reports `true`: losing the gate means a noisy log, while
+    /// losing the line means a silent refusal, and noisy beats silent.
+    pub fn should_log_midturn_refusal(&self, conversation_id: &str, turn_id: &str) -> bool {
+        match self.state.lock() {
+            Ok(mut state) => {
+                let already = state.logged_midturn_refusals.get(conversation_id);
+                if already.is_some_and(|logged| logged == turn_id) {
+                    return false;
+                }
+                state
+                    .logged_midturn_refusals
+                    .insert(conversation_id.to_owned(), turn_id.to_owned());
+                true
+            }
+            Err(_) => true,
+        }
+    }
+
     pub fn clear_restarting(&self, conversation_id: &str) {
         match self.state.lock() {
             Ok(mut state) => {
@@ -342,6 +375,7 @@ impl ConversationRuntimeStateService {
                 let had_cancelling = state.cancelling_conversations.remove(conversation_id);
                 let had_restarting = state.restarting_conversations.remove(conversation_id);
                 state.deferred_cancels.remove(conversation_id);
+                state.logged_midturn_refusals.remove(conversation_id);
                 if had_active_turn || had_deleting || had_cancelling || had_restarting {
                     info!(
                         conversation_id,
@@ -860,5 +894,62 @@ mod tests {
         assert_eq!(summary.state, ConversationRuntimeStateKind::Idle);
         assert!(!summary.is_processing);
         assert!(summary.can_send_message);
+    }
+
+    // ── mid-turn refusal log gate ──────────────────────────────────────
+
+    /// The cross-session drainer retries a queued delivery once a SECOND. When
+    /// the target's turn is parked on a confirmation card, every one of those
+    /// attempts is refused and used to print the same `info` line: a single
+    /// unanswered card produced 482 identical lines in eight minutes (3.5% of a
+    /// whole day's backend log). The line is worth exactly one entry per
+    /// occasion, so the gate lets the first attempt of a turn through and
+    /// silences the rest.
+    #[test]
+    fn a_turns_midturn_refusal_is_worth_logging_once() {
+        let state = ConversationRuntimeStateService::default();
+
+        assert!(state.should_log_midturn_refusal("conv-1", "turn-1"), "first attempt");
+        assert!(
+            !state.should_log_midturn_refusal("conv-1", "turn-1"),
+            "the drainer's retries add no information"
+        );
+        assert!(
+            !state.should_log_midturn_refusal("conv-1", "turn-1"),
+            "still silent however long the card stays unanswered"
+        );
+    }
+
+    /// A new turn is a new occasion — otherwise a conversation that hits the
+    /// same situation tomorrow would be silently un-diagnosable.
+    #[test]
+    fn a_later_turn_logs_again() {
+        let state = ConversationRuntimeStateService::default();
+
+        assert!(state.should_log_midturn_refusal("conv-1", "turn-1"));
+        assert!(state.should_log_midturn_refusal("conv-1", "turn-2"));
+        assert!(!state.should_log_midturn_refusal("conv-1", "turn-2"));
+    }
+
+    #[test]
+    fn conversations_are_gated_independently() {
+        let state = ConversationRuntimeStateService::default();
+
+        assert!(state.should_log_midturn_refusal("conv-1", "turn-1"));
+        assert!(
+            state.should_log_midturn_refusal("conv-2", "turn-1"),
+            "another conversation's turn id must not silence this one"
+        );
+    }
+
+    /// Clearing a conversation drops the memory with the rest of its state, so a
+    /// deleted-then-recreated id does not inherit a stale gate.
+    #[test]
+    fn clearing_a_conversation_forgets_that_it_logged() {
+        let state = ConversationRuntimeStateService::default();
+
+        assert!(state.should_log_midturn_refusal("conv-1", "turn-1"));
+        state.clear_conversation("conv-1");
+        assert!(state.should_log_midturn_refusal("conv-1", "turn-1"));
     }
 }
