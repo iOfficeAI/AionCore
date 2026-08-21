@@ -160,6 +160,18 @@ pub struct CloneConversationRequest {
     pub conversation: CreateConversationRequest,
 }
 
+/// A conversation the user referenced with `@@` in the send box.
+///
+/// Id only, deliberately: the conversation name is mutable (an agent can
+/// rename it — that is what `name_source: "agent"` records), so a
+/// client-supplied name may already be stale. The backend resolves the name
+/// from the id, in the same query it needs anyway to decide the `workspace`
+/// field. Single source of truth.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SessionRef {
+    pub id: String,
+}
+
 /// Body for `POST /api/conversations/:id/messages`.
 ///
 /// `msg_id` is server-generated — clients must not provide one.
@@ -168,6 +180,10 @@ pub struct SendMessageRequest {
     pub content: String,
     #[serde(default)]
     pub files: Vec<ChatFileRef>,
+    /// Conversations the user referenced with `@@`. Resolved at the send
+    /// boundary into the `[[AION_SESSIONS]]` block appended to `content`.
+    #[serde(default)]
+    pub sessions: Vec<SessionRef>,
     #[serde(default)]
     pub inject_skills: Vec<String>,
     #[serde(default)]

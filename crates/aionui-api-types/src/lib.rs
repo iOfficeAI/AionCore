@@ -27,6 +27,7 @@ mod provider;
 mod remote_agent;
 mod response;
 mod runtime;
+mod session_tools;
 mod shell;
 mod sidebar;
 mod skill;
@@ -97,7 +98,7 @@ pub use conversation::{
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
     ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
     MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,
@@ -153,6 +154,13 @@ pub use runtime::{
     EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload,
     RuntimeStatusPhase, RuntimeStatusScope, RuntimeStatusScopeKind,
 };
+pub use session_tools::{
+    SESSION_TOOLS_SCHEMA_VERSION, SessionCliEnvelope, SessionCliMeta, SessionDeliveryStatus, SessionMentionTarget,
+    SessionMentionableQuery, SessionMentionableResponse, SessionMessageRateLimitedPayload, SessionRateGate,
+    SessionSendMessageRequest, SessionSendMessageResponse, SessionToolDescriptor, SessionToolErrorCode,
+    SessionToolErrorPayload, SessionToolName, session_tool_descriptor, session_tool_descriptors,
+    tool_name_for_session_cli_path,
+};
 pub use shell::{
     CheckToolInstalledRequest, CheckToolInstalledResponse, DeepgramSpeechToTextConfig, OpenAISpeechToTextConfig,
     OpenExternalRequest, OpenFileRequest, OpenFolderWithRequest, ShowItemInFolderRequest, SpeechToTextConfig,
@@ -173,9 +181,9 @@ pub use skill::{
     WriteAssistantRuleRequest,
 };
 pub use system::{
-    ClientPreferencesResponse, FeedbackDiagnosticsContextResponse, FeedbackDiagnosticsPrivacyResponse,
-    FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse, SystemSettingsResponse,
-    UpdateClientPreferencesRequest, UpdateSettingsRequest,
+    ClientPreferencesResponse, CurrentUserResponse, FeedbackDiagnosticsContextResponse,
+    FeedbackDiagnosticsPrivacyResponse, FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery,
+    FeedbackDiagnosticsResponse, SystemSettingsResponse, UpdateClientPreferencesRequest, UpdateSettingsRequest,
 };
 pub use team::{
     AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, InterruptTeamAgentRequest,

@@ -44,6 +44,8 @@ use crate::services::AppServices;
 
 use super::fs_monitor::spawn_fs_monitor;
 use super::health::health_check;
+use aionui_session_message::{session_message_routes, session_message_user_routes};
+
 use super::runtime_team_tools::{RuntimeTeamToolsState, runtime_team_tools_routes};
 use super::scm_monitor::{CompositeMessageRouter, spawn_scm_monitor};
 use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
@@ -362,6 +364,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         team_service: states.team.service.clone(),
         runtime_token_service: services.runtime_token_service.clone(),
     });
+    // Runtime routes authenticate on their own token header — deliberately NOT
+    // behind auth_middleware, same as runtime_team_tools.
+    let session_message_runtime = session_message_routes(states.session_message.clone());
+    // The `@@` picker's outlet goes through ordinary user auth.
+    let session_message_authenticated = session_message_user_routes(states.session_message)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: route groups built");
 
     // Antigravity permission hook callback. Deliberately NOT behind
@@ -396,7 +404,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(cron_authenticated)
         .merge(office_authenticated)
         .merge(shell_authenticated)
-        .merge(assistant_authenticated);
+        .merge(assistant_authenticated)
+        .merge(session_message_authenticated);
 
     // Conditionally merge WeChat login SSE route (feature-gated)
     #[cfg(feature = "weixin")]
@@ -412,6 +421,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     }
     .merge(ws_routes)
     .merge(runtime_team_tools)
+    .merge(session_message_runtime)
     .merge(office_proxy)
     .merge(public_assets)
     .layer(middleware::from_fn(security_headers_middleware));

@@ -16,11 +16,17 @@ use aionui_db::{
     IProjectStore, ISkillRepository, IUserOrderStore, IUserRepository, SqliteAcpSessionRepository,
     SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
     SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteMcpServerRepository, SqliteProjectStore,
-    SqliteProviderRepository, SqliteSkillRepository, SqliteUserOrderStore, SqliteUserRepository,
+    SqliteProviderRepository, SqliteSettingsRepository, SqliteSkillRepository, SqliteUserOrderStore,
+    SqliteUserRepository,
 };
 use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
+use aionui_session_message::QueueClearingCancelHook;
+use aionui_session_message::queue::{DeliveryQueue, SystemClock};
+use aionui_session_message::rate_limit::RateLimiter;
+use aionui_session_message::service::{SessionMessageDeps, SessionMessageService};
 use aionui_sidebar::UserOrderDeleteHook;
+use tokio::sync::Notify;
 
 pub struct AppServices {
     pub database: Database,
@@ -35,6 +41,15 @@ pub struct AppServices {
     pub runtime_token_service: Arc<RuntimeTokenService>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
+    /// Cross-session messaging. The queue, the rate limiter and the notify
+    /// handle are shared by the send path, the drainer, and the cancel hook, so
+    /// they are built once here (`AppServices` is the sole construction centre).
+    pub session_message_service: Arc<SessionMessageService>,
+    /// Same queue the service and the cancel hook share. Exposed so the router
+    /// layer can build the drainer without reaching into the service.
+    pub session_message_queue: Arc<DeliveryQueue>,
+    /// Woken on enqueue so the idle drainer stops sleeping.
+    pub session_message_notify: Arc<Notify>,
     /// Project-bind service (project-bind side branch). Shared by conversation
     /// and team wiring to bind/backfill project/folder rows. Cheap to clone.
     pub project_service: ProjectService,
@@ -306,6 +321,24 @@ impl AppServices {
             user_order_store: user_order_store.clone(),
         });
 
+        let session_message_queue = Arc::new(DeliveryQueue::new(Arc::new(SystemClock)));
+        let session_message_notify = Arc::new(Notify::new());
+        let session_message_service = Arc::new(SessionMessageService::new(SessionMessageDeps {
+            conversation_service: conversation_service.clone(),
+            conversation_repo: conversation_repo.clone(),
+            settings_repo: Arc::new(SqliteSettingsRepository::new(database.pool().clone())),
+            task_manager: worker_task_manager.clone(),
+            broadcaster: event_bus.clone(),
+            queue: session_message_queue.clone(),
+            rate_limiter: Arc::new(RateLimiter::new(Arc::new(SystemClock))),
+            notify: session_message_notify.clone(),
+        }));
+        // Cancel ⇒ clear the deliveries queued for that conversation. Injected
+        // rather than called directly because the queue lives in an upper-layer
+        // crate (see `OnConversationTurnCancelled`).
+        conversation_service
+            .with_turn_cancelled_hook(Arc::new(QueueClearingCancelHook::new(session_message_queue.clone())));
+
         Ok(Self {
             database,
             jwt_service: Arc::new(JwtService::new(secret.clone())),
@@ -320,6 +353,9 @@ impl AppServices {
             runtime_token_service,
             conversation_runtime_state,
             conversation_service,
+            session_message_service,
+            session_message_queue,
+            session_message_notify,
             project_service,
             user_order_store,
             task_manager_delete_hook: Some(task_manager_delete_hook),

@@ -28,7 +28,7 @@ pub use enums::{
 pub use error::{
     ApiError, ApiErrorLogContext, ErrorChain, WorkspacePathValidationError, validate_workspace_path_availability,
 };
-pub use hooks::OnConversationDelete;
+pub use hooks::{OnConversationDelete, OnConversationTurnCancelled, TurnCancelCause};
 pub use id::{fnv1a_hex8, generate_id, generate_id_with_length, generate_prefixed_id, generate_short_id};
 pub use pagination::PaginatedResult;
 pub use timestamp::{TimestampMs, now_ms};

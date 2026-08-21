@@ -36,6 +36,9 @@ use aionui_mcp::{
 use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
 use aionui_project::{ProjectRouterState, ProjectService};
 use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
+use aionui_session_message::drainer::Drainer;
+use aionui_session_message::state::SessionMessageRouterState;
+use aionui_session_message::targets::MentionableTargets;
 use aionui_shell::ShellRouterState;
 use aionui_sidebar::{SidebarRouterState, SidebarService};
 use aionui_system::{
@@ -138,6 +141,7 @@ pub struct ModuleStates {
     pub skill: SkillRouterState,
     pub channel: ChannelRouterState,
     pub team: TeamRouterState,
+    pub session_message: SessionMessageRouterState,
     pub cron: CronRouterState,
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
@@ -321,6 +325,7 @@ pub async fn build_module_states(
                 assistant.service.clone(),
             )
         }),
+        session_message: build_module_state_phase(&boot, "session_message", || build_session_message_state(services)),
         cron,
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
@@ -348,6 +353,35 @@ pub async fn build_module_states(
         .await;
 
     Ok((states, channel_components))
+}
+
+/// Cross-session messaging state, plus the process's single drainer.
+///
+/// The drainer is spawned here rather than in `routes.rs` because this is where
+/// this crate already starts background work — see
+/// `spawn_assistant_mcp_binding_watcher`, called from `build_assistant_state`.
+pub fn build_session_message_state(services: &AppServices) -> SessionMessageRouterState {
+    let state = SessionMessageRouterState {
+        service: services.session_message_service.clone(),
+        targets: Arc::new(MentionableTargets::new(
+            services.conversation_repo.clone(),
+            // `ProjectService` is `#[derive(Clone)]` and cheap to clone.
+            Arc::new(services.project_service.clone()),
+        )),
+        runtime_token_service: services.runtime_token_service.clone(),
+    };
+
+    // ONE drainer for the whole process — not one per target, not one per
+    // message. Both `DeliverySink` and `DrainGate` are implemented by the same
+    // service, hence the same Arc twice.
+    Arc::new(Drainer::new(
+        services.session_message_queue.clone(),
+        services.session_message_service.clone(),
+        services.session_message_service.clone(),
+    ))
+    .spawn(services.session_message_notify.clone());
+
+    state
 }
 
 /// Build the default `AssistantRouterState` from application services.

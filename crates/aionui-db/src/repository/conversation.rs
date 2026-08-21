@@ -41,6 +41,40 @@ pub trait IConversationRepository: Send + Sync {
         filters: &ConversationFilters,
     ) -> Result<PaginatedResult<ConversationRow>, DbError>;
 
+    /// One page of `@@` mention candidates, ranked inside the query.
+    ///
+    /// The ranking MUST happen in SQL rather than over an already-truncated
+    /// page: re-sorting a recency-ordered page in memory can only reorder the
+    /// newest N rows, so a name match or a same-project conversation outside
+    /// that window stays invisible no matter how highly it would rank.
+    ///
+    /// Team-owned rows and the caller's own conversation are NOT filtered here.
+    /// `extra` is opaque JSON at this layer, and "is this team-owned" is owned
+    /// by `TeamSessionBinding::team_id_marker_from_extra_str` — duplicating that
+    /// predicate as SQL is exactly the drift that helper exists to prevent.
+    /// Callers filter the holes and re-page around them.
+    ///
+    /// Defaults to no candidates, because the eight mock repositories in tests
+    /// have no use for the ranking query and only the sqlite one implements it.
+    ///
+    /// The default WARNS rather than returning quietly. An empty page is a
+    /// perfectly valid answer here, so a real implementation that forgets this
+    /// method would produce "the `@@` picker is always empty" with nothing
+    /// anywhere to explain it — the same silent-failure shape this feature keeps
+    /// running into. The log is the only signal that separates "no matches" from
+    /// "nobody implemented the query".
+    async fn list_mentionable_candidates(
+        &self,
+        _user_id: &str,
+        _params: &MentionableCandidatesParams,
+    ) -> Result<Vec<ConversationRow>, DbError> {
+        tracing::warn!(
+            repository = std::any::type_name::<Self>(),
+            "list_mentionable_candidates is not implemented; the @@ mention picker will look empty"
+        );
+        Ok(Vec::new())
+    }
+
     // ── Extended queries ────────────────────────────────────────────
 
     /// Finds a conversation by source, channel chat ID, and agent type.
@@ -360,6 +394,39 @@ impl ConversationFilters {
     pub fn effective_limit(&self) -> u32 {
         if self.limit == 0 { 20 } else { self.limit }
     }
+}
+
+/// Query for one ranked page of `@@` mention candidates.
+///
+/// Deliberately separate from [`ConversationFilters`]: the name filter and the
+/// project-first ordering are specific to the mention picker, and folding them
+/// into the general list query would leak picker semantics into every other
+/// caller of `list_paginated` (cross-session-messaging design §5.3).
+#[derive(Debug, Clone, Default)]
+pub struct MentionableCandidatesParams {
+    /// Conversations bound to this project sort above all others. A SORT key
+    /// only — it never removes rows. Distinct from [`Self::filter_project_id`].
+    pub project_id: Option<String>,
+    /// Restrict the result to this one conversation. `None` keeps every row.
+    ///
+    /// Used to answer "is this id still a legal mention target?" through the same
+    /// filters the picker applies, so the answer cannot drift from what the
+    /// picker would have shown.
+    pub id: Option<String>,
+    /// Restrict the result to this project. `None` keeps every project.
+    ///
+    /// Separate from [`Self::project_id`] because the two answer different
+    /// questions: the picker always groups by the CALLER's project, while a
+    /// caller may independently ask to be scoped to one project. Collapsing
+    /// them would make "scope to project X" silently mean "sort X first".
+    pub filter_project_id: Option<String>,
+    /// Case-insensitive substring filter on the name; prefix matches sort above
+    /// mid-string matches. `None` keeps every row.
+    pub name_query: Option<String>,
+    /// Rows to return. Clamped by the caller; a 0 is read as 1.
+    pub limit: u32,
+    /// Rows to skip, counted in the ranked order.
+    pub offset: u32,
 }
 
 /// Partial update payload for a conversation row.

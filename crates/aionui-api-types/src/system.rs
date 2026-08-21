@@ -14,6 +14,19 @@ pub struct SystemSettingsResponse {
     pub cron_notification_enabled: bool,
     pub command_queue_enabled: bool,
     pub save_upload_to_workspace: bool,
+    /// Cross-session messaging master switch. Positive wording, default on
+    /// (spec §5.7): the UI switch reads "allow", never "disable".
+    ///
+    /// `default = "enabled_by_default"` rather than a bare `#[serde(default)]`:
+    /// the latter yields `false`, which would silently DISABLE the feature for
+    /// any payload written before this field existed — the opposite of the
+    /// schema's `NOT NULL DEFAULT 1`.
+    #[serde(default = "enabled_by_default")]
+    pub cross_session_message_enabled: bool,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 impl Default for SystemSettingsResponse {
@@ -24,6 +37,7 @@ impl Default for SystemSettingsResponse {
             cron_notification_enabled: false,
             command_queue_enabled: false,
             save_upload_to_workspace: false,
+            cross_session_message_enabled: true,
         }
     }
 }
@@ -39,6 +53,7 @@ pub struct UpdateSettingsRequest {
     pub cron_notification_enabled: Option<bool>,
     pub command_queue_enabled: Option<bool>,
     pub save_upload_to_workspace: Option<bool>,
+    pub cross_session_message_enabled: Option<bool>,
 }
 
 impl UpdateSettingsRequest {
@@ -49,7 +64,25 @@ impl UpdateSettingsRequest {
             && self.cron_notification_enabled.is_none()
             && self.command_queue_enabled.is_none()
             && self.save_upload_to_workspace.is_none()
+            && self.cross_session_message_enabled.is_none()
     }
+}
+
+/// Response for `GET /api/system/current-user`.
+///
+/// Answers "which user id does the backend attribute my requests to". Needed
+/// because `GET /api/auth/user` cannot: the auth router runs its own
+/// `AuthState` whose identity mode is never `Local`, so in local mode it
+/// returns 401 even though every ordinary route is serving an injected default
+/// user. A client comparing a broadcast payload's `user_id` against "me" needs
+/// the id the ORDINARY middleware produced.
+///
+/// Deliberately only `id` + `username`: this is an identity echo, not a user
+/// profile endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CurrentUserResponse {
+    pub id: String,
+    pub username: String,
 }
 
 /// Response for `GET /api/settings/client`.
@@ -166,6 +199,10 @@ mod tests {
         assert!(resp.cron_notification_enabled);
         assert!(resp.command_queue_enabled);
         assert!(resp.save_upload_to_workspace);
+        assert!(
+            resp.cross_session_message_enabled,
+            "a payload predating the field must read as ENABLED, matching the schema default"
+        );
     }
 
     #[test]
@@ -176,6 +213,7 @@ mod tests {
             cron_notification_enabled: true,
             command_queue_enabled: true,
             save_upload_to_workspace: true,
+            cross_session_message_enabled: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: SystemSettingsResponse = serde_json::from_str(&json).unwrap();

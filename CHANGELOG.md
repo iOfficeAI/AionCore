@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.71](https://github.com/iOfficeAI/AionCore/compare/v0.1.70...v0.1.71) (2026-08-21)
+
+
+### Features
+
+* **project:** add fs/remount to rebuild stale mounts ([#910](https://github.com/iOfficeAI/AionCore/issues/910)) ([345f70b](https://github.com/iOfficeAI/AionCore/commit/345f70b3d4cee250ef12a7efa425e78f5f11960e))
+* **session-message:** deliver messages across a user's conversations ([#914](https://github.com/iOfficeAI/AionCore/issues/914)) ([f2b490f](https://github.com/iOfficeAI/AionCore/commit/f2b490f821fbc781b248d497e2955a9869213b02))
+* **sidebar:** archive foundation and aggregated read model ([#911](https://github.com/iOfficeAI/AionCore/issues/911)) ([8d6f6cc](https://github.com/iOfficeAI/AionCore/commit/8d6f6ccdbbadd69fb45a60b5cc135f256bd7359b))
+
+
+### Bug Fixes
+
+* **app:** fall back to default log dir when custom log dir is unusable (AIONUI-231) ([#898](https://github.com/iOfficeAI/AionCore/issues/898)) ([a2391ae](https://github.com/iOfficeAI/AionCore/commit/a2391ae68fe3f0408b1ade052031ba458bfcba63))
+* **claude:** append the assistant preset instead of replacing the system prompt ([#900](https://github.com/iOfficeAI/AionCore/issues/900)) ([b4543b4](https://github.com/iOfficeAI/AionCore/commit/b4543b471b06e3aa1159339dc15e137773a86c27))
+* **codex:** send the assistant preset as developerInstructions, not baseInstructions ([#897](https://github.com/iOfficeAI/AionCore/issues/897)) ([a3d47a9](https://github.com/iOfficeAI/AionCore/commit/a3d47a91de714f6d5b6f2b5339d14b1d84ebfbbd))
+* **conversation:** apply agent session titles at the relay level ([#896](https://github.com/iOfficeAI/AionCore/issues/896)) ([1a2c86a](https://github.com/iOfficeAI/AionCore/commit/1a2c86a8a702aa1d7aa081114da93ac3c734adfc))
+* **extension:** bound the builtin-skills materialize lock acquisition (AIONUI-168) ([#903](https://github.com/iOfficeAI/AionCore/issues/903)) ([b584da0](https://github.com/iOfficeAI/AionCore/commit/b584da01e1608da15438264e34ea506b4d947d95))
+* **project:** keep mounted targets when one fs/subscribe target fails (AIONUI-236) ([#902](https://github.com/iOfficeAI/AionCore/issues/902)) ([2f5edd4](https://github.com/iOfficeAI/AionCore/commit/2f5edd4151ed0d6ce59e8491068c95b0578f5c58))
+* **runtime:** log npm/npx probe stderr and missing-executable snapshot (AIONUI-62) ([#904](https://github.com/iOfficeAI/AionCore/issues/904)) ([9124b20](https://github.com/iOfficeAI/AionCore/commit/9124b2078cdd3f5029553a0a3ee3d177b1b998d9))
+
 ## [0.1.70](https://github.com/iOfficeAI/AionCore/compare/v0.1.69...v0.1.70) (2026-08-19)
 
 

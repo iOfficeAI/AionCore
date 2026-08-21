@@ -14,7 +14,6 @@ use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
-use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
     ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
     AssistantMcpBindingChanged, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
@@ -28,9 +27,11 @@ use aionui_api_types::{
     UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
+use aionui_api_types::{ChatFileRef, SessionRef};
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    PaginatedResult, WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
+    OnConversationTurnCancelled, PaginatedResult, TurnCancelCause, WorkspacePathValidationError, generate_short_id,
+    now_ms, validate_workspace_path_availability,
 };
 use aionui_db::models::{
     AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
@@ -58,6 +59,7 @@ use crate::convert::{
 };
 use crate::error::ConversationError;
 use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
+use crate::session_mentions;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
@@ -319,6 +321,10 @@ pub struct ConversationService {
     /// per-conversation state. Wrapped in `Arc<RwLock<…>>` so registration
     /// can happen post-construction without breaking the `Clone` impl.
     delete_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationDelete>>>>,
+    /// Hooks invoked when `cancel()` actually cancelled a turn, so upper-layer
+    /// services can drop work aimed at this conversation. See
+    /// `OnConversationTurnCancelled` for why only some branches fire.
+    turn_cancelled_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationTurnCancelled>>>>,
     mcp_server_repo: Arc<RwLock<Option<Arc<dyn IMcpServerRepository>>>>,
     assistant_definition_repo: Arc<RwLock<Option<Arc<dyn IAssistantDefinitionRepository>>>>,
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
@@ -403,6 +409,7 @@ impl ConversationService {
             skill_resolver,
             task_manager,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
+            turn_cancelled_hooks: Arc::new(RwLock::new(Vec::new())),
             mcp_server_repo: Arc::new(RwLock::new(None)),
             assistant_definition_repo: Arc::new(RwLock::new(None)),
             assistant_state_repo: Arc::new(RwLock::new(None)),
@@ -539,6 +546,49 @@ impl ConversationService {
             })
     }
 
+    /// Resolve `@@` conversation references into the `[[AION_SESSIONS]]` block
+    /// appended to the message content.
+    ///
+    /// Atomic like `[[AION_FILES]]`: any bad reference (missing, another
+    /// user's, or team-owned) fails the whole message. Name and workspace come
+    /// from the row — never from the client.
+    pub async fn resolve_session_mentions(
+        &self,
+        user_id: &str,
+        content: &str,
+        sessions: &[SessionRef],
+        sender_workspace: Option<&str>,
+    ) -> Result<String, ConversationError> {
+        if sessions.is_empty() {
+            return Ok(content.to_owned());
+        }
+
+        let mut targets = Vec::with_capacity(sessions.len());
+        for reference in sessions {
+            // Scoped by user_id, so another user's id yields NotFound rather
+            // than Forbidden — refuse without leaking existence (spec §9.1).
+            let row = self
+                .conversation_repo
+                .get(user_id, &reference.id)
+                .await?
+                .ok_or_else(|| ConversationError::NotFound {
+                    id: reference.id.clone(),
+                })?;
+            // Empty sender id: the picker already excludes the current
+            // conversation (spec §5.3), and the CLI side re-checks it as
+            // `target_is_self`.
+            session_mentions::reject_unusable_target("", &row.id, &row.extra)?;
+            targets.push(session_mentions::SessionMentionTargetInfo {
+                id: row.id.clone(),
+                name: row.name.clone(),
+                workspace: session_mentions::workspace_from_extra(&row.extra),
+            });
+        }
+
+        let block = session_mentions::build_sessions_block(sender_workspace, &targets);
+        Ok(format!("{content}\n\n{block}"))
+    }
+
     pub fn with_assistant_definition_repo(&self, repo: Arc<dyn IAssistantDefinitionRepository>) {
         if let Ok(mut guard) = self.assistant_definition_repo.write() {
             *guard = Some(repo);
@@ -578,6 +628,27 @@ impl ConversationService {
     pub fn with_delete_hook(&self, hook: Arc<dyn OnConversationDelete>) {
         if let Ok(mut guard) = self.delete_hooks.write() {
             guard.push(hook);
+        }
+    }
+
+    /// Register a hook notified when `cancel()` cancelled a turn.
+    pub fn with_turn_cancelled_hook(&self, hook: Arc<dyn OnConversationTurnCancelled>) {
+        if let Ok(mut guard) = self.turn_cancelled_hooks.write() {
+            guard.push(hook);
+        }
+    }
+
+    /// Snapshot the hook list, then drop the guard before awaiting:
+    /// `RwLockReadGuard` is not `Send`, so holding it across `.await` would
+    /// make the caller's future non-`Send`. Same pattern as `delete()`.
+    async fn notify_turn_cancelled(&self, user_id: &str, conversation_id: &str, turn_id: &str, cause: TurnCancelCause) {
+        let hooks: Vec<Arc<dyn OnConversationTurnCancelled>> = self
+            .turn_cancelled_hooks
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        for hook in hooks {
+            hook.on_turn_cancelled(user_id, conversation_id, turn_id, cause).await;
         }
     }
 
@@ -3773,11 +3844,37 @@ impl ConversationService {
 
         reject_deprecated_runtime_row(&row)?;
 
+        // `@@` references resolve at the same boundary and with the same
+        // atomicity as file attachments. Sender workspace comes from the row so
+        // the block can state `workspace: same` without the model comparing
+        // path strings.
+        //
+        // ⚠️ ORDER MATTERS TWICE, and both constraints are load-bearing:
+        //
+        // 1. This MUST stay above the mid-turn branch below: that branch
+        //    consumes the resolved content, so appending the block after it
+        //    would silently drop `@@` context whenever the message merged into
+        //    a running turn — and every unit test would still pass.
+        // 2. This MUST run BEFORE `resolve_message_attachments`, so that
+        //    `[[AION_FILES]]` stays the LAST block in the content. The
+        //    front-end's file-chip parser takes every non-empty line after the
+        //    `[[AION_FILES]]` marker as a path and bails out entirely if any of
+        //    them is not one (`MessageText.tsx`, `parseFileMarker`). With the
+        //    sessions block appended afterwards, a message carrying BOTH `@` and
+        //    `@@` lost its file chips and rendered the raw marker as text.
+        let content_with_sessions = if req.sessions.is_empty() {
+            req.content.clone()
+        } else {
+            let sender_workspace = session_mentions::workspace_from_extra(&row.extra);
+            self.resolve_session_mentions(user_id, &req.content, &req.sessions, sender_workspace.as_deref())
+                .await?
+        };
+
         // Resolve file attachments at the send boundary before any persist/claim
         // (atomic: a bad reference fails the whole send). Produces the inlined
         // `[[AION_FILES]]` content used for persistence, broadcast, and the turn.
         let resolved = self
-            .resolve_message_attachments(user_id, &req.content, &req.files)
+            .resolve_message_attachments(user_id, &content_with_sessions, &req.files)
             .await?;
 
         // ── Mid-turn delivery (B5, spec §4.3) ────────────────────────────
@@ -3798,12 +3895,22 @@ impl ConversationService {
             // gate. Same authoritative source the runtime summary's
             // `pending_confirmations` reads (`get_confirmations`).
             if !agent.get_confirmations().is_empty() {
-                info!(
-                    conversation_id = %conversation_id,
-                    route = "rejected_requires_action",
-                    active_turn_id = %active_turn_id,
-                    "mid-turn delivery refused: a confirmation is pending (spec §4.6)"
-                );
+                // Once per turn, not once per attempt: the cross-session
+                // drainer retries a queued delivery every second and each
+                // retry is refused identically, which turned one unanswered
+                // card into 600 identical lines over a 10-minute TTL.
+                if self.runtime_state.should_log_once_for_turn(
+                    crate::runtime_state::OncePerTurn::MidturnRefusal,
+                    conversation_id,
+                    &active_turn_id,
+                ) {
+                    info!(
+                        conversation_id = %conversation_id,
+                        route = "rejected_requires_action",
+                        active_turn_id = %active_turn_id,
+                        "mid-turn delivery refused: a confirmation is pending (spec §4.6)"
+                    );
+                }
             } else {
                 match self
                     .deliver_midturn_message(
@@ -4222,12 +4329,35 @@ impl ConversationService {
         Ok(())
     }
 
+    /// Cancel the active turn on a user's request.
+    ///
+    /// The public entry point, and the one the cancel route and the team
+    /// adapter use. `restart_runtime` goes through `cancel_with_cause` instead
+    /// so hooks can tell a stop from a process recycle.
     pub async fn cancel(
         &self,
         user_id: &str,
         conversation_id: &str,
         turn_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<CancelConversationResponse, ConversationError> {
+        self.cancel_with_cause(
+            user_id,
+            conversation_id,
+            turn_id,
+            task_manager,
+            TurnCancelCause::UserRequested,
+        )
+        .await
+    }
+
+    async fn cancel_with_cause(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+        cause: TurnCancelCause,
     ) -> Result<CancelConversationResponse, ConversationError> {
         // Verify conversation exists and belongs to user
         self.conversation_repo
@@ -4266,6 +4396,12 @@ impl ConversationService {
                 conversation_id,
                 turn_id, "Cancel arrived before the agent registered; deferring it to the build"
             );
+            // A deferred cancel IS a real cancel intent — the orchestrator
+            // applies it as soon as the task appears — so pending deliveries
+            // aimed here must go now, not after the turn we are cancelling
+            // finally starts.
+            self.notify_turn_cancelled(user_id, conversation_id, turn_id, cause)
+                .await;
             return Ok(CancelConversationResponse {
                 runtime: self.runtime_summary_for(conversation_id).await,
             });
@@ -4307,6 +4443,8 @@ impl ConversationService {
         }
 
         info!(conversation_id, turn_id, "Stream cancel acknowledged");
+        self.notify_turn_cancelled(user_id, conversation_id, turn_id, cause)
+            .await;
         Ok(CancelConversationResponse {
             runtime: self.runtime_summary_for(conversation_id).await,
         })
@@ -4461,7 +4599,19 @@ impl ConversationService {
         self.runtime_state.begin_restart(conversation_id)?;
         let restart_result = async {
             if let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) {
-                self.cancel(user_id, conversation_id, &turn_id, task_manager).await?;
+                // `RuntimeRestart`, not a user stop: cancelling here is only a
+                // precondition for killing the agent process. The user wants the
+                // conversation working again, and the restart leaves it idle —
+                // so work queued FOR it must survive, not be discarded at the
+                // exact moment it became deliverable.
+                self.cancel_with_cause(
+                    user_id,
+                    conversation_id,
+                    &turn_id,
+                    task_manager,
+                    TurnCancelCause::RuntimeRestart,
+                )
+                .await?;
             }
 
             info!(conversation_id, "Restarting conversation runtime");

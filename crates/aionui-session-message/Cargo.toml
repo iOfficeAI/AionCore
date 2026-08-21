@@ -1,0 +1,30 @@
+[package]
+name = "aionui-session-message"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aionui-api-types.workspace = true
+aionui-common.workspace = true
+aionui-conversation.workspace = true
+aionui-db.workspace = true
+aionui-ai-agent.workspace = true
+aionui-project.workspace = true
+aionui-realtime.workspace = true
+aionui-auth.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+sqlx.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tower.workspace = true
+# Enables the `AgentInstance::Mock` variant so the delivery and e2e tests can
+# build busy fake agents through the trait-object escape hatch instead of
+# spawning real CLIs. Same reason `aionui-team` pulls it in.
+aionui-ai-agent = { workspace = true, features = ["test-support"] }

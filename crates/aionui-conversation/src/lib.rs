@@ -17,6 +17,7 @@ pub mod runtime_state;
 pub mod service;
 mod service_ops;
 pub(crate) mod session_context;
+pub mod session_mentions;
 pub mod skill_resolver;
 pub mod skill_snapshot;
 mod startup_recovery;

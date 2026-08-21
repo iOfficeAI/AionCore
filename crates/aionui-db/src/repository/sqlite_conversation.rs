@@ -8,8 +8,9 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 use crate::repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
+    ConversationFilters, ConversationRowUpdate, IConversationRepository, MentionableCandidatesParams,
+    MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    StaleRuntimeMessageRow,
 };
 
 /// Bump `conversations.updated_at` so the conversation-list sort
@@ -487,6 +488,84 @@ impl IConversationRepository for SqliteConversationRepository {
             total,
             has_more,
         })
+    }
+
+    async fn list_mentionable_candidates(
+        &self,
+        user_id: &str,
+        params: &MentionableCandidatesParams,
+    ) -> Result<Vec<ConversationRow>, DbError> {
+        // Lowercased here and compared against `lower(c.name)`. SQLite's `lower`
+        // is ASCII-only, which is the same fold the picker applied when it
+        // ranked in Rust — neither side attempts non-ASCII case folding.
+        let needle = params
+            .name_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|term| !term.is_empty())
+            .map(|term| escape_like_pattern(&term.to_lowercase()));
+
+        // Archiving is the user putting a conversation away, so it stops being a
+        // mention candidate — the same rule the sidebar and the paginated list
+        // apply. Filtered in SQL, not by the caller: a Rust-side filter would
+        // punch holes in the page the way the team/self filters do, and the
+        // scan-past-holes machinery exists for predicates SQL cannot express.
+        let mut where_clause = String::from("c.user_id = ? AND c.archived_at IS NULL");
+        let mut binds: Vec<BindValue> = vec![BindValue::Str(user_id.to_owned())];
+        if let Some(ref needle) = needle {
+            where_clause.push_str(r" AND lower(c.name) LIKE ? ESCAPE '\'");
+            binds.push(BindValue::Str(format!("%{needle}%")));
+        }
+        // A real filter, unlike `project_id` below which is only a sort key. An
+        // explicit `=` rather than the NULL-tolerant trick used for the sort:
+        // scoping to a project must EXCLUDE unbound rows, not match them.
+        if let Some(ref project_id) = params.filter_project_id {
+            where_clause.push_str(" AND c.project_id = ?");
+            binds.push(BindValue::Str(project_id.clone()));
+        }
+        // Narrowing to a single row still goes through every other filter and
+        // through the caller's hard filters, which is the point: the answer to
+        // "may I mention this id?" must be the picker's answer, not a second
+        // opinion.
+        if let Some(ref id) = params.id {
+            where_clause.push_str(" AND c.id = ?");
+            binds.push(BindValue::Str(id.clone()));
+        }
+
+        // Sort keys in design §5.3 order. Binds are pushed in the order their
+        // placeholders appear in the final statement: WHERE first, then ORDER BY.
+        let mut order_parts: Vec<&str> = Vec::with_capacity(4);
+        // Prefix matches above mid-string ones. Omitted rather than collapsed to
+        // a constant when there is no search term: a bare integer in ORDER BY is
+        // a column ordinal to SQLite, not a value.
+        if let Some(ref needle) = needle {
+            binds.push(BindValue::Str(format!("{needle}%")));
+            order_parts.push(r"CASE WHEN lower(c.name) LIKE ? ESCAPE '\' THEN 0 ELSE 1 END");
+        }
+        // A NULL bind makes the equality NULL, which falls through to 1 for
+        // every row — no project means no grouping, so no branch is needed.
+        binds.push(BindValue::OptStr(params.project_id.clone()));
+        order_parts.push("CASE WHEN c.project_id = ? THEN 0 ELSE 1 END");
+        order_parts.push("c.updated_at DESC");
+        order_parts.push("c.id DESC");
+        let order_clause = order_parts.join(", ");
+
+        let sql = format!(
+            "SELECT c.* FROM conversations c \
+             WHERE {where_clause} \
+             ORDER BY {order_clause} \
+             LIMIT ? OFFSET ?"
+        );
+        // A 0 limit would return nothing while still reporting progress to a
+        // caller that pages until the rows run out; read it as 1 instead.
+        binds.push(BindValue::I64(i64::from(params.limit.max(1))));
+        binds.push(BindValue::I64(i64::from(params.offset)));
+
+        let mut query = sqlx::query_as::<_, ConversationRow>(&sql);
+        for bind in &binds {
+            query = bind_value_as(query, bind);
+        }
+        Ok(query.fetch_all(&self.pool).await?)
     }
 
     // ── Extended queries ────────────────────────────────────────────
@@ -1426,6 +1505,23 @@ enum BindValue {
     OptI64(Option<i64>),
 }
 
+/// Escape LIKE metacharacters so a search term matches literally.
+///
+/// Without this a user typing `%` into the mention picker would match every
+/// conversation, and `_` would match any single character — silently different
+/// from the plain substring test the picker used before the filter moved into
+/// SQL. Pairs with `ESCAPE '\'` on every `LIKE` that consumes the result.
+fn escape_like_pattern(term: &str) -> String {
+    let mut escaped = String::with_capacity(term.len());
+    for character in term.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
 /// Binds a `BindValue` to a raw `sqlx::query::Query`.
 fn bind_value<'q>(
     query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
@@ -1830,6 +1926,75 @@ mod tests {
         assert_eq!(result.items[0].name, "Third");
         assert_eq!(result.items[1].name, "Second");
         assert_eq!(result.items[2].name, "First");
+    }
+
+    /// Archiving is the user putting a conversation away, so it must not come
+    /// back as a `@@` mention candidate — same rule the sidebar and paginated
+    /// list already apply. Both mentionable outlets (the picker and the agent's
+    /// `session list`) read through this query, so one filter covers both.
+    #[tokio::test]
+    async fn list_mentionable_candidates_excludes_archived() {
+        let (repo, db) = setup().await;
+
+        let mut active = sample_conversation(SYSTEM_USER_ID);
+        active.name = "Active target".to_string();
+        repo.create(&active).await.unwrap();
+
+        let mut archived = sample_conversation(SYSTEM_USER_ID);
+        archived.name = "Archived target".to_string();
+        repo.create(&archived).await.unwrap();
+        sqlx::query("UPDATE conversations SET archived_at = ? WHERE id = ?")
+            .bind(1_700_000_000_000_i64)
+            .bind(&archived.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let rows = repo
+            .list_mentionable_candidates(
+                SYSTEM_USER_ID,
+                &MentionableCandidatesParams {
+                    limit: 20,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, vec!["Active target"]);
+    }
+
+    /// Narrowing to one id answers "may I still mention this?", so an archived
+    /// row must answer NO there too — otherwise clicking a chip on an older
+    /// message would resurrect a conversation the user put away.
+    #[tokio::test]
+    async fn a_single_id_lookup_also_refuses_an_archived_row() {
+        let (repo, db) = setup().await;
+
+        let mut archived = sample_conversation(SYSTEM_USER_ID);
+        archived.name = "Archived target".to_string();
+        repo.create(&archived).await.unwrap();
+        sqlx::query("UPDATE conversations SET archived_at = ? WHERE id = ?")
+            .bind(1_700_000_000_000_i64)
+            .bind(&archived.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let rows = repo
+            .list_mentionable_candidates(
+                SYSTEM_USER_ID,
+                &MentionableCandidatesParams {
+                    id: Some(archived.id.clone()),
+                    limit: 20,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(rows.is_empty(), "an archived conversation is not mentionable");
     }
 
     #[tokio::test]

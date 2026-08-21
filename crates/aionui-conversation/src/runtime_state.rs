@@ -25,7 +25,24 @@ struct ConversationRuntimeState {
     /// Cancels that arrived before the turn's agent registered, keyed by
     /// conversation and holding the turn they were meant for.
     deferred_cancels: HashMap<String, String>,
+    /// The turn each (event, conversation) pair has already been reported for.
+    /// One entry per pair, overwritten as turns advance, so it cannot grow with
+    /// time. See [`ConversationRuntimeStateService::should_log_once_for_turn`].
+    logged_once_per_turn: HashMap<(OncePerTurn, String), String>,
     shutting_down: bool,
+}
+
+/// Events that are worth one log line per turn rather than one per attempt.
+///
+/// Both of these are reported from paths the cross-session drainer retries once
+/// a second, so an unattended target turns each of them into hundreds of
+/// identical lines. The FACT is per turn, not per attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OncePerTurn {
+    /// A turn claim lost to the turn already running.
+    ClaimRejected,
+    /// A mid-turn write was refused because a confirmation card is pending.
+    MidturnRefusal,
 }
 
 #[derive(Debug)]
@@ -88,13 +105,36 @@ impl ConversationRuntimeStateService {
             });
         }
 
-        if state.active_turns.contains_key(conversation_id) {
-            info!(
-                conversation_id,
-                turn_id,
-                active_turn_id = state.active_turns.get(conversation_id).map(String::as_str),
-                "conversation runtime turn claim rejected"
-            );
+        if let Some(active_turn_id) = state.active_turns.get(conversation_id).cloned() {
+            // Once per active turn, not once per attempt: the cross-session
+            // drainer retries a queued delivery every second and loses the claim
+            // identically each time, which is what turned this line into a
+            // per-second stream.
+            //
+            // Keyed on the ACTIVE turn id, which is stable across those retries
+            // — the REJECTED `turn_id` is freshly minted per attempt, so keying
+            // on it would gate nothing. Inlined rather than calling
+            // `should_log_once_for_turn`, which would deadlock on the lock this
+            // scope is already holding.
+            let worth_logging = {
+                let key = (OncePerTurn::ClaimRejected, conversation_id.to_owned());
+                let first = state
+                    .logged_once_per_turn
+                    .get(&key)
+                    .is_none_or(|logged| *logged != active_turn_id);
+                if first {
+                    state.logged_once_per_turn.insert(key, active_turn_id.clone());
+                }
+                first
+            };
+            if worth_logging {
+                info!(
+                    conversation_id,
+                    turn_id,
+                    active_turn_id = %active_turn_id,
+                    "conversation runtime turn claim rejected"
+                );
+            }
             return Err(ConversationError::Busy {
                 reason: format!("conversation {conversation_id} is already running"),
             });
@@ -289,6 +329,41 @@ impl ConversationRuntimeStateService {
         Ok(())
     }
 
+    /// Whether this event is still worth an `info` line for this turn.
+    ///
+    /// True once per (event, conversation, turn), then false. Both events it
+    /// guards sit on paths the cross-session drainer retries every second, so
+    /// an unattended target reprints them indefinitely: measured live, a single
+    /// unanswered confirmation card produced exactly 600 identical lines over a
+    /// 10-minute TTL. Repeats carry no information — the first line already
+    /// names the conversation and the turn — so they are dropped here rather
+    /// than downgraded to `debug`, which would merely move the flood into
+    /// development, where that level is on.
+    ///
+    /// `turn_id` must be the ACTIVE turn, which is stable across retries. The
+    /// claim rejection also has a rejected turn id, but the drainer mints a
+    /// fresh one per attempt, so keying on that would gate nothing.
+    ///
+    /// A poisoned lock reports `true`: losing the gate means a noisy log, while
+    /// losing the line means a silent rejection, and noisy beats silent.
+    pub fn should_log_once_for_turn(&self, event: OncePerTurn, conversation_id: &str, turn_id: &str) -> bool {
+        match self.state.lock() {
+            Ok(mut state) => {
+                let key = (event, conversation_id.to_owned());
+                if state
+                    .logged_once_per_turn
+                    .get(&key)
+                    .is_some_and(|logged| logged == turn_id)
+                {
+                    return false;
+                }
+                state.logged_once_per_turn.insert(key, turn_id.to_owned());
+                true
+            }
+            Err(_) => true,
+        }
+    }
+
     pub fn clear_restarting(&self, conversation_id: &str) {
         match self.state.lock() {
             Ok(mut state) => {
@@ -342,6 +417,9 @@ impl ConversationRuntimeStateService {
                 let had_cancelling = state.cancelling_conversations.remove(conversation_id);
                 let had_restarting = state.restarting_conversations.remove(conversation_id);
                 state.deferred_cancels.remove(conversation_id);
+                state
+                    .logged_once_per_turn
+                    .retain(|(_, conversation), _| conversation != conversation_id);
                 if had_active_turn || had_deleting || had_cancelling || had_restarting {
                     info!(
                         conversation_id,
@@ -860,5 +938,115 @@ mod tests {
         assert_eq!(summary.state, ConversationRuntimeStateKind::Idle);
         assert!(!summary.is_processing);
         assert!(summary.can_send_message);
+    }
+
+    // ── once-per-turn log gate ─────────────────────────────────────────
+
+    /// The cross-session drainer retries a queued delivery once a SECOND and
+    /// each retry re-reports the same rejection. Measured live: one unanswered
+    /// confirmation card produced exactly 600 identical `mid-turn delivery
+    /// refused` lines over a 10-minute TTL, and the claim rejection underneath
+    /// it flooded at the same rate. The event is worth one entry per occasion,
+    /// so the gate lets a turn's first attempt through and silences the rest.
+    #[test]
+    fn an_events_first_attempt_in_a_turn_is_worth_logging_once() {
+        let state = ConversationRuntimeStateService::default();
+
+        assert!(
+            state.should_log_once_for_turn(OncePerTurn::MidturnRefusal, "conv-1", "turn-1"),
+            "first attempt"
+        );
+        assert!(
+            !state.should_log_once_for_turn(OncePerTurn::MidturnRefusal, "conv-1", "turn-1"),
+            "the drainer's retries add no information"
+        );
+        assert!(
+            !state.should_log_once_for_turn(OncePerTurn::MidturnRefusal, "conv-1", "turn-1"),
+            "still silent however long the card stays unanswered"
+        );
+    }
+
+    /// A new turn is a new occasion — otherwise a conversation that hits the
+    /// same situation tomorrow would be silently un-diagnosable.
+    #[test]
+    fn a_later_turn_logs_again() {
+        let state = ConversationRuntimeStateService::default();
+
+        assert!(state.should_log_once_for_turn(OncePerTurn::MidturnRefusal, "conv-1", "turn-1"));
+        assert!(state.should_log_once_for_turn(OncePerTurn::MidturnRefusal, "conv-1", "turn-2"));
+        assert!(!state.should_log_once_for_turn(OncePerTurn::MidturnRefusal, "conv-1", "turn-2"));
+    }
+
+    #[test]
+    fn conversations_are_gated_independently() {
+        let state = ConversationRuntimeStateService::default();
+
+        assert!(state.should_log_once_for_turn(OncePerTurn::MidturnRefusal, "conv-1", "turn-1"));
+        assert!(
+            state.should_log_once_for_turn(OncePerTurn::MidturnRefusal, "conv-2", "turn-1"),
+            "another conversation's turn id must not silence this one"
+        );
+    }
+
+    /// Two different events during the SAME turn each deserve a line: "the claim
+    /// lost to a turn already running" and "a mid-turn write was refused because
+    /// a card is pending" are different facts about that turn.
+    #[test]
+    fn different_events_in_one_turn_are_gated_independently() {
+        let state = ConversationRuntimeStateService::default();
+
+        assert!(state.should_log_once_for_turn(OncePerTurn::ClaimRejected, "conv-1", "turn-1"));
+        assert!(
+            state.should_log_once_for_turn(OncePerTurn::MidturnRefusal, "conv-1", "turn-1"),
+            "a different event in the same turn is a different fact"
+        );
+        assert!(!state.should_log_once_for_turn(OncePerTurn::ClaimRejected, "conv-1", "turn-1"));
+        assert!(!state.should_log_once_for_turn(OncePerTurn::MidturnRefusal, "conv-1", "turn-1"));
+    }
+
+    /// `try_claim_turn` cannot call `should_log_once_for_turn` — it already holds
+    /// the lock that method takes — so it inlines the same compare-and-set. This
+    /// pins that copy: a rejected claim must SPEND the gate for the active turn,
+    /// or the inlined logic has drifted and the line floods again.
+    #[test]
+    fn a_rejected_claim_spends_its_own_log_gate() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let _claim = state.try_claim_turn("conv-1", "turn-1").expect("first claim wins");
+
+        assert!(
+            state.try_claim_turn("conv-1", "turn-2").is_err(),
+            "a second claim loses while turn-1 runs"
+        );
+
+        assert!(
+            !state.should_log_once_for_turn(OncePerTurn::ClaimRejected, "conv-1", "turn-1"),
+            "the rejection already reported itself for this active turn"
+        );
+        assert!(
+            state.should_log_once_for_turn(OncePerTurn::ClaimRejected, "conv-1", "turn-9"),
+            "a different active turn is a new occasion"
+        );
+    }
+
+    /// Clearing a conversation drops its gates with the rest of its state, so a
+    /// deleted-then-recreated id does not inherit a stale one — and it must not
+    /// take another conversation's gate with it.
+    #[test]
+    fn clearing_a_conversation_forgets_only_its_own_gates() {
+        let state = ConversationRuntimeStateService::default();
+
+        assert!(state.should_log_once_for_turn(OncePerTurn::MidturnRefusal, "conv-1", "turn-1"));
+        assert!(state.should_log_once_for_turn(OncePerTurn::ClaimRejected, "conv-2", "turn-1"));
+
+        state.clear_conversation("conv-1");
+
+        assert!(
+            state.should_log_once_for_turn(OncePerTurn::MidturnRefusal, "conv-1", "turn-1"),
+            "conv-1 forgot"
+        );
+        assert!(
+            !state.should_log_once_for_turn(OncePerTurn::ClaimRejected, "conv-2", "turn-1"),
+            "conv-2 still remembers"
+        );
     }
 }

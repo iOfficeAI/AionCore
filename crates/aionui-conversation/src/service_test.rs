@@ -6037,6 +6037,7 @@ async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_
                 content: "hello".into(),
                 hidden: false,
                 files: vec![],
+                sessions: vec![],
                 inject_skills: vec![],
             },
             &task_mgr,
@@ -9351,4 +9352,363 @@ async fn other_build_failures_keep_the_persisted_session_id() {
         Some("sess-live"),
         "an unrelated build failure must not drop a resumable session"
     );
+}
+
+// ── `@@` session mentions at the send boundary ──────────────────────
+//
+// Lives here rather than beside `session_mentions.rs` because `MockRepo` and
+// the service builders are private to this module. The nested module name
+// keeps `cargo test session_mentions` matching.
+mod session_mentions_integration {
+    use super::*;
+    use aionui_api_types::SessionRef;
+
+    /// Insert a conversation row directly so the test controls name, workspace
+    /// and `extra` (team marker) exactly.
+    async fn insert_conv(repo: &Arc<MockRepo>, user_id: &str, id: &str, name: &str, extra: serde_json::Value) {
+        let row = ConversationRow {
+            id: id.to_owned(),
+            user_id: user_id.to_owned(),
+            name: name.to_owned(),
+            r#type: AgentType::Acp.serde_name().to_owned(),
+            extra: extra.to_string(),
+            model: None,
+            status: Some("finished".into()),
+            source: Some("aionui".into()),
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            created_at: 1,
+            updated_at: 1,
+            project_id: None,
+            folder_id: None,
+            name_source: None,
+        };
+        repo.create(&row).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_session_reference_appends_the_block_with_the_name_from_the_row() {
+        let (svc, _b, repo, _t) = make_service();
+        insert_conv(
+            &repo,
+            "user_1",
+            "conv_target",
+            "重构-鉴权模块",
+            json!({"workspace": "/w/a"}),
+        )
+        .await;
+
+        let resolved = svc
+            .resolve_session_mentions(
+                "user_1",
+                "问下他那边接口定完了没",
+                &[SessionRef {
+                    id: "conv_target".to_owned(),
+                }],
+                Some("/w/a"),
+            )
+            .await
+            .expect("resolution succeeds");
+
+        assert!(resolved.starts_with("问下他那边接口定完了没"), "{resolved}");
+        assert!(
+            resolved.contains("重构-鉴权模块\tconv_target\tworkspace: same"),
+            "the name must come from the row, not the client: {resolved}"
+        );
+        assert!(resolved.trim_end().ends_with("[[/AION_SESSIONS]]"), "{resolved}");
+    }
+
+    #[tokio::test]
+    async fn a_cross_workspace_reference_states_the_target_path_and_the_warning() {
+        let (svc, _b, repo, _t) = make_service();
+        insert_conv(
+            &repo,
+            "user_1",
+            "conv_docs",
+            "文档站改版",
+            json!({"workspace": "/w/docs"}),
+        )
+        .await;
+
+        let resolved = svc
+            .resolve_session_mentions(
+                "user_1",
+                "hi",
+                &[SessionRef {
+                    id: "conv_docs".to_owned(),
+                }],
+                Some("/w/a"),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            resolved.contains("文档站改版\tconv_docs\tworkspace: /w/docs（与你不同）"),
+            "{resolved}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_session_list_leaves_content_byte_identical() {
+        let (svc, _b, _repo, _t) = make_service();
+        let resolved = svc
+            .resolve_session_mentions("user_1", "no mentions here", &[], Some("/w/a"))
+            .await
+            .unwrap();
+        assert_eq!(resolved, "no mentions here");
+    }
+
+    #[tokio::test]
+    async fn a_reference_to_another_users_conversation_fails_the_whole_message() {
+        let (svc, _b, repo, _t) = make_service();
+        insert_conv(&repo, "user_2", "conv_theirs", "theirs", json!({"workspace": "/w/b"})).await;
+
+        let err = svc
+            .resolve_session_mentions(
+                "user_1",
+                "hi",
+                &[SessionRef {
+                    id: "conv_theirs".to_owned(),
+                }],
+                Some("/w/a"),
+            )
+            .await
+            .expect_err("must fail atomically");
+
+        // 404, not 403 — do not leak that the id exists (spec §9.1).
+        assert!(matches!(err, ConversationError::NotFound { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_reference_to_a_missing_conversation_fails_the_whole_message() {
+        let (svc, _b, _repo, _t) = make_service();
+        let err = svc
+            .resolve_session_mentions(
+                "user_1",
+                "hi",
+                &[SessionRef {
+                    id: "conv_does_not_exist".to_owned(),
+                }],
+                Some("/w/a"),
+            )
+            .await
+            .expect_err("must fail atomically");
+        assert!(matches!(err, ConversationError::NotFound { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_reference_to_a_team_conversation_is_rejected() {
+        let (svc, _b, repo, _t) = make_service();
+        insert_conv(&repo, "user_1", "conv_team", "team chat", json!({"teamId": "team_1"})).await;
+
+        let err = svc
+            .resolve_session_mentions(
+                "user_1",
+                "hi",
+                &[SessionRef {
+                    id: "conv_team".to_owned(),
+                }],
+                Some("/w/a"),
+            )
+            .await
+            .expect_err("team conversations are not valid @@ targets");
+        assert!(matches!(err, ConversationError::Forbidden { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn one_bad_reference_fails_the_send_even_when_another_is_valid() {
+        let (svc, _b, repo, _t) = make_service();
+        insert_conv(&repo, "user_1", "conv_ok", "ok", json!({"workspace": "/w/a"})).await;
+
+        let err = svc
+            .resolve_session_mentions(
+                "user_1",
+                "hi",
+                &[
+                    SessionRef {
+                        id: "conv_ok".to_owned(),
+                    },
+                    SessionRef {
+                        id: "conv_missing".to_owned(),
+                    },
+                ],
+                Some("/w/a"),
+            )
+            .await
+            .expect_err("atomicity: one bad reference fails the whole message");
+        assert!(matches!(err, ConversationError::NotFound { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn send_message_persists_and_broadcasts_the_block_inline() {
+        let (svc, broadcaster, repo, task_mgr) = make_service();
+        let sender = svc.create("user_1", make_create_req()).await.unwrap();
+        insert_conv(
+            &repo,
+            "user_1",
+            "conv_target",
+            "重构-鉴权模块",
+            json!({"workspace": "/w/a"}),
+        )
+        .await;
+        broadcaster.take_events();
+
+        let request: SendMessageRequest = serde_json::from_value(json!({
+            "content": "问下他",
+            "sessions": [{ "id": "conv_target" }]
+        }))
+        .unwrap();
+
+        let response = svc
+            .send_message("user_1", &sender.id, request, &task_mgr)
+            .await
+            .expect("send succeeds");
+
+        let rows: Vec<_> = repo
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.msg_id.as_deref() == Some(response.msg_id.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(rows.len(), 1, "persisted exactly once");
+        // The `content` column stores a JSON envelope, so read the text back
+        // out rather than matching against escaped tabs.
+        let envelope: serde_json::Value = serde_json::from_str(&rows[0].content).expect("content is a JSON envelope");
+        let persisted = envelope["content"].as_str().expect("content text").to_owned();
+        assert!(
+            persisted.contains("重构-鉴权模块\tconv_target\tworkspace:"),
+            "the block must be persisted verbatim: {persisted}"
+        );
+        assert!(persisted.starts_with("问下他\n\n[[AION_SESSIONS]]"), "{persisted}");
+    }
+
+    /// The ordering constraint the plan calls a hard requirement: the block is
+    /// appended BEFORE the mid-turn branch consumes `resolved`. Hooking it
+    /// after would leave every other test green while silently dropping `@@`
+    /// context on the mid-turn path.
+    #[tokio::test]
+    async fn a_midturn_delivery_still_carries_the_sessions_block() {
+        let (svc, _b, repo, _t) = make_service();
+        let sender = svc.create("user_1", make_create_req()).await.unwrap();
+        insert_conv(
+            &repo,
+            "user_1",
+            "conv_target",
+            "重构-鉴权模块",
+            json!({"workspace": "/w/a"}),
+        )
+        .await;
+        let _claim = svc
+            .runtime_state()
+            .try_claim_turn(&sender.id, "turn_active")
+            .expect("claim the active turn");
+        let agent = Arc::new(MidturnMockAgent::new(&sender.id));
+        let task_mgr = Arc::new(MockTaskManager::new());
+        task_mgr.insert_agent(&sender.id, AgentInstance::Mock(agent.clone()));
+        let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+
+        let request: SendMessageRequest = serde_json::from_value(json!({
+            "content": "问下他",
+            "sessions": [{ "id": "conv_target" }]
+        }))
+        .unwrap();
+
+        let response = svc
+            .send_message("user_1", &sender.id, request, &task_mgr_dyn)
+            .await
+            .expect("mid-turn send must not 409");
+        assert!(response.delivered_midturn, "this test must exercise the mid-turn path");
+
+        let delivered = agent.delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1);
+        assert!(
+            delivered[0].content.contains("[[AION_SESSIONS]]"),
+            "mid-turn delivery must not drop the @@ block: {}",
+            delivered[0].content
+        );
+        assert!(
+            delivered[0].content.contains("重构-鉴权模块\tconv_target\tworkspace:"),
+            "{}",
+            delivered[0].content
+        );
+    }
+
+    /// `[[AION_FILES]]` MUST remain the last block in the content.
+    ///
+    /// The front-end's file-chip parser reads every non-empty line after the
+    /// `[[AION_FILES]]` marker as a path and abandons the whole parse if any of
+    /// them is not one (`MessageText.tsx`, `parseFileMarker`). While the
+    /// sessions block was appended after the files block, a message carrying
+    /// BOTH `@` and `@@` lost its file chips and rendered the raw marker plus
+    /// the absolute path as plain text. Only a message with both kinds of
+    /// reference reproduces it, which is why no earlier test caught it.
+    #[tokio::test]
+    async fn the_files_block_stays_last_when_a_message_carries_both_a_file_and_a_session() {
+        let work_root = tempfile::tempdir().unwrap();
+        let (svc, _bc, repo, task_mgr) = make_service_with_workspace_root(work_root.path().to_path_buf());
+        svc.with_project_service(make_injected_project_service(work_root.path()).await);
+
+        let sender = svc.create("user_1", make_create_req()).await.unwrap();
+        insert_conv(
+            &repo,
+            "user_1",
+            "conv_target",
+            "重构-鉴权模块",
+            json!({"workspace": "/w/a"}),
+        )
+        .await;
+
+        // A `Local` ref only has to be an existing regular file, so it needs no
+        // upload root and no project binding.
+        let attachment = work_root.path().join("auth.rs");
+        std::fs::write(&attachment, "fn main() {}").unwrap();
+
+        let request: SendMessageRequest = serde_json::from_value(json!({
+            "content": "看下这个文件，然后问下他",
+            "files": [{ "kind": "local", "path": attachment.to_string_lossy() }],
+            "sessions": [{ "id": "conv_target" }]
+        }))
+        .unwrap();
+
+        let response = svc
+            .send_message("user_1", &sender.id, request, &task_mgr)
+            .await
+            .expect("send succeeds");
+
+        let rows: Vec<_> = repo
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.msg_id.as_deref() == Some(response.msg_id.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(rows.len(), 1);
+        let envelope: serde_json::Value = serde_json::from_str(&rows[0].content).expect("content is a JSON envelope");
+        let persisted = envelope["content"].as_str().expect("content text");
+
+        let sessions_at = persisted
+            .find("[[AION_SESSIONS]]")
+            .unwrap_or_else(|| panic!("sessions block missing: {persisted}"));
+        let files_at = persisted
+            .find("[[AION_FILES]]")
+            .unwrap_or_else(|| panic!("files block missing: {persisted}"));
+        assert!(
+            sessions_at < files_at,
+            "the files block must come last so every line after its marker is a path: {persisted}"
+        );
+
+        // The concrete property the front-end depends on: nothing but paths
+        // follows the marker.
+        let after_marker = &persisted[files_at + "[[AION_FILES]]".len()..];
+        for line in after_marker.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            assert!(
+                line.starts_with('/') || line.starts_with('\\') || line.contains(":\\"),
+                "only absolute paths may follow the files marker, found {line:?} in {persisted}"
+            );
+        }
+    }
 }
