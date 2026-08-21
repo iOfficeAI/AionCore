@@ -3163,6 +3163,32 @@ impl ConversationService {
     }
 
     /// Return one full message for a conversation after verifying ownership.
+    /// Newest message of one type, or `None`.
+    ///
+    /// Serves the plan bar's rehydration: the paginated load alone cannot find a
+    /// plan row that its own turn buried under later messages (`upsert_message`
+    /// does not refresh `created_at`).
+    pub async fn latest_message_of_type(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        message_type: &str,
+    ) -> Result<Option<MessageResponse>, ConversationError> {
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+
+        let row = self
+            .conversation_repo
+            .latest_message_of_type(user_id, conversation_id, message_type)
+            .await?;
+
+        row.map(row_to_message_response).transpose()
+    }
+
     pub async fn get_message(
         &self,
         user_id: &str,
