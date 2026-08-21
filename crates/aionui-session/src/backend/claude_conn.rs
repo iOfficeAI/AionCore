@@ -138,8 +138,12 @@ fn prepend_args(head: &[String], tail: &[String]) -> Vec<String> {
 /// - `init.mcp_servers` → `--mcp-config <json>` + `--strict-mcp-config` (the latter
 ///   ONLY alongside `--mcp-config`: it makes the session ignore the machine's
 ///   ambient `~/.claude` servers, which we must NOT do when we inject none).
-/// - `init.preset_context` → `--system-prompt` (composed `[Assistant Rules]` /
-///   skills index / team-guide text, already assembled by the app boundary).
+/// - `init.preset_context` → `--append-system-prompt` (composed `[Assistant Rules]` /
+///   skills index / team-guide text, already assembled by the app boundary). It MUST be
+///   the APPEND flag: `--system-prompt` REPLACES claude's built-in prompt wholesale
+///   ("System prompt to use for the session" vs "Append a system prompt to the default
+///   system prompt", verified: `claude --help`, 2.1.234), silently stripping the
+///   harness's own guidance — the same defect class as codex `baseInstructions`.
 /// - `model` → `--model`; `mode` → `--permission-mode` (claude has no in-band
 ///   switch at spawn; a UI switch persists + evicts so the rebuild re-applies here).
 ///
@@ -156,7 +160,7 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        args.push("--system-prompt".to_string());
+        args.push("--append-system-prompt".to_string());
         args.push(preset.to_string());
     }
 
@@ -2644,13 +2648,17 @@ fn sniff_task(
         .map(str::to_string);
     let parent_ref = frame.get("tool_use_id").and_then(Value::as_str).map(str::to_string);
     // Container kind, declared ONLY on `task_started` (`task_type`:
-    // "local_workflow" for a Workflow container, "local_bash" for a background
-    // bash — verified: samples/claude-cli/2.1.176/workflow_*.ndjson +
-    // 2.1.220/_all_workflow_interrupt.jsonl; progress/updated/notification
-    // frames carry no task_type → None). The pump admits ONLY WorkflowContainer
-    // refs into its Finish-suppression roster.
+    // "local_workflow" for a Workflow container, "local_agent" for a Task
+    // subagent, "local_bash" for a background bash — verified:
+    // samples/claude-cli/2.1.176/workflow_*.ndjson +
+    // 2.1.220/_all_workflow_interrupt.jsonl +
+    // tests/fixtures/claude_2.1.169_single_tool_turn.ndjson;
+    // progress/updated/notification frames carry no task_type → None). The pump
+    // admits ONLY WorkflowContainer refs into its Finish-suppression roster;
+    // AgentContainer only changes the progress-card headline downstream.
     let kind = frame.get("task_type").and_then(Value::as_str).map(|t| match t {
         "local_workflow" => crate::event::SubagentTaskKind::WorkflowContainer,
+        "local_agent" => crate::event::SubagentTaskKind::AgentContainer,
         _ => crate::event::SubagentTaskKind::Other,
     });
     let _ = event_tx.send(SessionEnvelope {
@@ -3490,7 +3498,40 @@ mod tests {
         );
     }
 
-    /// preset_context → `--system-prompt`; model → `--model`; mode →
+    /// The assistant preset must NOT replace claude's default system prompt.
+    ///
+    /// `--system-prompt` REPLACES the built-in prompt wholesale (claude 2.1.234
+    /// `--help`: "System prompt to use for the session"), silently stripping
+    /// the harness's own guidance — the same defect class as codex
+    /// `baseInstructions` (#895). The additive flag is `--append-system-prompt`
+    /// ("Append a system prompt to the default system prompt", verified:
+    /// `claude --help`, 2.1.234).
+    #[test]
+    fn preset_context_appends_not_replaces_system_prompt() {
+        let config = SessionConfig {
+            init: SessionInit {
+                preset_context: Some("[Assistant Rules] be precise".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let args = build_claude_init_args(&config);
+        let pair = |flag: &str| -> Option<String> {
+            args.iter()
+                .position(|a| a == flag)
+                .and_then(|i| args.get(i + 1).cloned())
+        };
+        assert_eq!(
+            pair("--append-system-prompt").as_deref(),
+            Some("[Assistant Rules] be precise")
+        );
+        assert!(
+            !args.iter().any(|a| a == "--system-prompt"),
+            "the preset must not wipe claude's default system prompt"
+        );
+    }
+
+    /// preset_context → `--append-system-prompt`; model → `--model`; mode →
     /// `--permission-mode`; each omitted independently when its source is empty.
     #[test]
     fn build_claude_init_args_threads_preset_model_mode() {
@@ -3509,7 +3550,10 @@ mod tests {
                 .position(|a| a == flag)
                 .and_then(|i| args.get(i + 1).cloned())
         };
-        assert_eq!(pair("--system-prompt").as_deref(), Some("[Assistant Rules] be precise"));
+        assert_eq!(
+            pair("--append-system-prompt").as_deref(),
+            Some("[Assistant Rules] be precise")
+        );
         assert_eq!(pair("--model").as_deref(), Some("global.anthropic.claude-opus-4-8"));
         assert_eq!(pair("--permission-mode").as_deref(), Some("plan"));
 
@@ -3528,7 +3572,9 @@ mod tests {
         };
         let blank_args = build_claude_init_args(&blank);
         assert!(
-            !blank_args.iter().any(|a| a == "--model" || a == "--system-prompt"),
+            !blank_args
+                .iter()
+                .any(|a| a == "--model" || a == "--append-system-prompt"),
             "blank model/preset emit no flags"
         );
         assert_eq!(
@@ -6074,12 +6120,15 @@ mod tests {
         // Running; task_notification{status} → terminal. The reducer upserts these
         // into Running.subagents, which drives has_foreground_activity.
         // `kind` is learned ONLY from task_started.task_type: local_workflow →
-        // WorkflowContainer, local_bash (or any other value) → Other, absent
-        // (progress/notification frames) → None — the pump admits only
-        // WorkflowContainer refs into its Finish-suppression roster.
+        // WorkflowContainer, local_agent → AgentContainer, local_bash (or any
+        // other value) → Other, absent (progress/notification frames) → None —
+        // the pump admits only WorkflowContainer refs into its
+        // Finish-suppression roster; AgentContainer drives the "subagent" card
+        // headline.
         let frames = [
             r#"{"type":"system","subtype":"task_started","task_id":"tk-1","tool_use_id":"toolu-9","subagent_type":"general-purpose","task_type":"local_workflow"}"#,
             r#"{"type":"system","subtype":"task_started","task_id":"tk-2","tool_use_id":"toolu-8","subagent_type":"bash","task_type":"local_bash"}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"tk-3","tool_use_id":"toolu-7","subagent_type":"general-purpose","task_type":"local_agent"}"#,
             r#"{"type":"system","subtype":"task_notification","task_id":"tk-1","tool_use_id":"toolu-9","status":"completed"}"#,
         ];
         let bytes = format!("{}\n", frames.join("\n")).into_bytes();
@@ -6098,7 +6147,7 @@ mod tests {
                 } = env.event
                 {
                     updates.push((r#ref, status, parent_ref, label, kind));
-                    if updates.len() == 3 {
+                    if updates.len() == 4 {
                         return;
                     }
                 }
@@ -6108,8 +6157,8 @@ mod tests {
 
         assert_eq!(
             updates.len(),
-            3,
-            "2 task_started + task_notification → 3 SubagentUpdate, got {updates:?}"
+            4,
+            "3 task_started + task_notification → 4 SubagentUpdate, got {updates:?}"
         );
         // started → Running, keyed by task_id, parent = tool_use_id, label = subagent_type.
         assert_eq!(updates[0].0, "tk-1", "ref = task_id");
@@ -6136,15 +6185,22 @@ mod tests {
             Some(crate::event::SubagentTaskKind::Other),
             "task_type=local_bash → Other"
         );
+        // A Task subagent keeps its own kind, so the card layer can label it
+        // "subagent" instead of "bg task".
+        assert_eq!(
+            updates[2].4,
+            Some(crate::event::SubagentTaskKind::AgentContainer),
+            "task_type=local_agent → AgentContainer"
+        );
         // notification completed → Completed, SAME ref (lifecycle upsert); the
         // frame carries no task_type → kind None.
-        assert_eq!(updates[2].0, "tk-1", "same ref across the lifecycle");
+        assert_eq!(updates[3].0, "tk-1", "same ref across the lifecycle");
         assert_eq!(
-            updates[2].1,
+            updates[3].1,
             crate::event::SubagentStatus::Completed,
             "status=completed → Completed"
         );
-        assert_eq!(updates[2].4, None, "task_notification carries no task_type → kind None");
+        assert_eq!(updates[3].4, None, "task_notification carries no task_type → kind None");
     }
 
     /// sniff_mode: claude's AUTHORITATIVE mode signal is `permissionMode` on a

@@ -76,6 +76,7 @@ impl OutputSink for BackendOutputSink {
             input: Some(parsed_input),
             output: None,
             description: None,
+            parent_call_id: None,
         }));
     }
 
@@ -115,6 +116,7 @@ impl OutputSink for BackendOutputSink {
                 Some(content.to_owned())
             },
             description: None,
+            parent_call_id: None,
         }));
     }
 

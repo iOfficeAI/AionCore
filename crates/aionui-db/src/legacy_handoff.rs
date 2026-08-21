@@ -41,6 +41,16 @@ pub(crate) const LEGACY_HANDOFF_COLUMNS: &[LegacyHandoffColumn] = &[
         column: "agents_version",
         definition: "TEXT NOT NULL DEFAULT '1.0.0'",
     },
+    // AIONUI-230 (Sentry): legacy databases that never ran AionUi JS-side v22
+    // lack `messages.hidden`, and migration 002 Part D.1 reads it from the old
+    // table (`COALESCE(hidden, 0)` fails at SQL prepare time when the source
+    // column is absent), leaving startup permanently broken. Definition matches
+    // the JS v22 migration and migration 002's rebuilt-table target.
+    LegacyHandoffColumn {
+        table: "messages",
+        column: "hidden",
+        definition: "INTEGER NOT NULL DEFAULT 0",
+    },
 ];
 
 pub(crate) async fn ensure_legacy_handoff_schema(pool: &SqlitePool) -> Result<(), DbError> {
@@ -106,6 +116,7 @@ mod tests {
                 ("conversations", "pinned_at", "INTEGER"),
                 ("teams", "session_mode", "TEXT"),
                 ("teams", "agents_version", "TEXT NOT NULL DEFAULT '1.0.0'"),
+                ("messages", "hidden", "INTEGER NOT NULL DEFAULT 0"),
             ]
         );
     }
@@ -119,6 +130,11 @@ mod tests {
             ("conversations", "pinned_at"),
             ("teams", "session_mode"),
             ("teams", "agents_version"),
+            // Moved out of the documented non-contract reads below: AIONUI-230
+            // (Sentry) proved legacy databases exist that never ran the JS-side
+            // v22 migration, so migration 002's read of `messages.hidden` does
+            // hit compatible drift and must be repaired before the migrator.
+            ("messages", "hidden"),
         ];
 
         for (table, column) in repaired_by_handoff_contract {
@@ -136,7 +152,6 @@ mod tests {
         // of future migration-002 edits has an explicit contract decision
         // point instead of a hidden assumption.
         let documented_non_contract_reads = [
-            ("messages", "hidden", "AionUi v22 adds it before v23-v26 issue path"),
             (
                 "conversations",
                 "source",

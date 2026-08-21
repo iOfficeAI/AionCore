@@ -672,13 +672,17 @@ pub enum SubagentKind {
 
 /// Container kind of a `SubagentUpdate` roster entry (see that variant's `kind`
 /// field). Normalized from the claude wire's `task_started.task_type`:
-/// `"local_workflow"` → `WorkflowContainer`, any other declared value (e.g.
-/// `"local_bash"`) → `Other`. Deliberately two-valued: the only consumer is the
-/// pump's suppression-roster admission, which needs exactly the bit "may this
-/// ref hold the turn open".
+/// `"local_workflow"` → `WorkflowContainer`, `"local_agent"` (a Task subagent,
+/// foreground or background — the wire declares both the same way, verified:
+/// `claude_2.1.169_single_tool_turn.ndjson`) → `AgentContainer`, any other
+/// declared value (e.g. `"local_bash"`) → `Other`. Two consumers: the pump's
+/// suppression-roster admission (WorkflowContainer alone may hold a turn open)
+/// and the background-card headline (AgentContainer renders "subagent", not
+/// "bg task", so a Task subagent is distinguishable from a background bash).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SubagentTaskKind {
     WorkflowContainer,
+    AgentContainer,
     Other,
 }
 

@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.70](https://github.com/iOfficeAI/AionCore/compare/v0.1.69...v0.1.70) (2026-08-19)
+
+
+### Features
+
+* **monitor:** add fs/createFile command ([#891](https://github.com/iOfficeAI/AionCore/issues/891)) ([19c7837](https://github.com/iOfficeAI/AionCore/commit/19c7837ba5c5ce6dffa022478d5322275805097c))
+* **monitor:** back explorer drag-transfer with fs/copy and fs/move ([#877](https://github.com/iOfficeAI/AionCore/issues/877)) ([85670aa](https://github.com/iOfficeAI/AionCore/commit/85670aa2ebd7bdda180e89bec07f6158d101f7ef))
+* **session:** distinguish Task subagents from background tasks ([#890](https://github.com/iOfficeAI/AionCore/issues/890)) ([a978cf7](https://github.com/iOfficeAI/AionCore/commit/a978cf71a932842d2c83b7598de002c85a7dd95c))
+
+
+### Bug Fixes
+
+* **agent:** pair native media blocks with a link to the same file ([#876](https://github.com/iOfficeAI/AionCore/issues/876)) ([da91f82](https://github.com/iOfficeAI/AionCore/commit/da91f826bbfdde21e415e9f6080a53075479f729))
+* **antigravity:** collapse agy's U+FFFD runs at text_delta joins ([#888](https://github.com/iOfficeAI/AionCore/issues/888)) ([0324fa9](https://github.com/iOfficeAI/AionCore/commit/0324fa93660beaf53337bb12b18d6056a5132953))
+* **antigravity:** route Team over the CLI, which is what agy was already using ([#881](https://github.com/iOfficeAI/AionCore/issues/881)) ([70781cc](https://github.com/iOfficeAI/AionCore/commit/70781ccb890ef1aa0d60f11ad29d3f852eb20715))
+* **app:** bound the graceful-shutdown tail so the data-dir instance lock is released ([#884](https://github.com/iOfficeAI/AionCore/issues/884)) ([1e20ab4](https://github.com/iOfficeAI/AionCore/commit/1e20ab46f56d92237f6548a67fbd05abdef20726))
+* **app:** harden the shutdown watchdog force-exit path ([679f34d](https://github.com/iOfficeAI/AionCore/commit/679f34dfd535ccd4e016f0ae4abc028406ef76b3))
+* **app:** harden the shutdown watchdog force-exit path ([d94b574](https://github.com/iOfficeAI/AionCore/commit/d94b5741aa32e69642155f951ad8c14ea7af28bf))
+* **app:** keep backend_binary_path cmd.exe-launchable on Windows ([#887](https://github.com/iOfficeAI/AionCore/issues/887)) ([c8bbde6](https://github.com/iOfficeAI/AionCore/commit/c8bbde61179012a4c07b341107b665759407f092))
+* **app:** reuse the app-level ConversationService in build_cron_state ([#885](https://github.com/iOfficeAI/AionCore/issues/885)) ([9182eaa](https://github.com/iOfficeAI/AionCore/commit/9182eaaf1f9a1f9fe024676dbb1ba876b40ccf93))
+
 ## [0.1.69](https://github.com/iOfficeAI/AionCore/compare/v0.1.68...v0.1.69) (2026-08-18)
 
 

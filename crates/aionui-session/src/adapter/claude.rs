@@ -1075,7 +1075,7 @@ impl BackendAdapter for ClaudeAdapter {
                 args.push("--fork-session".to_string());
             }
         }
-        // Manager-supplied flags (S18: --system-prompt / --mcp-config /
+        // Manager-supplied flags (S18: --append-system-prompt / --mcp-config /
         // --strict-mcp-config). Kept backend-neutral: the adapter does not build
         // them, only appends them.
         args.extend(extra_args.iter().cloned());

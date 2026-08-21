@@ -445,3 +445,114 @@ async fn end_to_end_watch_change_produces_delta() {
 
     assert_eq!(delta.canonical, c);
 }
+
+// ── remount (force fresh mount of a watched canonical) ──────────────────────
+
+#[tokio::test]
+async fn remount_rereads_baseline_that_resubscribe_would_miss() {
+    // The load-bearing distinction: a re-subscribe of a live node serves the
+    // cached listing (mount is idempotent), so a change the watcher never
+    // delivered stays invisible; a remount tears the node down and re-reads it.
+    let (mut shard, dir) = real_shard(100);
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+    let c = canon(dir.path()).as_str().to_owned();
+
+    shard
+        .handle(Command::Subscribe {
+            sub: sub("s1"),
+            canonical: c.clone(),
+            now: 0,
+        })
+        .await
+        .unwrap();
+
+    // Change the directory WITHOUT feeding the watcher event through the shard
+    // (the raw event lands in the dropped receiver): the tree's cached facts now
+    // lag the disk, exactly the "backend mount went stale" the refresh recovers.
+    std::fs::write(dir.path().join("b.txt"), b"y").unwrap();
+
+    // A re-subscribe (AlreadyLive) serves the cached listing → b.txt is missing.
+    let resub = shard
+        .handle(Command::Subscribe {
+            sub: sub("s1"),
+            canonical: c.clone(),
+            now: 0,
+        })
+        .await
+        .unwrap();
+    match resub.as_slice() {
+        [ShardOutput::Snapshot { snapshot, .. }] => {
+            let names: Vec<&str> = snapshot.entries.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, vec!["a.txt"], "re-subscribe serves the stale cached listing");
+        }
+        other => panic!("expected one Snapshot, got {other:?}"),
+    }
+
+    // Remount re-reads the baseline → b.txt appears; subscribers are preserved.
+    let out = shard.handle(Command::Remount { canonical: c.clone() }).await.unwrap();
+    match out.as_slice() {
+        [ShardOutput::Snapshot { subscribers, snapshot }] => {
+            assert_eq!(
+                subscribers,
+                &vec![sub("s1")],
+                "remount snapshot carries current subscribers"
+            );
+            let mut names: Vec<&str> = snapshot.entries.iter().map(|(n, _)| n.as_str()).collect();
+            names.sort();
+            assert_eq!(names, vec!["a.txt", "b.txt"], "remount re-reads the baseline from disk");
+        }
+        other => panic!("expected one Snapshot, got {other:?}"),
+    }
+    assert!(shard.is_watched(&c), "still watched after remount");
+}
+
+#[tokio::test]
+async fn remount_unwatched_canonical_is_noop() {
+    // Never subscribed → not watched. Remounting must NOT mount it (that would
+    // orphan a tree node the reaper never reclaims); it produces no output.
+    let (mut shard, dir) = real_shard(100);
+    let c = canon(dir.path()).as_str().to_owned();
+    let out = shard.handle(Command::Remount { canonical: c.clone() }).await.unwrap();
+    assert!(out.is_empty(), "remount of an unwatched canonical is a no-op");
+    assert!(!shard.is_watched(&c), "remount did not mount the cold canonical");
+}
+
+#[tokio::test]
+async fn remount_preserves_subscription_so_later_deltas_still_fan_out() {
+    // A remount must not disturb the subscription registry: after it, a change to
+    // the directory still fans a delta to the original subscriber.
+    let (mut shard, dir) = real_shard(100);
+    let c = canon(dir.path()).as_str().to_owned();
+    shard
+        .handle(Command::Subscribe {
+            sub: sub("s1"),
+            canonical: c.clone(),
+            now: 0,
+        })
+        .await
+        .unwrap();
+
+    shard.handle(Command::Remount { canonical: c.clone() }).await.unwrap();
+
+    std::fs::write(dir.path().join("new.txt"), b"x").unwrap();
+    let out = shard
+        .handle(Command::Apply {
+            canonical: c.clone(),
+            hint: Hint::ChildNames(vec!["new.txt".to_owned()]),
+        })
+        .await
+        .unwrap();
+    match out.as_slice() {
+        [ShardOutput::Delta { subscribers, delta }] => {
+            assert_eq!(subscribers, &vec![sub("s1")], "subscription survived the remount");
+            assert_eq!(
+                delta.changes,
+                vec![Change::Added {
+                    name: "new.txt".to_owned(),
+                    kind: crate::runtime::provider::Kind::File
+                }]
+            );
+        }
+        other => panic!("expected one Delta to s1, got {other:?}"),
+    }
+}

@@ -15,13 +15,13 @@ use aionui_channel::ChannelRouterState;
 use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
-    IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository,
-    IProviderRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
-    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
-    SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteClientPreferenceRepository,
-    SqliteConversationRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
-    SqliteRemoteAgentRepository, SqliteSettingsRepository,
+    IProviderRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
+    SqliteAssistantRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
+    SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
+    SqliteSettingsRepository,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -34,12 +34,13 @@ use aionui_mcp::{
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
 };
 use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
-use aionui_project::ProjectRouterState;
+use aionui_project::{ProjectRouterState, ProjectService};
 use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
 use aionui_session_message::drainer::Drainer;
 use aionui_session_message::state::SessionMessageRouterState;
 use aionui_session_message::targets::MentionableTargets;
 use aionui_shell::ShellRouterState;
+use aionui_sidebar::{SidebarRouterState, SidebarService};
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
     ProtocolDetectionService, ProviderService, RuntimePrepareService, SettingsService, SystemRouterState,
@@ -133,6 +134,7 @@ pub struct ModuleStates {
     pub connection_test: ConnectionTestRouterState,
     pub file: FileRouterState,
     pub project: ProjectRouterState,
+    pub sidebar: SidebarRouterState,
     pub mcp: McpRouterState,
     pub extension: ExtensionRouterState,
     pub hub: HubRouterState,
@@ -309,6 +311,7 @@ pub async fn build_module_states(
         connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
         project: build_module_state_phase(&boot, "project", || build_project_state(services)),
+        sidebar: build_module_state_phase(&boot, "sidebar", || build_sidebar_state(services)),
         mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
         extension: ext_state,
         hub: hub_state,
@@ -332,6 +335,17 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module state build completed"
     );
+    // Late-inject the sidebar's remove-project ports: the team service is built
+    // after the sidebar state above, so the wiring cannot happen inside
+    // `build_sidebar_state`. `set_remove_project_ports` is set-once.
+    states
+        .sidebar
+        .service
+        .set_remove_project_ports(Arc::new(RemoveProjectAdapter {
+            conversation: services.conversation_service.clone(),
+            team: states.team.service.clone(),
+            project: services.project_service.clone(),
+        }));
     states
         .conversation
         .service
@@ -531,6 +545,58 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
 pub fn build_project_state(services: &AppServices) -> ProjectRouterState {
     ProjectRouterState {
         project: Arc::new(services.project_service.clone()),
+    }
+}
+
+/// Build the sidebar read/ordering router state from application services.
+/// The sidebar store and ordering store share the app-wide pool; `work_dir` is
+/// the conversation temp-workspace root used for path classification (must match
+/// `ProjectService`'s temp root).
+pub fn build_sidebar_state(services: &AppServices) -> SidebarRouterState {
+    let sidebar_store: Arc<dyn aionui_db::ISidebarStore> =
+        Arc::new(aionui_db::SqliteSidebarStore::new(services.database.pool().clone()));
+    let service = SidebarService::new(
+        sidebar_store,
+        services.user_order_store.clone(),
+        services.work_dir.join("conversations"),
+    );
+    SidebarRouterState {
+        service: Arc::new(service),
+    }
+}
+
+/// Adapts the concrete conversation / team / project services to the sidebar's
+/// [`aionui_sidebar::RemoveProjectPorts`] trait so `remove_project` (BR-19) can
+/// reuse the existing per-unit delete paths (`ConversationService::delete`,
+/// `TeamSessionService::remove_team`, `ProjectService::delete_project`) without
+/// the sidebar crate depending on any of them.
+struct RemoveProjectAdapter {
+    conversation: ConversationService,
+    team: Arc<TeamSessionService>,
+    project: ProjectService,
+}
+
+#[async_trait::async_trait]
+impl aionui_sidebar::RemoveProjectPorts for RemoveProjectAdapter {
+    async fn delete_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), String> {
+        self.conversation
+            .delete(user_id, conversation_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), String> {
+        self.team
+            .remove_team(user_id, team_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn delete_project_record(&self, user_id: &str, project_id: &str) -> Result<(), String> {
+        self.project
+            .delete_project(user_id, project_id)
+            .await
+            .map_err(|err| err.to_string())
     }
 }
 
@@ -869,6 +935,8 @@ pub fn build_team_state(
     );
     spawn_assistant_mcp_binding_watcher(services.event_bus.subscribe(), Arc::clone(&service));
     service.with_project_service(Arc::new(services.project_service.clone()));
+    // Path-2 cascade: removing a team drops its `user_order` row (sidebar §4.3).
+    service.with_user_order_store(services.user_order_store.clone());
     TeamRouterState {
         service,
         active_leases: services.active_lease_registry.clone(),
@@ -879,44 +947,19 @@ pub fn build_team_state(
 pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     let pool = services.database.pool().clone();
     let cron_repo: Arc<dyn aionui_db::ICronRepository> = Arc::new(aionui_db::SqliteCronRepository::new(pool.clone()));
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(pool));
 
-    let conv_repo: Arc<dyn aionui_db::IConversationRepository> =
-        Arc::new(SqliteConversationRepository::new(pool.clone()));
-    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
-        Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
-    let acp_session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
-    let skill_resolver = Arc::new(aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
-        services.skill_paths.clone(),
-        services.skill_repo.clone(),
-    ));
-    let conv_service = ConversationService::new(
-        services.work_dir.clone(),
-        services.event_bus.clone(),
-        skill_resolver,
-        services.worker_task_manager.clone(),
-        conv_repo.clone(),
-        agent_metadata_repo.clone(),
-        acp_session_repo,
-    )
-    .with_runtime_state(services.conversation_runtime_state.clone())
-    .with_runtime_helper_context(services.runtime_helper_bin(), services.runtime_base_url());
-    conv_service.with_mcp_server_repo(Arc::new(aionui_db::SqliteMcpServerRepository::new(
-        services.database.pool().clone(),
-    )));
-    conv_service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(
-        services.database.pool().clone(),
-    )));
-    conv_service.with_assistant_state_repo(Arc::new(SqliteAssistantOverlayRepository::new(
-        services.database.pool().clone(),
-    )));
-    conv_service.with_assistant_preference_repo(Arc::new(SqliteAssistantPreferenceRepository::new(
-        services.database.pool().clone(),
-    )));
-    conv_service.with_project_service(Arc::new(services.project_service.clone()));
+    // Reuse the app-level ConversationService (AppServices is the sole service
+    // construction center). A separate instance carries its own
+    // background-watcher registry — `ensure_background_watcher` is idempotent
+    // only within one instance — so a cron-triggered conversation would get a
+    // second BackgroundStreamWatcher on the same agent broadcast channel and
+    // every CLI-initiated (orphan) turn would be persisted twice.
+    let conv_service = services.conversation_service.clone();
 
     let executor = Arc::new(aionui_cron::executor::JobExecutor::new(
         services.worker_task_manager.clone(),
-        conv_repo,
+        conv_service.conversation_repo().clone(),
         Arc::new(conv_service.clone()),
         services.work_dir.clone(),
         services.data_dir.clone(),
@@ -1424,6 +1467,39 @@ mod tests {
         assert!(
             env.contains(&(AIONUI_BASE_URL_ENV.to_owned(), config.local_base_url())),
             "cron conversation runtime env should include AIONUI_BASE_URL"
+        );
+
+        services.database.close().await;
+    }
+
+    /// The cron path must share the app-level `ConversationService` (a clone,
+    /// so all `Arc` internals — including the background-watcher registry —
+    /// are shared) rather than construct its own instance. A second instance
+    /// carries its own watcher registry: `ensure_background_watcher` is
+    /// idempotent only within one instance, so a cron-triggered conversation
+    /// got a SECOND `BackgroundStreamWatcher` subscribed to the same agent
+    /// broadcast channel and every CLI-initiated (orphan) turn's text and
+    /// thinking rows were persisted twice.
+    #[tokio::test]
+    async fn build_cron_state_reuses_app_conversation_service() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = AppConfig {
+            data_dir: tmp.path().join("data"),
+            work_dir: tmp.path().join("work"),
+            ..Default::default()
+        };
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let services = AppServices::from_config(db, &config).await.unwrap();
+
+        let cron = build_cron_state(&services);
+
+        assert!(
+            Arc::ptr_eq(
+                cron.conversation_service.conversation_repo(),
+                services.conversation_service.conversation_repo(),
+            ),
+            "cron's ConversationService must be a clone of AppServices' instance, \
+             not an independently constructed one"
         );
 
         services.database.close().await;

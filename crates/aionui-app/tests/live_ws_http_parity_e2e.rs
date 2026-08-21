@@ -32,6 +32,28 @@ struct LiveApp {
     router: axum::Router,
     token: String,
     csrf: String,
+    /// Kept so a test can END this app the way a process exit would, instead of
+    /// letting the binding fall out of scope and hoping. Background tasks hold
+    /// their own Arcs into the services, so dropping `LiveApp` does NOT stop the
+    /// CLI subprocesses — the restart test proved it, by resuming while the
+    /// first app's codex was still running.
+    task_manager: std::sync::Arc<dyn aionui_ai_agent::IWorkerTaskManager>,
+}
+
+impl LiveApp {
+    /// Stop every agent this app started, and wait for the processes to go.
+    ///
+    /// The restart test needs this to mean anything: codex 0.148.0 refuses
+    /// `thread/resume` while another writer holds the thread, so resuming
+    /// against a still-live predecessor is not a restart — it is two apps
+    /// fighting over one conversation.
+    async fn shutdown(&self, conversation_ids: &[&str]) {
+        for id in conversation_ids {
+            self.task_manager
+                .kill_and_wait(id, Some(aionui_common::AgentKillReason::UserCancelTimeout))
+                .await;
+        }
+    }
 }
 
 async fn start_live_app() -> LiveApp {
@@ -75,6 +97,7 @@ async fn start_live_app_on(db: aionui_db::Database, create_user: bool) -> LiveAp
         router,
         token,
         csrf,
+        task_manager: services.worker_task_manager.clone(),
     }
 }
 
@@ -830,7 +853,7 @@ async fn run_backend_resume(backend: &str) {
     std::fs::create_dir_all(&ws_dir).unwrap();
 
     // ---- first app: tell the agent something only this conversation knows ----
-    let conv_id = {
+    let (conv_id, first_app) = {
         let app = start_live_app_on(db.clone(), true).await;
         let created = http_json(
             &app,
@@ -864,10 +887,15 @@ async fn run_backend_resume(backend: &str) {
             }
         }
         assert!(finished, "[{backend}] the first turn never finished");
-        conv_id
+        (conv_id, app)
     };
 
-    // The first app (and the CLI process it owned) is dropped here.
+    // End the first app the way a process exit would. Dropping the binding is
+    // NOT enough — background tasks hold their own Arcs into the services, so
+    // the CLI keeps running. Proven by codex 0.148.0, which refuses
+    // `thread/resume` while another writer holds the thread: the "restart" was
+    // resuming against a predecessor that had never stopped.
+    first_app.shutdown(&[&conv_id]).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // ---- second app, same database: the conversation must carry on ----
@@ -1116,7 +1144,6 @@ async fn run_direct_backend_team_mcp_and_runtime_env(backend: &str, agent_id: &s
         .chain(shell_tool_frames.iter())
         .copied()
         .collect::<Vec<_>>();
-    let mcp_tool_evidence = serde_json::to_string(&mcp_tool_frames).unwrap();
     let shell_tool_evidence = serde_json::to_string(&shell_tool_frames).unwrap();
     let tool_names = tool_frames
         .iter()
@@ -1126,10 +1153,36 @@ async fn run_direct_backend_team_mcp_and_runtime_env(backend: &str, agent_id: &s
                 .or_else(|| frame["data"]["data"]["update"]["name"].as_str())
         })
         .collect::<BTreeSet<_>>();
-    assert!(
-        mcp_tool_evidence.contains("team_members"),
-        "[{backend}] no streamed Team MCP tools/call evidence; tool names={tool_names:?}"
-    );
+    // agy is routed CliAssumed on purpose: we have no way to hand it an MCP
+    // server, because it reads `mcp_config.json` only from `~/.gemini/config/`
+    // and `plugins/<name>/`, never the per-workspace file this repo writes
+    // (measured 2026-08-19). Asserting an MCP tools/call for it would pin
+    // behaviour the product deliberately does not have.
+    //
+    // The old assertion was also weaker than it looked for the backends that DO
+    // take the MCP route: it searched every tool frame's JSON for the substring
+    // `team_members`, and this test's own prompt contains that string, so a
+    // shell command echoing the name satisfied it.
+    //
+    // The name field alone is not enough either: the two MCP backends shape it
+    // differently. claude names the frame after the tool (`team_members`);
+    // codex names every MCP call `mcpToolCall` and carries the tool name
+    // inside. Requiring one OR the other keeps a plain shell frame out — its
+    // name is the command line, which is neither.
+    let mcp_tool_frames_json = serde_json::to_string(&mcp_tool_frames).unwrap();
+    let called_team_members_over_mcp = tool_names.iter().any(|name| name.contains("team_members"))
+        || (tool_names.contains("mcpToolCall") && mcp_tool_frames_json.contains("team_members"));
+    if backend == "antigravity" {
+        assert!(
+            !called_team_members_over_mcp,
+            "[{backend}] routed CliAssumed, so no team_members MCP call should appear; tool names={tool_names:?}"
+        );
+    } else {
+        assert!(
+            called_team_members_over_mcp,
+            "[{backend}] no streamed Team MCP tools/call evidence; tool names={tool_names:?}"
+        );
+    }
     assert!(
         shell_tool_evidence.contains("AIONUI_HELPER_BIN")
             && (shell_tool_evidence.contains("AIONUI_E2E_SENTINEL") || shell_tool_evidence.contains("AIONUI_ENV_OK")),
@@ -1145,9 +1198,14 @@ async fn run_direct_backend_team_mcp_and_runtime_env(backend: &str, agent_id: &s
                 .or_else(|| frame["data"]["data"]["update"]["tool_call_id"].as_str())
         })
         .collect::<BTreeSet<_>>();
+    // Two calls are only expected where the two phases use different tools. A
+    // CliAssumed backend runs both over the shell, and the model may well do it
+    // in one command, so requiring two ids there asserts a shape the transport
+    // does not have.
+    let expected_distinct_calls = if backend == "antigravity" { 1 } else { 2 };
     assert!(
-        tool_call_ids.len() >= 2,
-        "[{backend}] expected distinct Team MCP and shell tool calls, got {tool_call_ids:?}; \
+        tool_call_ids.len() >= expected_distinct_calls,
+        "[{backend}] expected at least {expected_distinct_calls} tool call(s), got {tool_call_ids:?}; \
          tool names={tool_names:?}"
     );
     let mcp_reply = mcp_frames

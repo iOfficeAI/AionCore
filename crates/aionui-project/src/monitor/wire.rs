@@ -70,6 +70,15 @@ pub struct SubscribeParams {
     pub targets: Vec<ResourceRef>,
 }
 
+/// `fs/remount` params. Same shape as subscribe (`targets` are the pe-relative
+/// directories to force-remount), but it does not register subscriptions — it
+/// re-arms the watch + re-reads the baseline of directories already being
+/// watched, for recovery from a stale backend mount.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemountParams {
+    pub targets: Vec<ResourceRef>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnsubscribeParams {
     pub targets: Vec<ResourceRef>,
@@ -78,6 +87,11 @@ pub struct UnsubscribeParams {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MkdirParams {
     pub dir: ResourceRef,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateFileParams {
+    pub file: ResourceRef,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,6 +105,17 @@ pub struct RemoveParams {
 pub struct RenameParams {
     pub from: ResourceRef,
     pub to: ResourceRef,
+}
+
+/// `fs/copy` and `fs/move` params. Unlike rename, `to_dir` names the *target
+/// directory* (not the full destination path): the source basename is preserved
+/// and auto-renamed to a non-colliding sibling (`name copy`, `name copy 2`, …)
+/// when it already exists there. One shape serves both methods — a move is a
+/// copy whose source is removed after it lands.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransferParams {
+    pub from: ResourceRef,
+    pub to_dir: ResourceRef,
 }
 
 // ── Filename search (fs/search) ───────────────────────────────────────────
@@ -336,6 +361,27 @@ pub fn fs_error_to_rpc(err: &FsError) -> (i64, &'static str) {
         | FsError::PermissionDenied { .. }
         | FsError::NotADirectory { .. }
         | FsError::Io { .. } => (CODE_PROVIDER_UNAVAILABLE, "provider_unavailable"),
+    }
+}
+
+/// The underlying provider failure detail behind an [`FsError`], for logs only.
+///
+/// [`fs_error_to_rpc`] deliberately collapses several variants onto one stable
+/// protocol name (`provider_unavailable`), which drops the real cause — notably
+/// the `notify` message behind [`FsError::Io`] (e.g. an exhausted inotify watch
+/// limit). Logging this next to the protocol code keeps the wire contract
+/// unchanged while making the failure diagnosable. The absolute `uri` is
+/// intentionally left out: callers log the pe-relative identity instead.
+pub fn fs_error_detail(err: &FsError) -> &str {
+    match err {
+        FsError::Io { message, .. } => message,
+        FsError::UnsupportedScheme { scheme } => scheme,
+        // The remaining variants carry nothing beyond their protocol code and
+        // the uri, so the static text is the whole detail.
+        FsError::NotFound { .. } => "resource not found",
+        FsError::AlreadyExists { .. } => "resource already exists",
+        FsError::PermissionDenied { .. } => "permission denied",
+        FsError::NotADirectory { .. } => "not a directory",
     }
 }
 

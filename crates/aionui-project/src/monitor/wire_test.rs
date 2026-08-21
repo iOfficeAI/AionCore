@@ -65,6 +65,14 @@ fn remove_params_recursive_defaults_false() {
     assert!(!p.recursive);
 }
 
+#[test]
+fn create_file_params_parse_file_ref() {
+    let p: CreateFileParams =
+        serde_json::from_value(json!({"file":{"pe_id":"pe1","relative_path":"src/new.ts"}})).unwrap();
+    assert_eq!(p.file.pe_id, "pe1");
+    assert_eq!(p.file.relative_path, "src/new.ts");
+}
+
 // ── entry / kind ──────────────────────────────────────────────────────────
 
 #[test]
@@ -310,5 +318,35 @@ fn fs_error_maps_to_protocol_codes() {
             message: "boom".into(),
         }),
         (CODE_PROVIDER_UNAVAILABLE, "provider_unavailable")
+    );
+}
+
+#[test]
+fn fs_error_detail_surfaces_the_cause_the_protocol_code_hides() {
+    // `Io` is the variant the protocol code flattens to `provider_unavailable`:
+    // the real cause (e.g. an exhausted inotify watch limit) only survives here.
+    assert_eq!(
+        fs_error_detail(&FsError::Io {
+            uri: "file:///x".into(),
+            message: "No space left on device (os error 28)".into(),
+        }),
+        "No space left on device (os error 28)"
+    );
+    assert_eq!(
+        fs_error_detail(&FsError::NotADirectory {
+            uri: "file:///x".into()
+        }),
+        "not a directory"
+    );
+    assert_eq!(
+        fs_error_detail(&FsError::UnsupportedScheme { scheme: "ssh".into() }),
+        "ssh"
+    );
+    // The absolute uri is deliberately not part of the detail.
+    assert!(
+        !fs_error_detail(&FsError::NotFound {
+            uri: "file:///secret/path".into()
+        })
+        .contains("secret")
     );
 }

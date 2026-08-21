@@ -566,6 +566,7 @@ mod tests {
             args: serde_json::Value::Null,
             status: ToolCallStatus::Running,
             description: None,
+            parent_call_id: None,
             input: None,
             output: None,
         });

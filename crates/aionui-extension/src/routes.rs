@@ -51,6 +51,15 @@ impl From<ExtensionError> for ApiError {
             ExtensionError::BuiltinSkillDeletion(name) => {
                 ApiError::BadRequest(format!("Cannot delete built-in skill: {name}"))
             }
+            // Transient: a peer process owns the materialize lock. The lock
+            // path stays out of the response body — it is already logged and
+            // reported on the startup boundary line.
+            ExtensionError::BuiltinSkillsLockTimeout { .. } => ApiError::coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BUILTIN_SKILLS_LOCK_TIMEOUT",
+                "Builtin skills are being updated by another process. Try again shortly.",
+                None,
+            ),
             ExtensionError::SkillNotFound(name) => ApiError::NotFound(format!("Skill not found: {name}")),
             ExtensionError::InvalidSkillPath(path) => ApiError::BadRequest(format!("Invalid skill path: {path}")),
             ExtensionError::SkillInvalidFrontmatter(_) => ApiError::coded(

@@ -222,6 +222,80 @@ async fn subscribe_parent_escape_is_invalid_relative_path() {
     assert_eq!(reply["error"]["message"], "invalid_relative_path");
 }
 
+/// A target that resolves (phase 1) but cannot mount (phase 2) must not take the
+/// whole batch down. Mount = arm watch + read the baseline listing, so it can
+/// fail per-target for reasons that say nothing about the siblings — on a large
+/// tree, an exhausted OS watch-descriptor limit (AIONUI-236). A regular file
+/// stands in for that here: it passes lexical resolution, then fails the mount.
+#[tokio::test]
+async fn subscribe_keeps_mounted_targets_when_one_target_fails() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src").join("main.ts"), b"x").unwrap();
+    // Resolves fine, but is not a directory → mount fails for this target only.
+    std::fs::write(dir.path().join("notadir"), b"x").unwrap();
+
+    // Failing target first, so a leading failure cannot short-circuit the batch.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                4,
+                "fs/subscribe",
+                json!({"targets":[dir_ref(&pe, "notadir"), dir_ref(&pe, ""), dir_ref(&pe, "src")]}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert!(
+        reply.get("error").is_none(),
+        "a partially mountable batch must not fail the request: {reply}"
+    );
+    let snaps = reply["result"]["snapshots"].as_array().unwrap();
+    assert_eq!(snaps.len(), 2, "both mountable targets keep their snapshot: {reply}");
+    assert_eq!(snaps[0]["target"], dir_ref(&pe, ""));
+    assert_eq!(snaps[1]["target"], dir_ref(&pe, "src"));
+    let src_names: Vec<&str> = snaps[1]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(src_names, vec!["main.ts"]);
+}
+
+/// The degrade is only for partial success: when nothing mounts, the request
+/// still fails with the first target's error rather than replying with a
+/// silently empty snapshot list.
+#[tokio::test]
+async fn subscribe_all_targets_failing_to_mount_still_errors() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+    std::fs::write(dir.path().join("b.txt"), b"x").unwrap();
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                5,
+                "fs/subscribe",
+                json!({"targets":[dir_ref(&pe, "a.txt"), dir_ref(&pe, "b.txt")]}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert!(reply.get("result").is_none(), "no snapshots mounted: {reply}");
+    assert_eq!(reply["error"]["code"], -32006);
+    assert_eq!(reply["error"]["message"], "provider_unavailable");
+    // The first failure identifies the batch, as it did before the degrade.
+    assert_eq!(reply["error"]["data"]["pe_id"], pe);
+    assert_eq!(reply["error"]["data"]["relative_path"], "a.txt");
+}
+
 #[tokio::test]
 async fn mkdir_then_remove_roundtrip() {
     let (mut actor, _rx, push, pe, dir, _db) = setup().await;
@@ -246,6 +320,23 @@ async fn mkdir_then_remove_roundtrip() {
 }
 
 #[tokio::test]
+async fn create_file_makes_empty_file() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(10, "fs/createFile", json!({"file":dir_ref(&pe, "new.ts")})),
+        )
+        .await;
+    assert!(push.last_for("1").unwrap()["result"].is_object());
+    let path = dir.path().join("new.ts");
+    assert!(path.is_file());
+    // create_new opens without truncating existing content, but a fresh file is empty.
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn rename_moves_entry() {
     let (mut actor, _rx, push, pe, dir, _db) = setup().await;
     std::fs::write(dir.path().join("old.txt"), b"x").unwrap();
@@ -263,6 +354,241 @@ async fn rename_moves_entry() {
     assert!(push.last_for("1").unwrap()["result"].is_object());
     assert!(!dir.path().join("old.txt").exists());
     assert!(dir.path().join("renamed.txt").exists());
+}
+
+// ══ fs/copy · fs/move (drag-transfer) ════════════════════════════════════════
+
+#[tokio::test]
+async fn copy_file_into_subdir_keeps_source() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                40,
+                "fs/copy",
+                json!({"from":dir_ref(&pe, "a.txt"),"to_dir":dir_ref(&pe, "sub")}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["result"]["name"], "a.txt");
+    assert_eq!(reply["result"]["to"]["relative_path"], "sub/a.txt");
+    assert!(dir.path().join("sub").join("a.txt").is_file());
+    // Copy keeps the source.
+    assert!(dir.path().join("a.txt").is_file());
+}
+
+#[tokio::test]
+async fn copy_into_same_dir_auto_renames() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+
+    // Copy a.txt into the dir it already lives in → deliberate duplicate,
+    // auto-renamed with the extension preserved.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                41,
+                "fs/copy",
+                json!({"from":dir_ref(&pe, "a.txt"),"to_dir":dir_ref(&pe, "")}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["result"]["name"], "a copy.txt");
+    assert_eq!(reply["result"]["to"]["relative_path"], "a copy.txt");
+    assert!(dir.path().join("a.txt").is_file());
+    assert!(dir.path().join("a copy.txt").is_file());
+}
+
+#[tokio::test]
+async fn copy_directory_is_recursive() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src").join("child.txt"), b"x").unwrap();
+    std::fs::create_dir(dir.path().join("dest")).unwrap();
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                42,
+                "fs/copy",
+                json!({"from":dir_ref(&pe, "src"),"to_dir":dir_ref(&pe, "dest")}),
+            ),
+        )
+        .await;
+
+    assert!(push.last_for("1").unwrap()["result"].is_object());
+    assert!(dir.path().join("dest").join("src").join("child.txt").is_file());
+    // Source tree untouched.
+    assert!(dir.path().join("src").join("child.txt").is_file());
+}
+
+#[tokio::test]
+async fn move_file_into_subdir_removes_source() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                43,
+                "fs/move",
+                json!({"from":dir_ref(&pe, "a.txt"),"to_dir":dir_ref(&pe, "sub")}),
+            ),
+        )
+        .await;
+
+    assert!(push.last_for("1").unwrap()["result"].is_object());
+    assert!(dir.path().join("sub").join("a.txt").is_file());
+    // Move removes the source.
+    assert!(!dir.path().join("a.txt").exists());
+}
+
+#[tokio::test]
+async fn move_into_own_parent_is_noop() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+
+    // Moving into the directory it already sits in must not manufacture a copy.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                44,
+                "fs/move",
+                json!({"from":dir_ref(&pe, "a.txt"),"to_dir":dir_ref(&pe, "")}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["result"]["name"], "a.txt");
+    assert!(dir.path().join("a.txt").is_file());
+    assert!(!dir.path().join("a copy.txt").exists());
+}
+
+#[tokio::test]
+async fn copy_directory_into_own_descendant_is_rejected() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::create_dir(dir.path().join("a")).unwrap();
+    std::fs::create_dir(dir.path().join("a").join("b")).unwrap();
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                45,
+                "fs/copy",
+                json!({"from":dir_ref(&pe, "a"),"to_dir":dir_ref(&pe, "a/b")}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["error"]["code"], -32602);
+    assert_eq!(reply["error"]["message"], "invalid_params");
+}
+
+#[tokio::test]
+async fn transfer_missing_source_is_resource_not_found() {
+    let (mut actor, _rx, push, pe, _dir, _db) = setup().await;
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                46,
+                "fs/copy",
+                json!({"from":dir_ref(&pe, "ghost.txt"),"to_dir":dir_ref(&pe, "")}),
+            ),
+        )
+        .await;
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["error"]["code"], -32002);
+    assert_eq!(reply["error"]["message"], "resource_not_found");
+}
+
+#[tokio::test]
+async fn transfer_root_source_is_invalid_params() {
+    let (mut actor, _rx, push, pe, _dir, _db) = setup().await;
+    // The workspace root cannot itself be a transfer source.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                47,
+                "fs/copy",
+                json!({"from":dir_ref(&pe, ""),"to_dir":dir_ref(&pe, "")}),
+            ),
+        )
+        .await;
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn copy_across_project_explorers() {
+    // Two independently-bound roots on one service → cross-pe copy resolves each
+    // reference against its own root.
+    let db = init_database_memory().await.unwrap();
+    let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
+    let service = Arc::new(ProjectService::new(Arc::clone(&store), std::env::temp_dir()));
+
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let pe_a = service
+        .create_standard("system_default_user", to_file_uri(dir_a.path()).unwrap())
+        .await
+        .unwrap()
+        .project_explorer
+        .pe_id;
+    let pe_b = service
+        .create_standard("system_default_user", to_file_uri(dir_b.path()).unwrap())
+        .await
+        .unwrap()
+        .project_explorer
+        .pe_id;
+    std::fs::write(dir_a.path().join("x.txt"), b"cross").unwrap();
+
+    let push = RecordingPush::default();
+    let (mut actor, _rx) = FsMonitorActor::new(service, Arc::new(push.clone()), 4096).unwrap();
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                48,
+                "fs/copy",
+                json!({"from":dir_ref(&pe_a, "x.txt"),"to_dir":dir_ref(&pe_b, "")}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["result"]["name"], "x.txt");
+    assert_eq!(reply["result"]["to"]["pe_id"], pe_b);
+    assert!(dir_b.path().join("x.txt").is_file());
+    // Source root untouched.
+    assert!(dir_a.path().join("x.txt").is_file());
 }
 
 #[tokio::test]
@@ -283,6 +609,27 @@ async fn mkdir_existing_dir_is_provider_unavailable() {
     assert_eq!(reply["error"]["code"], -32006);
     assert_eq!(reply["error"]["message"], "provider_unavailable");
     assert_eq!(reply["error"]["data"]["relative_path"], "sub");
+}
+
+#[tokio::test]
+async fn create_file_existing_is_provider_unavailable() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("keep.txt"), b"original").unwrap();
+
+    // createFile over an existing file → AlreadyExists → provider_unavailable
+    // (-32006), and it must NOT truncate the existing content.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(30, "fs/createFile", json!({"file":dir_ref(&pe, "keep.txt")})),
+        )
+        .await;
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["error"]["code"], -32006);
+    assert_eq!(reply["error"]["message"], "provider_unavailable");
+    assert_eq!(reply["error"]["data"]["relative_path"], "keep.txt");
+    assert_eq!(std::fs::read(dir.path().join("keep.txt")).unwrap(), b"original");
 }
 
 #[tokio::test]
@@ -1010,4 +1357,119 @@ async fn completion_signals_done_actor_clears_and_later_cancel_is_noop() {
         !actor.cancel_search("1", &json!(5)),
         "a completed search must not be treated as in-flight by fs/searchCancel"
     );
+}
+
+// ══ remount (force-refresh a stale backend mount) ════════════════════════════
+
+/// Entry names on a wire snapshot object (`{ target, entries }`).
+fn entry_names(snapshot: &Value) -> Vec<String> {
+    snapshot["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The behavioral contract that motivates the feature: a re-subscribe of a
+/// still-live root serves the cached listing (so a change the watcher never
+/// delivered stays invisible), whereas `fs/remount` tears the node down and
+/// re-reads the baseline from disk.
+#[tokio::test]
+async fn remount_rereads_baseline_where_resubscribe_serves_stale_cache() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+
+    // Subscribe → mounts, baseline = [a.txt].
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
+        )
+        .await;
+
+    // Change the directory without letting the watcher event reach the shard
+    // (raw_rx is never drained in these dispatch-level tests) → the backend's
+    // cached listing now lags the disk, the "mount went stale" the refresh fixes.
+    std::fs::write(dir.path().join("b.txt"), b"y").unwrap();
+
+    // A re-subscribe (AlreadyLive) serves the stale cached listing → no b.txt.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(2, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
+        )
+        .await;
+    let resub = push.last_for("1").unwrap();
+    assert_eq!(
+        entry_names(&resub["result"]["snapshots"][0]),
+        vec!["a.txt"],
+        "re-subscribe serves the stale cached listing: {resub}"
+    );
+
+    // Remount re-reads the baseline → b.txt now present in a normal snapshot.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(3, "fs/remount", json!({"targets":[dir_ref(&pe, "")]})),
+        )
+        .await;
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["id"], 3);
+    let snaps = reply["result"]["snapshots"].as_array().unwrap();
+    assert_eq!(snaps.len(), 1);
+    assert_eq!(snaps[0]["target"], dir_ref(&pe, ""));
+    let mut names = entry_names(&snaps[0]);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["a.txt", "b.txt"],
+        "remount re-read the baseline from disk: {reply}"
+    );
+    // canonical / absolute path must never leak on the wire.
+    assert!(reply.to_string().find("file://").is_none(), "no canonical uri: {reply}");
+}
+
+/// A remount of a root that is not currently watched (never subscribed, or a
+/// collapsed root) is a no-op: an empty—but successful—snapshot batch, never an
+/// error, and it must not mount the cold canonical.
+#[tokio::test]
+async fn remount_unwatched_root_returns_empty_success() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+
+    // No prior subscribe → the root is cold.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(1, "fs/remount", json!({"targets":[dir_ref(&pe, "")]})),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert!(reply.get("error").is_none(), "a no-op remount is not an error: {reply}");
+    let snaps = reply["result"]["snapshots"].as_array().unwrap();
+    assert!(snaps.is_empty(), "an unwatched target contributes no snapshot: {reply}");
+}
+
+/// Phase 1 resolves atomically (like subscribe): an unresolvable pe fails the
+/// whole request rather than silently dropping the target.
+#[tokio::test]
+async fn remount_unknown_pe_is_out_of_scope() {
+    let (mut actor, _rx, push, _pe, _dir, _db) = setup().await;
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(2, "fs/remount", json!({"targets":[dir_ref("pe-nope", "")]})),
+        )
+        .await;
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["error"]["code"], -32000);
+    assert_eq!(reply["error"]["message"], "out_of_scope");
+    assert_eq!(reply["error"]["data"]["pe_id"], "pe-nope");
 }

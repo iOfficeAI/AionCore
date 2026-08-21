@@ -127,17 +127,20 @@ impl BackgroundStreamWatcher {
                 // Instance torn down (conversation deleted / process replaced).
                 Err(broadcast::error::RecvError::Closed) => break,
             };
-            // Agent session titles are consumed HERE, unconditionally — the
-            // watcher is the SINGLE consumer for both backend families, and the
+            // Agent session titles are consumed HERE unconditionally — the
             // active-turn gate below must NOT apply:
             // - claude: the generate_session_title reply lands seconds AFTER the
             //   first turn's Finish (live 2026-08-04: TurnResult 07:21:33 →
             //   title frame 07:21:36) — the per-turn relay is already gone.
             // - ACP agents (pi/omp, live 2026-08-04): session_info_update fires
             //   at session-open (no turn yet) and ~1ms BEFORE the turn's Finish
-            //   — racing the relay's exit. Only a gate-free persistent consumer
-            //   catches both. apply_agent_title is guarded (name_source) and
-            //   idempotent (same-title no-op), so timing is never harmful.
+            //   — racing the relay's exit.
+            // The StreamRelay ALSO applies titles (live 2026-08-19, conv
+            // a7f2838a: a reply landing 0.6s into an orphan turn — while this
+            // watcher's receiver was lent to `run_orphan_turn` — was otherwise
+            // lost with the latch already completed). apply_agent_title is
+            // guarded (name_source) and idempotent (same-title no-op), so the
+            // watcher/relay overlap is never harmful.
             if let AgentStreamEvent::AcpSessionInfo(payload) = &ev {
                 if let Some(title) = payload
                     .get("title")
@@ -151,6 +154,7 @@ impl BackgroundStreamWatcher {
                         &self.user_id,
                         &self.conversation_id,
                         title,
+                        "watcher",
                     )
                     .await
                     {
@@ -619,6 +623,7 @@ mod tests {
                 input: None,
                 output: None,
                 description: Some("sleep 30 · bg task b1 · 00:01".into()),
+                parent_call_id: None,
             },
             agents: vec![],
             settle_only: false,
@@ -635,6 +640,7 @@ mod tests {
                 input: None,
                 output: None,
                 description: Some("sleep 30 · bg task b1 · 00:30".into()),
+                parent_call_id: None,
             },
             agents: vec![ToolGroupEntry {
                 call_id: "toolu_bg:1".into(),
@@ -753,6 +759,7 @@ mod tests {
                     input: None,
                     output: None,
                     description: None,
+                    parent_call_id: None,
                 },
                 agents: vec![],
                 settle_only: true,
@@ -769,6 +776,7 @@ mod tests {
                     input: None,
                     output: None,
                     description: None,
+                    parent_call_id: None,
                 },
                 agents: vec![],
                 settle_only: true,
@@ -1150,6 +1158,47 @@ mod tests {
             }
         }
         assert!(saw_name_updated, "nameUpdated must be broadcast");
+    }
+
+    /// Live 2026-08-19 (conv a7f2838a): the title reply landed 0.6s AFTER the
+    /// watcher had lent its receiver to a CLI-initiated orphan turn
+    /// (`run_orphan_turn`), so the watcher's own gate-free title arm never saw
+    /// the frame — the nested relay was the only consumer, dropped it, and the
+    /// one-shot claude latch was already completed (no retry). A title frame
+    /// arriving MID-orphan-turn must still rename the conversation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn title_arriving_mid_orphan_turn_still_renames() {
+        let rig = rig().await;
+        // Orphan-turn content first: the watcher claims the turn and hands its
+        // receiver to the nested relay before the title frame arrives.
+        rig.tx
+            .send(AgentStreamEvent::Text(TextEventData {
+                content: "background continuation".into(),
+            }))
+            .unwrap();
+        rig.tx
+            .send(AgentStreamEvent::AcpSessionInfo(serde_json::json!({
+                "title": "Fix login bug"
+            })))
+            .unwrap();
+        rig.tx
+            .send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let row = rig.repo.get(&rig.user_id, "conv-1").await.unwrap().unwrap();
+            if row.name == "Fix login bug" {
+                assert_eq!(row.name_source.as_deref(), Some("agent"));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a title arriving mid-orphan-turn must still be applied, name still {:?}",
+                row.name
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     /// A config-options snapshot arriving BETWEEN turns must still reach the frontend.

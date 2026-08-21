@@ -35,6 +35,10 @@ const MANAGED_NODE_ACTIVATION_COPY_BACKOFFS: [Duration; 3] = [
     Duration::from_millis(500),
     Duration::from_millis(1000),
 ];
+// Cap on directory entry names sampled into the missing-executable diagnostic log.
+// A healthy managed Node bin/ holds only a handful of entries, so 20 is enough to show
+// whether the copy landed at all while keeping an unexpected directory out of the log.
+const MISSING_EXECUTABLE_SAMPLE_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, Copy)]
 struct PlatformSpec {
@@ -301,6 +305,19 @@ fn runtime_from_root_for_layout(
 
     let node_path = managed_node_path_for_layout(root, layout);
     if !node_path.is_file() {
+        // AIONUI-62: "executable missing" alone cannot distinguish a copy source that
+        // never contained the Node binary from a binary removed right after a clean copy
+        // (e.g. by antivirus). Snapshot what IS on disk. Log-only: the returned error is
+        // unchanged, because `classify_error` matches on the stringified message.
+        let parent = node_path.parent().unwrap_or(root);
+        let listing = directory_listing_sample(parent, MISSING_EXECUTABLE_SAMPLE_LIMIT);
+        warn!(
+            node_path = %node_path.display(),
+            parent_dir = %parent.display(),
+            entry_count = ?listing.entry_count,
+            entries = %listing.sample,
+            "managed node executable missing; runtime directory snapshot"
+        );
         return Err(NodeRuntimeError::managed_invalid(format!(
             "managed node executable missing: {}",
             node_path.display()
@@ -321,6 +338,44 @@ fn runtime_from_root_for_layout(
         npx_args_prefix,
         env: managed_env(root)?,
     })
+}
+
+/// Bounded snapshot of a directory's contents, used only for diagnostics.
+struct DirectoryListingSample {
+    /// `None` when the directory could not be listed at all.
+    entry_count: Option<usize>,
+    /// Human-readable, bounded entry-name sample (or a marker when unreadable).
+    sample: String,
+}
+
+/// List `dir` for diagnostics: cheap and infallible by construction — a directory that
+/// cannot be read reports itself as unreadable instead of failing the caller. Names are
+/// sorted for stable, comparable log lines and capped at `limit`.
+fn directory_listing_sample(dir: &Path, limit: usize) -> DirectoryListingSample {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return DirectoryListingSample {
+            entry_count: None,
+            sample: "<unreadable>".to_owned(),
+        };
+    };
+
+    let mut names = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+
+    let total = names.len();
+    let sample = if total > limit {
+        format!("{}, ...({} more)", names[..limit].join(", "), total - limit)
+    } else {
+        names.join(", ")
+    };
+
+    DirectoryListingSample {
+        entry_count: Some(total),
+        sample,
+    }
 }
 
 fn resolve_managed_entrypoint(
