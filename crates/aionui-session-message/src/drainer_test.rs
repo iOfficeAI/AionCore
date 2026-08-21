@@ -226,6 +226,43 @@ async fn a_disabled_user_is_not_drained_and_the_queue_is_cleared() {
     );
 }
 
+/// The toggle is per user (`system_settings.user_id` is its PK), so one user
+/// switching it off must not touch anyone else's pending deliveries. This is
+/// exactly why the queue has no `clear_all`: a wipe keyed to a per-user decision
+/// would have the wrong blast radius.
+#[tokio::test]
+async fn disabling_one_user_leaves_another_users_backlog_alone() {
+    struct OnlyUserTwoEnabled;
+
+    #[async_trait]
+    impl DrainGate for OnlyUserTwoEnabled {
+        async fn is_enabled_for(&self, user_id: &str) -> bool {
+            user_id == "user_2"
+        }
+    }
+
+    let sink = Arc::new(RecordingSink::default());
+    let (drainer, queue, _clock) = harness(sink.clone(), Arc::new(OnlyUserTwoEnabled));
+    queue.push(delivery("b", "from the disabled user")).unwrap();
+    let mut other = delivery("c", "from the enabled user");
+    other.user_id = "user_2".to_owned();
+    queue.push(other).unwrap();
+
+    drainer.tick_once().await;
+
+    assert_eq!(
+        sink.delivered.lock().unwrap().clone(),
+        vec!["from the enabled user"],
+        "the enabled user's message still goes out"
+    );
+    assert_eq!(queue.len_for("b"), 0, "the disabled user's backlog is cleared");
+    assert_eq!(
+        queue.total_len(),
+        0,
+        "and the delivered one left the queue normally, not by being wiped"
+    );
+}
+
 #[tokio::test]
 async fn an_empty_tick_is_harmless() {
     let sink = Arc::new(RecordingSink::default());

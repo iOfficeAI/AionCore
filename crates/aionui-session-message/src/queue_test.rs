@@ -126,15 +126,6 @@ fn clear_for_an_unknown_target_is_a_no_op() {
 }
 
 #[test]
-fn clear_all_empties_every_target_and_reports_the_total() {
-    let (q, _clock) = queue();
-    q.push(delivery("b", "1", 99_999)).unwrap();
-    q.push(delivery("c", "2", 99_999)).unwrap();
-    assert_eq!(q.clear_all(), 2);
-    assert!(q.is_empty());
-}
-
-#[test]
 fn a_target_that_drains_completely_frees_its_slot_for_the_global_budget() {
     let (q, _clock) = queue();
     q.push(delivery("b", "1", 99_999)).unwrap();

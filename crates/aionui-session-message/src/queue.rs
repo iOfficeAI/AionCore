@@ -178,15 +178,13 @@ impl DeliveryQueue {
         removed
     }
 
-    /// Drop everything. Used when the global toggle is switched off, so
-    /// re-enabling does not suddenly flush a batch of stale messages.
-    pub fn clear_all(&self) -> usize {
-        let mut state = self.lock();
-        let removed = state.total;
-        state.by_target.clear();
-        state.total = 0;
-        removed
-    }
+    // No `clear_all`: the "cross-session messaging" toggle lives on
+    // `system_settings`, whose primary key is `user_id`, so switching it off is
+    // ONE user's decision. A queue-wide wipe would take everyone else's pending
+    // deliveries with it. The drainer instead consults the gate per item and
+    // calls `clear_for` on that user's target (`drainer.rs`), which reaches the
+    // same outcome the spec asks for — re-enabling never flushes stale messages
+    // — with the right blast radius.
 
     pub fn is_empty(&self) -> bool {
         self.lock().total == 0
