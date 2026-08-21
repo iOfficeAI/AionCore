@@ -12,7 +12,7 @@ use aionui_assistant::{
 };
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
-use aionui_conversation::ConversationRouterState;
+use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
@@ -34,9 +34,10 @@ use aionui_mcp::{
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
 };
 use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
-use aionui_project::ProjectRouterState;
+use aionui_project::{ProjectRouterState, ProjectService};
 use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
 use aionui_shell::ShellRouterState;
+use aionui_sidebar::{SidebarRouterState, SidebarService};
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
     ProtocolDetectionService, ProviderService, RuntimePrepareService, SettingsService, SystemRouterState,
@@ -130,6 +131,7 @@ pub struct ModuleStates {
     pub connection_test: ConnectionTestRouterState,
     pub file: FileRouterState,
     pub project: ProjectRouterState,
+    pub sidebar: SidebarRouterState,
     pub mcp: McpRouterState,
     pub extension: ExtensionRouterState,
     pub hub: HubRouterState,
@@ -305,6 +307,7 @@ pub async fn build_module_states(
         connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
         project: build_module_state_phase(&boot, "project", || build_project_state(services)),
+        sidebar: build_module_state_phase(&boot, "sidebar", || build_sidebar_state(services)),
         mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
         extension: ext_state,
         hub: hub_state,
@@ -327,6 +330,17 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module state build completed"
     );
+    // Late-inject the sidebar's remove-project ports: the team service is built
+    // after the sidebar state above, so the wiring cannot happen inside
+    // `build_sidebar_state`. `set_remove_project_ports` is set-once.
+    states
+        .sidebar
+        .service
+        .set_remove_project_ports(Arc::new(RemoveProjectAdapter {
+            conversation: services.conversation_service.clone(),
+            team: states.team.service.clone(),
+            project: services.project_service.clone(),
+        }));
     states
         .conversation
         .service
@@ -497,6 +511,58 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
 pub fn build_project_state(services: &AppServices) -> ProjectRouterState {
     ProjectRouterState {
         project: Arc::new(services.project_service.clone()),
+    }
+}
+
+/// Build the sidebar read/ordering router state from application services.
+/// The sidebar store and ordering store share the app-wide pool; `work_dir` is
+/// the conversation temp-workspace root used for path classification (must match
+/// `ProjectService`'s temp root).
+pub fn build_sidebar_state(services: &AppServices) -> SidebarRouterState {
+    let sidebar_store: Arc<dyn aionui_db::ISidebarStore> =
+        Arc::new(aionui_db::SqliteSidebarStore::new(services.database.pool().clone()));
+    let service = SidebarService::new(
+        sidebar_store,
+        services.user_order_store.clone(),
+        services.work_dir.join("conversations"),
+    );
+    SidebarRouterState {
+        service: Arc::new(service),
+    }
+}
+
+/// Adapts the concrete conversation / team / project services to the sidebar's
+/// [`aionui_sidebar::RemoveProjectPorts`] trait so `remove_project` (BR-19) can
+/// reuse the existing per-unit delete paths (`ConversationService::delete`,
+/// `TeamSessionService::remove_team`, `ProjectService::delete_project`) without
+/// the sidebar crate depending on any of them.
+struct RemoveProjectAdapter {
+    conversation: ConversationService,
+    team: Arc<TeamSessionService>,
+    project: ProjectService,
+}
+
+#[async_trait::async_trait]
+impl aionui_sidebar::RemoveProjectPorts for RemoveProjectAdapter {
+    async fn delete_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), String> {
+        self.conversation
+            .delete(user_id, conversation_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), String> {
+        self.team
+            .remove_team(user_id, team_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn delete_project_record(&self, user_id: &str, project_id: &str) -> Result<(), String> {
+        self.project
+            .delete_project(user_id, project_id)
+            .await
+            .map_err(|err| err.to_string())
     }
 }
 
@@ -835,6 +901,8 @@ pub fn build_team_state(
     );
     spawn_assistant_mcp_binding_watcher(services.event_bus.subscribe(), Arc::clone(&service));
     service.with_project_service(Arc::new(services.project_service.clone()));
+    // Path-2 cascade: removing a team drops its `user_order` row (sidebar §4.3).
+    service.with_user_order_store(services.user_order_store.clone());
     TeamRouterState {
         service,
         active_leases: services.active_lease_registry.clone(),

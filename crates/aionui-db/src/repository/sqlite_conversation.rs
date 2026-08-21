@@ -435,6 +435,9 @@ impl IConversationRepository for SqliteConversationRepository {
         let fetch_limit = limit + 1;
 
         let mut where_parts = vec!["c.user_id = ?".to_string()];
+        // The active conversation feed never shows archived rows; those live only
+        // in the sidebar archive read model (`sqlite_sidebar`, `archived_at IS NOT NULL`).
+        where_parts.push("c.archived_at IS NULL".to_string());
         let mut binds: Vec<BindValue> = vec![BindValue::Str(user_id.to_string())];
 
         // Cursor-based pagination: use updated_at of the cursor row
@@ -1450,6 +1453,8 @@ fn append_filter_conditions(filters: &ConversationFilters, where_parts: &mut Vec
 /// Builds a count query and bind values for the total (ignoring cursor).
 fn build_count_sql(user_id: &str, filters: &ConversationFilters) -> (String, Vec<BindValue>) {
     let mut where_parts = vec!["c.user_id = ?".to_string()];
+    // Keep the total in step with `list_paginated`: exclude archived rows.
+    where_parts.push("c.archived_at IS NULL".to_string());
     let mut binds: Vec<BindValue> = vec![BindValue::Str(user_id.to_string())];
 
     append_filter_conditions(filters, &mut where_parts, &mut binds);
@@ -1800,6 +1805,41 @@ mod tests {
         assert_eq!(result.items[0].name, "Third");
         assert_eq!(result.items[1].name, "Second");
         assert_eq!(result.items[2].name, "First");
+    }
+
+    #[tokio::test]
+    async fn list_paginated_excludes_archived() {
+        let (repo, db) = setup().await;
+
+        let mut active = sample_conversation(SYSTEM_USER_ID);
+        active.name = "Active".to_string();
+        repo.create(&active).await.unwrap();
+
+        let mut archived = sample_conversation(SYSTEM_USER_ID);
+        archived.name = "Archived".to_string();
+        repo.create(&archived).await.unwrap();
+        sqlx::query("UPDATE conversations SET archived_at = ? WHERE id = ?")
+            .bind(1_700_000_000_000_i64)
+            .bind(&archived.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let result = repo
+            .list_paginated(
+                SYSTEM_USER_ID,
+                &ConversationFilters {
+                    limit: 20,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The archived row is excluded from both the page and the total.
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.items[0].name, "Active");
     }
 
     #[tokio::test]
