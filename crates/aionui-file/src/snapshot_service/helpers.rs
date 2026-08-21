@@ -225,7 +225,7 @@ pub(super) fn parse_statuses(repo: &Repository, workspace: &Path) -> Result<Comp
             Ok(p) => p.to_string(),
             Err(_) => continue,
         };
-        let full_path = format!("{}/{}", ws_str.trim_end_matches('/'), &rel_path);
+        let full_path = format!("{}/{}", ws_str.trim_end_matches('/'), rel_path);
 
         if let Some(op) = index_operation(status) {
             staged.push(FileChangeInfo {
