@@ -13,5 +13,9 @@ pub struct SystemSettings {
     pub cron_notification_enabled: bool,
     pub command_queue_enabled: bool,
     pub save_upload_to_workspace: bool,
+    /// Cross-session messaging master switch. `NOT NULL DEFAULT 1` (migration
+    /// 040), so "default on" is expressed by the schema rather than re-derived
+    /// at every read site.
+    pub cross_session_message_enabled: bool,
     pub updated_at: TimestampMs,
 }

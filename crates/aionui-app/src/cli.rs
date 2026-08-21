@@ -115,6 +115,9 @@ pub(crate) enum Command {
     Diagnose(DiagnoseArgs),
     /// Agent-facing Team collaboration CLI fallback.
     Team(TeamArgs),
+    /// Cross-session messaging: list deliverable conversations and deliver a
+    /// message to one of them.
+    Session(SessionArgs),
     /// PreToolUse permission gate for the Antigravity CLI (spawned by agy).
     /// Reads the tool request on stdin, asks the running WorkMate backend, and
     /// writes agy's decision to stdout.
@@ -154,6 +157,7 @@ impl Command {
             Self::Config(_) => "config",
             Self::Diagnose(_) => "diagnose",
             Self::Team(_) => "team",
+            Self::Session(_) => "session",
             Self::AntigravityHook => "antigravity-hook",
             Self::McpBridge => "mcp-bridge",
             Self::McpTeamStdio => "mcp-team-stdio",
@@ -216,6 +220,21 @@ pub(crate) enum TeamTaskCommand {
     Create,
     Update,
     List,
+    #[command(external_subcommand)]
+    Unknown(Vec<OsString>),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SessionArgs {
+    #[command(subcommand)]
+    pub command: SessionCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum SessionCommand {
+    Capabilities,
+    List,
+    SendMessage,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
 }
@@ -758,7 +777,7 @@ mod tests {
 
     use super::{
         Cli, Command, ConfigArgs, ConfigCommand, ManagedResourcesModeArg, PrepareManagedResourcesArgs, SecretArgs,
-        SecretCommand, TeamCommand, UserArgs, UserCommand, UserStatusArgs,
+        SecretCommand, SessionCommand, TeamCommand, UserArgs, UserCommand, UserStatusArgs,
     };
 
     #[test]
@@ -979,6 +998,85 @@ mod tests {
         for command in commands {
             let result = Cli::try_parse_from(*command);
             assert!(result.is_ok(), "command should parse: {command:?}");
+        }
+    }
+
+    /// Resolves a `team ...` argv to its parsed subcommand, or `None` when clap
+    /// swallowed it into `TeamCommand::Unknown`.
+    ///
+    /// `Unknown` is an `external_subcommand`, so a missing subcommand still
+    /// parses successfully — asserting `is_ok()` alone proves nothing about
+    /// whether the command is actually wired.
+    fn parse_team_command(argv: &[&str]) -> Option<TeamCommand> {
+        let cli = Cli::try_parse_from(argv).ok()?;
+        let Some(Command::Team(args)) = cli.command else {
+            return None;
+        };
+        match args.command {
+            TeamCommand::Unknown(_) => None,
+            command => Some(command),
+        }
+    }
+
+    fn parse_session_command(argv: &[&str]) -> Option<SessionCommand> {
+        let cli = Cli::try_parse_from(argv).ok()?;
+        let Some(Command::Session(args)) = cli.command else {
+            return None;
+        };
+        match args.command {
+            SessionCommand::Unknown(_) => None,
+            command => Some(command),
+        }
+    }
+
+    /// Every tool in the session registry advertises a `cli_command`, and that
+    /// path is printed by `session capabilities` and copied into the
+    /// auto-inject skill. A registry entry with no wired subcommand sends
+    /// agents at a command that can only fail.
+    #[test]
+    fn every_registry_tool_has_a_wired_session_cli_subcommand() {
+        for tool in aionui_api_types::session_tool_descriptors() {
+            let mut argv = vec!["aioncore", "session"];
+            argv.extend(tool.cli_command.iter().map(String::as_str));
+            assert!(
+                parse_session_command(&argv).is_some(),
+                "`{}` is advertised by tool {} but is not wired into SessionCommand",
+                argv[1..].join(" "),
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn session_cli_accepts_capabilities() {
+        assert!(parse_session_command(&["aioncore", "session", "capabilities"]).is_some());
+    }
+
+    #[test]
+    fn unwired_session_subcommand_is_reported_as_unknown() {
+        assert!(
+            parse_session_command(&["aioncore", "session", "definitely-not-a-command"]).is_none(),
+            "the guard above only works if an unwired path resolves to Unknown"
+        );
+    }
+
+    /// Every tool in the shared Team registry advertises a `cli_command`, and
+    /// that path is printed by `team capabilities`, `team help`, and the CLI
+    /// transport prompt. A tool present in the registry but missing from
+    /// `TeamCommand` sends agents at a command that can only fail, so the
+    /// registry is the source of truth for this test rather than a hand-kept
+    /// list that drifts when a tool is added.
+    #[test]
+    fn every_registry_tool_has_a_wired_team_cli_subcommand() {
+        for tool in aionui_api_types::team_tool_descriptors() {
+            let mut argv = vec!["aioncore", "team"];
+            argv.extend(tool.cli_command.iter().map(String::as_str));
+            assert!(
+                parse_team_command(&argv).is_some(),
+                "`{}` is advertised by tool {} but is not wired into TeamCommand",
+                argv[1..].join(" "),
+                tool.name
+            );
         }
     }
 

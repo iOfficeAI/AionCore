@@ -9,6 +9,7 @@ members = [
     "crates/aionui-runtime",
     "crates/aionui-process",
     "crates/aionui-session",
+    "crates/aionui-session-message",
     "crates/aionui-auth",
     "crates/aionui-system",
     "crates/aionui-file",
@@ -43,6 +44,7 @@ aionui-realtime = { path = "crates/aionui-realtime" }
 aionui-runtime = { path = "crates/aionui-runtime" }
 aionui-process = { path = "crates/aionui-process" }
 aionui-session = { path = "crates/aionui-session" }
+aionui-session-message = { path = "crates/aionui-session-message" }
 aionui-auth = { path = "crates/aionui-auth" }
 aionui-system = { path = "crates/aionui-system" }
 aionui-file = { path = "crates/aionui-file" }

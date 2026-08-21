@@ -279,6 +279,10 @@ pub enum AgentKillReason {
     /// The owning user's Core session was revoked, so foreground runtime state
     /// and agent processes for that user must be torn down.
     SessionRevoked,
+    /// The user explicitly requested a runtime restart. Any active turn is
+    /// intentionally cancelled and must converge without a user-facing error
+    /// before the old process is replaced.
+    RuntimeRestart,
     /// The owning conversation (or its team) was archived. Like
     /// `ConversationDeleted` the agent process is torn down so it stops
     /// streaming for a unit the user moved out of the active workspace, but the
