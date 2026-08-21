@@ -6,6 +6,7 @@ pub mod path_safety;
 pub mod routes;
 pub mod service;
 pub mod snapshot_service;
+mod text_decode;
 pub mod traits;
 pub mod types;
 

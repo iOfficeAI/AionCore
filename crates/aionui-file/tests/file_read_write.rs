@@ -130,6 +130,20 @@ async fn read_file_unicode_content() {
 }
 
 #[tokio::test]
+async fn read_file_utf16_le_bom_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("output.json");
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend(r#"{"count":50}"#.encode_utf16().flat_map(u16::to_le_bytes));
+    fs::write(&file, bytes).unwrap();
+
+    let svc = make_service(dir.path());
+    let result = svc.read_file(file.to_str().unwrap(), None).await.unwrap();
+
+    assert_eq!(result.as_deref(), Some(r#"{"count":50}"#));
+}
+
+#[tokio::test]
 async fn read_file_with_extra_workspace_root_outside_home() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();

@@ -42,4 +42,21 @@ pub enum FileError {
     /// into the response body. Maps to the stable API code `FILE_NOT_FOUND`.
     #[error("target not found")]
     TargetNotFound,
+
+    /// The file exists but is not valid UTF-8 or UTF-16 text.
+    ///
+    /// Preview and other utf8 reads used to collapse this into a generic
+    /// `Internal("cannot read file")`, which the client could only show as
+    /// "preview failed". Windows PowerShell's default `Out-File` encoding is
+    /// UTF-16 LE with BOM — a JSON file written that way is text, just not
+    /// UTF-8. Maps to the stable API code `INVALID_TEXT_ENCODING`.
+    #[error("file is not valid UTF-8 or UTF-16 text")]
+    InvalidTextEncoding,
+
+    /// The file exists but is temporarily locked (Windows sharing/lock
+    /// violation after retries). Distinct from `Internal` so the client can
+    /// ask the user to retry instead of treating it as a permanent failure.
+    /// Maps to the stable API code `FILE_BUSY`.
+    #[error("file is in use")]
+    Busy,
 }

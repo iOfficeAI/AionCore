@@ -66,6 +66,18 @@ impl From<FileError> for ApiError {
                 "The requested file no longer exists.",
                 None::<serde_json::Value>,
             ),
+            FileError::InvalidTextEncoding => ApiError::coded(
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "INVALID_TEXT_ENCODING",
+                "The file is not valid UTF-8 or UTF-16 text.",
+                None::<serde_json::Value>,
+            ),
+            FileError::Busy => ApiError::coded(
+                axum::http::StatusCode::CONFLICT,
+                "FILE_BUSY",
+                "The file is in use and could not be read. Retry.",
+                None::<serde_json::Value>,
+            ),
         }
     }
 }
@@ -940,6 +952,25 @@ mod tests {
         assert_eq!(api_err.status_code(), axum::http::StatusCode::NOT_FOUND);
         assert_eq!(api_err.public_message(), "The requested file no longer exists.");
         assert!(api_err.error_details().is_none(), "details must not carry path context");
+    }
+
+    #[test]
+    fn invalid_text_encoding_maps_to_stable_code() {
+        let api_err = ApiError::from(FileError::InvalidTextEncoding);
+        assert_eq!(api_err.error_code(), "INVALID_TEXT_ENCODING");
+        assert_eq!(api_err.status_code(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            !api_err.public_message().contains('\\') && !api_err.public_message().contains('/'),
+            "encoding error must not quote a path, got {:?}",
+            api_err.public_message()
+        );
+    }
+
+    #[test]
+    fn busy_maps_to_stable_code() {
+        let api_err = ApiError::from(FileError::Busy);
+        assert_eq!(api_err.error_code(), "FILE_BUSY");
+        assert_eq!(api_err.status_code(), axum::http::StatusCode::CONFLICT);
     }
 
     // -- open_system_file: the system-open port seam ---------------------------

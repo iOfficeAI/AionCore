@@ -297,17 +297,60 @@ fn validate_file_for_read(path: &Path) -> Result<Option<()>, FileError> {
     Ok(Some(()))
 }
 
-/// Read a file as UTF-8 text. Returns `None` if the file does not exist.
+/// Read a file as UTF-8 or UTF-16 text. Returns `None` if the file does not exist.
 /// Rejects files larger than 256 MB.
 fn read_file_sync(path: &Path) -> Result<Option<String>, FileError> {
     if validate_file_for_read(path)?.is_none() {
         return Ok(None);
     }
 
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| FileError::Internal(format!("cannot read file '{}': {e}", path.display())))?;
+    let bytes = read_file_bytes_retrying(path)?;
+    crate::text_decode::decode_text_bytes(&bytes).map(Some)
+}
 
-    Ok(Some(content))
+/// Windows writers (`Out-File`, `Set-Content`, exclusive `CreateFile`) hold a
+/// sharing lock for the duration of the write. A preview click during that
+/// window used to fail immediately as a generic internal error. Retry a short
+/// burst so a just-written JSON file can be opened without asking the user to
+/// click again.
+fn read_file_bytes_retrying(path: &Path) -> Result<Vec<u8>, FileError> {
+    const ATTEMPTS: u32 = 12;
+    const DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..ATTEMPTS {
+        match std::fs::read(path) {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) if is_transient_file_lock(&err) => {
+                last_err = Some(err);
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(DELAY);
+                }
+            }
+            Err(err) => {
+                return Err(FileError::Internal(format!(
+                    "cannot read file '{}': {err}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    tracing::warn!(
+        target: "chat_file",
+        path = %path.display(),
+        error = %last_err.as_ref().map(ToString::to_string).unwrap_or_default(),
+        "file remained locked after retries"
+    );
+    Err(FileError::Busy)
+}
+
+/// Windows `ERROR_SHARING_VIOLATION` (32) / `ERROR_LOCK_VIOLATION` (33), plus
+/// the portable `ResourceBusy` mapping used by newer rustc.
+pub(crate) fn is_transient_file_lock(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ResourceBusy | std::io::ErrorKind::TimedOut
+    ) || matches!(err.raw_os_error(), Some(32 | 33))
 }
 
 /// Write data to a file synchronously. Creates the file if it does not exist.
@@ -1322,6 +1365,51 @@ mod tests {
         let err = read_file_sync(&folder).unwrap_err();
         assert!(matches!(err, FileError::BadRequest(_)));
         assert!(err.to_string().contains("is a directory"));
+    }
+
+    #[test]
+    fn read_file_sync_utf16_le_bom_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("output.json");
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(r#"{"ok":true}"#.encode_utf16().flat_map(u16::to_le_bytes));
+        fs::write(&file, bytes).unwrap();
+
+        let result = read_file_sync(&file).unwrap();
+        assert_eq!(result.as_deref(), Some(r#"{"ok":true}"#));
+    }
+
+    #[test]
+    fn read_file_sync_utf16_le_without_bom_ascii_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("output.json");
+        let bytes: Vec<u8> = r#"{"n":50}"#.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        fs::write(&file, bytes).unwrap();
+
+        let result = read_file_sync(&file).unwrap();
+        assert_eq!(result.as_deref(), Some(r#"{"n":50}"#));
+    }
+
+    #[test]
+    fn read_file_sync_utf8_bom_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("output.json");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(br#"{"ok":true}"#);
+        fs::write(&file, bytes).unwrap();
+
+        let result = read_file_sync(&file).unwrap();
+        assert_eq!(result.as_deref(), Some(r#"{"ok":true}"#));
+    }
+
+    #[test]
+    fn is_transient_file_lock_recognizes_windows_sharing_violation() {
+        let err = std::io::Error::from_raw_os_error(32);
+        assert!(is_transient_file_lock(&err));
+        let lock = std::io::Error::from_raw_os_error(33);
+        assert!(is_transient_file_lock(&lock));
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(!is_transient_file_lock(&missing));
     }
 
     // -- validate_file_for_read tests --

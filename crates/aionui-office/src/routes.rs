@@ -382,6 +382,18 @@ fn file_error_to_api_error(error: FileError) -> ApiError {
             "The requested file no longer exists.",
             None::<serde_json::Value>,
         ),
+        FileError::InvalidTextEncoding => ApiError::coded(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "INVALID_TEXT_ENCODING",
+            "The file is not valid UTF-8 or UTF-16 text.",
+            None::<serde_json::Value>,
+        ),
+        FileError::Busy => ApiError::coded(
+            axum::http::StatusCode::CONFLICT,
+            "FILE_BUSY",
+            "The file is in use and could not be read. Retry.",
+            None::<serde_json::Value>,
+        ),
     }
 }
 
