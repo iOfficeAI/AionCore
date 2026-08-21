@@ -3873,10 +3873,11 @@ impl ConversationService {
                 // drainer retries a queued delivery every second and each
                 // retry is refused identically, which turned one unanswered
                 // card into 600 identical lines over a 10-minute TTL.
-                if self
-                    .runtime_state
-                    .should_log_midturn_refusal(conversation_id, &active_turn_id)
-                {
+                if self.runtime_state.should_log_once_for_turn(
+                    crate::runtime_state::OncePerTurn::MidturnRefusal,
+                    conversation_id,
+                    &active_turn_id,
+                ) {
                     info!(
                         conversation_id = %conversation_id,
                         route = "rejected_requires_action",
