@@ -7,10 +7,10 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 
 use aionui_api_types::{
-    ApiResponse, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest, EnsureNodeRuntimeRequest,
-    EnsureNodeRuntimeResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse, FetchModelsAnonymousRequest,
-    FetchModelsRequest, FetchModelsResponse, ProtocolDetectionResponse, ProviderResponse, SystemInfoResponse,
-    SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
+    ApiResponse, ClientPreferencesResponse, CreateProviderRequest, CurrentUserResponse, DetectProtocolRequest,
+    EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse,
+    FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, ProtocolDetectionResponse, ProviderResponse,
+    SystemInfoResponse, SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
     UpdateProviderRequest, UpdateSettingsRequest,
 };
 use aionui_auth::CurrentUser;
@@ -69,6 +69,7 @@ impl From<SystemError> for ApiError {
 /// - `POST /api/providers/:id/models`        — fetch models from remote API
 /// - `POST /api/providers/fetch-models`      — fetch models anonymously (pre-create preview)
 /// - `POST /api/providers/detect-protocol`   — detect API protocol
+/// - `GET  /api/system/current-user`         — the identity the auth middleware injected
 /// - `GET  /api/system/info`                 — system directory & platform info
 /// - `POST /api/system/check-update`         — check GitHub for new versions
 /// - `POST /api/system/ensure-node-runtime`  — prepare managed Node runtime
@@ -88,6 +89,7 @@ pub fn system_routes(state: SystemRouterState) -> Router {
         .route("/api/providers/fetch-models", post(fetch_models_anonymous))
         .route("/api/providers/{id}", delete(delete_provider).put(update_provider))
         .route("/api/providers/{id}/models", post(fetch_models))
+        .route("/api/system/current-user", get(get_current_user))
         .route("/api/system/info", get(get_system_info))
         .route("/api/system/check-update", post(check_update))
         .route("/api/system/ensure-node-runtime", post(ensure_node_runtime))
@@ -286,6 +288,24 @@ async fn detect_protocol(
 // ===========================================================================
 // System info & version check handlers
 // ===========================================================================
+
+/// `GET /api/system/current-user` — echo the identity the auth middleware
+/// injected for this request.
+///
+/// No repository lookup on purpose: the answer must be exactly what the
+/// middleware decided, because callers use it to recognise their own id inside
+/// broadcast payloads. Reading the user row instead would introduce a second
+/// source that can disagree with request scoping.
+///
+/// Lives here rather than in `aionui-auth` because the auth router builds its
+/// own `AuthState` that is never in `Local` identity mode, so a route there
+/// would 401 in exactly the case this exists to serve.
+async fn get_current_user(Extension(user): Extension<CurrentUser>) -> Json<ApiResponse<CurrentUserResponse>> {
+    Json(ApiResponse::ok(CurrentUserResponse {
+        id: user.id,
+        username: user.username,
+    }))
+}
 
 async fn get_system_info() -> Json<ApiResponse<SystemInfoResponse>> {
     let info = crate::sysinfo::get_system_info();

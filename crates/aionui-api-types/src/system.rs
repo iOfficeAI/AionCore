@@ -68,6 +68,23 @@ impl UpdateSettingsRequest {
     }
 }
 
+/// Response for `GET /api/system/current-user`.
+///
+/// Answers "which user id does the backend attribute my requests to". Needed
+/// because `GET /api/auth/user` cannot: the auth router runs its own
+/// `AuthState` whose identity mode is never `Local`, so in local mode it
+/// returns 401 even though every ordinary route is serving an injected default
+/// user. A client comparing a broadcast payload's `user_id` against "me" needs
+/// the id the ORDINARY middleware produced.
+///
+/// Deliberately only `id` + `username`: this is an identity echo, not a user
+/// profile endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CurrentUserResponse {
+    pub id: String,
+    pub username: String,
+}
+
 /// Response for `GET /api/settings/client`.
 ///
 /// A flat key-value map where values can be any JSON type (string,

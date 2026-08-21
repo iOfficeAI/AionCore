@@ -175,9 +175,9 @@ pub use skill::{
     WriteAssistantRuleRequest,
 };
 pub use system::{
-    ClientPreferencesResponse, FeedbackDiagnosticsContextResponse, FeedbackDiagnosticsPrivacyResponse,
-    FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse, SystemSettingsResponse,
-    UpdateClientPreferencesRequest, UpdateSettingsRequest,
+    ClientPreferencesResponse, CurrentUserResponse, FeedbackDiagnosticsContextResponse,
+    FeedbackDiagnosticsPrivacyResponse, FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery,
+    FeedbackDiagnosticsResponse, SystemSettingsResponse, UpdateClientPreferencesRequest, UpdateSettingsRequest,
 };
 pub use team::{
     AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, InterruptTeamAgentRequest,
