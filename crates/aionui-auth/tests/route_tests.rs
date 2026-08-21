@@ -498,6 +498,20 @@ async fn t7_3_get_user_no_token() {
     assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
+#[tokio::test]
+async fn t7_4_get_user_local_mode_without_token() {
+    let (app, _ctx) = test_app_with_local(true).await;
+
+    let req = get_anonymous("/api/auth/user");
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    assert_eq!(json["user"]["id"], "system_default_user");
+    assert_eq!(json["user"]["username"], "system_default_user");
+}
+
 // ===========================================================================
 // T8. Change Password (POST /api/auth/change-password)
 // ===========================================================================

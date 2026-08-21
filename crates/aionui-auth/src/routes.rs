@@ -249,11 +249,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     let auth_state = AuthState {
         jwt_service: state.jwt_service.clone(),
         user_repo: state.user_repo.clone(),
-        identity_mode: if state.aionpro_mode {
-            AuthIdentityMode::AionPro
-        } else {
-            AuthIdentityMode::UserSession
-        },
+        identity_mode: state.identity_mode,
         // Auth endpoints manage sessions themselves; the helper CLI never
         // calls them, so the runtime-token channel stays disabled here.
         runtime_token_verifier: None,
