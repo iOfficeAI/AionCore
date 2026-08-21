@@ -373,6 +373,7 @@ async fn handle_callback_query(
 
     let msg = UnifiedIncomingMessage {
         owner_user_id: None,
+        connection_id: None,
         id: cb.id.clone(),
         platform: PluginType::Telegram,
         chat_id: chat_id.to_string(),
@@ -419,6 +420,7 @@ async fn handle_message(msg: &TgMessage, message_tx: &mpsc::Sender<UnifiedIncomi
 
     let unified = UnifiedIncomingMessage {
         owner_user_id: None,
+        connection_id: None,
         id: msg.message_id.to_string(),
         platform: PluginType::Telegram,
         chat_id: msg.chat.id.to_string(),

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use aionui_common::{generate_id, now_ms};
 use aionui_db::IChannelRepository;
-use aionui_db::models::AssistantSessionRow;
+use aionui_db::models::ChannelConversationBindingRow;
 use tracing::{debug, info};
 
 use crate::error::ChannelError;
@@ -25,26 +25,26 @@ impl SessionManager {
     /// Finds an existing session for the user+chat pair, or creates one.
     ///
     /// - If found: updates `last_activity` and returns the existing session.
-    /// - If not found: creates a new session with the given `agent_type`.
+    /// - If not found: creates a fresh binding for the pair.
     ///
-    /// The `workspace` parameter is optional and may be set later by
-    /// the `ChannelManager` when it knows the active workspace path.
+    /// Agent configuration is not part of the binding: it is resolved per
+    /// turn from channel settings and the conversation snapshot.
     pub async fn get_or_create_session(
         &self,
         owner_user_id: &str,
         user_id: &str,
         chat_id: &str,
-        agent_type: &str,
-        workspace: Option<&str>,
-    ) -> Result<AssistantSessionRow, ChannelError> {
+    ) -> Result<ChannelConversationBindingRow, ChannelError> {
         let now = now_ms();
-        let new_row = AssistantSessionRow {
+        let new_row = ChannelConversationBindingRow {
             id: generate_id(),
+            owner_user_id: owner_user_id.to_owned(),
+            // The repository INSERT derives the real connection id from the
+            // active `channel_users` row, so the caller never supplies one.
+            connection_id: String::new(),
             user_id: user_id.to_owned(),
-            agent_type: agent_type.to_owned(),
-            conversation_id: None,
-            workspace: workspace.map(String::from),
             chat_id: Some(chat_id.to_owned()),
+            conversation_id: None,
             created_at: now,
             last_activity: now,
         };
@@ -65,7 +65,10 @@ impl SessionManager {
     }
 
     /// Returns all active sessions.
-    pub async fn get_active_sessions(&self, owner_user_id: &str) -> Result<Vec<AssistantSessionRow>, ChannelError> {
+    pub async fn get_active_sessions(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<Vec<ChannelConversationBindingRow>, ChannelError> {
         let sessions = self.repo.get_all_sessions(owner_user_id).await?;
         Ok(sessions)
     }
@@ -79,9 +82,7 @@ impl SessionManager {
         owner_user_id: &str,
         user_id: &str,
         chat_id: &str,
-        agent_type: &str,
-        workspace: Option<&str>,
-    ) -> Result<AssistantSessionRow, ChannelError> {
+    ) -> Result<ChannelConversationBindingRow, ChannelError> {
         // Delete old session if it exists
         self.repo
             .delete_session_by_user_chat(owner_user_id, user_id, chat_id)
@@ -89,13 +90,15 @@ impl SessionManager {
 
         // Create a fresh session
         let now = now_ms();
-        let new_row = AssistantSessionRow {
+        let new_row = ChannelConversationBindingRow {
             id: generate_id(),
+            owner_user_id: owner_user_id.to_owned(),
+            // Derived by the repository INSERT from the active
+            // `channel_users` row — see `get_or_create_session`.
+            connection_id: String::new(),
             user_id: user_id.to_owned(),
-            agent_type: agent_type.to_owned(),
-            conversation_id: None,
-            workspace: workspace.map(String::from),
             chat_id: Some(chat_id.to_owned()),
+            conversation_id: None,
             created_at: now,
             last_activity: now,
         };
@@ -113,25 +116,6 @@ impl SessionManager {
         );
 
         Ok(session)
-    }
-
-    /// Updates the agent_type for an existing session.
-    pub async fn update_agent_type(
-        &self,
-        owner_user_id: &str,
-        session_id: &str,
-        agent_type: &str,
-    ) -> Result<(), ChannelError> {
-        self.repo
-            .update_session_agent_type(owner_user_id, session_id, agent_type)
-            .await?;
-
-        debug!(
-            session_id = %session_id,
-            agent_type = %agent_type,
-            "session agent_type updated"
-        );
-        Ok(())
     }
 
     /// Removes all sessions belonging to a user.
@@ -166,7 +150,7 @@ impl SessionManager {
         &self,
         owner_user_id: &str,
         session_id: &str,
-    ) -> Result<Option<AssistantSessionRow>, ChannelError> {
+    ) -> Result<Option<ChannelConversationBindingRow>, ChannelError> {
         Ok(self.repo.get_session(owner_user_id, session_id).await?)
     }
 
@@ -197,15 +181,20 @@ impl SessionManager {
 mod tests {
     use super::*;
     use aionui_common::TimestampMs;
-    use aionui_db::models::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
-    use aionui_db::{DbError, IChannelRepository, UpdatePluginStatusParams};
+    use aionui_db::models::{
+        ChannelConnectionRow, ChannelConversationBindingRow, ChannelPairingRequestRow, ChannelUserRow,
+    };
+    use aionui_db::{DbError, IChannelRepository, UpdateConnectionStatusParams};
     use std::sync::Mutex;
 
     // ── Mock IChannelRepository ────────────────────────────────────────
     const OWNER_ID: &str = "owner-test";
+    /// The connection the mock's single authorized channel user hangs off.
+    /// Stands in for the `channel_users` row the real INSERT derives from.
+    const CONNECTION_ID: &str = "conn-test";
 
     struct MockRepo {
-        sessions: Mutex<Vec<AssistantSessionRow>>,
+        sessions: Mutex<Vec<ChannelConversationBindingRow>>,
     }
 
     impl MockRepo {
@@ -215,7 +204,7 @@ mod tests {
             }
         }
 
-        fn get_sessions(&self) -> Vec<AssistantSessionRow> {
+        fn get_sessions(&self) -> Vec<ChannelConversationBindingRow> {
             self.sessions.lock().unwrap().clone()
         }
     }
@@ -223,29 +212,41 @@ mod tests {
     #[async_trait::async_trait]
     impl IChannelRepository for MockRepo {
         // -- Plugin CRUD (unused stubs) --
-        async fn get_all_plugins(&self, _owner_user_id: &str) -> Result<Vec<ChannelPluginRow>, DbError> {
+        async fn get_all_connections(&self, _owner_user_id: &str) -> Result<Vec<ChannelConnectionRow>, DbError> {
             Ok(vec![])
         }
-        async fn get_plugin(&self, _owner_user_id: &str, _id: &str) -> Result<Option<ChannelPluginRow>, DbError> {
-            Ok(None)
-        }
-        async fn upsert_plugin(&self, _owner_user_id: &str, _row: &ChannelPluginRow) -> Result<(), DbError> {
-            Ok(())
-        }
-        async fn update_plugin_status(
+        async fn get_connection(
             &self,
             _owner_user_id: &str,
             _id: &str,
-            _params: &UpdatePluginStatusParams,
+        ) -> Result<Option<ChannelConnectionRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn get_connection_by_plugin_key(
+            &self,
+            _owner_user_id: &str,
+            _plugin_key: &str,
+        ) -> Result<Option<ChannelConnectionRow>, DbError> {
+            Ok(None)
+        }
+        async fn upsert_connection(&self, _owner_user_id: &str, _row: &ChannelConnectionRow) -> Result<(), DbError> {
+            Ok(())
+        }
+        async fn update_connection_status(
+            &self,
+            _owner_user_id: &str,
+            _id: &str,
+            _params: &UpdateConnectionStatusParams,
         ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn delete_plugin(&self, _owner_user_id: &str, _id: &str) -> Result<(), DbError> {
+        async fn delete_connection(&self, _owner_user_id: &str, _id: &str) -> Result<(), DbError> {
             Ok(())
         }
 
         // -- User CRUD (unused stubs) --
-        async fn get_all_users(&self, _owner_user_id: &str) -> Result<Vec<AssistantUserRow>, DbError> {
+        async fn get_all_users(&self, _owner_user_id: &str) -> Result<Vec<ChannelUserRow>, DbError> {
             Ok(vec![])
         }
         async fn get_user_by_platform(
@@ -253,10 +254,10 @@ mod tests {
             _owner_user_id: &str,
             _platform_user_id: &str,
             _platform_type: &str,
-        ) -> Result<Option<AssistantUserRow>, DbError> {
+        ) -> Result<Option<ChannelUserRow>, DbError> {
             Ok(None)
         }
-        async fn create_user(&self, _owner_user_id: &str, _row: &AssistantUserRow) -> Result<(), DbError> {
+        async fn create_user(&self, _owner_user_id: &str, _row: &ChannelUserRow) -> Result<(), DbError> {
             Ok(())
         }
         async fn update_user_last_active(
@@ -267,27 +268,31 @@ mod tests {
         ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn delete_user(&self, _owner_user_id: &str, _id: &str) -> Result<(), DbError> {
+        async fn revoke_user(&self, _owner_user_id: &str, _id: &str) -> Result<(), DbError> {
             Ok(())
         }
 
-        // -- Session CRUD --
-        async fn get_all_sessions(&self, _owner_user_id: &str) -> Result<Vec<AssistantSessionRow>, DbError> {
+        // -- Conversation binding CRUD --
+        async fn get_all_sessions(&self, _owner_user_id: &str) -> Result<Vec<ChannelConversationBindingRow>, DbError> {
             Ok(self.sessions.lock().unwrap().clone())
         }
 
-        async fn get_session(&self, _owner_user_id: &str, id: &str) -> Result<Option<AssistantSessionRow>, DbError> {
+        async fn get_session(
+            &self,
+            _owner_user_id: &str,
+            id: &str,
+        ) -> Result<Option<ChannelConversationBindingRow>, DbError> {
             let sessions = self.sessions.lock().unwrap();
             Ok(sessions.iter().find(|s| s.id == id).cloned())
         }
 
         async fn get_or_create_session(
             &self,
-            _owner_user_id: &str,
+            owner_user_id: &str,
             user_id: &str,
             chat_id: &str,
-            new_row: &AssistantSessionRow,
-        ) -> Result<AssistantSessionRow, DbError> {
+            new_row: &ChannelConversationBindingRow,
+        ) -> Result<ChannelConversationBindingRow, DbError> {
             let mut sessions = self.sessions.lock().unwrap();
             // Look for existing session by user_id + chat_id
             if let Some(existing) = sessions
@@ -297,9 +302,15 @@ mod tests {
                 existing.last_activity = new_row.last_activity;
                 return Ok(existing.clone());
             }
-            // Create new
-            sessions.push(new_row.clone());
-            Ok(new_row.clone())
+            // Mirror the real INSERT: owner/connection come from the channel
+            // user row, never from the caller-supplied binding.
+            let created = ChannelConversationBindingRow {
+                owner_user_id: owner_user_id.to_owned(),
+                connection_id: CONNECTION_ID.to_owned(),
+                ..new_row.clone()
+            };
+            sessions.push(created.clone());
+            Ok(created)
         }
 
         async fn update_session_activity(
@@ -333,22 +344,6 @@ mod tests {
             }
         }
 
-        async fn update_session_agent_type(
-            &self,
-            _owner_user_id: &str,
-            id: &str,
-            agent_type: &str,
-        ) -> Result<(), DbError> {
-            let mut sessions = self.sessions.lock().unwrap();
-            if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
-                s.agent_type = agent_type.to_owned();
-                s.last_activity = aionui_common::now_ms();
-                Ok(())
-            } else {
-                Err(DbError::NotFound(id.into()))
-            }
-        }
-
         async fn delete_sessions_by_user(&self, _owner_user_id: &str, user_id: &str) -> Result<(), DbError> {
             let mut sessions = self.sessions.lock().unwrap();
             sessions.retain(|s| s.user_id != user_id);
@@ -366,22 +361,43 @@ mod tests {
             Ok(())
         }
 
-        // -- Pairing codes (unused stubs) --
-        async fn create_pairing(&self, _owner_user_id: &str, _row: &PairingCodeRow) -> Result<(), DbError> {
+        // -- Pairing requests (unused stubs) --
+        async fn create_pairing(&self, _owner_user_id: &str, _row: &ChannelPairingRequestRow) -> Result<(), DbError> {
             Ok(())
         }
-        async fn get_pending_pairings(&self, _owner_user_id: &str) -> Result<Vec<PairingCodeRow>, DbError> {
+        async fn get_pending_pairings(&self, _owner_user_id: &str) -> Result<Vec<ChannelPairingRequestRow>, DbError> {
             Ok(vec![])
         }
-        async fn get_pairing_by_code(
+        async fn get_pairing(
             &self,
             _owner_user_id: &str,
-            _code: &str,
-        ) -> Result<Option<PairingCodeRow>, DbError> {
+            _id: &str,
+        ) -> Result<Option<ChannelPairingRequestRow>, DbError> {
             Ok(None)
         }
-        async fn update_pairing_status(&self, _owner_user_id: &str, _code: &str, _status: &str) -> Result<(), DbError> {
+        async fn get_pending_pairing_by_code_hash(
+            &self,
+            _owner_user_id: &str,
+            _code_hash: &str,
+        ) -> Result<Option<ChannelPairingRequestRow>, DbError> {
+            Ok(None)
+        }
+        async fn update_pairing_status(
+            &self,
+            _owner_user_id: &str,
+            _id: &str,
+            _status: &str,
+            _approved_channel_user_id: Option<&str>,
+        ) -> Result<(), DbError> {
             Ok(())
+        }
+        async fn expire_pending_pairings_for_user(
+            &self,
+            _owner_user_id: &str,
+            _connection_id: &str,
+            _external_user_id: &str,
+        ) -> Result<u64, DbError> {
+            Ok(0)
         }
         async fn cleanup_expired_pairings(&self, _owner_user_id: &str, _now: TimestampMs) -> Result<u64, DbError> {
             Ok(0)
@@ -399,32 +415,28 @@ mod tests {
     #[tokio::test]
     async fn creates_new_session() {
         let (mgr, repo) = make_manager();
-        let session = mgr
-            .get_or_create_session(OWNER_ID, "user1", "chat1", "gemini", None)
-            .await
-            .unwrap();
+        let session = mgr.get_or_create_session(OWNER_ID, "user1", "chat1").await.unwrap();
 
         assert_eq!(session.user_id, "user1");
         assert_eq!(session.chat_id.as_deref(), Some("chat1"));
-        assert_eq!(session.agent_type, "gemini");
         assert!(session.conversation_id.is_none());
+        // Identity comes back resolved from the channel user row.
+        assert_eq!(session.owner_user_id, OWNER_ID);
+        assert_eq!(session.connection_id, CONNECTION_ID);
+        assert!(!session.connection_id.is_empty());
 
         let all = repo.get_sessions();
         assert_eq!(all.len(), 1);
+        assert_eq!(all[0].owner_user_id, OWNER_ID);
+        assert_eq!(all[0].connection_id, CONNECTION_ID);
     }
 
     #[tokio::test]
     async fn reuses_existing_session_for_same_user_chat() {
         let (mgr, repo) = make_manager();
 
-        let s1 = mgr
-            .get_or_create_session(OWNER_ID, "user1", "chat1", "gemini", None)
-            .await
-            .unwrap();
-        let s2 = mgr
-            .get_or_create_session(OWNER_ID, "user1", "chat1", "gemini", None)
-            .await
-            .unwrap();
+        let s1 = mgr.get_or_create_session(OWNER_ID, "user1", "chat1").await.unwrap();
+        let s2 = mgr.get_or_create_session(OWNER_ID, "user1", "chat1").await.unwrap();
 
         assert_eq!(s1.id, s2.id);
         assert_eq!(repo.get_sessions().len(), 1);
@@ -434,14 +446,8 @@ mod tests {
     async fn different_chats_get_different_sessions() {
         let (mgr, repo) = make_manager();
 
-        let s1 = mgr
-            .get_or_create_session(OWNER_ID, "user1", "chatA", "acp", None)
-            .await
-            .unwrap();
-        let s2 = mgr
-            .get_or_create_session(OWNER_ID, "user1", "chatB", "acp", None)
-            .await
-            .unwrap();
+        let s1 = mgr.get_or_create_session(OWNER_ID, "user1", "chatA").await.unwrap();
+        let s2 = mgr.get_or_create_session(OWNER_ID, "user1", "chatB").await.unwrap();
 
         assert_ne!(s1.id, s2.id);
         assert_eq!(repo.get_sessions().len(), 2);
@@ -451,28 +457,11 @@ mod tests {
     async fn different_users_same_chat_get_different_sessions() {
         let (mgr, repo) = make_manager();
 
-        let s1 = mgr
-            .get_or_create_session(OWNER_ID, "user1", "chat1", "gemini", None)
-            .await
-            .unwrap();
-        let s2 = mgr
-            .get_or_create_session(OWNER_ID, "user2", "chat1", "gemini", None)
-            .await
-            .unwrap();
+        let s1 = mgr.get_or_create_session(OWNER_ID, "user1", "chat1").await.unwrap();
+        let s2 = mgr.get_or_create_session(OWNER_ID, "user2", "chat1").await.unwrap();
 
         assert_ne!(s1.id, s2.id);
         assert_eq!(repo.get_sessions().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn session_with_workspace() {
-        let (mgr, _repo) = make_manager();
-        let session = mgr
-            .get_or_create_session(OWNER_ID, "u1", "c1", "acp", Some("/workspace"))
-            .await
-            .unwrap();
-
-        assert_eq!(session.workspace.as_deref(), Some("/workspace"));
     }
 
     // ── get_active_sessions ────────────────────────────────────────────
@@ -487,12 +476,8 @@ mod tests {
     #[tokio::test]
     async fn get_active_sessions_returns_all() {
         let (mgr, _repo) = make_manager();
-        mgr.get_or_create_session(OWNER_ID, "u1", "c1", "gemini", None)
-            .await
-            .unwrap();
-        mgr.get_or_create_session(OWNER_ID, "u2", "c2", "acp", None)
-            .await
-            .unwrap();
+        mgr.get_or_create_session(OWNER_ID, "u1", "c1").await.unwrap();
+        mgr.get_or_create_session(OWNER_ID, "u2", "c2").await.unwrap();
 
         let sessions = mgr.get_active_sessions(OWNER_ID).await.unwrap();
         assert_eq!(sessions.len(), 2);
@@ -503,15 +488,9 @@ mod tests {
     #[tokio::test]
     async fn cleanup_removes_user_sessions() {
         let (mgr, repo) = make_manager();
-        mgr.get_or_create_session(OWNER_ID, "u1", "c1", "gemini", None)
-            .await
-            .unwrap();
-        mgr.get_or_create_session(OWNER_ID, "u1", "c2", "gemini", None)
-            .await
-            .unwrap();
-        mgr.get_or_create_session(OWNER_ID, "u2", "c1", "acp", None)
-            .await
-            .unwrap();
+        mgr.get_or_create_session(OWNER_ID, "u1", "c1").await.unwrap();
+        mgr.get_or_create_session(OWNER_ID, "u1", "c2").await.unwrap();
+        mgr.get_or_create_session(OWNER_ID, "u2", "c1").await.unwrap();
 
         mgr.cleanup_user_sessions(OWNER_ID, "u1").await.unwrap();
 
@@ -523,9 +502,7 @@ mod tests {
     #[tokio::test]
     async fn cleanup_noop_for_unknown_user() {
         let (mgr, repo) = make_manager();
-        mgr.get_or_create_session(OWNER_ID, "u1", "c1", "gemini", None)
-            .await
-            .unwrap();
+        mgr.get_or_create_session(OWNER_ID, "u1", "c1").await.unwrap();
 
         mgr.cleanup_user_sessions(OWNER_ID, "u999").await.unwrap();
 
@@ -537,10 +514,7 @@ mod tests {
     #[tokio::test]
     async fn bind_conversation_persists_conversation_id() {
         let (mgr, repo) = make_manager();
-        let session = mgr
-            .get_or_create_session(OWNER_ID, "u1", "c1", "acp", None)
-            .await
-            .unwrap();
+        let session = mgr.get_or_create_session(OWNER_ID, "u1", "c1").await.unwrap();
         assert!(session.conversation_id.is_none());
 
         mgr.bind_conversation(OWNER_ID, &session.id, "conv_123").await.unwrap();
@@ -561,18 +535,18 @@ mod tests {
     #[tokio::test]
     async fn reset_session_creates_fresh_session() {
         let (mgr, repo) = make_manager();
-        let s1 = mgr
-            .get_or_create_session(OWNER_ID, "u1", "c1", "gemini", None)
-            .await
-            .unwrap();
+        let s1 = mgr.get_or_create_session(OWNER_ID, "u1", "c1").await.unwrap();
 
-        let s2 = mgr.reset_session(OWNER_ID, "u1", "c1", "gemini", None).await.unwrap();
+        let s2 = mgr.reset_session(OWNER_ID, "u1", "c1").await.unwrap();
 
         // New session should have a different ID
         assert_ne!(s1.id, s2.id);
         assert_eq!(s2.user_id, "u1");
         assert_eq!(s2.chat_id.as_deref(), Some("c1"));
         assert!(s2.conversation_id.is_none());
+        // The replacement binding is re-derived, not carried over.
+        assert_eq!(s2.owner_user_id, OWNER_ID);
+        assert_eq!(s2.connection_id, CONNECTION_ID);
 
         // Only 1 session should exist (old one deleted)
         assert_eq!(repo.get_sessions().len(), 1);
@@ -581,33 +555,11 @@ mod tests {
     #[tokio::test]
     async fn reset_session_noop_when_no_existing() {
         let (mgr, repo) = make_manager();
-        let session = mgr.reset_session(OWNER_ID, "u1", "c1", "acp", None).await.unwrap();
+        let session = mgr.reset_session(OWNER_ID, "u1", "c1").await.unwrap();
 
         assert_eq!(session.user_id, "u1");
+        assert_eq!(session.owner_user_id, OWNER_ID);
+        assert_eq!(session.connection_id, CONNECTION_ID);
         assert_eq!(repo.get_sessions().len(), 1);
-    }
-
-    // ── update_agent_type ─────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn update_agent_type_persists() {
-        let (mgr, repo) = make_manager();
-        let session = mgr
-            .get_or_create_session(OWNER_ID, "u1", "c1", "gemini", None)
-            .await
-            .unwrap();
-        assert_eq!(session.agent_type, "gemini");
-
-        mgr.update_agent_type(OWNER_ID, &session.id, "acp").await.unwrap();
-
-        let updated = repo.get_sessions().into_iter().find(|s| s.id == session.id).unwrap();
-        assert_eq!(updated.agent_type, "acp");
-    }
-
-    #[tokio::test]
-    async fn update_agent_type_not_found() {
-        let (mgr, _repo) = make_manager();
-        let err = mgr.update_agent_type(OWNER_ID, "nonexistent", "acp").await;
-        assert!(err.is_err());
     }
 }

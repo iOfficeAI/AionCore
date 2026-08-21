@@ -11,6 +11,21 @@ use crate::keep_awake::{DynKeepAwakeController, KEEP_AWAKE_KEY, NoopKeepAwakeCon
 /// Maximum allowed key length for client preferences.
 const MAX_KEY_LENGTH: usize = 255;
 
+/// Preference keys that describe the machine, not the account. They are stored
+/// once per device (`scope = 'device'`, no owning user) so every account on the
+/// machine reads and writes the same value. Confirmed by the settings-dedup B1
+/// inventory and promoted by migration 031.
+const DEVICE_SCOPED_KEYS: &[&str] = &["system.closeToTray", KEEP_AWAKE_KEY, "autoPreviewOfficeFiles"];
+
+/// Key prefixes that are device-scoped as a family (desktop pet geometry and
+/// visibility describe the screen, not the account).
+const DEVICE_SCOPED_KEY_PREFIXES: &[&str] = &["pet."];
+
+/// Whether a preference key is stored machine-level rather than per-account.
+fn is_device_scoped_key(key: &str) -> bool {
+    DEVICE_SCOPED_KEYS.contains(&key) || DEVICE_SCOPED_KEY_PREFIXES.iter().any(|prefix| key.starts_with(prefix))
+}
+
 /// Business logic for client preferences (generic key-value store).
 #[derive(Clone)]
 pub struct ClientPrefService {
@@ -26,41 +41,63 @@ impl ClientPrefService {
         }
     }
 
+    /// Build the service and restore the persisted keep-awake assertion.
+    ///
+    /// `keepAwake` is device-scoped, so the restore needs no user: whatever the
+    /// machine last stored is reapplied at startup regardless of who logs in.
     pub fn with_keep_awake_controller(
         repo: Arc<dyn IClientPreferenceRepository>,
         keep_awake_controller: DynKeepAwakeController,
-        keep_awake_restore_user_id: impl Into<String>,
     ) -> Self {
-        let service = Self::with_keep_awake_controller_without_restore(repo, keep_awake_controller);
-        service.restore_keep_awake_from_preferences(keep_awake_restore_user_id.into());
+        let service = Self {
+            repo,
+            keep_awake_controller,
+        };
+        service.restore_keep_awake_from_preferences();
         service
     }
 
-    pub fn with_keep_awake_controller_without_restore(
-        repo: Arc<dyn IClientPreferenceRepository>,
-        keep_awake_controller: DynKeepAwakeController,
-    ) -> Self {
-        Self {
-            repo,
-            keep_awake_controller,
-        }
-    }
-
     /// Get all client preferences, or only the specified keys.
+    ///
+    /// The response merges the caller's account-scope rows with the machine's
+    /// device-scope rows; the two sets never share a key (write routing sends
+    /// each key to exactly one scope, and migration 031 moved the historical
+    /// per-user copies of device keys into the single device row).
     pub async fn get_preferences(
         &self,
         user_id: &str,
         keys: Option<&[&str]>,
     ) -> Result<ClientPreferencesResponse, SystemError> {
-        let rows = match keys {
-            Some(k) if !k.is_empty() => self.repo.get_by_keys(user_id, k).await,
-            _ => self.repo.get_all(user_id).await,
-        }
-        .map_err(|e| SystemError::Internal(format!("Failed to get preferences: {e}")))?;
+        let (account_rows, device_rows) = match keys {
+            Some(requested) if !requested.is_empty() => {
+                let (device_keys, account_keys): (Vec<&str>, Vec<&str>) =
+                    requested.iter().copied().partition(|key| is_device_scoped_key(key));
+                (
+                    self.repo
+                        .get_by_keys(user_id, &account_keys)
+                        .await
+                        .map_err(|e| SystemError::Internal(format!("Failed to get preferences: {e}")))?,
+                    self.repo
+                        .get_device_by_keys(&device_keys)
+                        .await
+                        .map_err(|e| SystemError::Internal(format!("Failed to get device preferences: {e}")))?,
+                )
+            }
+            _ => (
+                self.repo
+                    .get_all(user_id)
+                    .await
+                    .map_err(|e| SystemError::Internal(format!("Failed to get preferences: {e}")))?,
+                self.repo
+                    .get_all_device()
+                    .await
+                    .map_err(|e| SystemError::Internal(format!("Failed to get device preferences: {e}")))?,
+            ),
+        };
 
         let mut found_keys = BTreeSet::new();
         let mut map = ClientPreferencesResponse::new();
-        for row in rows {
+        for row in account_rows.into_iter().chain(device_rows) {
             let value: serde_json::Value =
                 serde_json::from_str(&row.value).unwrap_or(serde_json::Value::String(row.value));
             found_keys.insert(row.key.clone());
@@ -126,7 +163,7 @@ impl ClientPrefService {
         }
 
         let previous_keep_awake = if keep_awake_update.is_some() {
-            Some(self.get_stored_keep_awake(user_id).await?)
+            Some(self.get_stored_keep_awake().await?)
         } else {
             None
         };
@@ -135,34 +172,52 @@ impl ClientPrefService {
             self.apply_keep_awake(enabled).await?;
         }
 
-        if !upserts.is_empty() {
-            let entries: Vec<(&str, &str)> = upserts.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-            if let Err(error) = self
-                .repo
-                .upsert_batch(user_id, &entries)
-                .await
-                .map_err(|e| SystemError::Internal(format!("Failed to upsert preferences: {e}")))
-            {
-                if let Some(previous) = previous_keep_awake {
-                    let _ = self.apply_keep_awake(previous).await;
-                }
-                return Err(error);
-            }
-        }
+        // Route each key to the scope it is stored in.
+        let (device_upserts, account_upserts): (Vec<_>, Vec<_>) = upserts
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .partition(|(key, _)| is_device_scoped_key(key));
+        let (device_deletes, account_deletes): (Vec<&str>, Vec<&str>) = deletes
+            .iter()
+            .map(|key| key.as_str())
+            .partition(|key| is_device_scoped_key(key));
 
-        if !deletes.is_empty() {
-            let keys: Vec<&str> = deletes.iter().map(|k| k.as_str()).collect();
-            if let Err(error) = self
-                .repo
-                .delete_keys(user_id, &keys)
-                .await
-                .map_err(|e| SystemError::Internal(format!("Failed to delete preferences: {e}")))
-            {
-                if let Some(previous) = previous_keep_awake {
-                    let _ = self.apply_keep_awake(previous).await;
-                }
-                return Err(error);
+        let stored = async {
+            if !account_upserts.is_empty() {
+                self.repo
+                    .upsert_batch(user_id, &account_upserts)
+                    .await
+                    .map_err(|e| SystemError::Internal(format!("Failed to upsert preferences: {e}")))?;
             }
+            if !device_upserts.is_empty() {
+                self.repo
+                    .upsert_device_batch(&device_upserts)
+                    .await
+                    .map_err(|e| SystemError::Internal(format!("Failed to upsert device preferences: {e}")))?;
+            }
+            if !account_deletes.is_empty() {
+                self.repo
+                    .delete_keys(user_id, &account_deletes)
+                    .await
+                    .map_err(|e| SystemError::Internal(format!("Failed to delete preferences: {e}")))?;
+            }
+            if !device_deletes.is_empty() {
+                self.repo
+                    .delete_device_keys(&device_deletes)
+                    .await
+                    .map_err(|e| SystemError::Internal(format!("Failed to delete device preferences: {e}")))?;
+            }
+            Ok::<(), SystemError>(())
+        }
+        .await;
+
+        if let Err(error) = stored {
+            // Persistence failed after the assertion was already flipped —
+            // put the machine back where it was.
+            if let Some(previous) = previous_keep_awake {
+                let _ = self.apply_keep_awake(previous).await;
+            }
+            return Err(error);
         }
 
         Ok(())
@@ -177,10 +232,12 @@ impl ClientPrefService {
         Ok(())
     }
 
-    async fn get_stored_keep_awake(&self, user_id: &str) -> Result<bool, SystemError> {
+    /// Reads the machine's stored keep-awake value. Device-scoped: there is one
+    /// value per machine, so no user is involved.
+    async fn get_stored_keep_awake(&self) -> Result<bool, SystemError> {
         let rows = self
             .repo
-            .get_by_keys(user_id, &[KEEP_AWAKE_KEY])
+            .get_device_by_keys(&[KEEP_AWAKE_KEY])
             .await
             .map_err(|e| SystemError::Internal(format!("Failed to get keep-awake preference: {e}")))?;
 
@@ -206,14 +263,14 @@ impl ClientPrefService {
         Ok(())
     }
 
-    fn restore_keep_awake_from_preferences(&self, user_id: String) {
+    fn restore_keep_awake_from_preferences(&self) {
         let service = self.clone();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             warn!("Cannot restore system keep-awake preference without a Tokio runtime");
             return;
         };
         handle.spawn(async move {
-            match service.get_stored_keep_awake(&user_id).await {
+            match service.get_stored_keep_awake().await {
                 Ok(true) => {
                     if let Err(error) = service.apply_keep_awake(true).await {
                         warn!(error = %error, "Failed to restore system keep-awake assertion");
@@ -275,6 +332,7 @@ mod tests {
     use tracing_subscriber::fmt;
 
     const TEST_USER_ID: &str = "user-1";
+    const OTHER_USER_ID: &str = "user-2";
 
     #[derive(Clone)]
     struct SharedBuf(Arc<Mutex<Vec<u8>>>);
@@ -315,37 +373,32 @@ mod tests {
         String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
     }
 
-    async fn setup() -> ClientPrefService {
+    async fn setup_repo() -> Arc<SqliteClientPreferenceRepository> {
         let db = init_database_memory().await.unwrap();
-        sqlx::query(
-            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
-             VALUES (?, 'local', ?, '', 'active', 0, 1, 1)",
-        )
-        .bind(TEST_USER_ID)
-        .bind(TEST_USER_ID)
-        .execute(db.pool())
-        .await
-        .unwrap();
+        for user_id in [TEST_USER_ID, OTHER_USER_ID] {
+            sqlx::query(
+                "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+                 VALUES (?, 'local', ?, '', 'active', 0, 1, 1)",
+            )
+            .bind(user_id)
+            .bind(user_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
         let repo = Arc::new(SqliteClientPreferenceRepository::new(db.pool().clone()));
+        // Leak the db handle so the pool stays alive for the test
         std::mem::forget(db);
-        ClientPrefService::new(repo)
+        repo
+    }
+
+    async fn setup() -> ClientPrefService {
+        ClientPrefService::new(setup_repo().await)
     }
 
     async fn setup_with_keep_awake_controller(controller: DynKeepAwakeController) -> ClientPrefService {
-        let db = init_database_memory().await.unwrap();
-        sqlx::query(
-            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
-             VALUES (?, 'local', ?, '', 'active', 0, 1, 1)",
-        )
-        .bind(TEST_USER_ID)
-        .bind(TEST_USER_ID)
-        .execute(db.pool())
-        .await
-        .unwrap();
-        let repo = Arc::new(SqliteClientPreferenceRepository::new(db.pool().clone()));
-        std::mem::forget(db);
         ClientPrefService {
-            repo,
+            repo: setup_repo().await,
             keep_awake_controller: controller,
         }
     }
@@ -653,8 +706,7 @@ mod tests {
         initial.update_preferences(TEST_USER_ID, req).await.unwrap();
 
         let controller = Arc::new(RecordingKeepAwakeController::default());
-        let service =
-            ClientPrefService::with_keep_awake_controller(initial.repo.clone(), controller.clone(), TEST_USER_ID);
+        let service = ClientPrefService::with_keep_awake_controller(initial.repo.clone(), controller.clone());
 
         for _ in 0..50 {
             if !controller.calls.lock().unwrap().is_empty() {
@@ -668,19 +720,187 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keep_awake_without_restore_does_not_read_persisted_default_user_preference() {
+    async fn keep_awake_restore_reads_the_machine_value_written_by_any_account() {
+        // `keepAwake` is device-scoped: the value another account stored is the
+        // machine's value, and startup restore must pick it up without knowing
+        // which user wrote it.
         let initial = setup().await;
         let mut req = UpdateClientPreferencesRequest::new();
         req.insert(KEEP_AWAKE_KEY.into(), json!(true));
-        initial.update_preferences(TEST_USER_ID, req).await.unwrap();
+        initial.update_preferences(OTHER_USER_ID, req).await.unwrap();
 
         let controller = Arc::new(RecordingKeepAwakeController::default());
-        let service =
-            ClientPrefService::with_keep_awake_controller_without_restore(initial.repo.clone(), controller.clone());
+        let service = ClientPrefService::with_keep_awake_controller(initial.repo.clone(), controller.clone());
 
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        for _ in 0..50 {
+            if !controller.calls.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
 
-        assert!(controller.calls.lock().unwrap().is_empty());
+        assert_eq!(*controller.calls.lock().unwrap(), vec![true]);
         drop(service);
+    }
+
+    #[tokio::test]
+    async fn keep_awake_restore_leaves_controller_untouched_without_a_stored_value() {
+        let initial = setup().await;
+        let controller = Arc::new(RecordingKeepAwakeController::default());
+        let service = ClientPrefService::with_keep_awake_controller(initial.repo.clone(), controller.clone());
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            controller.calls.lock().unwrap().is_empty(),
+            "restore must not assert keep-awake when the machine stored nothing"
+        );
+        drop(service);
+    }
+
+    // -- device vs account scope --
+
+    #[test]
+    fn device_scoped_keys_are_the_machine_level_set() {
+        for key in ["system.closeToTray", "keepAwake", "autoPreviewOfficeFiles"] {
+            assert!(is_device_scoped_key(key), "{key} must be device-scoped");
+        }
+        for key in ["pet.", "pet.size", "pet.visible", "pet.anything.nested"] {
+            assert!(is_device_scoped_key(key), "{key} must be device-scoped");
+        }
+    }
+
+    #[test]
+    fn account_scoped_keys_are_not_device_scoped() {
+        for key in [
+            "theme",
+            "language",
+            "system.notificationEnabled",
+            "system.saveUploadToWorkspace",
+            "assistant.telegram.agent",
+            // Near-misses: the prefix rule must not swallow these.
+            "petals",
+            "pet",
+            "appearance.pet.size",
+            "system.closeToTrayExtra",
+        ] {
+            assert!(!is_device_scoped_key(key), "{key} must be account-scoped");
+        }
+    }
+
+    #[tokio::test]
+    async fn device_key_written_by_one_user_is_visible_to_another() {
+        let svc = setup().await;
+        let mut req = UpdateClientPreferencesRequest::new();
+        req.insert("system.closeToTray".into(), json!(true));
+        req.insert("pet.size".into(), json!(360));
+        svc.update_preferences(TEST_USER_ID, req).await.unwrap();
+
+        // Full read for the other account sees the machine's values…
+        let prefs = svc.get_preferences(OTHER_USER_ID, None).await.unwrap();
+        assert_eq!(prefs["system.closeToTray"], json!(true));
+        assert_eq!(prefs["pet.size"], json!(360));
+
+        // …and so does a keyed read.
+        let prefs = svc
+            .get_preferences(OTHER_USER_ID, Some(&["system.closeToTray", "pet.size"]))
+            .await
+            .unwrap();
+        assert_eq!(prefs["system.closeToTray"], json!(true));
+        assert_eq!(prefs["pet.size"], json!(360));
+    }
+
+    #[tokio::test]
+    async fn device_key_write_by_second_user_overwrites_the_machine_value() {
+        let svc = setup().await;
+        let mut first = UpdateClientPreferencesRequest::new();
+        first.insert("autoPreviewOfficeFiles".into(), json!(true));
+        svc.update_preferences(TEST_USER_ID, first).await.unwrap();
+
+        let mut second = UpdateClientPreferencesRequest::new();
+        second.insert("autoPreviewOfficeFiles".into(), json!(false));
+        svc.update_preferences(OTHER_USER_ID, second).await.unwrap();
+
+        for user in [TEST_USER_ID, OTHER_USER_ID] {
+            let prefs = svc.get_preferences(user, None).await.unwrap();
+            assert_eq!(prefs["autoPreviewOfficeFiles"], json!(false), "for {user}");
+        }
+    }
+
+    #[tokio::test]
+    async fn device_key_delete_removes_it_for_every_account() {
+        let svc = setup().await;
+        let mut req = UpdateClientPreferencesRequest::new();
+        req.insert("pet.size".into(), json!(360));
+        svc.update_preferences(TEST_USER_ID, req).await.unwrap();
+
+        let mut delete = UpdateClientPreferencesRequest::new();
+        delete.insert("pet.size".into(), json!(null));
+        svc.update_preferences(OTHER_USER_ID, delete).await.unwrap();
+
+        let prefs = svc.get_preferences(TEST_USER_ID, None).await.unwrap();
+        assert!(!prefs.contains_key("pet.size"));
+    }
+
+    #[tokio::test]
+    async fn account_keys_stay_isolated_between_users() {
+        let svc = setup().await;
+        let mut mine = UpdateClientPreferencesRequest::new();
+        mine.insert("theme".into(), json!("dark"));
+        svc.update_preferences(TEST_USER_ID, mine).await.unwrap();
+
+        let mut theirs = UpdateClientPreferencesRequest::new();
+        theirs.insert("theme".into(), json!("light"));
+        svc.update_preferences(OTHER_USER_ID, theirs).await.unwrap();
+
+        assert_eq!(
+            svc.get_preferences(TEST_USER_ID, None).await.unwrap()["theme"],
+            json!("dark")
+        );
+        assert_eq!(
+            svc.get_preferences(OTHER_USER_ID, None).await.unwrap()["theme"],
+            json!("light")
+        );
+
+        // Deleting one account's key leaves the other's alone.
+        let mut delete = UpdateClientPreferencesRequest::new();
+        delete.insert("theme".into(), json!(null));
+        svc.update_preferences(OTHER_USER_ID, delete).await.unwrap();
+        assert!(
+            !svc.get_preferences(OTHER_USER_ID, None)
+                .await
+                .unwrap()
+                .contains_key("theme")
+        );
+        assert_eq!(
+            svc.get_preferences(TEST_USER_ID, None).await.unwrap()["theme"],
+            json!("dark")
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_scope_batch_routes_each_key_to_its_own_store() {
+        let svc = setup().await;
+        let mut req = UpdateClientPreferencesRequest::new();
+        req.insert("pet.size".into(), json!(360));
+        req.insert("theme".into(), json!("dark"));
+        svc.update_preferences(TEST_USER_ID, req).await.unwrap();
+
+        // The device key lives in the device store only…
+        let device_rows = svc.repo.get_all_device().await.unwrap();
+        let device_keys: Vec<&str> = device_rows.iter().map(|row| row.key.as_str()).collect();
+        assert_eq!(device_keys, vec!["pet.size"]);
+        assert!(device_rows[0].user_id.is_none());
+
+        // …and the account key in the account store only.
+        let account_rows = svc.repo.get_all(TEST_USER_ID).await.unwrap();
+        let account_keys: Vec<&str> = account_rows.iter().map(|row| row.key.as_str()).collect();
+        assert_eq!(account_keys, vec!["theme"]);
+
+        // The merged read still returns both.
+        let prefs = svc.get_preferences(TEST_USER_ID, None).await.unwrap();
+        assert_eq!(prefs.len(), 2);
+        assert_eq!(prefs["pet.size"], json!(360));
+        assert_eq!(prefs["theme"], json!("dark"));
     }
 }

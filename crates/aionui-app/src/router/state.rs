@@ -405,14 +405,14 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
 
     let client_pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
     let keep_awake_controller = Arc::new(aionui_system::SystemKeepAwakeController::new());
-    let client_pref_service = if services.identity_mode.is_local() {
-        ClientPrefService::with_keep_awake_controller(client_pref_repo, keep_awake_controller, "system_default_user")
-    } else {
-        ClientPrefService::with_keep_awake_controller_without_restore(client_pref_repo, keep_awake_controller)
-    };
+    // `keepAwake` is device-scoped (migration 031 segment): one value for the
+    // machine, owned by no account. Restoring it at startup is therefore
+    // correct in both identity modes — there is no per-user value to leak.
+    let client_pref_service =
+        ClientPrefService::with_keep_awake_controller(client_pref_repo.clone(), keep_awake_controller);
 
     SystemRouterState {
-        settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone()))),
+        settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone())), client_pref_repo),
         client_pref_service,
         provider_service: ProviderService::new(provider_repo.clone(), encryption_key),
         model_fetch_service: ModelFetchService::new(provider_repo, encryption_key, http_client.clone()),
@@ -556,6 +556,10 @@ fn build_channel_settings_service(
         Arc::new(SqliteClientPreferenceRepository::new(services.database.pool().clone()));
 
     let mut service = aionui_channel::channel_settings::ChannelSettingsService::new(pref_repo)
+        // Connection-scoped preference keys (channel refactor A4).
+        .with_channel_repo(Arc::new(aionui_db::SqliteChannelRepository::new(
+            services.database.pool().clone(),
+        )))
         .with_agent_metadata_repo(Arc::new(SqliteAgentMetadataRepository::new(
             services.database.pool().clone(),
         )))
@@ -621,9 +625,12 @@ pub async fn build_channel_state(
         confirm_tx,
     ));
 
+    // The pairing-code HMAC shares the channel credential key: both protect
+    // channel secrets at rest and rotate together with the JWT secret.
     let pairing_service = Arc::new(aionui_channel::pairing::PairingService::new(
         repo.clone(),
         services.event_bus.clone(),
+        encryption_key,
     ));
 
     let session_manager = Arc::new(aionui_channel::session::SessionManager::new(repo.clone()));
@@ -1050,7 +1057,7 @@ mod tests {
     use aionui_api_types::{CreateConversationRequest, SendMessageRequest};
     use aionui_channel::types::PluginType;
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs};
-    use aionui_db::models::{AssistantSessionRow, UpsertAssistantDefinitionParams};
+    use aionui_db::models::{ChannelConversationBindingRow, UpsertAssistantDefinitionParams};
     use aionui_db::{
         IAssistantDefinitionRepository, IClientPreferenceRepository, IConversationRepository,
         SqliteAssistantDefinitionRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
@@ -1261,13 +1268,13 @@ mod tests {
 
         let settings = build_channel_settings_service(&services, None);
         let message_service = build_channel_message_service(&services, settings).await;
-        let session = AssistantSessionRow {
+        let session = ChannelConversationBindingRow {
             id: "session-channel-state".to_owned(),
+            owner_user_id: "system_default_user".to_owned(),
+            connection_id: "conn-channel-state".to_owned(),
             user_id: "channel-user-state".to_owned(),
-            agent_type: "aionrs".to_owned(),
-            conversation_id: None,
-            workspace: None,
             chat_id: Some("wx-chat-state".to_owned()),
+            conversation_id: None,
             created_at: 1,
             last_activity: 1,
         };
@@ -1299,7 +1306,7 @@ mod tests {
         assert_eq!(conversation.r#type, AgentType::Aionrs.serde_name());
         assert_eq!(conversation.name, "Weixin Aionrs");
 
-        let second_session = AssistantSessionRow {
+        let second_session = ChannelConversationBindingRow {
             conversation_id: Some(first.conversation_id.clone()),
             ..session
         };

@@ -44,14 +44,14 @@ const GLOBAL_TABLES: &[(&str, &str)] = &[
 /// Without this, "has a `user_id` column" would classify the table as an
 /// ownership root by accident and the gate would pass without a conscious
 /// decision. Each entry: (table, the non-Core table its `user_id` points at).
-const NON_CORE_USER_ID_TABLES: &[(&str, &str)] = &[
-    // assistant_sessions.user_id -> assistant_users.id (a channel/platform
-    // user). Core ownership flows through assistant_users.owner_user_id, which
-    // adoption re-owns; adoption's UPDATE on this `user_id` never matches
-    // 'system_default_user' (it holds assistant_users UUIDs), so it is a
-    // harmless no-op.
-    ("assistant_sessions", "assistant_users"),
-];
+///
+/// Currently empty: the only entry was `assistant_sessions`, whose misleading
+/// `user_id` the channel refactor renamed to `channel_user_id` on
+/// `channel_conversation_bindings`. That table now carries its own
+/// `owner_user_id` and classifies as a plain ownership root. The mechanism is
+/// kept so a future table with the same shape needs a conscious declaration
+/// rather than silently passing the gate.
+const NON_CORE_USER_ID_TABLES: &[(&str, &str)] = &[];
 
 /// Identity / infrastructure tables outside the ownership model.
 const INFRA_TABLES: &[&str] = &["users", "_sqlx_migrations"];
@@ -220,10 +220,21 @@ async fn first_external_user_adopts_owner_user_id_tables_too() {
     let (project_id, pe_id) = seed_default_user_project(pool).await;
 
     // Channel binding owned by the pre-upgrade local user (`owner_user_id`
-    // table with a coexisting platform identity column).
+    // table with a coexisting platform identity column). The binding hangs
+    // off a connection, itself an owner_user_id table, so both must be
+    // adopted together for the composite FK to stay satisfied.
     sqlx::query(
-        "INSERT INTO assistant_users (id, platform_user_id, platform_type, display_name, authorized_at, owner_user_id)
-         VALUES ('au-legacy', 'tg-123', 'telegram', 'TG User', 1, 'system_default_user')",
+        "INSERT INTO channel_connections
+             (id, owner_user_id, plugin_key, name, enabled, config, created_at, updated_at)
+         VALUES ('conn-legacy', 'system_default_user', 'telegram', 'TG', 0, '{}', 1, 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO channel_users
+             (id, owner_user_id, connection_id, external_user_id, display_name, status, authorized_at)
+         VALUES ('au-legacy', 'system_default_user', 'conn-legacy', 'tg-123', 'TG User', 'active', 1)",
     )
     .execute(pool)
     .await
@@ -247,11 +258,20 @@ async fn first_external_user_adopts_owner_user_id_tables_too() {
         "conversation + project + explorer entry + channel binding must move, moved={moved}"
     );
 
-    let binding_owner: String = sqlx::query_scalar("SELECT owner_user_id FROM assistant_users WHERE id = 'au-legacy'")
+    let binding_owner: String = sqlx::query_scalar("SELECT owner_user_id FROM channel_users WHERE id = 'au-legacy'")
         .fetch_one(pool)
         .await
         .unwrap();
     assert_eq!(binding_owner, user.id, "channel platform binding must be adopted");
+
+    // Its connection must move with it, or the composite FK
+    // (owner_user_id, connection_id) would dangle.
+    let connection_owner: String =
+        sqlx::query_scalar("SELECT owner_user_id FROM channel_connections WHERE id = 'conn-legacy'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(connection_owner, user.id, "channel connection must be adopted too");
 
     let conv_owner: String = sqlx::query_scalar("SELECT user_id FROM conversations WHERE id = 'conv-legacy'")
         .fetch_one(pool)
@@ -274,6 +294,66 @@ async fn first_external_user_adopts_owner_user_id_tables_too() {
         .unwrap();
     assert_eq!(project_owner, user.id);
     assert_eq!(entry_owner, user.id, "explorer entry must be adopted with its project");
+
+    db.close().await;
+}
+
+/// `client_preferences` is an ownership root by its `user_id` column, but that
+/// column is nullable since migration 031: device-scope rows describe the
+/// machine and carry no owner. Adoption must move the account rows and leave
+/// the machine rows exactly where they are — the same rule the ownership loop
+/// already applies to NULL-owner catalog rows.
+#[tokio::test]
+async fn adoption_moves_account_preferences_and_leaves_device_preferences_machine_global() {
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool();
+    let repo = SqliteUserRepository::new(pool.clone());
+
+    sqlx::query(
+        "INSERT INTO client_preferences (scope, user_id, key, value, updated_at)
+         VALUES ('account', 'system_default_user', 'theme', '\"dark\"', 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO client_preferences (scope, user_id, key, value, updated_at)
+         VALUES ('device', NULL, 'keepAwake', 'true', 1)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let user = repo
+        .ensure_external_user(
+            UserType::Aionpro,
+            "ext-prefs",
+            ExternalUserProjection {
+                username: Some("Pro".into()),
+                email: None,
+                avatar_path: None,
+            },
+        )
+        .await
+        .unwrap();
+    repo.adopt_system_default_data(&user.id).await.unwrap();
+
+    let theme_owner: Option<String> = sqlx::query_scalar("SELECT user_id FROM client_preferences WHERE key = 'theme'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        theme_owner.as_deref(),
+        Some(user.id.as_str()),
+        "account pref is adopted"
+    );
+
+    let keep_awake_owner: Option<String> =
+        sqlx::query_scalar("SELECT user_id FROM client_preferences WHERE key = 'keepAwake'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(keep_awake_owner, None, "device pref must stay owner-less");
 
     db.close().await;
 }

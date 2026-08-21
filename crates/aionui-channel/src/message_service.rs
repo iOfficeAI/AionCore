@@ -4,7 +4,7 @@ use aionui_ai_agent::{AgentStreamEvent, IWorkerTaskManager};
 use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest, SendMessageRequest};
 use aionui_common::{AgentType, ConversationSource};
 use aionui_conversation::ConversationService;
-use aionui_db::models::AssistantSessionRow;
+use aionui_db::models::ChannelConversationBindingRow;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -54,7 +54,7 @@ impl ChannelMessageService {
     pub async fn send_to_agent(
         &self,
         owner_user_id: &str,
-        session: &AssistantSessionRow,
+        session: &ChannelConversationBindingRow,
         text: &str,
         platform: PluginType,
     ) -> Result<SendResult, ChannelError> {
@@ -123,7 +123,7 @@ impl ChannelMessageService {
     async fn create_conversation_for_session(
         &self,
         owner_user_id: &str,
-        session: &AssistantSessionRow,
+        session: &ChannelConversationBindingRow,
         platform: PluginType,
     ) -> Result<String, ChannelError> {
         let source = platform_to_source(platform);

@@ -6,8 +6,8 @@ use aionui_api_types::{
 };
 use aionui_common::ProviderWithModel;
 use aionui_db::{
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IClientPreferenceRepository,
-    resolve_agent_binding_from_rows,
+    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IChannelRepository,
+    IClientPreferenceRepository, resolve_agent_binding_from_rows,
 };
 use tracing::debug;
 
@@ -18,11 +18,17 @@ const DEFAULT_AGENT_TYPE: &str = "aionrs";
 
 /// Per-plugin agent/model configuration read from `client_preferences`.
 ///
-/// Keys follow the pattern established by the old Electron frontend:
-/// - `assistant.{platform}.agent`       → JSON `{"backend":"claude","name":"Claude"}`
-/// - `assistant.{platform}.defaultModel` → JSON `{"id":"provider_id","use_model":"model_name"}`
+/// Keys (channel refactor A4) are connection-scoped with a legacy fallback:
+/// - `assistant.{connection_id}.agent`        → JSON `{"backend":"claude","name":"Claude"}`
+/// - `assistant.{connection_id}.defaultModel` → JSON `{"id":"provider_id","use_model":"model_name"}`
+///
+/// Reads fall back to the legacy platform-keyed entries
+/// (`assistant.{platform}.*`) written before connections existed; writes land
+/// on the connection key whenever the platform has a connection. Phase 1 keeps
+/// one connection per (owner, platform), so old and new keys map one-to-one.
 pub struct ChannelSettingsService {
     pref_repo: Arc<dyn IClientPreferenceRepository>,
+    channel_repo: Option<Arc<dyn IChannelRepository>>,
     agent_metadata_repo: Option<Arc<dyn IAgentMetadataRepository>>,
     assistant_definition_repo: Option<Arc<dyn IAssistantDefinitionRepository>>,
     assistant_overlay_repo: Option<Arc<dyn IAssistantOverlayRepository>>,
@@ -63,11 +69,70 @@ impl ChannelSettingsService {
     pub fn new(pref_repo: Arc<dyn IClientPreferenceRepository>) -> Self {
         Self {
             pref_repo,
+            channel_repo: None,
             agent_metadata_repo: None,
             assistant_definition_repo: None,
             assistant_overlay_repo: None,
             generated_assistant_materializer: None,
         }
+    }
+
+    /// Enables connection-scoped preference keys. Without this the service
+    /// keeps addressing settings by platform key only (legacy behavior).
+    pub fn with_channel_repo(mut self, channel_repo: Arc<dyn IChannelRepository>) -> Self {
+        self.channel_repo = Some(channel_repo);
+        self
+    }
+
+    /// Resolves the owner's connection id for a platform, if any.
+    async fn connection_id_for(&self, user_id: &str, platform: PluginType) -> Result<Option<String>, ChannelError> {
+        let Some(repo) = &self.channel_repo else {
+            return Ok(None);
+        };
+        Ok(repo
+            .get_connection_by_plugin_key(user_id, &platform.to_string())
+            .await?
+            .map(|row| row.id))
+    }
+
+    /// Read-order keys for one setting: connection key first (when a
+    /// connection exists), then the legacy platform key.
+    async fn read_keys(
+        &self,
+        user_id: &str,
+        platform: PluginType,
+        build: fn(&str) -> String,
+    ) -> Result<Vec<String>, ChannelError> {
+        let mut keys = Vec::with_capacity(2);
+        if let Some(connection_id) = self.connection_id_for(user_id, platform).await? {
+            keys.push(build(&connection_id));
+        }
+        keys.push(build(&platform.to_string()));
+        Ok(keys)
+    }
+
+    /// Write key for one setting: the connection key when a connection
+    /// exists, else the legacy platform key (a platform can be configured
+    /// before its plugin is first enabled).
+    async fn write_key(
+        &self,
+        user_id: &str,
+        platform: PluginType,
+        build: fn(&str) -> String,
+    ) -> Result<String, ChannelError> {
+        Ok(match self.connection_id_for(user_id, platform).await? {
+            Some(connection_id) => build(&connection_id),
+            None => build(&platform.to_string()),
+        })
+    }
+
+    /// Picks the highest-priority preference row according to `keys` order.
+    fn pick_preferred(
+        keys: &[String],
+        prefs: Vec<aionui_db::models::ClientPreference>,
+    ) -> Option<aionui_db::models::ClientPreference> {
+        keys.iter()
+            .find_map(|key| prefs.iter().find(|p| &p.key == key).cloned())
     }
 
     pub fn with_generated_assistant_materializer(
@@ -105,10 +170,11 @@ impl ChannelSettingsService {
         user_id: &str,
         platform: PluginType,
     ) -> Result<ResolvedAgentConfig, ChannelError> {
-        let key = agent_key(platform);
-        let prefs = self.pref_repo.get_by_keys(user_id, &[&key]).await?;
+        let keys = self.read_keys(user_id, platform, agent_key).await?;
+        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let prefs = self.pref_repo.get_by_keys(user_id, &key_refs).await?;
 
-        let Some(pref) = prefs.into_iter().next() else {
+        let Some(pref) = Self::pick_preferred(&keys, prefs) else {
             return Ok(default_agent_config());
         };
 
@@ -176,10 +242,11 @@ impl ChannelSettingsService {
         user_id: &str,
         platform: PluginType,
     ) -> Result<Option<ResolvedModelConfig>, ChannelError> {
-        let key = model_key(platform);
-        let prefs = self.pref_repo.get_by_keys(user_id, &[&key]).await?;
+        let keys = self.read_keys(user_id, platform, model_key).await?;
+        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let prefs = self.pref_repo.get_by_keys(user_id, &key_refs).await?;
 
-        let Some(pref) = prefs.into_iter().next() else {
+        let Some(pref) = Self::pick_preferred(&keys, prefs) else {
             return Ok(None);
         };
 
@@ -206,24 +273,24 @@ impl ChannelSettingsService {
         user_id: &str,
         platform: PluginType,
     ) -> Result<ChannelPlatformSettingsResponse, ChannelError> {
-        let key_agent = agent_key(platform);
-        let key_model = model_key(platform);
-        let prefs = self.pref_repo.get_by_keys(user_id, &[&key_agent, &key_model]).await?;
+        let agent_keys = self.read_keys(user_id, platform, agent_key).await?;
+        let model_keys = self.read_keys(user_id, platform, model_key).await?;
+        let all_keys: Vec<&str> = agent_keys.iter().chain(model_keys.iter()).map(String::as_str).collect();
+        let prefs = self.pref_repo.get_by_keys(user_id, &all_keys).await?;
 
         let mut assistant = None;
         let mut default_model = None;
 
-        for pref in prefs {
-            if pref.key == key_agent {
-                if let Some(parsed) = parse_channel_assistant_setting(&pref.value) {
-                    assistant = Some(
-                        self.normalize_channel_assistant_setting_for_response(user_id, parsed)
-                            .await?,
-                    );
-                }
-            } else if pref.key == key_model {
-                default_model = parse_channel_model_setting(&pref.value);
-            }
+        if let Some(pref) = Self::pick_preferred(&agent_keys, prefs.clone())
+            && let Some(parsed) = parse_channel_assistant_setting(&pref.value)
+        {
+            assistant = Some(
+                self.normalize_channel_assistant_setting_for_response(user_id, parsed)
+                    .await?,
+            );
+        }
+        if let Some(pref) = Self::pick_preferred(&model_keys, prefs) {
+            default_model = parse_channel_model_setting(&pref.value);
         }
 
         if assistant.is_none() {
@@ -242,10 +309,11 @@ impl ChannelSettingsService {
         user_id: &str,
         platform: PluginType,
     ) -> Result<Option<ChannelAssistantSettingResponse>, ChannelError> {
-        let key = agent_key(platform);
-        let prefs = self.pref_repo.get_by_keys(user_id, &[&key]).await?;
+        let keys = self.read_keys(user_id, platform, agent_key).await?;
+        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let prefs = self.pref_repo.get_by_keys(user_id, &key_refs).await?;
 
-        let Some(pref) = prefs.into_iter().next() else {
+        let Some(pref) = Self::pick_preferred(&keys, prefs) else {
             return self.resolve_default_channel_assistant_setting(user_id).await;
         };
 
@@ -269,7 +337,7 @@ impl ChannelSettingsService {
     ) -> Result<(), ChannelError> {
         let normalized = normalize_channel_assistant_setting_for_write(assistant);
         let payload = serde_json::to_string(&normalized).map_err(ChannelError::Json)?;
-        let key = agent_key(platform);
+        let key = self.write_key(user_id, platform, agent_key).await?;
         self.pref_repo
             .upsert_batch(user_id, &[(&key, payload.as_str())])
             .await?;
@@ -283,7 +351,7 @@ impl ChannelSettingsService {
         model: &ChannelDefaultModelSetting,
     ) -> Result<(), ChannelError> {
         let payload = serde_json::to_string(model).map_err(ChannelError::Json)?;
-        let key = model_key(platform);
+        let key = self.write_key(user_id, platform, model_key).await?;
         self.pref_repo
             .upsert_batch(user_id, &[(&key, payload.as_str())])
             .await?;
@@ -476,12 +544,14 @@ impl ChannelSettingsService {
     }
 }
 
-fn agent_key(platform: PluginType) -> String {
-    format!("assistant.{platform}.agent")
+/// `scope` is a connection id (current) or a platform key (legacy fallback).
+fn agent_key(scope: &str) -> String {
+    format!("assistant.{scope}.agent")
 }
 
-fn model_key(platform: PluginType) -> String {
-    format!("assistant.{platform}.defaultModel")
+/// `scope` is a connection id (current) or a platform key (legacy fallback).
+fn model_key(scope: &str) -> String {
+    format!("assistant.{scope}.defaultModel")
 }
 
 fn default_agent_config() -> ResolvedAgentConfig {
@@ -616,7 +686,8 @@ mod tests {
             Ok(data
                 .iter()
                 .map(|(k, v)| ClientPreference {
-                    user_id: TEST_USER_ID.to_owned(),
+                    scope: "account".to_owned(),
+                    user_id: Some(TEST_USER_ID.to_owned()),
                     key: k.clone(),
                     value: v.clone(),
                     updated_at: 0,
@@ -630,7 +701,8 @@ mod tests {
                 .iter()
                 .filter(|(k, _)| keys.contains(&k.as_str()))
                 .map(|(k, v)| ClientPreference {
-                    user_id: TEST_USER_ID.to_owned(),
+                    scope: "account".to_owned(),
+                    user_id: Some(TEST_USER_ID.to_owned()),
                     key: k.clone(),
                     value: v.clone(),
                     updated_at: 0,
@@ -654,6 +726,24 @@ mod tests {
             let mut data = self.data.lock().unwrap();
             data.retain(|(k, _)| !keys.contains(&k.as_str()));
             Ok(())
+        }
+
+        // Channel settings keys (`assistant.{platform}.*`) are per-account by
+        // design; touching the device scope from here would be a bug.
+        async fn get_all_device(&self) -> Result<Vec<ClientPreference>, DbError> {
+            unreachable!("channel settings must not read device-scope preferences")
+        }
+
+        async fn get_device_by_keys(&self, _keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
+            unreachable!("channel settings must not read device-scope preferences")
+        }
+
+        async fn upsert_device_batch(&self, _entries: &[(&str, &str)]) -> Result<(), DbError> {
+            unreachable!("channel settings must not write device-scope preferences")
+        }
+
+        async fn delete_device_keys(&self, _keys: &[&str]) -> Result<(), DbError> {
+            unreachable!("channel settings must not write device-scope preferences")
         }
     }
 
@@ -1337,5 +1427,138 @@ mod tests {
         assert!(p.provider_id.is_empty());
         assert!(p.model.is_empty());
         assert!(p.use_model.is_none());
+    }
+
+    // ── Connection-scoped preference keys (A4) ────────────────────────
+
+    mod connection_scoped_keys {
+        use super::*;
+        use aionui_db::models::ChannelConnectionRow;
+        use aionui_db::{IUserRepository, SqliteChannelRepository, SqliteUserRepository, init_database_memory};
+
+        const CONN_ID: &str = "conn_test_telegram";
+
+        /// Real in-memory channel repo with one telegram connection owned by
+        /// the returned user id.
+        async fn channel_repo_with_connection() -> (Arc<SqliteChannelRepository>, String) {
+            let db = init_database_memory().await.unwrap();
+            let owner = SqliteUserRepository::new(db.pool().clone())
+                .create_user("settings-owner", "hash")
+                .await
+                .unwrap()
+                .id;
+            let repo = SqliteChannelRepository::new(db.pool().clone());
+            let now = aionui_common::now_ms();
+            repo.upsert_connection(
+                &owner,
+                &ChannelConnectionRow {
+                    id: CONN_ID.into(),
+                    owner_user_id: owner.clone(),
+                    plugin_key: "telegram".into(),
+                    name: "TG".into(),
+                    enabled: true,
+                    config: String::new(),
+                    status: None,
+                    last_connected: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .await
+            .unwrap();
+            std::mem::forget(db);
+            (Arc::new(repo), owner)
+        }
+
+        #[tokio::test]
+        async fn writes_land_on_the_connection_key() {
+            let (channel_repo, owner) = channel_repo_with_connection().await;
+            let prefs = Arc::new(MockPrefRepo::new());
+            let svc = ChannelSettingsService::new(prefs.clone()).with_channel_repo(channel_repo);
+
+            svc.set_assistant_setting(
+                &owner,
+                PluginType::Telegram,
+                &ChannelAssistantSettingRequest {
+                    assistant_id: "bare-claude".into(),
+                    name: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            let stored = prefs
+                .get_by_keys(&owner, &["assistant.conn_test_telegram.agent"])
+                .await
+                .unwrap();
+            assert_eq!(stored.len(), 1, "write must land on the connection key");
+            // The legacy platform key is NOT written.
+            assert!(
+                prefs
+                    .get_by_keys(&owner, &["assistant.telegram.agent"])
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn reads_prefer_the_connection_key_over_the_legacy_platform_key() {
+            let (channel_repo, owner) = channel_repo_with_connection().await;
+            let prefs = Arc::new(MockPrefRepo::with_data(vec![
+                (
+                    "assistant.conn_test_telegram.agent",
+                    r#"{"agent_type":"acp","backend":"claude"}"#,
+                ),
+                ("assistant.telegram.agent", r#"{"agent_type":"aionrs"}"#),
+            ]));
+            let svc = ChannelSettingsService::new(prefs).with_channel_repo(channel_repo);
+
+            let config = svc.get_agent_config(&owner, PluginType::Telegram).await.unwrap();
+            assert_eq!(config.agent_type, "acp");
+            assert_eq!(config.backend.as_deref(), Some("claude"));
+        }
+
+        #[tokio::test]
+        async fn reads_fall_back_to_the_legacy_platform_key() {
+            let (channel_repo, owner) = channel_repo_with_connection().await;
+            let prefs = Arc::new(MockPrefRepo::with_data(vec![(
+                "assistant.telegram.agent",
+                r#"{"agent_type":"aionrs"}"#,
+            )]));
+            let svc = ChannelSettingsService::new(prefs).with_channel_repo(channel_repo);
+
+            let config = svc.get_agent_config(&owner, PluginType::Telegram).await.unwrap();
+            assert_eq!(config.agent_type, "aionrs");
+        }
+
+        #[tokio::test]
+        async fn platform_without_a_connection_keeps_the_platform_key() {
+            let (channel_repo, owner) = channel_repo_with_connection().await;
+            let prefs = Arc::new(MockPrefRepo::new());
+            let svc = ChannelSettingsService::new(prefs.clone()).with_channel_repo(channel_repo);
+
+            // Lark has no connection row: the write stays on the platform key
+            // so a platform can be configured before its plugin is enabled.
+            svc.set_model_setting(
+                &owner,
+                PluginType::Lark,
+                &ChannelDefaultModelSetting {
+                    id: "prov".into(),
+                    use_model: "m1".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                prefs
+                    .get_by_keys(&owner, &["assistant.lark.defaultModel"])
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
     }
 }

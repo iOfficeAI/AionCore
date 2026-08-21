@@ -6,7 +6,7 @@
 mod common;
 
 use aionui_common::now_ms;
-use aionui_db::models::{AssistantSessionRow, AssistantUserRow};
+use aionui_db::models::{ChannelConnectionRow, ChannelConversationBindingRow, ChannelUserRow};
 use aionui_db::{IChannelRepository, SqliteChannelRepository};
 use axum::http::StatusCode;
 use serde_json::json;
@@ -184,6 +184,31 @@ async fn test_plugin_missing_token() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// Seeds the connection a channel user or pairing request attaches to,
+/// returning its connection id.
+async fn seed_connection(repo: &std::sync::Arc<dyn IChannelRepository>, plugin_key: &str) -> String {
+    let now = now_ms();
+    let id = format!("conn-{plugin_key}");
+    repo.upsert_connection(
+        OWNER_ID,
+        &ChannelConnectionRow {
+            id: id.clone(),
+            owner_user_id: OWNER_ID.to_owned(),
+            plugin_key: plugin_key.to_owned(),
+            name: format!("{plugin_key} bot"),
+            enabled: true,
+            config: "{}".to_owned(),
+            status: None,
+            last_connected: None,
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    id
+}
+
 // ===========================================================================
 // §2 Pairing management
 // ===========================================================================
@@ -314,6 +339,73 @@ async fn get_sessions_empty() {
     assert!(json["data"].as_array().unwrap().is_empty());
 }
 
+// GS-2: A populated session response carries the binding fields, and the
+// deprecated agent_type/workspace fields are omitted rather than serialized.
+#[tokio::test]
+async fn get_sessions_returns_binding_without_deprecated_agent_fields() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let repo: std::sync::Arc<dyn IChannelRepository> =
+        std::sync::Arc::new(SqliteChannelRepository::new(services.database.pool().clone()));
+
+    let now = now_ms();
+    let connection_id = seed_connection(&repo, "telegram").await;
+    repo.create_user(
+        OWNER_ID,
+        &ChannelUserRow {
+            id: "cu-sessions".to_owned(),
+            owner_user_id: OWNER_ID.to_owned(),
+            connection_id,
+            platform_user_id: "tg-sessions".to_owned(),
+            platform_type: "telegram".to_owned(),
+            display_name: Some("Sessions User".to_owned()),
+            status: "active".to_owned(),
+            revoked_at: None,
+            authorized_at: now,
+            last_active: None,
+        },
+    )
+    .await
+    .unwrap();
+    repo.get_or_create_session(
+        OWNER_ID,
+        "cu-sessions",
+        "chat-sessions",
+        &ChannelConversationBindingRow {
+            id: "cs-sessions".to_owned(),
+            owner_user_id: String::new(),
+            connection_id: String::new(),
+            user_id: "cu-sessions".to_owned(),
+            conversation_id: None,
+            chat_id: Some("chat-sessions".to_owned()),
+            created_at: now,
+            last_activity: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    let req = get_with_token("/api/channel/sessions", &token);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let sessions = json["data"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    let session = &sessions[0];
+    assert_eq!(session["id"], "cs-sessions");
+    assert_eq!(session["user_id"], "cu-sessions");
+    assert_eq!(session["chat_id"], "chat-sessions");
+    assert!(
+        session.get("agent_type").is_none(),
+        "deprecated agent_type must be omitted, got: {session}"
+    );
+    assert!(
+        session.get("workspace").is_none(),
+        "deprecated workspace must be omitted, got: {session}"
+    );
+}
+
 // ===========================================================================
 // §5 Settings sync
 // ===========================================================================
@@ -417,27 +509,32 @@ async fn put_channel_assistant_setting_clears_active_sessions() {
         std::sync::Arc::new(SqliteChannelRepository::new(services.database.pool().clone()));
 
     let now = now_ms();
+    let connection_id = seed_connection(&repo, "lark").await;
     repo.create_user(
         OWNER_ID,
-        &AssistantUserRow {
+        &ChannelUserRow {
             id: "user-channel-assistant".to_owned(),
             owner_user_id: OWNER_ID.to_owned(),
+            connection_id,
             platform_user_id: "user-channel-assistant".to_owned(),
             platform_type: "lark".to_owned(),
             display_name: Some("Channel Assistant User".to_owned()),
+            status: "active".to_owned(),
+            revoked_at: None,
             authorized_at: now,
             last_active: Some(now),
-            session_id: None,
         },
     )
     .await
     .unwrap();
-    let new_session = AssistantSessionRow {
+    let new_session = ChannelConversationBindingRow {
         id: "sess-channel-assistant".to_owned(),
+        // Owner and connection are derived by the repository from the
+        // active channel user; the caller leaves them empty.
+        owner_user_id: String::new(),
+        connection_id: String::new(),
         user_id: "user-channel-assistant".to_owned(),
-        agent_type: "acp".to_owned(),
         conversation_id: None,
-        workspace: None,
         chat_id: Some("chat-channel-assistant".to_owned()),
         created_at: now,
         last_activity: now,
@@ -475,27 +572,32 @@ async fn put_channel_default_model_setting_clears_active_sessions() {
         std::sync::Arc::new(SqliteChannelRepository::new(services.database.pool().clone()));
 
     let now = now_ms();
+    let connection_id = seed_connection(&repo, "lark").await;
     repo.create_user(
         OWNER_ID,
-        &AssistantUserRow {
+        &ChannelUserRow {
             id: "user-channel-model".to_owned(),
             owner_user_id: OWNER_ID.to_owned(),
+            connection_id,
             platform_user_id: "user-channel-model".to_owned(),
             platform_type: "lark".to_owned(),
             display_name: Some("Channel Model User".to_owned()),
+            status: "active".to_owned(),
+            revoked_at: None,
             authorized_at: now,
             last_active: Some(now),
-            session_id: None,
         },
     )
     .await
     .unwrap();
-    let new_session = AssistantSessionRow {
+    let new_session = ChannelConversationBindingRow {
         id: "sess-channel-model".to_owned(),
+        // Owner and connection are derived by the repository from the
+        // active channel user; the caller leaves them empty.
+        owner_user_id: String::new(),
+        connection_id: String::new(),
         user_id: "user-channel-model".to_owned(),
-        agent_type: "acp".to_owned(),
         conversation_id: None,
-        workspace: None,
         chat_id: Some("chat-channel-model".to_owned()),
         created_at: now,
         last_activity: now,
@@ -585,7 +687,14 @@ async fn pairing_approve_creates_user() {
     let pool = services.database.pool().clone();
     let repo: std::sync::Arc<dyn aionui_db::IChannelRepository> =
         std::sync::Arc::new(aionui_db::SqliteChannelRepository::new(pool));
-    let pairing_svc = aionui_channel::pairing::PairingService::new(repo.clone(), services.event_bus.clone());
+    // The route's pairing service hashes codes with the app's channel key;
+    // this one must share it so a code minted here approves over HTTP.
+    let pairing_svc = aionui_channel::pairing::PairingService::new(
+        repo.clone(),
+        services.event_bus.clone(),
+        aionui_app::derive_encryption_key(&services.jwt_secret_raw),
+    );
+    seed_connection(&repo, "telegram").await;
 
     let code = pairing_svc
         .request_pairing(OWNER_ID, "tg_user_42", "telegram", Some("Alice"))
@@ -599,7 +708,10 @@ async fn pairing_approve_creates_user() {
     let json = body_json(resp).await;
     let pairings = json["data"].as_array().unwrap();
     assert_eq!(pairings.len(), 1);
-    assert_eq!(pairings[0]["code"], code);
+    // The cold-loaded list exposes the addressable id, never the code.
+    let pairing_id = pairings[0]["id"].as_str().unwrap().to_owned();
+    assert!(!pairing_id.is_empty());
+    assert!(pairings[0].get("code").is_none());
     assert_eq!(pairings[0]["platform_user_id"], "tg_user_42");
     assert_eq!(pairings[0]["platform_type"], "telegram");
     assert_eq!(pairings[0]["display_name"], "Alice");
@@ -629,11 +741,24 @@ async fn pairing_approve_creates_user() {
     assert_eq!(users[0]["display_name"], "Alice");
     let user_id = users[0]["id"].as_str().unwrap().to_owned();
 
-    // Verify double-approve fails
+    // Verify double-approve fails. A used code is no longer resolvable —
+    // the hash lookup only matches pending requests — so replaying it is a
+    // 404, while addressing the same request by id reports it as already
+    // processed.
     let req = json_with_token(
         "POST",
         "/api/channel/pairings/approve",
         json!({ "code": code }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let req = json_with_token(
+        "POST",
+        "/api/channel/pairings/approve",
+        json!({ "id": pairing_id }),
         &token,
         &csrf,
     );
@@ -664,6 +789,16 @@ async fn pairing_approve_creates_user() {
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
     assert!(json["data"].as_array().unwrap().is_empty());
+
+    // Revocation is a soft delete: the authorization history survives.
+    let (status, revoked_at): (String, Option<i64>) =
+        sqlx::query_as("SELECT status, revoked_at FROM channel_users WHERE id = ?")
+            .bind(&user_id)
+            .fetch_one(services.database.pool())
+            .await
+            .unwrap();
+    assert_eq!(status, "revoked");
+    assert!(revoked_at.is_some());
 }
 
 /// Test pairing rejection flow.
@@ -676,7 +811,12 @@ async fn pairing_reject_removes_from_pending() {
     let pool = services.database.pool().clone();
     let repo: std::sync::Arc<dyn aionui_db::IChannelRepository> =
         std::sync::Arc::new(aionui_db::SqliteChannelRepository::new(pool));
-    let pairing_svc = aionui_channel::pairing::PairingService::new(repo.clone(), services.event_bus.clone());
+    let pairing_svc = aionui_channel::pairing::PairingService::new(
+        repo.clone(),
+        services.event_bus.clone(),
+        aionui_app::derive_encryption_key(&services.jwt_secret_raw),
+    );
+    seed_connection(&repo, "telegram").await;
 
     let code = pairing_svc
         .request_pairing(OWNER_ID, "tg_user_99", "telegram", None)
@@ -708,7 +848,8 @@ async fn pairing_reject_removes_from_pending() {
     let json = body_json(resp).await;
     assert!(json["data"].as_array().unwrap().is_empty());
 
-    // Verify reject same code again fails (already processed)
+    // Verify rejecting the same code again fails: the rejected request is
+    // no longer pending, so its code hash resolves to nothing (404).
     let req = json_with_token(
         "POST",
         "/api/channel/pairings/reject",
@@ -717,7 +858,7 @@ async fn pairing_reject_removes_from_pending() {
         &csrf,
     );
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 // ===========================================================================

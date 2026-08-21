@@ -231,7 +231,7 @@ mod telegram_tests {
     #[tokio::test]
     async fn disable_without_db_row_returns_error() {
         let (manager, _repo, _bc) = setup().await;
-        // Plugin was never enabled (no DB row), so update_plugin_status fails
+        // Plugin was never enabled (no DB row), so update_connection_status fails
         let result = manager.disable_plugin(OWNER_USER_ID, "telegram").await;
         assert!(result.is_err());
     }

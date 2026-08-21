@@ -621,12 +621,12 @@ async fn eq19_channel_status_merges_extension_meta_for_persisted_row() {
     let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
     let owner_user_id = services.user_repo.find_by_username("user1").await.unwrap().unwrap().id;
     let now = now_ms();
-    repo.upsert_plugin(
+    repo.upsert_connection(
         &owner_user_id,
-        &aionui_db::models::ChannelPluginRow {
+        &aionui_db::models::ChannelConnectionRow {
             id: "legacy-channel".to_string(),
             owner_user_id: owner_user_id.clone(),
-            r#type: "legacy-channel".to_string(),
+            plugin_key: "legacy-channel".to_string(),
             name: "Legacy Channel Persisted".to_string(),
             enabled: true,
             config: "{\"token\":\"secret\"}".to_string(),
@@ -694,12 +694,12 @@ async fn eq20_enable_extension_channel_persists_config_and_exposes_status() {
     assert_eq!(enable_json["data"]["success"], true);
 
     let row = repo
-        .get_plugin(&owner_user_id, "legacy-channel")
+        .get_connection_by_plugin_key(&owner_user_id, "legacy-channel")
         .await
         .unwrap()
         .unwrap();
     assert!(row.enabled);
-    assert_eq!(row.r#type, "legacy-channel");
+    assert_eq!(row.plugin_key, "legacy-channel");
     assert_eq!(row.status.as_deref(), Some("stopped"));
 
     let encryption_key = derive_encryption_key(&services.jwt_secret_raw);

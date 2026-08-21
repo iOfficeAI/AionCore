@@ -6,10 +6,16 @@
 
 use std::sync::Arc;
 
-use aionui_db::models::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
-use aionui_db::{DbError, IChannelRepository, SqliteChannelRepository, UpdatePluginStatusParams, init_database_memory};
+use aionui_db::models::{
+    ChannelConnectionRow, ChannelConversationBindingRow, ChannelPairingRequestRow, ChannelUserRow,
+};
+use aionui_db::{
+    DbError, IChannelRepository, SqliteChannelRepository, UpdateConnectionStatusParams, init_database_memory,
+};
 
 const OWNER_ID: &str = "system_default_user";
+/// Connection every channel user / pairing request in this file attaches to.
+const TG_CONN: &str = "conn-telegram";
 
 async fn repo() -> (Arc<dyn IChannelRepository>, aionui_db::Database) {
     let db = init_database_memory().await.unwrap();
@@ -17,12 +23,19 @@ async fn repo() -> (Arc<dyn IChannelRepository>, aionui_db::Database) {
     (r as Arc<dyn IChannelRepository>, db)
 }
 
-fn make_plugin(id: &str, plugin_type: &str) -> ChannelPluginRow {
+/// Seeds the FK-parent connection channel users and pairings hang off.
+async fn seed_connection(repo: &Arc<dyn IChannelRepository>) {
+    repo.upsert_connection(OWNER_ID, &make_plugin(TG_CONN, "telegram"))
+        .await
+        .unwrap();
+}
+
+fn make_plugin(id: &str, plugin_type: &str) -> ChannelConnectionRow {
     let now = aionui_common::now_ms();
-    ChannelPluginRow {
+    ChannelConnectionRow {
         id: id.into(),
         owner_user_id: OWNER_ID.into(),
-        r#type: plugin_type.into(),
+        plugin_key: plugin_type.into(),
         name: format!("{plugin_type} bot"),
         enabled: false,
         config: r#"{"credentials":{}}"#.into(),
@@ -33,45 +46,56 @@ fn make_plugin(id: &str, plugin_type: &str) -> ChannelPluginRow {
     }
 }
 
-fn make_user(id: &str, platform_uid: &str, platform: &str) -> AssistantUserRow {
+fn make_user(id: &str, platform_uid: &str, platform: &str) -> ChannelUserRow {
     let now = aionui_common::now_ms();
-    AssistantUserRow {
+    ChannelUserRow {
         id: id.into(),
         owner_user_id: OWNER_ID.into(),
+        connection_id: TG_CONN.into(),
         platform_user_id: platform_uid.into(),
+        // Derived from the connection on read; ignored on write.
         platform_type: platform.into(),
         display_name: Some(format!("User {id}")),
+        status: "active".into(),
+        revoked_at: None,
         authorized_at: now,
         last_active: None,
-        session_id: None,
     }
 }
 
-fn make_session(id: &str, user_id: &str, chat_id: &str) -> AssistantSessionRow {
+/// `owner_user_id`/`connection_id` are left empty: the repository derives
+/// both from the active `channel_users` row rather than trusting the caller.
+fn make_session(id: &str, user_id: &str, chat_id: &str) -> ChannelConversationBindingRow {
     let now = aionui_common::now_ms();
-    AssistantSessionRow {
+    ChannelConversationBindingRow {
         id: id.into(),
+        owner_user_id: String::new(),
+        connection_id: String::new(),
         user_id: user_id.into(),
-        agent_type: "gemini".into(),
-        conversation_id: None,
-        workspace: None,
         chat_id: Some(chat_id.into()),
+        conversation_id: None,
         created_at: now,
         last_activity: now,
     }
 }
 
-fn make_pairing(code: &str, platform_uid: &str, expires_offset_ms: i64) -> PairingCodeRow {
+/// Builds a pairing request. `code` is only ever hashed — the plaintext is
+/// never persisted, so the row carries `code_hash` derived from it here.
+fn make_pairing(id: &str, code: &str, platform_uid: &str, expires_offset_ms: i64) -> ChannelPairingRequestRow {
     let now = aionui_common::now_ms();
-    PairingCodeRow {
-        code: code.into(),
+    ChannelPairingRequestRow {
+        id: id.into(),
         owner_user_id: OWNER_ID.into(),
+        connection_id: TG_CONN.into(),
         platform_user_id: platform_uid.into(),
+        // Derived from the connection on read; ignored on write.
         platform_type: "telegram".into(),
         display_name: Some("Tester".into()),
+        code_hash: format!("hash-{code}"),
+        status: "pending".into(),
         requested_at: now,
         expires_at: now + expires_offset_ms,
-        status: "pending".into(),
+        approved_channel_user_id: None,
     }
 }
 
@@ -82,22 +106,22 @@ async fn plugin_full_lifecycle() {
     let (repo, _db) = repo().await;
 
     // Empty initially.
-    assert!(repo.get_all_plugins(OWNER_ID).await.unwrap().is_empty());
+    assert!(repo.get_all_connections(OWNER_ID).await.unwrap().is_empty());
 
     // Create two plugins.
-    repo.upsert_plugin(OWNER_ID, &make_plugin("tg-1", "telegram"))
+    repo.upsert_connection(OWNER_ID, &make_plugin("tg-1", "telegram"))
         .await
         .unwrap();
-    repo.upsert_plugin(OWNER_ID, &make_plugin("lark-1", "lark"))
+    repo.upsert_connection(OWNER_ID, &make_plugin("lark-1", "lark"))
         .await
         .unwrap();
-    assert_eq!(repo.get_all_plugins(OWNER_ID).await.unwrap().len(), 2);
+    assert_eq!(repo.get_all_connections(OWNER_ID).await.unwrap().len(), 2);
 
     // Update status.
-    repo.update_plugin_status(
+    repo.update_connection_status(
         OWNER_ID,
         "tg-1",
-        &UpdatePluginStatusParams {
+        &UpdateConnectionStatusParams {
             status: Some("running".into()),
             enabled: Some(true),
             ..Default::default()
@@ -106,13 +130,43 @@ async fn plugin_full_lifecycle() {
     .await
     .unwrap();
 
-    let tg = repo.get_plugin(OWNER_ID, "tg-1").await.unwrap().unwrap();
+    let tg = repo.get_connection(OWNER_ID, "tg-1").await.unwrap().unwrap();
     assert!(tg.enabled);
     assert_eq!(tg.status.as_deref(), Some("running"));
 
     // Delete one.
-    repo.delete_plugin(OWNER_ID, "lark-1").await.unwrap();
-    assert_eq!(repo.get_all_plugins(OWNER_ID).await.unwrap().len(), 1);
+    repo.delete_connection(OWNER_ID, "lark-1").await.unwrap();
+    assert_eq!(repo.get_all_connections(OWNER_ID).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn phase1_single_connection_per_plugin_key_enforced() {
+    let (repo, _db) = repo().await;
+    repo.upsert_connection(OWNER_ID, &make_plugin("conn-a", "telegram"))
+        .await
+        .unwrap();
+
+    // A second connection for the same (owner, plugin_key) violates the
+    // phase-1 single-instance unique index.
+    let err = repo
+        .upsert_connection(OWNER_ID, &make_plugin("conn-b", "telegram"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("UNIQUE"), "unexpected error: {err}");
+
+    // Plugin-key lookup resolves the single instance.
+    let found = repo
+        .get_connection_by_plugin_key(OWNER_ID, "telegram")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, "conn-a");
+    assert!(
+        repo.get_connection_by_plugin_key(OWNER_ID, "lark")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 // ── DC-3: Same platform user uniqueness constraint ───────────────────
@@ -120,6 +174,7 @@ async fn plugin_full_lifecycle() {
 #[tokio::test]
 async fn dc3_duplicate_platform_user_rejected() {
     let (repo, _db) = repo().await;
+    seed_connection(&repo).await;
     repo.create_user(OWNER_ID, &make_user("u1", "tg_100", "telegram"))
         .await
         .unwrap();
@@ -130,11 +185,16 @@ async fn dc3_duplicate_platform_user_rejected() {
     assert!(matches!(err, DbError::Conflict(_)));
 }
 
-// ── DC-1: Revoke user cascade deletes sessions ───────────────────────
+// ── DC-1: Revoking a user removes their sessions ─────────────────────
+//
+// Revocation is a soft delete, so the sessions no longer disappear via FK
+// cascade — `revoke_user` deletes them explicitly. The authorization row
+// itself is retained for audit.
 
 #[tokio::test]
-async fn dc1_delete_user_cascades_sessions() {
-    let (repo, _db) = repo().await;
+async fn dc1_revoke_user_removes_sessions() {
+    let (repo, db) = repo().await;
+    seed_connection(&repo).await;
     repo.create_user(OWNER_ID, &make_user("u1", "tg_1", "telegram"))
         .await
         .unwrap();
@@ -148,9 +208,43 @@ async fn dc1_delete_user_cascades_sessions() {
         .unwrap();
     assert_eq!(repo.get_all_sessions(OWNER_ID).await.unwrap().len(), 2);
 
-    // Delete user → sessions cascade.
-    repo.delete_user(OWNER_ID, "u1").await.unwrap();
+    repo.revoke_user(OWNER_ID, "u1").await.unwrap();
+
     assert!(repo.get_all_sessions(OWNER_ID).await.unwrap().is_empty());
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM channel_conversation_bindings WHERE channel_user_id = 'u1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(remaining, 0);
+
+    // Revocation is also forward-looking: a revoked user cannot open a new
+    // binding, so message routing cannot resurrect itself.
+    let err = repo
+        .get_or_create_session(OWNER_ID, "u1", "chat-c", &make_session("s3", "u1", "chat-c"))
+        .await;
+    assert!(
+        matches!(err, Err(DbError::NotFound(_))),
+        "revoked user must not create a binding, got {err:?}"
+    );
+    assert!(repo.get_all_sessions(OWNER_ID).await.unwrap().is_empty());
+
+    // The user is gone from the active surface …
+    assert!(repo.get_all_users(OWNER_ID).await.unwrap().is_empty());
+    assert!(
+        repo.get_user_by_platform(OWNER_ID, "tg_1", "telegram")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // … but the audit row survives.
+    let (status, revoked_at): (String, Option<i64>) =
+        sqlx::query_as("SELECT status, revoked_at FROM channel_users WHERE id = 'u1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(status, "revoked");
+    assert!(revoked_at.is_some());
 }
 
 // ── Cross-account guard: a channel session may not bind another Core user's
@@ -161,6 +255,7 @@ async fn session_rejects_conversation_owned_by_another_core_user() {
     let (repo, db) = repo().await;
     let pool = db.pool();
 
+    seed_connection(&repo).await;
     repo.create_user(OWNER_ID, &make_user("u1", "tg_1", "telegram"))
         .await
         .unwrap();
@@ -225,6 +320,7 @@ async fn session_rejects_conversation_owned_by_another_core_user() {
 #[tokio::test]
 async fn pc1_same_user_different_chat_ids() {
     let (repo, _db) = repo().await;
+    seed_connection(&repo).await;
     repo.create_user(OWNER_ID, &make_user("u1", "tg_1", "telegram"))
         .await
         .unwrap();
@@ -240,6 +336,13 @@ async fn pc1_same_user_different_chat_ids() {
 
     assert_ne!(s1.id, s2.id);
     assert_eq!(repo.get_all_sessions(OWNER_ID).await.unwrap().len(), 2);
+
+    // Both bindings carry the identity derived from the channel user, not the
+    // empty owner/connection the caller passed in.
+    for s in [&s1, &s2] {
+        assert_eq!(s.owner_user_id, OWNER_ID);
+        assert_eq!(s.connection_id, TG_CONN);
+    }
 }
 
 // ── PC-2: Different users, same chatId → different sessions ──────────
@@ -247,6 +350,7 @@ async fn pc1_same_user_different_chat_ids() {
 #[tokio::test]
 async fn pc2_different_users_same_chat_id() {
     let (repo, _db) = repo().await;
+    seed_connection(&repo).await;
     repo.create_user(OWNER_ID, &make_user("u1", "tg_1", "telegram"))
         .await
         .unwrap();
@@ -271,6 +375,7 @@ async fn pc2_different_users_same_chat_id() {
 #[tokio::test]
 async fn pc3_same_user_same_chat_reuses_session() {
     let (repo, _db) = repo().await;
+    seed_connection(&repo).await;
     repo.create_user(OWNER_ID, &make_user("u1", "tg_1", "telegram"))
         .await
         .unwrap();
@@ -296,11 +401,20 @@ async fn pc3_same_user_same_chat_reuses_session() {
 #[tokio::test]
 async fn pg2_pairing_code_expiry_is_10_minutes() {
     let (repo, _db) = repo().await;
-    let pairing = make_pairing("123456", "tg_99", 600_000);
+    seed_connection(&repo).await;
+    let pairing = make_pairing("p1", "123456", "tg_99", 600_000);
     repo.create_pairing(OWNER_ID, &pairing).await.unwrap();
 
-    let found = repo.get_pairing_by_code(OWNER_ID, "123456").await.unwrap().unwrap();
+    let found = repo.get_pairing(OWNER_ID, "p1").await.unwrap().unwrap();
     assert_eq!(found.expires_at - found.requested_at, 600_000);
+
+    // The code is addressable only through its hash while pending.
+    let by_hash = repo
+        .get_pending_pairing_by_code_hash(OWNER_ID, "hash-123456")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(by_hash.id, "p1");
 }
 
 // ── EC-1 / EC-2: Expired pairings cleaned up, valid ones preserved ──
@@ -308,24 +422,25 @@ async fn pg2_pairing_code_expiry_is_10_minutes() {
 #[tokio::test]
 async fn expired_pairings_cleaned_up() {
     let (repo, _db) = repo().await;
+    seed_connection(&repo).await;
     let now = aionui_common::now_ms();
 
     // Already expired.
-    repo.create_pairing(OWNER_ID, &make_pairing("111111", "tg_1", -1000))
+    repo.create_pairing(OWNER_ID, &make_pairing("p-old", "111111", "tg_1", -1000))
         .await
         .unwrap();
     // Still valid.
-    repo.create_pairing(OWNER_ID, &make_pairing("222222", "tg_2", 600_000))
+    repo.create_pairing(OWNER_ID, &make_pairing("p-new", "222222", "tg_2", 600_000))
         .await
         .unwrap();
 
     let cleaned = repo.cleanup_expired_pairings(OWNER_ID, now).await.unwrap();
     assert_eq!(cleaned, 1);
 
-    let expired = repo.get_pairing_by_code(OWNER_ID, "111111").await.unwrap().unwrap();
+    let expired = repo.get_pairing(OWNER_ID, "p-old").await.unwrap().unwrap();
     assert_eq!(expired.status, "expired");
 
-    let valid = repo.get_pairing_by_code(OWNER_ID, "222222").await.unwrap().unwrap();
+    let valid = repo.get_pairing(OWNER_ID, "p-new").await.unwrap().unwrap();
     assert_eq!(valid.status, "pending");
 }
 
@@ -334,17 +449,21 @@ async fn expired_pairings_cleaned_up() {
 #[tokio::test]
 async fn pairing_approve_and_reject() {
     let (repo, _db) = repo().await;
-    repo.create_pairing(OWNER_ID, &make_pairing("100001", "tg_a", 600_000))
+    seed_connection(&repo).await;
+    repo.create_user(OWNER_ID, &make_user("u-approved", "tg_a", "telegram"))
         .await
         .unwrap();
-    repo.create_pairing(OWNER_ID, &make_pairing("100002", "tg_b", 600_000))
+    repo.create_pairing(OWNER_ID, &make_pairing("p-a", "100001", "tg_a", 600_000))
+        .await
+        .unwrap();
+    repo.create_pairing(OWNER_ID, &make_pairing("p-b", "100002", "tg_b", 600_000))
         .await
         .unwrap();
 
-    repo.update_pairing_status(OWNER_ID, "100001", "approved")
+    repo.update_pairing_status(OWNER_ID, "p-a", "approved", Some("u-approved"))
         .await
         .unwrap();
-    repo.update_pairing_status(OWNER_ID, "100002", "rejected")
+    repo.update_pairing_status(OWNER_ID, "p-b", "rejected", None)
         .await
         .unwrap();
 
@@ -352,21 +471,27 @@ async fn pairing_approve_and_reject() {
     let pending = repo.get_pending_pairings(OWNER_ID).await.unwrap();
     assert!(pending.is_empty());
 
-    assert_eq!(
-        repo.get_pairing_by_code(OWNER_ID, "100001")
+    let approved = repo.get_pairing(OWNER_ID, "p-a").await.unwrap().unwrap();
+    assert_eq!(approved.status, "approved");
+    // An approval records which channel user it created.
+    assert_eq!(approved.approved_channel_user_id.as_deref(), Some("u-approved"));
+
+    let rejected = repo.get_pairing(OWNER_ID, "p-b").await.unwrap().unwrap();
+    assert_eq!(rejected.status, "rejected");
+    assert_eq!(rejected.approved_channel_user_id, None);
+
+    // Processed requests are no longer resolvable by code hash.
+    assert!(
+        repo.get_pending_pairing_by_code_hash(OWNER_ID, "hash-100001")
             .await
             .unwrap()
-            .unwrap()
-            .status,
-        "approved"
+            .is_none()
     );
-    assert_eq!(
-        repo.get_pairing_by_code(OWNER_ID, "100002")
+    assert!(
+        repo.get_pending_pairing_by_code_hash(OWNER_ID, "hash-100002")
             .await
             .unwrap()
-            .unwrap()
-            .status,
-        "rejected"
+            .is_none()
     );
 }
 
@@ -375,6 +500,7 @@ async fn pairing_approve_and_reject() {
 #[tokio::test]
 async fn users_ordered_by_authorized_at_desc() {
     let (repo, _db) = repo().await;
+    seed_connection(&repo).await;
 
     let mut u1 = make_user("u1", "tg_1", "telegram");
     u1.authorized_at = 1000;

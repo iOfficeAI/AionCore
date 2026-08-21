@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use aionui_api_types::{PluginStatusChangedPayload, PluginStatusResponse, WebSocketMessage};
 use aionui_common::{decrypt_string, encrypt_string, now_ms};
-use aionui_db::models::ChannelPluginRow;
-use aionui_db::{IChannelRepository, UpdatePluginStatusParams};
+use aionui_db::models::ChannelConnectionRow;
+use aionui_db::{IChannelRepository, UpdateConnectionStatusParams};
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
@@ -28,7 +28,7 @@ pub struct ChannelManager {
     repo: Arc<dyn IChannelRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     encryption_key: [u8; 32],
-    /// Active plugin instances keyed by owner user ID + plugin ID.
+    /// Active plugin instances keyed by owner user ID + connection ID.
     plugins: DashMap<ChannelRuntimeKey, Box<dyn ChannelPlugin>>,
     /// Sender for incoming messages from all plugins.
     /// The `ActionExecutor` holds the receiving end.
@@ -40,14 +40,14 @@ pub struct ChannelManager {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ChannelRuntimeKey {
     owner_user_id: String,
-    plugin_id: String,
+    connection_id: String,
 }
 
 impl ChannelRuntimeKey {
-    fn new(owner_user_id: &str, plugin_id: &str) -> Self {
+    fn new(owner_user_id: &str, connection_id: &str) -> Self {
         Self {
             owner_user_id: owner_user_id.to_owned(),
-            plugin_id: plugin_id.to_owned(),
+            connection_id: connection_id.to_owned(),
         }
     }
 }
@@ -93,7 +93,7 @@ impl ChannelManager {
     ///
     /// Merges DB state with live runtime status for active plugins.
     pub async fn get_plugin_status(&self, owner_user_id: &str) -> Result<Vec<PluginStatusResponse>, ChannelError> {
-        let rows = self.repo.get_all_plugins(owner_user_id).await?;
+        let rows = self.repo.get_all_connections(owner_user_id).await?;
         let statuses: Vec<PluginStatusResponse> = rows
             .into_iter()
             .map(|row| {
@@ -115,18 +115,27 @@ impl ChannelManager {
     ///
     /// # Arguments
     ///
-    /// - `plugin_id`: Platform identifier (e.g., "telegram")
+    /// - `plugin_key`: Platform identifier (e.g., "telegram")
     /// - `config_value`: Raw JSON config containing credentials and options
     /// - `factory`: Function to create the platform-specific plugin instance
+    ///
+    /// Phase 1 keeps one connection per (owner, plugin_key): the existing
+    /// connection row is reused when present, otherwise a fresh connection id
+    /// is generated.
     pub async fn enable_plugin(
         &self,
         owner_user_id: &str,
-        plugin_id: &str,
+        plugin_key: &str,
         config_value: &serde_json::Value,
         factory: &PluginFactory,
     ) -> Result<(), ChannelError> {
-        let plugin_type =
-            PluginType::from_str_opt(plugin_id).ok_or_else(|| ChannelError::InvalidPluginType(plugin_id.to_owned()))?;
+        let plugin_type = PluginType::from_str_opt(plugin_key)
+            .ok_or_else(|| ChannelError::InvalidPluginType(plugin_key.to_owned()))?;
+
+        let existing = self
+            .repo
+            .get_connection_by_plugin_key(owner_user_id, plugin_key)
+            .await?;
 
         // Resolve the effective config. The Settings re-enable toggle sends an
         // empty config and expects the previously stored credentials to be
@@ -134,10 +143,15 @@ impl ChannelManager {
         // are supplied.
         let config: PluginConfig = match Self::config_with_credentials(config_value)? {
             Some(config) => config,
-            None => self.load_stored_config(owner_user_id, plugin_id).await?,
+            None => Self::decrypt_stored_config(existing.as_ref(), plugin_key, &self.encryption_key)?,
         };
 
-        self.stop_plugin(owner_user_id, plugin_id).await;
+        let connection_id = existing
+            .as_ref()
+            .map(|row| row.id.clone())
+            .unwrap_or_else(|| aionui_common::generate_prefixed_id("conn"));
+
+        self.stop_plugin(owner_user_id, &connection_id).await;
 
         // Encrypt config for storage
         let config_json = serde_json::to_string(&config)?;
@@ -146,53 +160,61 @@ impl ChannelManager {
 
         // Persist to DB
         let now = now_ms();
-        let row = ChannelPluginRow {
-            id: plugin_id.to_owned(),
+        let row = ChannelConnectionRow {
+            id: connection_id.clone(),
             owner_user_id: owner_user_id.to_owned(),
-            r#type: plugin_type.to_string(),
+            plugin_key: plugin_type.to_string(),
             name: self.default_plugin_name(plugin_type),
             enabled: true,
             config: encrypted_config,
             status: Some(PluginStatus::Created.to_string()),
-            last_connected: None,
-            created_at: now,
+            last_connected: existing.as_ref().and_then(|row| row.last_connected),
+            created_at: existing.as_ref().map(|row| row.created_at).unwrap_or(now),
             updated_at: now,
         };
-        self.repo.upsert_plugin(owner_user_id, &row).await?;
+        self.repo.upsert_connection(owner_user_id, &row).await?;
 
         // Create and start plugin instance
         let mut plugin = factory(plugin_type)
             .ok_or_else(|| ChannelError::InvalidPluginType(format!("No implementation for {plugin_type}")))?;
 
-        let callbacks = self.callbacks_for_owner(owner_user_id);
+        let callbacks = self.callbacks_for_connection(owner_user_id, &connection_id);
 
         if let Err(e) = plugin.initialize(config, callbacks).await {
-            self.update_plugin_error(owner_user_id, plugin_id, &e.to_string()).await;
-            self.broadcast_status_change(owner_user_id, plugin_id).await;
+            self.update_plugin_error(owner_user_id, &connection_id, &e.to_string())
+                .await;
+            self.broadcast_status_change(owner_user_id, &connection_id).await;
             return Err(e);
         }
 
         if let Err(e) = plugin.start().await {
-            self.update_plugin_error(owner_user_id, plugin_id, &e.to_string()).await;
-            self.broadcast_status_change(owner_user_id, plugin_id).await;
+            self.update_plugin_error(owner_user_id, &connection_id, &e.to_string())
+                .await;
+            self.broadcast_status_change(owner_user_id, &connection_id).await;
             return Err(e);
         }
 
         // Update DB with running status
-        let params = UpdatePluginStatusParams {
+        let params = UpdateConnectionStatusParams {
             status: Some(PluginStatus::Running.to_string()),
             last_connected: Some(now_ms()),
             enabled: None,
         };
         self.repo
-            .update_plugin_status(owner_user_id, plugin_id, &params)
+            .update_connection_status(owner_user_id, &connection_id, &params)
             .await?;
 
         // Store active instance
-        self.plugins.insert(Self::runtime_key(owner_user_id, plugin_id), plugin);
+        self.plugins
+            .insert(Self::runtime_key(owner_user_id, &connection_id), plugin);
 
-        info!(owner_user_id = %owner_user_id, plugin_id = %plugin_id, "plugin enabled and started");
-        self.broadcast_status_change(owner_user_id, plugin_id).await;
+        info!(
+            owner_user_id = %owner_user_id,
+            plugin_key = %plugin_key,
+            connection_id = %connection_id,
+            "plugin enabled and started"
+        );
+        self.broadcast_status_change(owner_user_id, &connection_id).await;
         Ok(())
     }
 
@@ -204,22 +226,29 @@ impl ChannelManager {
     pub async fn enable_extension_plugin(
         &self,
         owner_user_id: &str,
-        plugin_id: &str,
+        plugin_key: &str,
         plugin_name: &str,
         config: &PluginConfig,
     ) -> Result<(), ChannelError> {
-        self.stop_plugin(owner_user_id, plugin_id).await;
-
         let config_json = serde_json::to_string(config)?;
         let encrypted_config = encrypt_string(&config_json, &self.encryption_key)
             .map_err(|e| ChannelError::EncryptionFailed(e.to_string()))?;
 
         let now = now_ms();
-        let existing = self.repo.get_plugin(owner_user_id, plugin_id).await?;
-        let row = ChannelPluginRow {
-            id: plugin_id.to_owned(),
+        let existing = self
+            .repo
+            .get_connection_by_plugin_key(owner_user_id, plugin_key)
+            .await?;
+        let connection_id = existing
+            .as_ref()
+            .map(|row| row.id.clone())
+            .unwrap_or_else(|| aionui_common::generate_prefixed_id("conn"));
+        self.stop_plugin(owner_user_id, &connection_id).await;
+
+        let row = ChannelConnectionRow {
+            id: connection_id.clone(),
             owner_user_id: owner_user_id.to_owned(),
-            r#type: plugin_id.to_owned(),
+            plugin_key: plugin_key.to_owned(),
             name: plugin_name.to_owned(),
             enabled: true,
             config: encrypted_config,
@@ -228,10 +257,15 @@ impl ChannelManager {
             created_at: existing.as_ref().map(|row| row.created_at).unwrap_or(now),
             updated_at: now,
         };
-        self.repo.upsert_plugin(owner_user_id, &row).await?;
+        self.repo.upsert_connection(owner_user_id, &row).await?;
 
-        info!(owner_user_id = %owner_user_id, plugin_id = %plugin_id, "extension plugin enabled (metadata-only mode)");
-        self.broadcast_status_change(owner_user_id, plugin_id).await;
+        info!(
+            owner_user_id = %owner_user_id,
+            plugin_key = %plugin_key,
+            connection_id = %connection_id,
+            "extension plugin enabled (metadata-only mode)"
+        );
+        self.broadcast_status_change(owner_user_id, &connection_id).await;
         Ok(())
     }
 
@@ -239,22 +273,33 @@ impl ChannelManager {
     /// the active instance.
     ///
     /// Idempotent — disabling an already-disabled plugin is a no-op.
-    pub async fn disable_plugin(&self, owner_user_id: &str, plugin_id: &str) -> Result<(), ChannelError> {
+    pub async fn disable_plugin(&self, owner_user_id: &str, plugin_key: &str) -> Result<(), ChannelError> {
+        let connection = self
+            .repo
+            .get_connection_by_plugin_key(owner_user_id, plugin_key)
+            .await?
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_key.to_owned()))?;
+
         // Stop running instance if any
-        self.stop_plugin(owner_user_id, plugin_id).await;
+        self.stop_plugin(owner_user_id, &connection.id).await;
 
         // Update DB
-        let params = UpdatePluginStatusParams {
+        let params = UpdateConnectionStatusParams {
             status: Some(PluginStatus::Stopped.to_string()),
             last_connected: None,
             enabled: Some(false),
         };
         self.repo
-            .update_plugin_status(owner_user_id, plugin_id, &params)
+            .update_connection_status(owner_user_id, &connection.id, &params)
             .await?;
 
-        info!(owner_user_id = %owner_user_id, plugin_id = %plugin_id, "plugin disabled");
-        self.broadcast_status_change(owner_user_id, plugin_id).await;
+        info!(
+            owner_user_id = %owner_user_id,
+            plugin_key = %plugin_key,
+            connection_id = %connection.id,
+            "plugin disabled"
+        );
+        self.broadcast_status_change(owner_user_id, &connection.id).await;
         Ok(())
     }
 
@@ -298,8 +343,8 @@ impl ChannelManager {
     /// starts them. Errors on individual plugins are logged but don't
     /// prevent other plugins from starting.
     pub async fn restore_plugins(&self, owner_user_id: &str, factory: &PluginFactory) -> Result<(), ChannelError> {
-        let rows = self.repo.get_all_plugins(owner_user_id).await?;
-        let enabled: Vec<ChannelPluginRow> = rows.into_iter().filter(|r| r.enabled).collect();
+        let rows = self.repo.get_all_connections(owner_user_id).await?;
+        let enabled: Vec<ChannelConnectionRow> = rows.into_iter().filter(|r| r.enabled).collect();
 
         if enabled.is_empty() {
             debug!("no enabled plugins to restore");
@@ -309,10 +354,10 @@ impl ChannelManager {
         info!(owner_user_id = %owner_user_id, count = enabled.len(), "restoring enabled plugins");
 
         for row in enabled {
-            if PluginType::from_str_opt(&row.r#type).is_none() {
+            if PluginType::from_str_opt(&row.plugin_key).is_none() {
                 info!(
-                    plugin_id = %row.id,
-                    plugin_type = %row.r#type,
+                    connection_id = %row.id,
+                    plugin_key = %row.plugin_key,
                     "skipping extension plugin runtime restore; metadata-only mode"
                 );
                 self.broadcast_status_change(owner_user_id, &row.id).await;
@@ -321,7 +366,8 @@ impl ChannelManager {
             if let Err(e) = self.restore_single_plugin(owner_user_id, &row, factory).await {
                 warn!(
                     owner_user_id = %owner_user_id,
-                    plugin_id = %row.id,
+                    connection_id = %row.id,
+                    plugin_key = %row.plugin_key,
                     error = %e,
                     "failed to restore plugin, marking as error"
                 );
@@ -372,46 +418,69 @@ impl ChannelManager {
         self.plugins.len()
     }
 
-    /// Checks whether a specific plugin is currently running.
-    pub fn is_plugin_running(&self, owner_user_id: &str, plugin_id: &str) -> bool {
-        self.plugins
-            .get(&Self::runtime_key(owner_user_id, plugin_id))
-            .map(|p| p.status() == PluginStatus::Running)
+    /// Checks whether the owner's plugin for a platform is currently running.
+    ///
+    /// Callers still address channels by platform (`plugin_key`) until
+    /// sessions carry connection ids (segment A2/A3); the runtime map is
+    /// keyed by connection id, so resolve by scanning the owner's live
+    /// instances (phase 1: at most one per platform).
+    pub fn is_plugin_running(&self, owner_user_id: &str, plugin_key: &str) -> bool {
+        self.live_runtime_key(owner_user_id, plugin_key)
+            .and_then(|key| self.plugins.get(&key).map(|p| p.status() == PluginStatus::Running))
             .unwrap_or(false)
     }
 
-    /// Sends a message through a specific plugin.
+    /// Sends a message through the owner's plugin for a platform.
     ///
     /// Used by the `ChannelMessageService` to route outgoing messages
     /// to the correct platform plugin.
     pub async fn send_message(
         &self,
         owner_user_id: &str,
-        plugin_id: &str,
+        plugin_key: &str,
         chat_id: &str,
         message: crate::types::UnifiedOutgoingMessage,
     ) -> Result<String, ChannelError> {
+        let key = self
+            .live_runtime_key(owner_user_id, plugin_key)
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_key.to_owned()))?;
         let plugin = self
             .plugins
-            .get(&Self::runtime_key(owner_user_id, plugin_id))
-            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
+            .get(&key)
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_key.to_owned()))?;
         plugin.send_message(chat_id, message).await
     }
 
-    /// Edits an existing message through a specific plugin.
+    /// Edits an existing message through the owner's plugin for a platform.
     pub async fn edit_message(
         &self,
         owner_user_id: &str,
-        plugin_id: &str,
+        plugin_key: &str,
         chat_id: &str,
         message_id: &str,
         message: crate::types::UnifiedOutgoingMessage,
     ) -> Result<(), ChannelError> {
+        let key = self
+            .live_runtime_key(owner_user_id, plugin_key)
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_key.to_owned()))?;
         let plugin = self
             .plugins
-            .get(&Self::runtime_key(owner_user_id, plugin_id))
-            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
+            .get(&key)
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_key.to_owned()))?;
         plugin.edit_message(chat_id, message_id, message).await
+    }
+
+    /// Resolves the live runtime key for the owner's plugin of a platform.
+    ///
+    /// Only built-in platform plugins ever enter the runtime map, and phase 1
+    /// keeps at most one connection per (owner, platform), so a scan over the
+    /// owner's live instances is unambiguous.
+    fn live_runtime_key(&self, owner_user_id: &str, plugin_key: &str) -> Option<ChannelRuntimeKey> {
+        let plugin_type = PluginType::from_str_opt(plugin_key)?;
+        self.plugins
+            .iter()
+            .find(|entry| entry.key().owner_user_id == owner_user_id && entry.value().plugin_type() == plugin_type)
+            .map(|entry| entry.key().clone())
     }
 
     // ── Private helpers ──────────────────────────────────────────────
@@ -441,41 +510,43 @@ impl ChannelManager {
         }
     }
 
-    /// Loads and decrypts the persisted config for a plugin.
+    /// Decrypts the persisted config of an already-resolved connection row.
     ///
     /// Used when an enable request omits credentials and the stored
     /// configuration should be reused (Settings re-enable toggle). Returns
     /// `InvalidConfig` when there is no stored config to fall back to.
-    async fn load_stored_config(&self, owner_user_id: &str, plugin_id: &str) -> Result<PluginConfig, ChannelError> {
-        let row = self
-            .repo
-            .get_plugin(owner_user_id, plugin_id)
-            .await?
-            .filter(|row| !row.config.is_empty())
-            .ok_or_else(|| {
-                ChannelError::InvalidConfig(format!(
-                    "No credentials provided and no stored configuration for plugin '{plugin_id}'"
-                ))
-            })?;
+    fn decrypt_stored_config(
+        existing: Option<&ChannelConnectionRow>,
+        plugin_key: &str,
+        encryption_key: &[u8; 32],
+    ) -> Result<PluginConfig, ChannelError> {
+        let row = existing.filter(|row| !row.config.is_empty()).ok_or_else(|| {
+            ChannelError::InvalidConfig(format!(
+                "No credentials provided and no stored configuration for plugin '{plugin_key}'"
+            ))
+        })?;
 
-        let config_json = decrypt_string(&row.config, &self.encryption_key)
-            .map_err(|e| ChannelError::DecryptionFailed(e.to_string()))?;
+        let config_json =
+            decrypt_string(&row.config, encryption_key).map_err(|e| ChannelError::DecryptionFailed(e.to_string()))?;
         let config: PluginConfig = serde_json::from_str(&config_json)?;
         Ok(config)
     }
 
-    /// Stops and removes an active plugin instance.
-    fn runtime_key(owner_user_id: &str, plugin_id: &str) -> ChannelRuntimeKey {
-        ChannelRuntimeKey::new(owner_user_id, plugin_id)
+    fn runtime_key(owner_user_id: &str, connection_id: &str) -> ChannelRuntimeKey {
+        ChannelRuntimeKey::new(owner_user_id, connection_id)
     }
 
-    fn callbacks_for_owner(&self, owner_user_id: &str) -> PluginCallbacks {
+    /// Builds plugin callbacks that stamp the owning user and connection onto
+    /// every incoming message before it enters the shared pipeline.
+    fn callbacks_for_connection(&self, owner_user_id: &str, connection_id: &str) -> PluginCallbacks {
         let (plugin_msg_tx, mut plugin_msg_rx) = mpsc::channel::<UnifiedIncomingMessage>(64);
         let message_tx = self.message_tx.clone();
         let owner_user_id = owner_user_id.to_owned();
+        let connection_id = connection_id.to_owned();
         tokio::spawn(async move {
             while let Some(mut msg) = plugin_msg_rx.recv().await {
                 msg.owner_user_id = Some(owner_user_id.clone());
+                msg.connection_id = Some(connection_id.clone());
                 if message_tx.send(msg).await.is_err() {
                     break;
                 }
@@ -488,8 +559,8 @@ impl ChannelManager {
         }
     }
 
-    async fn stop_plugin(&self, owner_user_id: &str, plugin_id: &str) {
-        let key = Self::runtime_key(owner_user_id, plugin_id);
+    async fn stop_plugin(&self, owner_user_id: &str, connection_id: &str) {
+        let key = Self::runtime_key(owner_user_id, connection_id);
         self.stop_plugin_by_key(&key).await;
     }
 
@@ -512,11 +583,11 @@ impl ChannelManager {
     async fn restore_single_plugin(
         &self,
         owner_user_id: &str,
-        row: &ChannelPluginRow,
+        row: &ChannelConnectionRow,
         factory: &PluginFactory,
     ) -> Result<(), ChannelError> {
-        let plugin_type =
-            PluginType::from_str_opt(&row.r#type).ok_or_else(|| ChannelError::InvalidPluginType(row.r#type.clone()))?;
+        let plugin_type = PluginType::from_str_opt(&row.plugin_key)
+            .ok_or_else(|| ChannelError::InvalidPluginType(row.plugin_key.clone()))?;
 
         // Decrypt config
         let config_json = decrypt_string(&row.config, &self.encryption_key)
@@ -526,36 +597,47 @@ impl ChannelManager {
         let mut plugin = factory(plugin_type)
             .ok_or_else(|| ChannelError::InvalidPluginType(format!("No implementation for {plugin_type}")))?;
 
-        let callbacks = self.callbacks_for_owner(owner_user_id);
+        let callbacks = self.callbacks_for_connection(owner_user_id, &row.id);
 
         plugin.initialize(config, callbacks).await?;
         plugin.start().await?;
 
         // Update DB with running status
-        let params = UpdatePluginStatusParams {
+        let params = UpdateConnectionStatusParams {
             status: Some(PluginStatus::Running.to_string()),
             last_connected: Some(now_ms()),
             enabled: None,
         };
-        self.repo.update_plugin_status(owner_user_id, &row.id, &params).await?;
+        self.repo
+            .update_connection_status(owner_user_id, &row.id, &params)
+            .await?;
 
         self.plugins.insert(Self::runtime_key(owner_user_id, &row.id), plugin);
-        info!(owner_user_id = %owner_user_id, plugin_id = %row.id, "plugin restored");
+        info!(
+            owner_user_id = %owner_user_id,
+            connection_id = %row.id,
+            plugin_key = %row.plugin_key,
+            "plugin restored"
+        );
         self.broadcast_status_change(owner_user_id, &row.id).await;
         Ok(())
     }
 
-    /// Updates a plugin to error status in the DB.
-    async fn update_plugin_error(&self, owner_user_id: &str, plugin_id: &str, error_msg: &str) {
-        let params = UpdatePluginStatusParams {
+    /// Updates a connection to error status in the DB.
+    async fn update_plugin_error(&self, owner_user_id: &str, connection_id: &str, error_msg: &str) {
+        let params = UpdateConnectionStatusParams {
             status: Some(PluginStatus::Error.to_string()),
             last_connected: None,
             enabled: None,
         };
-        if let Err(e) = self.repo.update_plugin_status(owner_user_id, plugin_id, &params).await {
+        if let Err(e) = self
+            .repo
+            .update_connection_status(owner_user_id, connection_id, &params)
+            .await
+        {
             error!(
                 owner_user_id = %owner_user_id,
-                plugin_id = %plugin_id,
+                connection_id = %connection_id,
                 db_error = %e,
                 original_error = %error_msg,
                 "failed to update plugin error status in DB"
@@ -564,19 +646,23 @@ impl ChannelManager {
     }
 
     /// Broadcasts a `channel.plugin-status-changed` event.
-    async fn broadcast_status_change(&self, owner_user_id: &str, plugin_id: &str) {
-        let row = match self.repo.get_plugin(owner_user_id, plugin_id).await {
+    async fn broadcast_status_change(&self, owner_user_id: &str, connection_id: &str) {
+        let row = match self.repo.get_connection(owner_user_id, connection_id).await {
             Ok(Some(row)) => row,
             Ok(None) => {
-                warn!(owner_user_id = %owner_user_id, plugin_id = %plugin_id, "plugin not found for status broadcast");
+                warn!(
+                    owner_user_id = %owner_user_id,
+                    connection_id = %connection_id,
+                    "connection not found for status broadcast"
+                );
                 return;
             }
             Err(e) => {
                 warn!(
                     owner_user_id = %owner_user_id,
-                    plugin_id = %plugin_id,
+                    connection_id = %connection_id,
                     error = %e,
-                    "failed to read plugin for status broadcast"
+                    "failed to read connection for status broadcast"
                 );
                 return;
             }
@@ -584,13 +670,15 @@ impl ChannelManager {
 
         let live_status = self
             .plugins
-            .get(&Self::runtime_key(owner_user_id, plugin_id))
+            .get(&Self::runtime_key(owner_user_id, connection_id))
             .map(|p| p.status().to_string());
         let status_response = self.row_to_status_response(&row, live_status);
 
         let payload = PluginStatusChangedPayload {
             user_id: owner_user_id.to_owned(),
-            plugin_id: plugin_id.to_owned(),
+            // The event keeps addressing plugins by platform for the UI;
+            // the connection id rides inside the status payload.
+            plugin_id: row.plugin_key.clone(),
             status: status_response,
         };
         let value = match serde_json::to_value(payload) {
@@ -605,14 +693,18 @@ impl ChannelManager {
     }
 
     /// Converts a DB row + optional live status to a `PluginStatusResponse`.
-    fn row_to_status_response(&self, row: &ChannelPluginRow, live_status: Option<String>) -> PluginStatusResponse {
+    ///
+    /// `plugin_id` stays the platform key (the UI's stable addressing);
+    /// `connection_id` carries the connection identity.
+    fn row_to_status_response(&self, row: &ChannelConnectionRow, live_status: Option<String>) -> PluginStatusResponse {
         let is_running = self
             .plugins
             .contains_key(&Self::runtime_key(&row.owner_user_id, &row.id));
         let has_token = !row.config.is_empty();
         PluginStatusResponse {
-            plugin_id: row.id.clone(),
-            plugin_type: row.r#type.clone(),
+            plugin_id: row.plugin_key.clone(),
+            connection_id: row.id.clone(),
+            plugin_type: row.plugin_key.clone(),
             name: row.name.clone(),
             enabled: row.enabled,
             status: live_status.or_else(|| row.status.clone()),
@@ -671,8 +763,10 @@ mod tests {
         BotInfo, OutgoingMessageType, PluginCredentials, PluginStatus, PluginType, UnifiedOutgoingMessage,
     };
     use aionui_common::TimestampMs;
-    use aionui_db::models::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
-    use aionui_db::{DbError, IChannelRepository, UpdatePluginStatusParams};
+    use aionui_db::models::{
+        ChannelConnectionRow, ChannelConversationBindingRow, ChannelPairingRequestRow, ChannelUserRow,
+    };
+    use aionui_db::{DbError, IChannelRepository, UpdateConnectionStatusParams};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -703,9 +797,11 @@ mod tests {
 
     // ── Mock IChannelRepository ────────────────────────────────────────
     const OWNER_ID: &str = "owner-test";
+    /// Connection the stub binding CRUD derives its `connection_id` from.
+    const STUB_CONNECTION_ID: &str = "conn-test";
 
     struct MockRepo {
-        plugins: Mutex<Vec<ChannelPluginRow>>,
+        plugins: Mutex<Vec<ChannelConnectionRow>>,
     }
 
     impl MockRepo {
@@ -715,23 +811,36 @@ mod tests {
             }
         }
 
-        fn get_plugins(&self) -> Vec<ChannelPluginRow> {
+        fn get_plugins(&self) -> Vec<ChannelConnectionRow> {
             self.plugins.lock().unwrap().clone()
         }
     }
 
     #[async_trait::async_trait]
     impl IChannelRepository for MockRepo {
-        async fn get_all_plugins(&self, _owner_user_id: &str) -> Result<Vec<ChannelPluginRow>, DbError> {
+        async fn get_all_connections(&self, _owner_user_id: &str) -> Result<Vec<ChannelConnectionRow>, DbError> {
             Ok(self.plugins.lock().unwrap().clone())
         }
 
-        async fn get_plugin(&self, _owner_user_id: &str, id: &str) -> Result<Option<ChannelPluginRow>, DbError> {
+        async fn get_connection(
+            &self,
+            _owner_user_id: &str,
+            id: &str,
+        ) -> Result<Option<ChannelConnectionRow>, DbError> {
             let plugins = self.plugins.lock().unwrap();
             Ok(plugins.iter().find(|p| p.id == id).cloned())
         }
 
-        async fn upsert_plugin(&self, _owner_user_id: &str, row: &ChannelPluginRow) -> Result<(), DbError> {
+        async fn get_connection_by_plugin_key(
+            &self,
+            _owner_user_id: &str,
+            plugin_key: &str,
+        ) -> Result<Option<ChannelConnectionRow>, DbError> {
+            let plugins = self.plugins.lock().unwrap();
+            Ok(plugins.iter().find(|p| p.plugin_key == plugin_key).cloned())
+        }
+
+        async fn upsert_connection(&self, _owner_user_id: &str, row: &ChannelConnectionRow) -> Result<(), DbError> {
             let mut plugins = self.plugins.lock().unwrap();
             if let Some(existing) = plugins.iter_mut().find(|p| p.id == row.id) {
                 *existing = row.clone();
@@ -741,11 +850,11 @@ mod tests {
             Ok(())
         }
 
-        async fn update_plugin_status(
+        async fn update_connection_status(
             &self,
             _owner_user_id: &str,
             id: &str,
-            params: &UpdatePluginStatusParams,
+            params: &UpdateConnectionStatusParams,
         ) -> Result<(), DbError> {
             let mut plugins = self.plugins.lock().unwrap();
             if let Some(p) = plugins.iter_mut().find(|p| p.id == id) {
@@ -765,7 +874,7 @@ mod tests {
             }
         }
 
-        async fn delete_plugin(&self, _owner_user_id: &str, id: &str) -> Result<(), DbError> {
+        async fn delete_connection(&self, _owner_user_id: &str, id: &str) -> Result<(), DbError> {
             let mut plugins = self.plugins.lock().unwrap();
             let len_before = plugins.len();
             plugins.retain(|p| p.id != id);
@@ -777,7 +886,7 @@ mod tests {
         }
 
         // -- User CRUD (unused stubs) --
-        async fn get_all_users(&self, _owner_user_id: &str) -> Result<Vec<AssistantUserRow>, DbError> {
+        async fn get_all_users(&self, _owner_user_id: &str) -> Result<Vec<ChannelUserRow>, DbError> {
             Ok(vec![])
         }
         async fn get_user_by_platform(
@@ -785,10 +894,10 @@ mod tests {
             _owner_user_id: &str,
             _pid: &str,
             _pt: &str,
-        ) -> Result<Option<AssistantUserRow>, DbError> {
+        ) -> Result<Option<ChannelUserRow>, DbError> {
             Ok(None)
         }
-        async fn create_user(&self, _owner_user_id: &str, _row: &AssistantUserRow) -> Result<(), DbError> {
+        async fn create_user(&self, _owner_user_id: &str, _row: &ChannelUserRow) -> Result<(), DbError> {
             Ok(())
         }
         async fn update_user_last_active(
@@ -799,25 +908,34 @@ mod tests {
         ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn delete_user(&self, _owner_user_id: &str, _id: &str) -> Result<(), DbError> {
+        async fn revoke_user(&self, _owner_user_id: &str, _id: &str) -> Result<(), DbError> {
             Ok(())
         }
 
         // -- Session CRUD (unused stubs) --
-        async fn get_all_sessions(&self, _owner_user_id: &str) -> Result<Vec<AssistantSessionRow>, DbError> {
+        async fn get_all_sessions(&self, _owner_user_id: &str) -> Result<Vec<ChannelConversationBindingRow>, DbError> {
             Ok(vec![])
         }
-        async fn get_session(&self, _owner_user_id: &str, _id: &str) -> Result<Option<AssistantSessionRow>, DbError> {
+        async fn get_session(
+            &self,
+            _owner_user_id: &str,
+            _id: &str,
+        ) -> Result<Option<ChannelConversationBindingRow>, DbError> {
             Ok(None)
         }
         async fn get_or_create_session(
             &self,
-            _owner_user_id: &str,
+            owner_user_id: &str,
             _uid: &str,
             _cid: &str,
-            new_row: &AssistantSessionRow,
-        ) -> Result<AssistantSessionRow, DbError> {
-            Ok(new_row.clone())
+            new_row: &ChannelConversationBindingRow,
+        ) -> Result<ChannelConversationBindingRow, DbError> {
+            // Mirror the real INSERT: identity comes from the channel user.
+            Ok(ChannelConversationBindingRow {
+                owner_user_id: owner_user_id.to_owned(),
+                connection_id: STUB_CONNECTION_ID.to_owned(),
+                ..new_row.clone()
+            })
         }
         async fn update_session_activity(
             &self,
@@ -835,9 +953,6 @@ mod tests {
         ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn update_session_agent_type(&self, _owner_user_id: &str, _id: &str, _at: &str) -> Result<(), DbError> {
-            Ok(())
-        }
         async fn delete_sessions_by_user(&self, _owner_user_id: &str, _uid: &str) -> Result<(), DbError> {
             Ok(())
         }
@@ -850,22 +965,43 @@ mod tests {
             Ok(())
         }
 
-        // -- Pairing codes (unused stubs) --
-        async fn create_pairing(&self, _owner_user_id: &str, _row: &PairingCodeRow) -> Result<(), DbError> {
+        // -- Pairing requests (unused stubs) --
+        async fn create_pairing(&self, _owner_user_id: &str, _row: &ChannelPairingRequestRow) -> Result<(), DbError> {
             Ok(())
         }
-        async fn get_pending_pairings(&self, _owner_user_id: &str) -> Result<Vec<PairingCodeRow>, DbError> {
+        async fn get_pending_pairings(&self, _owner_user_id: &str) -> Result<Vec<ChannelPairingRequestRow>, DbError> {
             Ok(vec![])
         }
-        async fn get_pairing_by_code(
+        async fn get_pairing(
             &self,
             _owner_user_id: &str,
-            _code: &str,
-        ) -> Result<Option<PairingCodeRow>, DbError> {
+            _id: &str,
+        ) -> Result<Option<ChannelPairingRequestRow>, DbError> {
             Ok(None)
         }
-        async fn update_pairing_status(&self, _owner_user_id: &str, _code: &str, _status: &str) -> Result<(), DbError> {
+        async fn get_pending_pairing_by_code_hash(
+            &self,
+            _owner_user_id: &str,
+            _code_hash: &str,
+        ) -> Result<Option<ChannelPairingRequestRow>, DbError> {
+            Ok(None)
+        }
+        async fn update_pairing_status(
+            &self,
+            _owner_user_id: &str,
+            _id: &str,
+            _status: &str,
+            _approved_channel_user_id: Option<&str>,
+        ) -> Result<(), DbError> {
             Ok(())
+        }
+        async fn expire_pending_pairings_for_user(
+            &self,
+            _owner_user_id: &str,
+            _connection_id: &str,
+            _external_user_id: &str,
+        ) -> Result<u64, DbError> {
+            Ok(0)
         }
         async fn cleanup_expired_pairings(&self, _owner_user_id: &str, _now: TimestampMs) -> Result<u64, DbError> {
             Ok(0)
@@ -1065,10 +1201,10 @@ mod tests {
     async fn get_status_returns_db_plugins() {
         let (mgr, repo, _bc) = make_manager();
         let now = now_ms();
-        repo.plugins.lock().unwrap().push(ChannelPluginRow {
+        repo.plugins.lock().unwrap().push(ChannelConnectionRow {
             id: "telegram".into(),
             owner_user_id: OWNER_ID.into(),
-            r#type: "telegram".into(),
+            plugin_key: "telegram".into(),
             name: "Telegram Bot".into(),
             enabled: true,
             config: "encrypted".into(),
@@ -1123,7 +1259,9 @@ mod tests {
 
         let plugins = repo.get_plugins();
         assert_eq!(plugins.len(), 1);
-        assert_eq!(plugins[0].id, "telegram");
+        // Connection id is generated; the platform lives in plugin_key.
+        assert!(plugins[0].id.starts_with("conn_"), "id: {}", plugins[0].id);
+        assert_eq!(plugins[0].plugin_key, "telegram");
         assert!(plugins[0].enabled);
         // Config should be encrypted (base64), not plaintext
         assert_ne!(plugins[0].config, serde_json::to_string(&make_test_config()).unwrap());
@@ -1290,10 +1428,10 @@ mod tests {
     async fn disable_idempotent_for_not_running() {
         let (mgr, repo, _bc) = make_manager();
         // Manually insert a disabled plugin in DB
-        repo.plugins.lock().unwrap().push(ChannelPluginRow {
+        repo.plugins.lock().unwrap().push(ChannelConnectionRow {
             id: "telegram".into(),
             owner_user_id: OWNER_ID.into(),
-            r#type: "telegram".into(),
+            plugin_key: "telegram".into(),
             name: "Telegram Bot".into(),
             enabled: false,
             config: "encrypted".into(),
@@ -1367,10 +1505,10 @@ mod tests {
         let config_json = serde_json::to_string(&make_plugin_config()).unwrap();
         let encrypted = encrypt_string(&config_json, &test_key()).unwrap();
 
-        repo.plugins.lock().unwrap().push(ChannelPluginRow {
+        repo.plugins.lock().unwrap().push(ChannelConnectionRow {
             id: "telegram".into(),
             owner_user_id: OWNER_ID.into(),
-            r#type: "telegram".into(),
+            plugin_key: "telegram".into(),
             name: "Telegram Bot".into(),
             enabled: false,
             config: encrypted,
@@ -1392,10 +1530,10 @@ mod tests {
         let config_json = serde_json::to_string(&make_plugin_config()).unwrap();
         let encrypted = encrypt_string(&config_json, &test_key()).unwrap();
 
-        repo.plugins.lock().unwrap().push(ChannelPluginRow {
+        repo.plugins.lock().unwrap().push(ChannelConnectionRow {
             id: "telegram".into(),
             owner_user_id: OWNER_ID.into(),
-            r#type: "telegram".into(),
+            plugin_key: "telegram".into(),
             name: "Telegram Bot".into(),
             enabled: true,
             config: encrypted,
@@ -1420,10 +1558,10 @@ mod tests {
         // One valid plugin and one with bad encrypted config
         {
             let mut plugins = repo.plugins.lock().unwrap();
-            plugins.push(ChannelPluginRow {
+            plugins.push(ChannelConnectionRow {
                 id: "telegram".into(),
                 owner_user_id: OWNER_ID.into(),
-                r#type: "telegram".into(),
+                plugin_key: "telegram".into(),
                 name: "Telegram Bot".into(),
                 enabled: true,
                 config: encrypted,
@@ -1432,10 +1570,10 @@ mod tests {
                 created_at: now_ms(),
                 updated_at: now_ms(),
             });
-            plugins.push(ChannelPluginRow {
+            plugins.push(ChannelConnectionRow {
                 id: "lark".into(),
                 owner_user_id: OWNER_ID.into(),
-                r#type: "lark".into(),
+                plugin_key: "lark".into(),
                 name: "Lark Bot".into(),
                 enabled: true,
                 config: "invalid-encrypted-data".into(),

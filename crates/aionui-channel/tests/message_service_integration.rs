@@ -12,7 +12,7 @@ use aionui_channel::types::PluginType;
 use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs};
 use aionui_conversation::ConversationService;
 use aionui_conversation::skill_resolver::{ResolvedAgentSkill, SkillResolver};
-use aionui_db::models::AssistantSessionRow;
+use aionui_db::models::ChannelConversationBindingRow;
 use aionui_db::models::UpsertAssistantDefinitionParams;
 use aionui_db::{
     IAcpSessionRepository, IAssistantDefinitionRepository, IClientPreferenceRepository, IConversationRepository,
@@ -241,12 +241,12 @@ async fn send_to_agent_warms_cold_task_before_returning_stream_subscription() {
     )));
     let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
 
-    let session = AssistantSessionRow {
+    let session = ChannelConversationBindingRow {
         id: "session-1".to_owned(),
+        owner_user_id: TEST_OWNER_USER_ID.to_owned(),
+        connection_id: "conn-telegram".to_owned(),
         user_id: "channel-user-1".to_owned(),
-        agent_type: "aionrs".to_owned(),
         conversation_id: None,
-        workspace: None,
         chat_id: Some("7088048016".to_owned()),
         created_at: 1,
         last_activity: 1,
@@ -319,12 +319,12 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
     let settings = Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
     let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
 
-    let session = AssistantSessionRow {
+    let session = ChannelConversationBindingRow {
         id: "session-assisted".to_owned(),
+        owner_user_id: TEST_OWNER_USER_ID.to_owned(),
+        connection_id: "conn-telegram".to_owned(),
         user_id: "channel-user-1".to_owned(),
-        agent_type: "aionrs".to_owned(),
         conversation_id: None,
-        workspace: None,
         chat_id: Some("7088048016".to_owned()),
         created_at: 1,
         last_activity: 1,
@@ -396,12 +396,12 @@ async fn send_to_agent_rejects_unresolvable_channel_assistant_binding() {
     let settings = Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
     let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
 
-    let session = AssistantSessionRow {
+    let session = ChannelConversationBindingRow {
         id: "session-assisted-missing".to_owned(),
+        owner_user_id: TEST_OWNER_USER_ID.to_owned(),
+        connection_id: "conn-telegram".to_owned(),
         user_id: "channel-user-missing".to_owned(),
-        agent_type: "aionrs".to_owned(),
         conversation_id: None,
-        workspace: None,
         chat_id: Some("7088048017".to_owned()),
         created_at: 1,
         last_activity: 1,
@@ -456,12 +456,12 @@ async fn send_to_agent_without_saved_binding_defaults_to_bare_aionrs_assistant()
     let settings = Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
     let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
 
-    let session = AssistantSessionRow {
+    let session = ChannelConversationBindingRow {
         id: "session-assisted-default-aionrs".to_owned(),
+        owner_user_id: TEST_OWNER_USER_ID.to_owned(),
+        connection_id: "conn-telegram".to_owned(),
         user_id: "channel-user-default".to_owned(),
-        agent_type: "aionrs".to_owned(),
         conversation_id: None,
-        workspace: None,
         chat_id: Some("7088048018".to_owned()),
         created_at: 1,
         last_activity: 1,
@@ -534,12 +534,12 @@ async fn send_to_agent_without_assistant_name_falls_back_to_legacy_channel_name(
     let settings = Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
     let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
 
-    let session = AssistantSessionRow {
+    let session = ChannelConversationBindingRow {
         id: "session-assisted-fallback-name".to_owned(),
+        owner_user_id: TEST_OWNER_USER_ID.to_owned(),
+        connection_id: "conn-telegram".to_owned(),
         user_id: "channel-user-2".to_owned(),
-        agent_type: "aionrs".to_owned(),
         conversation_id: None,
-        workspace: None,
         chat_id: Some("7088048016".to_owned()),
         created_at: 1,
         last_activity: 1,

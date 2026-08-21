@@ -33,7 +33,7 @@ pub use models::{
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams, UserStatus,
     UserType,
 };
-pub use repository::channel::UpdatePluginStatusParams;
+pub use repository::channel::UpdateConnectionStatusParams;
 pub use repository::conversation::{
     ConversationFilters, ConversationRowUpdate, MessagePageCursor, MessagePageDirection, MessagePageParams,
     MessagePageResult, MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,

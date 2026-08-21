@@ -281,6 +281,10 @@ pub struct BotInfo {
 pub struct UnifiedIncomingMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_user_id: Option<String>,
+    /// Connection that received this message. Stamped by the manager's
+    /// callback bridge; `platform` stays for display and legacy addressing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
     pub id: String,
     pub platform: PluginType,
     pub chat_id: String,
@@ -727,6 +731,7 @@ mod tests {
     fn unified_incoming_message_text() {
         let msg = UnifiedIncomingMessage {
             owner_user_id: None,
+            connection_id: None,
             id: "msg_1".into(),
             platform: PluginType::Telegram,
             chat_id: "chat_42".into(),
@@ -981,6 +986,7 @@ mod tests {
     fn incoming_message_roundtrip() {
         let msg = UnifiedIncomingMessage {
             owner_user_id: None,
+            connection_id: None,
             id: "m1".into(),
             platform: PluginType::Lark,
             chat_id: "c1".into(),

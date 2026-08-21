@@ -231,6 +231,13 @@ impl IUserRepository for SqliteUserRepository {
         // bindings) or reference another root's `user_id` (project explorer).
         // The exhaustiveness of this convention is enforced by the
         // adoption-coverage classification test in aionui-db/tests.
+        // Re-owning happens table by table, so a composite foreign key that
+        // spans two adopted tables (channel_users → channel_connections on
+        // (owner_user_id, id)) is transiently violated between the two
+        // UPDATEs even though the committed state is consistent. Defer FK
+        // checks to COMMIT; SQLite resets this at the end of the transaction.
+        sqlx::query("PRAGMA defer_foreign_keys = ON").execute(&mut *tx).await?;
+
         let mut moved: u64 = 0;
         for owner_column in ["user_id", "owner_user_id"] {
             let tables: Vec<(String,)> = sqlx::query_as(

@@ -24,7 +24,7 @@ use serde::Serialize;
 use crate::channel_settings::ChannelSettingsService;
 use crate::error::ChannelError;
 use crate::manager::{ChannelManager, PluginFactory};
-use crate::pairing::PairingService;
+use crate::pairing::{PairingSelector, PairingService};
 use crate::session::SessionManager;
 use crate::types::{PluginConfig, PluginConfigOptions, PluginCredentials, PluginType};
 
@@ -377,7 +377,7 @@ async fn disable_plugin(
         .is_some()
         && state
             .repo
-            .get_plugin(&user.id, &req.plugin_id)
+            .get_connection_by_plugin_key(&user.id, &req.plugin_id)
             .await
             .map_err(db_error_to_api_error)?
             .is_none()
@@ -456,7 +456,7 @@ async fn get_pending_pairings(
     let responses: Vec<PairingRequestResponse> = rows
         .into_iter()
         .map(|r| PairingRequestResponse {
-            code: r.code,
+            id: r.id,
             platform_user_id: r.platform_user_id,
             platform_type: r.platform_type,
             display_name: r.display_name,
@@ -467,6 +467,18 @@ async fn get_pending_pairings(
     Ok(Json(ApiResponse::ok(responses)))
 }
 
+/// Resolves the pairing selector from a request carrying `id` and/or `code`.
+/// `id` wins when both are present; neither is a 400.
+fn pairing_selector<'a>(id: &'a Option<String>, code: &'a Option<String>) -> Result<PairingSelector<'a>, ApiError> {
+    if let Some(id) = id.as_deref().filter(|value| !value.is_empty()) {
+        return Ok(PairingSelector::Id(id));
+    }
+    if let Some(code) = code.as_deref().filter(|value| !value.is_empty()) {
+        return Ok(PairingSelector::Code(code));
+    }
+    Err(ApiError::BadRequest("Either 'id' or 'code' is required".into()))
+}
+
 /// `POST /api/channel/pairings/approve` — approve a pairing request.
 async fn approve_pairing(
     State(state): State<ChannelRouterState>,
@@ -475,7 +487,8 @@ async fn approve_pairing(
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
-    state.pairing_service.approve_pairing(&user.id, &req.code).await?;
+    let selector = pairing_selector(&req.id, &req.code)?;
+    state.pairing_service.approve_pairing(&user.id, selector).await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
@@ -492,7 +505,8 @@ async fn reject_pairing(
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
-    state.pairing_service.reject_pairing(&user.id, &req.code).await?;
+    let selector = pairing_selector(&req.id, &req.code)?;
+    state.pairing_service.reject_pairing(&user.id, selector).await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
@@ -539,16 +553,17 @@ async fn revoke_user(
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
-    // Clean up sessions first
+    // Clean up in-memory sessions first
     state
         .session_manager
         .cleanup_user_sessions(&user.id, &req.user_id)
         .await?;
 
-    // Delete user record
+    // Soft-delete the authorization (audit row retained) and remove the
+    // user's persisted sessions.
     state
         .repo
-        .delete_user(&user.id, &req.user_id)
+        .revoke_user(&user.id, &req.user_id)
         .await
         .map_err(db_error_to_api_error)?;
 
@@ -574,9 +589,10 @@ async fn get_active_sessions(
         .map(|r| ChannelSessionResponse {
             id: r.id,
             user_id: r.user_id,
-            agent_type: r.agent_type,
+            // Deprecated: agent config is no longer part of the binding.
+            agent_type: None,
             conversation_id: r.conversation_id,
-            workspace: r.workspace,
+            workspace: None,
             chat_id: r.chat_id,
             created_at: r.created_at,
             last_activity: r.last_activity,

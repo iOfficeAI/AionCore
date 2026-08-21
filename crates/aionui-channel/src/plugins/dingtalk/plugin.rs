@@ -690,6 +690,7 @@ async fn handle_bot_message(data_str: &str, message_tx: &mpsc::Sender<UnifiedInc
 
     let unified = UnifiedIncomingMessage {
         owner_user_id: None,
+        connection_id: None,
         id: cb.msg_id.clone().unwrap_or_default(),
         platform: PluginType::Dingtalk,
         chat_id,
@@ -784,6 +785,7 @@ async fn handle_card_action(
 
     let msg = UnifiedIncomingMessage {
         owner_user_id: None,
+        connection_id: None,
         id: format!("card_{}", chrono_now()),
         platform: PluginType::Dingtalk,
         chat_id,

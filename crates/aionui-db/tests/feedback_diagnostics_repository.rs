@@ -512,8 +512,9 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
     }
 
     sqlx::query(
-        "INSERT INTO client_preferences (user_id, key, value, updated_at) VALUES (?, ?, ?, ?) \
-         ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        "INSERT INTO client_preferences (scope, user_id, key, value, updated_at) VALUES ('account', ?, ?, ?, ?) \
+         ON CONFLICT(user_id, key) WHERE scope = 'account' \
+         DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
     )
     .bind("system_default_user")
     .bind("appearance.uiScale")

@@ -302,9 +302,13 @@ async fn ep1_enable_telegram_plugin() {
         .unwrap();
 
     // Plugin persisted in DB
-    let row = repo.get_plugin(OWNER_ID, "telegram").await.unwrap().unwrap();
+    let row = repo
+        .get_connection_by_plugin_key(OWNER_ID, "telegram")
+        .await
+        .unwrap()
+        .unwrap();
     assert!(row.enabled);
-    assert_eq!(row.r#type, "telegram");
+    assert_eq!(row.plugin_key, "telegram");
     assert_eq!(row.name, "Telegram Bot");
     assert!(row.last_connected.is_some());
 
@@ -337,7 +341,11 @@ async fn ep2_re_enable_updates_config() {
     assert_eq!(mgr.active_plugin_count(), 1);
 
     // Config should be updated
-    let row = repo.get_plugin(OWNER_ID, "telegram").await.unwrap().unwrap();
+    let row = repo
+        .get_connection_by_plugin_key(OWNER_ID, "telegram")
+        .await
+        .unwrap()
+        .unwrap();
     let decrypted = decrypt_string(&row.config, &test_key()).unwrap();
     let config: PluginConfig = serde_json::from_str(&decrypted).unwrap();
     assert_eq!(config.credentials.token.as_deref(), Some("bot:new_token_456"));
@@ -364,7 +372,11 @@ async fn ep6_re_enable_empty_config_reuses_stored_credentials() {
 
     assert!(mgr.is_plugin_running(OWNER_ID, "telegram"));
 
-    let row = repo.get_plugin(OWNER_ID, "telegram").await.unwrap().unwrap();
+    let row = repo
+        .get_connection_by_plugin_key(OWNER_ID, "telegram")
+        .await
+        .unwrap()
+        .unwrap();
     assert!(row.enabled);
     let decrypted = decrypt_string(&row.config, &test_key()).unwrap();
     let config: PluginConfig = serde_json::from_str(&decrypted).unwrap();
@@ -416,7 +428,11 @@ async fn dp1_disable_enabled_plugin() {
     assert_eq!(mgr.active_plugin_count(), 0);
     assert!(!mgr.is_plugin_running(OWNER_ID, "telegram"));
 
-    let row = repo.get_plugin(OWNER_ID, "telegram").await.unwrap().unwrap();
+    let row = repo
+        .get_connection_by_plugin_key(OWNER_ID, "telegram")
+        .await
+        .unwrap()
+        .unwrap();
     assert!(!row.enabled);
     assert_eq!(row.status.as_deref(), Some("stopped"));
 }
@@ -506,7 +522,7 @@ async fn tp_test_does_not_persist() {
         .await
         .unwrap();
 
-    let plugins = repo.get_all_plugins(OWNER_ID).await.unwrap();
+    let plugins = repo.get_all_connections(OWNER_ID).await.unwrap();
     assert!(plugins.is_empty());
     assert_eq!(mgr.active_plugin_count(), 0);
 }
@@ -522,7 +538,11 @@ async fn cs1_credentials_stored_encrypted() {
         .await
         .unwrap();
 
-    let row = repo.get_plugin(OWNER_ID, "telegram").await.unwrap().unwrap();
+    let row = repo
+        .get_connection_by_plugin_key(OWNER_ID, "telegram")
+        .await
+        .unwrap()
+        .unwrap();
 
     // Config should not contain plaintext token
     assert!(!row.config.contains("bot:valid123"));
@@ -676,12 +696,14 @@ async fn same_plugin_id_is_runtime_isolated_by_owner() {
     assert!(mgr.is_plugin_running(OWNER_ID, "telegram"));
     assert!(mgr.is_plugin_running(&owner_b_id, "telegram"));
 
-    let owner_a_plugins = repo.get_all_plugins(OWNER_ID).await.unwrap();
-    let owner_b_plugins = repo.get_all_plugins(&owner_b_id).await.unwrap();
+    let owner_a_plugins = repo.get_all_connections(OWNER_ID).await.unwrap();
+    let owner_b_plugins = repo.get_all_connections(&owner_b_id).await.unwrap();
     assert_eq!(owner_a_plugins.len(), 1);
     assert_eq!(owner_b_plugins.len(), 1);
-    assert_eq!(owner_a_plugins[0].id, "telegram");
-    assert_eq!(owner_b_plugins[0].id, "telegram");
+    assert_eq!(owner_a_plugins[0].plugin_key, "telegram");
+    assert_eq!(owner_b_plugins[0].plugin_key, "telegram");
+    // Each owner gets its own generated connection id.
+    assert_ne!(owner_a_plugins[0].id, owner_b_plugins[0].id);
 
     mgr.disable_plugin(OWNER_ID, "telegram").await.unwrap();
 
@@ -764,7 +786,11 @@ async fn enable_failure_sets_error_in_db() {
     assert!(err.is_err());
 
     // Plugin should exist in DB with error status
-    let row = repo.get_plugin(OWNER_ID, "telegram").await.unwrap().unwrap();
+    let row = repo
+        .get_connection_by_plugin_key(OWNER_ID, "telegram")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.status.as_deref(), Some("error"));
     assert_eq!(mgr.active_plugin_count(), 0);
 }

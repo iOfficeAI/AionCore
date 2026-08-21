@@ -6,7 +6,7 @@
 //! services — revokes an AionPro session over HTTP, and asserts observable
 //! cleanup actually happened:
 //!
-//!   - channel sessions: the user's `assistant_sessions` rows are deleted by
+//!   - channel sessions: the user's `channel_conversation_bindings` rows are deleted by
 //!     `ChannelSessionManager::clear_all_sessions` (async part of the hook,
 //!     polled with a timeout);
 //!   - session invalidation: the revoked cookie token stops working
@@ -22,7 +22,7 @@ use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use aionui_db::models::{AssistantSessionRow, AssistantUserRow};
+use aionui_db::models::{ChannelConnectionRow, ChannelConversationBindingRow, ChannelUserRow};
 use aionui_db::{IChannelRepository, SqliteChannelRepository};
 
 const BOOTSTRAP: &str = "bootstrap-secret";
@@ -98,21 +98,42 @@ async fn http_revoke_runs_the_real_cleanup_hook_end_to_end() {
         .to_owned();
 
     // Seed observable channel state owned by that user: one channel user with
-    // one active channel session (assistant_sessions row).
+    // one active channel session (channel_conversation_bindings row).
     let channel_repo = SqliteChannelRepository::new(services.database.pool().clone());
     let now = aionui_common::now_ms();
+    // Channel users hang off the connection that authorized them.
+    channel_repo
+        .upsert_connection(
+            &user_id,
+            &ChannelConnectionRow {
+                id: "conn-revoke".into(),
+                owner_user_id: user_id.clone(),
+                plugin_key: "telegram".into(),
+                name: "TG".into(),
+                enabled: true,
+                config: "{}".into(),
+                status: None,
+                last_connected: None,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
     channel_repo
         .create_user(
             &user_id,
-            &AssistantUserRow {
+            &ChannelUserRow {
                 id: "cu-revoke".into(),
                 owner_user_id: user_id.clone(),
+                connection_id: "conn-revoke".into(),
                 platform_user_id: "tg-revoke".into(),
                 platform_type: "telegram".into(),
                 display_name: Some("TG".into()),
+                status: "active".into(),
+                revoked_at: None,
                 authorized_at: now,
                 last_active: None,
-                session_id: None,
             },
         )
         .await
@@ -122,12 +143,13 @@ async fn http_revoke_runs_the_real_cleanup_hook_end_to_end() {
             &user_id,
             "cu-revoke",
             "chat-revoke",
-            &AssistantSessionRow {
+            &ChannelConversationBindingRow {
                 id: "cs-revoke".into(),
+                // Derived by the repository from the active channel user.
+                owner_user_id: String::new(),
+                connection_id: String::new(),
                 user_id: "cu-revoke".into(),
-                agent_type: "gemini".into(),
                 conversation_id: None,
-                workspace: None,
                 chat_id: Some("chat-revoke".into()),
                 created_at: now,
                 last_activity: now,
