@@ -22,6 +22,9 @@ mod suspend;
 mod types;
 
 pub use acp_conn::{AcpConnection, AcpSessionBackend, acp_capabilities};
+// Shared plan-status normalizer: the claude adapter's TodoWrite translation
+// reuses it rather than adding a third copy of the same match.
+pub(crate) use acp_conn::map_plan_status;
 pub use antigravity::{AntigravityConnection, AntigravitySessionBackend, antigravity_capabilities};
 pub use claude_conn::{ClaudeConnection, ClaudeSessionBackend};
 pub use cli_version::{
