@@ -25,7 +25,11 @@ use super::tree_model::{DeltaBatch, Hint, Snapshot, TreeModel};
 use super::watcher::RawEvent;
 
 /// A command processed serially by a shard worker. `Mount`/`Unmount` are not
-/// external commands — they are internal effects of subscribe/reap.
+/// external commands — they are internal effects of subscribe/reap. `Remount` is
+/// the one exception: an explicit "the backend mount may be stale" refresh that
+/// composes unmount + mount to re-arm a possibly-dead watch and re-read the
+/// baseline (a plain re-subscribe cannot, because mount is idempotent on a live
+/// node).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Subscribe {
@@ -37,6 +41,14 @@ pub enum Command {
         sub: Subscriber,
         canonical: String,
         now: Millis,
+    },
+    /// Force a fresh mount of an already-watched canonical: tear the node down
+    /// (drop watch + facts) and mount it again (re-arm watch, re-read baseline).
+    /// Subscriptions are untouched, so subscribers and their pe identities are
+    /// preserved. A user-driven recovery for when the backend watcher/listing has
+    /// gone stale; a no-op for a canonical that is not currently watched.
+    Remount {
+        canonical: String,
     },
     Apply {
         canonical: String,
@@ -211,6 +223,28 @@ impl Shard {
                 // TTL; the reaper unmounts later. No immediate output.
                 let _ = self.subs.unsubscribe(&sub, &canonical, now);
                 Ok(Vec::new())
+            }
+
+            Command::Remount { canonical } => {
+                // Only meaningful for a canonical we are supposed to be watching
+                // (live or warm-in-grace). Mounting a cold canonical would orphan
+                // a tree node the reaper never reclaims (reap keys off the subs
+                // registry, which has no entry for it) → skip, no output.
+                if !self.subs.is_watched(&canonical) {
+                    return Ok(Vec::new());
+                }
+                // Tear down then mount fresh: re-arm the OS watch and re-read the
+                // baseline from disk. This is what a re-subscribe cannot do —
+                // mount is idempotent on a live node, so it would serve the cached
+                // (possibly stale) listing without touching the watch. `unmount`
+                // touches only the tree, never the subscription registry, so the
+                // subscribers here are exactly those before the remount.
+                self.tree.unmount(&canonical);
+                let snapshot = self.tree.mount(&canonical).await?;
+                Ok(vec![ShardOutput::Snapshot {
+                    subscribers: self.recipients(&canonical),
+                    snapshot,
+                }])
             }
 
             Command::Apply { canonical, hint } => {

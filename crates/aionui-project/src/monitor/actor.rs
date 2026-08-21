@@ -283,10 +283,11 @@ impl FsMonitorActor {
                             pe_id: sub.pe_id.clone(),
                             relative_path: sub.rel.clone(),
                         };
-                        // Only overflow reaches this fan-out: the subscribe reply is
-                        // returned to its caller by `shard_handle`, and no other
-                        // command yields a snapshot. So this push is always a rescan
-                        // and is tagged as one.
+                        // Only overflow reaches this fan-out: the subscribe and
+                        // remount replies are returned to their caller by
+                        // `shard_handle`, and no other command drives a snapshot
+                        // through here. So this push is always a rescan and is
+                        // tagged as one.
                         let params = wire::overflow_snapshot_params(&snapshot, &target);
                         self.push.push(&sub.session, wire::notification("fs/snapshot", params));
                     }

@@ -1,8 +1,9 @@
 //! Inbound JSON-RPC dispatch for the monitor actor.
 //!
 //! Parses one inner frame, routes by `method`, and drives the runtime:
-//! `initialize` handshakes; `fs/subscribe`/`fs/unsubscribe` go through the shard
-//! (identity resolved via [`ProjectService::resolve_reference`]); the file
+//! `initialize` handshakes; `fs/subscribe`/`fs/remount`/`fs/unsubscribe` go
+//! through the shard (identity resolved via [`ProjectService::resolve_reference`]);
+//! the file
 //! commands (`fs/mkdir|createFile|remove|rename`) resolve + realpath-guard, then
 //! hit the provider directly. Responses/notifications go out via the actor's
 //! push port. Errors map to protocol codes ([`wire`]) with `pe_id`/`relative_path`
@@ -21,8 +22,8 @@ use crate::types::{FileOp, ReferenceInput, ResolvedResource};
 use super::actor::FsMonitorActor;
 use super::search::{self, ActiveSearch, SearchRoot};
 use super::wire::{
-    self, CreateFileParams, InitializeParams, MkdirParams, RemoveParams, RenameParams, ResourceRef, SearchCancelParams,
-    SearchParams, SubscribeParams, TransferParams, UnsubscribeParams,
+    self, CreateFileParams, InitializeParams, MkdirParams, RemountParams, RemoveParams, RenameParams, ResourceRef,
+    SearchCancelParams, SearchParams, SubscribeParams, TransferParams, UnsubscribeParams,
 };
 
 /// Whether a transfer keeps the source (`Copy`) or removes it after it lands
@@ -55,6 +56,7 @@ impl FsMonitorActor {
         match incoming.method.as_str() {
             "initialize" => self.handle_initialize(session, id, params),
             "fs/subscribe" => self.handle_subscribe(session, user_id, id, params).await,
+            "fs/remount" => self.handle_remount(session, user_id, id, params).await,
             "fs/unsubscribe" => self.handle_unsubscribe(session, user_id, params).await,
             "fs/mkdir" => self.handle_mkdir(session, user_id, id, params).await,
             "fs/createFile" => self.handle_create_file(session, user_id, id, params).await,
@@ -201,6 +203,106 @@ impl FsMonitorActor {
             snapshots = snapshots.len(),
             failed,
             "fs subscribe"
+        );
+        self.push(session, wire::success(id, json!({ "snapshots": snapshots })));
+    }
+
+    /// `fs/remount` (request): force a fresh mount of directories the client is
+    /// already watching, recovering from a stale backend mount (a dead watch, a
+    /// path that was removed then recreated). Unlike `fs/subscribe` this registers
+    /// no subscription — it re-arms the watch and re-reads the baseline of nodes
+    /// that are already watched, then replies with the fresh snapshots (same
+    /// `{ snapshots }` shape as subscribe, so the client applies them identically).
+    /// A target that is not currently watched is a silent no-op (it contributes no
+    /// snapshot), so a remount of a collapsed root simply returns an empty batch.
+    async fn handle_remount(&mut self, session: &str, user_id: &str, id: Option<Value>, params: Value) {
+        let Ok(parsed) = serde_json::from_value::<RemountParams>(params) else {
+            self.push(session, invalid_params(id));
+            return;
+        };
+
+        let target_count = parsed.targets.len();
+
+        // Phase 1: resolve + canonicalize every target before mutating the shard,
+        // so a bad target fails the whole request atomically (mirrors subscribe).
+        let mut plan: Vec<(ResourceRef, String)> = Vec::new();
+        for target in parsed.targets {
+            let resolved = match self.resolve(user_id, &target, FileOp::Browse).await {
+                Ok(r) => r,
+                Err((code, message)) => {
+                    tracing::warn!(session, code = message, pe_id = %target.pe_id, "fs remount rejected");
+                    self.push(session, wire::error(id.clone(), code, message, ref_data(&target)));
+                    return;
+                }
+            };
+            let canonical = match canonical::canonicalize(&resolved.resource_uri) {
+                Ok(c) => c.as_str().to_owned(),
+                Err(_) => {
+                    tracing::warn!(session, code = "provider_unavailable", pe_id = %target.pe_id, "fs remount rejected");
+                    self.push(
+                        session,
+                        wire::error(
+                            id.clone(),
+                            wire::CODE_PROVIDER_UNAVAILABLE,
+                            "provider_unavailable",
+                            ref_data(&target),
+                        ),
+                    );
+                    return;
+                }
+            };
+            plan.push((target, canonical));
+        }
+
+        // Phase 2: remount each. Like subscribe's phase 2 this is NOT atomic — one
+        // target can fail to re-read (its path was removed) while others recover
+        // fine, so skip the failed target and keep every fresh snapshot. A target
+        // that is not currently watched yields no output (a legitimate no-op, not a
+        // failure). Fall back to the error reply only when a real failure occurred
+        // and nothing was remounted.
+        let mut snapshots: Vec<Value> = Vec::new();
+        let mut failed: usize = 0;
+        let mut first_failure: Option<(i64, &'static str, Value)> = None;
+        for (target, canonical) in plan {
+            match self.shard_handle(Command::Remount { canonical }).await {
+                Ok(outputs) => {
+                    for output in outputs {
+                        if let ShardOutput::Snapshot { snapshot, .. } = output {
+                            snapshots.push(wire::snapshot_params(&snapshot, &target));
+                        }
+                    }
+                }
+                Err(err) => {
+                    failed += 1;
+                    let (code, message) = wire::fs_error_to_rpc(&err);
+                    tracing::warn!(
+                        session,
+                        code = message,
+                        pe_id = %target.pe_id,
+                        rel = %target.relative_path,
+                        reason = wire::fs_error_detail(&err),
+                        "fs remount: target re-mount failed"
+                    );
+                    first_failure.get_or_insert_with(|| (code, message, ref_data(&target)));
+                }
+            }
+        }
+        // Nothing remounted *and* something failed → surface the failure rather
+        // than a misleadingly empty success. (Empty with no failure is valid: the
+        // targets were collapsed / not watched.)
+        if snapshots.is_empty()
+            && let Some((code, message, data)) = first_failure
+        {
+            self.push(session, wire::error(id, code, message, data));
+            return;
+        }
+        // Lifecycle boundary (low volume). `failed` > 0 marks a degraded reply.
+        tracing::info!(
+            session,
+            targets = target_count,
+            snapshots = snapshots.len(),
+            failed,
+            "fs remount"
         );
         self.push(session, wire::success(id, json!({ "snapshots": snapshots })));
     }
