@@ -704,6 +704,17 @@ impl StreamRelay {
                             // The raw frame still reaches the frontend via message.stream.
                             self.forward_to_websocket(&event);
                         }
+                        AgentStreamEvent::Plan(data) => {
+                            // A plan is a side-channel SNAPSHOT, not turn work. It
+                            // deliberately does NOT set `saw_tool_or_side_effect` (that
+                            // would make an otherwise-replayable turn look unsafe to
+                            // retry) and does NOT close the active text segment — a plan
+                            // refresh lands mid-reply and would otherwise shatter that
+                            // reply into a fresh bubble, the same reasoning as the
+                            // WorkflowProgress arm above.
+                            self.forward_to_websocket(&event);
+                            self.adapter.persist_plan(data, &self.turn_id).await;
+                        }
                         _ => {
                             self.forward_to_websocket(&event);
                         }
@@ -2532,6 +2543,68 @@ mod tests {
     }
 
     // ── Tool persistence tests ────────────────────────────────────
+
+    /// A plan snapshot must reach the DB, not just the WebSocket: a turn that
+    /// keeps running in the background has to rehydrate its plan bar when the
+    /// user comes back to the conversation.
+    ///
+    /// One row per turn, upserted — a plan is a FULL-REPLACEMENT snapshot, so a
+    /// second frame overwrites the first rather than stacking a second card.
+    #[tokio::test]
+    async fn run_plan_persists_message() {
+        use aionui_ai_agent::protocol::events::session_updates::PlanEventData;
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::Plan(PlanEventData {
+            session_id: None,
+            entries: vec![json!({"content": "step one", "status": "pending"})],
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Plan(PlanEventData {
+            session_id: None,
+            entries: vec![json!({"content": "step one", "status": "completed"})],
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let inserts = repo.take_inserts();
+        let plans: Vec<_> = inserts.iter().filter(|m| m.r#type == "plan").collect();
+        assert_eq!(plans.len(), 1, "one row per turn, not one per frame: {inserts:?}");
+
+        let row = plans[0];
+        assert_eq!(row.id, "plan:asst-1");
+        // BARE msg_id: the live WS frame carries the turn msg_id, and the
+        // renderer dedupes history against live frames on `${type}:${msg_id}`.
+        assert_eq!(row.msg_id.as_deref(), Some("asst-1"));
+
+        let updates = repo.take_updates();
+        let (_, upd) = updates
+            .iter()
+            .find(|(id, _)| id == "plan:asst-1")
+            .expect("the second frame must upsert the same row");
+
+        let content: serde_json::Value = serde_json::from_str(upd.content.as_deref().unwrap()).unwrap();
+        assert_eq!(content["entries"][0]["status"], "completed");
+        // turn_id rides inside content (the column set is fixed); the plan bar
+        // gates on it matching the running turn.
+        assert_eq!(content["turn_id"], "turn-1");
+    }
 
     #[tokio::test]
     async fn run_tool_call_persists_message() {
