@@ -1736,14 +1736,27 @@ mod tests {
     /// suppresses the tool card; the direct-CLI lane must match, or the same
     /// conversation shows a to-do bar over ACP and a bare "TodoWrite" tool card
     /// here.
+    ///
+    /// Wire-pinned against a REAL 2.1.141 frame (captured 2026-08-21), hence the
+    /// `activeForm` and `caller` keys we ignore: never hand-write a shape we have
+    /// not seen on the wire.
+    ///
+    /// VERSION NOTE: claude removed TodoWrite from the headless tool set in
+    /// **2.1.142** (bisected 2026-08-21: 2.1.141 advertises it, 2.1.142 does
+    /// not — the `system:init` frame's `tools` array is the ground truth). On
+    /// 2.1.142+ this arm is dormant: the model has no such tool to call. It is
+    /// kept because the translation is correct and cheap, and the CLI surface
+    /// moves — not because it fires today.
     #[test]
     fn todo_write_becomes_a_plan_event_and_no_tool_call() {
         let mut a = ClaudeAdapter::new();
+        // Verbatim 2.1.141 wire shape, including the `activeForm` / `caller`
+        // keys the translation ignores.
         let frame = r#"{"type":"assistant","message":{"role":"assistant","content":[
-            {"type":"tool_use","id":"tu_todo_1","name":"TodoWrite","input":{"todos":[
-                {"content":"read the readme","status":"completed"},
-                {"content":"count the files","status":"in_progress"},
-                {"content":"summarize","status":"pending"}]}}]}}"#;
+            {"type":"tool_use","id":"tu_todo_1","name":"TodoWrite","caller":{"type":"direct"},"input":{"todos":[
+                {"content":"read the readme","activeForm":"Reading the readme","status":"completed"},
+                {"content":"count the files","activeForm":"Counting the files","status":"in_progress"},
+                {"content":"summarize","activeForm":"Summarizing","status":"pending"}]}}]}}"#;
         let v: serde_json::Value = serde_json::from_str(frame).unwrap();
         let events = a.parse_assistant(&v);
 
