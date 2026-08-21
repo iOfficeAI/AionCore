@@ -1358,3 +1358,118 @@ async fn completion_signals_done_actor_clears_and_later_cancel_is_noop() {
         "a completed search must not be treated as in-flight by fs/searchCancel"
     );
 }
+
+// ══ remount (force-refresh a stale backend mount) ════════════════════════════
+
+/// Entry names on a wire snapshot object (`{ target, entries }`).
+fn entry_names(snapshot: &Value) -> Vec<String> {
+    snapshot["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The behavioral contract that motivates the feature: a re-subscribe of a
+/// still-live root serves the cached listing (so a change the watcher never
+/// delivered stays invisible), whereas `fs/remount` tears the node down and
+/// re-reads the baseline from disk.
+#[tokio::test]
+async fn remount_rereads_baseline_where_resubscribe_serves_stale_cache() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+
+    // Subscribe → mounts, baseline = [a.txt].
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
+        )
+        .await;
+
+    // Change the directory without letting the watcher event reach the shard
+    // (raw_rx is never drained in these dispatch-level tests) → the backend's
+    // cached listing now lags the disk, the "mount went stale" the refresh fixes.
+    std::fs::write(dir.path().join("b.txt"), b"y").unwrap();
+
+    // A re-subscribe (AlreadyLive) serves the stale cached listing → no b.txt.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(2, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
+        )
+        .await;
+    let resub = push.last_for("1").unwrap();
+    assert_eq!(
+        entry_names(&resub["result"]["snapshots"][0]),
+        vec!["a.txt"],
+        "re-subscribe serves the stale cached listing: {resub}"
+    );
+
+    // Remount re-reads the baseline → b.txt now present in a normal snapshot.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(3, "fs/remount", json!({"targets":[dir_ref(&pe, "")]})),
+        )
+        .await;
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["id"], 3);
+    let snaps = reply["result"]["snapshots"].as_array().unwrap();
+    assert_eq!(snaps.len(), 1);
+    assert_eq!(snaps[0]["target"], dir_ref(&pe, ""));
+    let mut names = entry_names(&snaps[0]);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["a.txt", "b.txt"],
+        "remount re-read the baseline from disk: {reply}"
+    );
+    // canonical / absolute path must never leak on the wire.
+    assert!(reply.to_string().find("file://").is_none(), "no canonical uri: {reply}");
+}
+
+/// A remount of a root that is not currently watched (never subscribed, or a
+/// collapsed root) is a no-op: an empty—but successful—snapshot batch, never an
+/// error, and it must not mount the cold canonical.
+#[tokio::test]
+async fn remount_unwatched_root_returns_empty_success() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+
+    // No prior subscribe → the root is cold.
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(1, "fs/remount", json!({"targets":[dir_ref(&pe, "")]})),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert!(reply.get("error").is_none(), "a no-op remount is not an error: {reply}");
+    let snaps = reply["result"]["snapshots"].as_array().unwrap();
+    assert!(snaps.is_empty(), "an unwatched target contributes no snapshot: {reply}");
+}
+
+/// Phase 1 resolves atomically (like subscribe): an unresolvable pe fails the
+/// whole request rather than silently dropping the target.
+#[tokio::test]
+async fn remount_unknown_pe_is_out_of_scope() {
+    let (mut actor, _rx, push, _pe, _dir, _db) = setup().await;
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(2, "fs/remount", json!({"targets":[dir_ref("pe-nope", "")]})),
+        )
+        .await;
+    let reply = push.last_for("1").unwrap();
+    assert_eq!(reply["error"]["code"], -32000);
+    assert_eq!(reply["error"]["message"], "out_of_scope");
+    assert_eq!(reply["error"]["data"]["pe_id"], "pe-nope");
+}

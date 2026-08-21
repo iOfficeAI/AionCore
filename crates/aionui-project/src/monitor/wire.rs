@@ -70,6 +70,15 @@ pub struct SubscribeParams {
     pub targets: Vec<ResourceRef>,
 }
 
+/// `fs/remount` params. Same shape as subscribe (`targets` are the pe-relative
+/// directories to force-remount), but it does not register subscriptions — it
+/// re-arms the watch + re-reads the baseline of directories already being
+/// watched, for recovery from a stale backend mount.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemountParams {
+    pub targets: Vec<ResourceRef>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnsubscribeParams {
     pub targets: Vec<ResourceRef>,
