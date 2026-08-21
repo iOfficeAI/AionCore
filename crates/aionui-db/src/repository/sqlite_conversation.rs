@@ -505,7 +505,12 @@ impl IConversationRepository for SqliteConversationRepository {
             .filter(|term| !term.is_empty())
             .map(|term| escape_like_pattern(&term.to_lowercase()));
 
-        let mut where_clause = String::from("c.user_id = ?");
+        // Archiving is the user putting a conversation away, so it stops being a
+        // mention candidate — the same rule the sidebar and the paginated list
+        // apply. Filtered in SQL, not by the caller: a Rust-side filter would
+        // punch holes in the page the way the team/self filters do, and the
+        // scan-past-holes machinery exists for predicates SQL cannot express.
+        let mut where_clause = String::from("c.user_id = ? AND c.archived_at IS NULL");
         let mut binds: Vec<BindValue> = vec![BindValue::Str(user_id.to_owned())];
         if let Some(ref needle) = needle {
             where_clause.push_str(r" AND lower(c.name) LIKE ? ESCAPE '\'");
@@ -1896,6 +1901,75 @@ mod tests {
         assert_eq!(result.items[0].name, "Third");
         assert_eq!(result.items[1].name, "Second");
         assert_eq!(result.items[2].name, "First");
+    }
+
+    /// Archiving is the user putting a conversation away, so it must not come
+    /// back as a `@@` mention candidate — same rule the sidebar and paginated
+    /// list already apply. Both mentionable outlets (the picker and the agent's
+    /// `session list`) read through this query, so one filter covers both.
+    #[tokio::test]
+    async fn list_mentionable_candidates_excludes_archived() {
+        let (repo, db) = setup().await;
+
+        let mut active = sample_conversation(SYSTEM_USER_ID);
+        active.name = "Active target".to_string();
+        repo.create(&active).await.unwrap();
+
+        let mut archived = sample_conversation(SYSTEM_USER_ID);
+        archived.name = "Archived target".to_string();
+        repo.create(&archived).await.unwrap();
+        sqlx::query("UPDATE conversations SET archived_at = ? WHERE id = ?")
+            .bind(1_700_000_000_000_i64)
+            .bind(&archived.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let rows = repo
+            .list_mentionable_candidates(
+                SYSTEM_USER_ID,
+                &MentionableCandidatesParams {
+                    limit: 20,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, vec!["Active target"]);
+    }
+
+    /// Narrowing to one id answers "may I still mention this?", so an archived
+    /// row must answer NO there too — otherwise clicking a chip on an older
+    /// message would resurrect a conversation the user put away.
+    #[tokio::test]
+    async fn a_single_id_lookup_also_refuses_an_archived_row() {
+        let (repo, db) = setup().await;
+
+        let mut archived = sample_conversation(SYSTEM_USER_ID);
+        archived.name = "Archived target".to_string();
+        repo.create(&archived).await.unwrap();
+        sqlx::query("UPDATE conversations SET archived_at = ? WHERE id = ?")
+            .bind(1_700_000_000_000_i64)
+            .bind(&archived.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let rows = repo
+            .list_mentionable_candidates(
+                SYSTEM_USER_ID,
+                &MentionableCandidatesParams {
+                    id: Some(archived.id.clone()),
+                    limit: 20,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(rows.is_empty(), "an archived conversation is not mentionable");
     }
 
     #[tokio::test]
