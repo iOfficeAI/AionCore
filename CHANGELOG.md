@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.82](https://github.com/suoak/AionCore/compare/v0.1.81...v0.1.82) (2026-08-21)
+
+### Bug Fixes
+
+* **file:** decode UTF-16 and UTF-8 BOM text and retry Windows locked reads
+
 ## [0.1.81](https://github.com/suoak/AionCore/compare/v0.1.80...v0.1.81) (2026-08-20)
 
 ### Features
