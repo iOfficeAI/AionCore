@@ -20,8 +20,8 @@ use aionui_api_types::{ErrorResponse, WebSocketMessage};
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
-    AuthIdentityMode, AuthRouterState, AuthState, IRuntimeTokenVerifier, SystemDefaultFilesystemAdopter,
-    auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
+    AuthIdentityMode, AuthRouterState, AuthState, IRuntimeTokenVerifier, RefreshCoalescer,
+    SystemDefaultFilesystemAdopter, auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
 };
 use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
@@ -208,6 +208,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
 
     let auth_state = AuthRouterState {
         jwt_service: services.jwt_service.clone(),
+        refresh_coalescer: RefreshCoalescer::new(),
         user_repo: services.user_repo.clone(),
         fs_adopter: Some(Arc::new(SkillFilesystemAdopter {
             skill_paths: services.skill_paths.clone(),

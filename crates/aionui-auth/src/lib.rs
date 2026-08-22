@@ -15,6 +15,7 @@ mod routes;
 mod secret;
 mod security;
 mod service;
+mod singleflight;
 mod validation;
 
 // Error type
@@ -69,6 +70,9 @@ pub use middleware::{
 
 // QR token store
 pub use qr_token::QrTokenStore;
+
+// Refresh-storm coalescing (shared into AuthRouterState)
+pub use singleflight::RefreshCoalescer;
 
 // Routes
 pub use routes::{AuthRouterState, SessionRevokedHook, auth_routes};

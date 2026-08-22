@@ -1,4 +1,7 @@
-use aionui_common::constants::{COOKIE_MAX_AGE_DAYS, COOKIE_NAME, CSRF_COOKIE_NAME};
+use aionui_common::constants::{
+    COOKIE_MAX_AGE_DAYS, COOKIE_NAME, CSRF_COOKIE_NAME, REFRESH_COOKIE_MAX_AGE_DAYS, REFRESH_COOKIE_NAME,
+    REFRESH_COOKIE_PATH,
+};
 
 /// Cookie security configuration derived from the deployment environment.
 #[derive(Debug, Clone)]
@@ -53,6 +56,34 @@ impl CookieConfig {
         let max_age = u64::from(COOKIE_MAX_AGE_DAYS) * 24 * 60 * 60;
         format!(
             "{CSRF_COOKIE_NAME}={token}; Path=/; SameSite={}{}; Max-Age={max_age}",
+            self.same_site,
+            if self.secure { "; Secure" } else { "" },
+        )
+    }
+
+    /// Build `Set-Cookie` header value for the refresh token.
+    ///
+    /// Scoped to [`REFRESH_COOKIE_PATH`] so the browser only attaches it when
+    /// calling the refresh endpoint — keeping this long-lived credential off
+    /// every ordinary API/WebSocket request. Always `HttpOnly`: unlike the CSRF
+    /// cookie, JavaScript must never read the refresh token.
+    pub fn build_refresh_cookie(&self, token: &str) -> String {
+        let max_age = u64::from(REFRESH_COOKIE_MAX_AGE_DAYS) * 24 * 60 * 60;
+        format!(
+            "{REFRESH_COOKIE_NAME}={token}; Path={REFRESH_COOKIE_PATH}; HttpOnly; SameSite={}{}; Max-Age={max_age}",
+            self.same_site,
+            if self.secure { "; Secure" } else { "" },
+        )
+    }
+
+    /// Build `Set-Cookie` header value that clears the refresh cookie.
+    ///
+    /// Must repeat the exact `Path` of [`CookieConfig::build_refresh_cookie`]:
+    /// browsers match deletion on name + path, so a mismatched path would leave
+    /// the refresh cookie in place.
+    pub fn clear_refresh_cookie(&self) -> String {
+        format!(
+            "{REFRESH_COOKIE_NAME}=; Path={REFRESH_COOKIE_PATH}; HttpOnly; SameSite={}{}; Max-Age=0",
             self.same_site,
             if self.secure { "; Secure" } else { "" },
         )
@@ -124,5 +155,48 @@ mod tests {
         let cookie = http_config().build_session_cookie("t");
         let expected = 30 * 24 * 60 * 60;
         assert!(cookie.contains(&format!("Max-Age={expected}")));
+    }
+
+    #[test]
+    fn refresh_cookie_http() {
+        let cookie = http_config().build_refresh_cookie("refresh_token");
+        assert!(cookie.contains("aionui-refresh=refresh_token"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Max-Age="));
+        assert!(!cookie.contains("Secure"));
+    }
+
+    #[test]
+    fn refresh_cookie_https() {
+        let cookie = https_config().build_refresh_cookie("refresh_token");
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("; Secure"));
+    }
+
+    #[test]
+    fn refresh_cookie_is_scoped_to_refresh_path() {
+        // The long-lived credential must not ride along on every request: it is
+        // pinned to the refresh endpoint's path, never the root path.
+        let cookie = http_config().build_refresh_cookie("t");
+        assert!(cookie.contains("Path=/api/auth/refresh"));
+        assert!(!cookie.contains("Path=/;"));
+    }
+
+    #[test]
+    fn refresh_cookie_max_age_30_days() {
+        let cookie = http_config().build_refresh_cookie("t");
+        let expected = 30 * 24 * 60 * 60;
+        assert!(cookie.contains(&format!("Max-Age={expected}")));
+    }
+
+    #[test]
+    fn clear_refresh_cookie_sets_max_age_zero_on_same_path() {
+        let cookie = http_config().clear_refresh_cookie();
+        assert!(cookie.contains("aionui-refresh="));
+        assert!(cookie.contains("Max-Age=0"));
+        assert!(cookie.contains("HttpOnly"));
+        // Deletion only takes effect when the path matches the set cookie.
+        assert!(cookie.contains("Path=/api/auth/refresh"));
     }
 }

@@ -8,22 +8,48 @@ use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode}
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use aionui_common::constants::REFRESH_COOKIE_MAX_AGE_DAYS;
+
 use crate::error::AuthError;
 
-/// JWT token lifetime: 30 days.
+/// Access-token lifetime.
 ///
-/// Stop-gap value aligned with the session cookie's `Max-Age`
-/// (`COOKIE_MAX_AGE_DAYS`). The cookie shell used to outlive this JWT, so after
-/// the previous 24h expiry every request carried a dead token, producing the
-/// 401/reconnect loop seen on remote WebUI. This stays long until token refresh
-/// lands, after which it returns to a short access-token lifetime.
-const TOKEN_EXPIRY: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Still 30 days as a stop-gap for #4124: before the refresh flow exists,
+/// shortening it would reintroduce the 401/reconnect loop on remote WebUI (a
+/// dead token on every request with no way to renew). It drops to a short
+/// lifetime only once clients consume the refresh flow end-to-end — an
+/// intentional, later contract change, not a regression.
+const ACCESS_TOKEN_EXPIRY: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Refresh-token lifetime — the window a session can be renewed without
+/// re-authenticating. Sliding: each refresh issues a fresh refresh token.
+/// Kept in sync with the refresh cookie's `Max-Age` so the token never outlives
+/// (or is outlived by) its container.
+const REFRESH_TOKEN_EXPIRY: Duration = Duration::from_secs(REFRESH_COOKIE_MAX_AGE_DAYS as u64 * 24 * 60 * 60);
 
 /// JWT issuer claim value.
 const JWT_ISSUER: &str = "aionui";
 
 /// JWT audience claim value.
 const JWT_AUDIENCE: &str = "aionui-webui";
+
+/// Which credential role a token fills.
+///
+/// Access tokens authenticate ordinary API/WebSocket requests; refresh tokens
+/// are accepted only at the refresh endpoint to mint new access tokens. Keeping
+/// the roles distinct means a leaked short-lived access token can never be
+/// replayed as a long-lived refresh credential, and a refresh token can never
+/// be used to call protected endpoints directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenType {
+    /// Short-lived credential for authenticating requests. Default so tokens
+    /// issued before this field existed deserialize as access tokens.
+    #[default]
+    Access,
+    /// Long-lived credential accepted only by the refresh endpoint.
+    Refresh,
+}
 
 /// JWT payload (claims embedded in the token).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +69,9 @@ pub struct TokenPayload {
     /// User session generation at token issuance time.
     #[serde(default)]
     pub session_generation: i64,
+    /// Credential role: access (default) vs refresh.
+    #[serde(default)]
+    pub token_type: TokenType,
 }
 
 /// JWT service for signing, verification, and token blacklisting.
@@ -66,20 +95,58 @@ impl JwtService {
         }
     }
 
-    /// Sign a new JWT for the given user. The token expires after 30 days.
+    /// Sign a new access JWT for the given user. Convenience for callers that
+    /// do not track a session generation (tests, local mode).
     pub fn sign(&self, user_id: &str, username: &str) -> Result<String, AuthError> {
         self.sign_with_session_generation(user_id, username, 0)
     }
 
-    /// Sign a new JWT bound to the user's current session generation.
+    /// Sign an access JWT bound to the user's current session generation.
+    ///
+    /// Access tokens authenticate ordinary requests and carry the
+    /// [`ACCESS_TOKEN_EXPIRY`]. Pair with [`JwtService::sign_refresh`] to also
+    /// issue the long-lived refresh token used to renew this one.
     pub fn sign_with_session_generation(
         &self,
         user_id: &str,
         username: &str,
         session_generation: i64,
     ) -> Result<String, AuthError> {
+        self.sign_claims(
+            user_id,
+            username,
+            session_generation,
+            TokenType::Access,
+            ACCESS_TOKEN_EXPIRY,
+        )
+    }
+
+    /// Sign a refresh JWT bound to the user's current session generation.
+    ///
+    /// Accepted only by the refresh endpoint (enforced via
+    /// [`JwtService::verify_refresh`]), never as a request credential. Carries
+    /// the long [`REFRESH_TOKEN_EXPIRY`].
+    pub fn sign_refresh(&self, user_id: &str, username: &str, session_generation: i64) -> Result<String, AuthError> {
+        self.sign_claims(
+            user_id,
+            username,
+            session_generation,
+            TokenType::Refresh,
+            REFRESH_TOKEN_EXPIRY,
+        )
+    }
+
+    /// Encode a signed JWT for the given credential role and lifetime.
+    fn sign_claims(
+        &self,
+        user_id: &str,
+        username: &str,
+        session_generation: i64,
+        token_type: TokenType,
+        ttl: Duration,
+    ) -> Result<String, AuthError> {
         let now = now_secs()?;
-        let exp = now + TOKEN_EXPIRY.as_secs();
+        let exp = now + ttl.as_secs();
 
         let claims = TokenPayload {
             user_id: user_id.to_owned(),
@@ -89,6 +156,7 @@ impl JwtService {
             iss: JWT_ISSUER.to_owned(),
             aud: JWT_AUDIENCE.to_owned(),
             session_generation,
+            token_type,
         };
 
         let secret = self
@@ -131,6 +199,30 @@ impl JwtService {
         Ok(token_data.claims)
     }
 
+    /// Verify a token and require it to be a [`TokenType::Access`] token.
+    ///
+    /// Used on the request-authentication path so a refresh token cannot be
+    /// replayed as a request credential.
+    pub fn verify_access(&self, token: &str) -> Result<TokenPayload, AuthError> {
+        let payload = self.verify(token)?;
+        if payload.token_type != TokenType::Access {
+            return Err(AuthError::TokenInvalid("expected an access token".into()));
+        }
+        Ok(payload)
+    }
+
+    /// Verify a token and require it to be a [`TokenType::Refresh`] token.
+    ///
+    /// Used by the refresh endpoint so an access token cannot be exchanged for
+    /// a renewed session.
+    pub fn verify_refresh(&self, token: &str) -> Result<TokenPayload, AuthError> {
+        let payload = self.verify(token)?;
+        if payload.token_type != TokenType::Refresh {
+            return Err(AuthError::TokenInvalid("expected a refresh token".into()));
+        }
+        Ok(payload)
+    }
+
     /// Add a token to the blacklist.
     ///
     /// Stores the token's SHA-256 hash with its expiry time for automatic cleanup.
@@ -138,7 +230,9 @@ impl JwtService {
         let hash = token_hash(token);
         let exp = self
             .extract_expiry(token)
-            .unwrap_or_else(|| now_secs().unwrap_or(0) + TOKEN_EXPIRY.as_secs());
+            // Fallback when the token cannot be parsed: keep the entry at least
+            // as long as the longest-lived token could survive.
+            .unwrap_or_else(|| now_secs().unwrap_or(0) + REFRESH_TOKEN_EXPIRY.as_secs());
         self.blacklist.insert(hash, exp);
     }
 
@@ -299,7 +393,7 @@ mod tests {
         let service = test_service();
         let token = service.sign("user_1", "admin").unwrap();
         let payload = service.verify(&token).unwrap();
-        assert_eq!(TOKEN_EXPIRY.as_secs(), 30 * 24 * 60 * 60);
+        assert_eq!(ACCESS_TOKEN_EXPIRY.as_secs(), 30 * 24 * 60 * 60);
         assert_eq!(payload.exp - payload.iat, 30 * 24 * 60 * 60);
     }
 
@@ -341,6 +435,7 @@ mod tests {
             iss: JWT_ISSUER.into(),
             aud: JWT_AUDIENCE.into(),
             session_generation: 0,
+            token_type: TokenType::Access,
         };
         let token = encode(
             &Header::default(),
@@ -423,6 +518,7 @@ mod tests {
             iss: JWT_ISSUER.into(),
             aud: JWT_AUDIENCE.into(),
             session_generation: 0,
+            token_type: TokenType::Access,
         };
         let token = encode(
             &Header::default(),
@@ -555,5 +651,101 @@ mod tests {
         let h = token_hash("test");
         assert_eq!(h.len(), 64);
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn access_token_carries_access_type() {
+        let service = test_service();
+        let token = service.sign_with_session_generation("user_1", "admin", 0).unwrap();
+        let payload = service.verify(&token).unwrap();
+        assert_eq!(payload.token_type, TokenType::Access);
+    }
+
+    #[test]
+    fn sign_refresh_produces_refresh_token() {
+        let service = test_service();
+        let token = service.sign_refresh("user_1", "admin", 3).unwrap();
+        let payload = service.verify(&token).unwrap();
+        assert_eq!(payload.token_type, TokenType::Refresh);
+        assert_eq!(payload.user_id, "user_1");
+        assert_eq!(payload.session_generation, 3);
+        // Refresh lifetime is kept in sync with the refresh cookie's Max-Age.
+        assert_eq!(payload.exp - payload.iat, REFRESH_TOKEN_EXPIRY.as_secs());
+    }
+
+    #[test]
+    fn verify_access_accepts_access_but_rejects_refresh() {
+        let service = test_service();
+        let access = service.sign("user_1", "admin").unwrap();
+        let refresh = service.sign_refresh("user_1", "admin", 0).unwrap();
+
+        // An access token is accepted on the request path.
+        assert!(service.verify_access(&access).is_ok());
+
+        // A refresh token must never authenticate an ordinary request.
+        let err = service.verify_access(&refresh).unwrap_err();
+        assert!(
+            matches!(&err, AuthError::TokenInvalid(msg) if msg == "expected an access token"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_refresh_accepts_refresh_but_rejects_access() {
+        let service = test_service();
+        let access = service.sign("user_1", "admin").unwrap();
+        let refresh = service.sign_refresh("user_1", "admin", 0).unwrap();
+
+        // A refresh token is accepted at the refresh endpoint.
+        assert!(service.verify_refresh(&refresh).is_ok());
+
+        // An access token cannot be exchanged for a renewed session.
+        let err = service.verify_refresh(&access).unwrap_err();
+        assert!(
+            matches!(&err, AuthError::TokenInvalid(msg) if msg == "expected a refresh token"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_token_without_type_defaults_to_access() {
+        // A token minted before `token_type` existed carries no such claim. It
+        // must deserialize as an access token (serde default) so pre-upgrade
+        // sessions keep authenticating instead of being rejected as "not an
+        // access token".
+        #[derive(Serialize)]
+        struct LegacyClaims {
+            user_id: String,
+            username: String,
+            iat: u64,
+            exp: u64,
+            iss: String,
+            aud: String,
+            session_generation: i64,
+        }
+
+        let service = test_service();
+        let now = now_secs().unwrap();
+        let secret = service.secret.read().unwrap();
+        let token = encode(
+            &Header::default(),
+            &LegacyClaims {
+                user_id: "user_1".into(),
+                username: "admin".into(),
+                iat: now,
+                exp: now + 3600,
+                iss: JWT_ISSUER.into(),
+                aud: JWT_AUDIENCE.into(),
+                session_generation: 0,
+            },
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+        drop(secret);
+
+        let payload = service.verify(&token).unwrap();
+        assert_eq!(payload.token_type, TokenType::Access);
+        // And it is therefore usable on the request-authentication path.
+        assert!(service.verify_access(&token).is_ok());
     }
 }
