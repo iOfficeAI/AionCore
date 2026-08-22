@@ -33,11 +33,11 @@ use crate::event::{LocalizedText, NoticeLevel};
 ///
 /// codex skips 0.147.0, which never completes a turn (its response stream
 /// disconnects with `httpStatusCode: null`, observed three times including a
-/// back-to-back control after three clean versions). 0.148.0 does complete
-/// turns and passes the suite, so the gate moves there and 0.147.0 stays
-/// unverified rather than becoming a floor anyone can install into.
+/// back-to-back control after three clean versions). Every release from 0.148.0
+/// on does complete turns and passes the suite, so the gate walks forward over
+/// 0.147.0 and leaves it unverified rather than a floor anyone can install into.
 pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.235";
-pub const VERIFIED_CODEX_VERSION: &str = "0.148.0";
+pub const VERIFIED_CODEX_VERSION: &str = "0.149.0";
 pub const VERIFIED_AGY_VERSION: &str = "1.1.14";
 
 /// The verified release for a direct-CLI backend, keyed by the program name the
@@ -456,10 +456,10 @@ mod tests {
 
     #[test]
     fn components_compare_numerically_not_lexically() {
-        // The bug a string compare would introduce: "0.148.0" < "0.99.0"
-        // lexically, but 148 > 99.
+        // The bug a string compare would introduce: "0.149.0" < "0.99.0"
+        // lexically, but 149 > 99.
         assert_eq!(classify("0.99.0", VERIFIED_CODEX_VERSION), VersionVerdict::Older);
-        assert_eq!(classify("0.148.1", VERIFIED_CODEX_VERSION), VersionVerdict::Newer);
+        assert_eq!(classify("0.149.1", VERIFIED_CODEX_VERSION), VersionVerdict::Newer);
     }
 
     #[test]
@@ -554,9 +554,9 @@ mod tests {
     fn local_codex_output_is_classified_as_newer() {
         // Real `codex --version` output shape, one release above the verified
         // one so the newer path is what gets exercised.
-        assert_eq!(parse_version("codex-cli 0.149.0"), Some(vec![0, 149, 0]));
-        let (level, _, localized) = drift_notice("codex", "codex-cli 0.149.0", VERIFIED_CODEX_VERSION)
-            .expect("0.149.0 drifts from the verified release");
+        assert_eq!(parse_version("codex-cli 0.150.0"), Some(vec![0, 150, 0]));
+        let (level, _, localized) = drift_notice("codex", "codex-cli 0.150.0", VERIFIED_CODEX_VERSION)
+            .expect("0.150.0 drifts from the verified release");
         assert_eq!(level, NoticeLevel::Info);
         assert_eq!(localized.code, CODE_CLI_VERSION_NEWER);
 
@@ -564,10 +564,10 @@ mod tests {
         // verified release is told nothing, and this breaks if a bump lands
         // without re-verifying against that exact binary.
         assert_eq!(
-            classify("codex-cli 0.148.0", VERIFIED_CODEX_VERSION),
+            classify("codex-cli 0.149.0", VERIFIED_CODEX_VERSION),
             VersionVerdict::Verified
         );
-        assert!(drift_notice("codex", "codex-cli 0.148.0", VERIFIED_CODEX_VERSION).is_none());
+        assert!(drift_notice("codex", "codex-cli 0.149.0", VERIFIED_CODEX_VERSION).is_none());
     }
 
     #[test]
