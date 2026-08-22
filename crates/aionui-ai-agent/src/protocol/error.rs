@@ -65,6 +65,7 @@ impl CloseReason {
                 }
                 Some(AgentKillReason::ModelChanged) => "Agent killed: model changed".to_owned(),
                 Some(AgentKillReason::SessionRevoked) => "Agent killed: session revoked".to_owned(),
+                Some(AgentKillReason::Archived) => "Agent killed: archived".to_owned(),
                 None => "Agent killed".to_owned(),
             },
             CloseReason::ProcessExited {
