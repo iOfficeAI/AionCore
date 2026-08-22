@@ -8,7 +8,7 @@ use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
     RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
 };
-use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
+use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_encryption_secret, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
@@ -45,8 +45,10 @@ pub struct AppServices {
     pub agent_registry: Arc<AgentRegistry>,
     pub conversation_repo: Arc<dyn IConversationRepository>,
     pub acp_session_sync: Arc<AcpSessionSyncService>,
-    /// Raw JWT secret string, used to derive encryption keys.
-    pub jwt_secret_raw: String,
+    /// Raw storage-encryption secret string, used to derive the AES-256-GCM
+    /// key for at-rest credentials. Decoupled from the JWT signing secret held
+    /// by `jwt_service`, so signing can rotate without changing the key.
+    pub encryption_secret_raw: String,
     pub data_dir: PathBuf,
     pub dump_prompts: bool,
     pub work_dir: PathBuf,
@@ -65,6 +67,26 @@ pub struct AppServices {
     runtime_base_url: String,
     /// Shared with the Antigravity hook endpoint so it can authenticate callbacks.
     pub(crate) antigravity_hook_tokens: Arc<aionui_ai_agent::antigravity_hook::HookTokenRegistry>,
+}
+
+/// ELECTRON-3T0 decision: must startup be refused because a fresh signing
+/// secret would be generated while the system-user row actually exists?
+///
+/// Generating a new secret is only legitimate on a genuinely fresh install
+/// (`is_new`). If the system-user read returned nothing (`!system_user_present`)
+/// yet an independent id lookup finds the row (`existing_row_present`), the read
+/// misfired (e.g. a stale post-migration connection, ELECTRON-3T0) and deriving
+/// a fresh key would silently orphan every stored credential. A secret resolved
+/// from storage (`!is_new`), or a genuinely absent row, is always safe.
+///
+/// Pure so its full truth table is unit-testable: `from_config` hard-constructs
+/// the repo, so the guard branch cannot be exercised with a mock.
+fn must_refuse_startup_on_unreadable_system_user(
+    is_new: bool,
+    system_user_present: bool,
+    existing_row_present: bool,
+) -> bool {
+    is_new && !system_user_present && existing_row_present
 }
 
 impl AppServices {
@@ -126,17 +148,20 @@ impl AppServices {
         let app_version = config.app_version.clone();
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
 
-        // Resolve JWT secret: env var → system user db field → random generation
+        // Resolve the JWT *signing* secret: env var → system user db field →
+        // random generation. This signs/verifies JWTs only; the storage-
+        // encryption root is resolved separately below so change-password can
+        // rotate the signing secret without changing the encryption key.
+        // `resolve_jwt_secret` treats an empty value from either source as absent
+        // (an empty string is never a usable secret), so both are passed through
+        // raw — the empty-handling invariant lives in one place.
         let env_secret = std::env::var("JWT_SECRET").ok();
         let system_user = user_repo
             .get_system_user()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get system user: {e}"))?;
 
-        let db_secret = system_user
-            .as_ref()
-            .and_then(|u| u.jwt_secret.as_deref())
-            .filter(|s| !s.is_empty());
+        let db_secret = system_user.as_ref().and_then(|u| u.jwt_secret.as_deref());
 
         let (secret, is_new) = resolve_jwt_secret(env_secret.as_deref(), db_secret);
 
@@ -147,16 +172,22 @@ impl AppServices {
         // ELECTRON-3T0), deriving a fresh key would silently break decryption
         // of every stored credential. Verify absence with an independent
         // query and fail startup instead of corrupting.
-        if is_new
-            && system_user.is_none()
-            && user_repo
+        // Only the fresh-generation path with an empty system-user read can be
+        // dangerous; gate the extra confirmation query behind those cheap checks
+        // so normal startups (resolved-from-storage secret) skip it entirely.
+        let system_user_present = system_user.is_some();
+        let existing_row_present = if is_new && !system_user_present {
+            user_repo
                 .find_by_id("system_default_user")
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to verify system user absence: {e}"))?
                 .is_some()
-        {
+        } else {
+            false
+        };
+        if must_refuse_startup_on_unreadable_system_user(is_new, system_user_present, existing_row_present) {
             anyhow::bail!(
-                "system user row exists but could not be read; refusing to generate a new                  JWT secret (would break decryption of stored credentials)"
+                "system user row exists but could not be read; refusing to generate a new JWT secret (would break decryption of stored credentials)"
             );
         }
 
@@ -169,7 +200,34 @@ impl AppServices {
             tracing::info!("Generated and persisted new JWT secret");
         }
 
-        let encryption_key = derive_encryption_key(&secret);
+        // Resolve the storage-encryption root, independent of the signing
+        // secret above: AIONUI_ENCRYPTION_SECRET env → users.encryption_secret
+        // db → seeded from the effective JWT secret. Seeding from the JWT secret
+        // is the zero-re-encrypt upgrade path — a database created before this
+        // split was encrypted under the JWT secret, so the derived key is
+        // unchanged. In every path the derived key equals what the pre-split
+        // code would have derived (only once a distinct encryption secret is
+        // persisted does it diverge, which is the point), so this introduces no
+        // decryption regression. The ELECTRON-3T0 guard above already refuses to
+        // proceed on the one dangerous state (fresh-generated signing secret
+        // masking an existing-but-unreadable row).
+        let env_encryption_secret = std::env::var("AIONUI_ENCRYPTION_SECRET").ok();
+        let db_encryption_secret = system_user.as_ref().and_then(|u| u.encryption_secret.as_deref());
+        let (encryption_secret, encryption_is_new) =
+            resolve_encryption_secret(env_encryption_secret.as_deref(), db_encryption_secret, &secret);
+
+        // Persist a seeded/generated encryption secret so it survives restarts
+        // and stays stable when the signing secret later rotates. Only persist
+        // when the system user row is readable (mirrors the signing-secret path).
+        if encryption_is_new && let Some(user) = &system_user {
+            user_repo
+                .update_encryption_secret(&user.id, &encryption_secret)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to persist encryption secret: {e}"))?;
+            tracing::info!("Seeded and persisted storage-encryption secret");
+        }
+
+        let encryption_key = derive_encryption_key(&encryption_secret);
 
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
@@ -313,7 +371,7 @@ impl AppServices {
             agent_registry,
             conversation_repo,
             acp_session_sync: acp_agent_service,
-            jwt_secret_raw: secret,
+            encryption_secret_raw: encryption_secret,
             data_dir,
             dump_prompts,
             work_dir,
@@ -458,5 +516,25 @@ mod tests {
         );
 
         services.database.close().await;
+    }
+
+    // ELECTRON-3T0 guard decision table. `from_config` hard-constructs the repo,
+    // so the guard branch can't be reached with a mock; the decision is factored
+    // into a pure predicate and its full truth table is locked here. The single
+    // dangerous state — a freshly generated secret while the system-user read
+    // came back empty but the row is really present — must refuse startup; every
+    // other combination must proceed.
+    #[test]
+    fn refuse_startup_only_when_fresh_secret_masks_an_unread_existing_row() {
+        // is_new, system_user_present, existing_row_present
+        assert!(must_refuse_startup_on_unreadable_system_user(true, false, true));
+
+        assert!(!must_refuse_startup_on_unreadable_system_user(true, false, false));
+        assert!(!must_refuse_startup_on_unreadable_system_user(true, true, true));
+        assert!(!must_refuse_startup_on_unreadable_system_user(true, true, false));
+        assert!(!must_refuse_startup_on_unreadable_system_user(false, false, true));
+        assert!(!must_refuse_startup_on_unreadable_system_user(false, false, false));
+        assert!(!must_refuse_startup_on_unreadable_system_user(false, true, true));
+        assert!(!must_refuse_startup_on_unreadable_system_user(false, true, false));
     }
 }

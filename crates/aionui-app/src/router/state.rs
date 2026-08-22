@@ -271,7 +271,7 @@ pub async fn build_module_states(
 
     let pool = services.database.pool().clone();
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
     let agent_service = AgentService::new(
         services.agent_registry.clone(),
         services.event_bus.clone(),
@@ -397,7 +397,7 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
 
 /// Build the default `SystemRouterState` from application services.
 pub fn build_system_state(services: &AppServices) -> SystemRouterState {
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
     let pool = services.database.pool().clone();
     let provider_repo = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let http_client = reqwest::Client::new();
@@ -446,7 +446,7 @@ pub fn build_conversation_state(
 
 /// Build the default `RemoteAgentRouterState` from application services.
 pub fn build_remote_agent_state(services: &AppServices) -> RemoteAgentRouterState {
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
     let pool = services.database.pool().clone();
     let repo = Arc::new(SqliteRemoteAgentRepository::new(pool));
     RemoteAgentRouterState {
@@ -607,7 +607,7 @@ pub async fn build_channel_state(
 ) -> (ChannelRouterState, ChannelOrchestratorComponents) {
     let pool = services.database.pool().clone();
     let repo: Arc<dyn aionui_db::IChannelRepository> = Arc::new(aionui_db::SqliteChannelRepository::new(pool));
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
 
     let (message_tx, message_rx) = tokio::sync::mpsc::channel(256);
     let (confirm_tx, confirm_rx) = tokio::sync::mpsc::channel(256);

@@ -282,13 +282,49 @@ impl JwtService {
 /// Priority: environment variable -> database value -> random generation.
 /// Returns `(secret_string, is_newly_generated)`.
 pub fn resolve_jwt_secret(env_secret: Option<&str>, db_secret: Option<&str>) -> (String, bool) {
-    if let Some(s) = env_secret {
+    // An empty value from either source is treated as absent. An empty string is
+    // never a usable secret, and because this value is the storage-encryption
+    // root, silently deriving an AES key from "" (e.g. a `JWT_SECRET=` empty-env
+    // footgun) would encrypt every credential under a key that cannot be
+    // reproduced. Normalizing here — rather than only at the composition-layer
+    // call site — keeps the running server, the `secret` overwrite guard, and the
+    // `secret status` report in agreement on what counts as "present".
+    if let Some(s) = env_secret.filter(|s| !s.is_empty()) {
         return (s.to_owned(), false);
     }
-    if let Some(s) = db_secret {
+    if let Some(s) = db_secret.filter(|s| !s.is_empty()) {
         return (s.to_owned(), false);
     }
     (generate_random_secret_string(), true)
+}
+
+/// Resolve the storage-encryption secret (the root the at-rest AES-256-GCM key
+/// is derived from), decoupled from the JWT signing secret.
+///
+/// Priority: `AIONUI_ENCRYPTION_SECRET` env → `users.encryption_secret` db →
+/// seed from `jwt_secret_seed` (the already-resolved effective JWT secret).
+/// Returns `(secret_string, is_newly_seeded)`; when `true`, the caller should
+/// persist it so it survives restarts and stays stable across signing-secret
+/// rotations.
+///
+/// Seeding from the JWT secret is the zero-re-encrypt upgrade path: before this
+/// split the JWT secret WAS the encryption root, so a database created under the
+/// old scheme still decrypts under it. `jwt_secret_seed` is always non-empty
+/// (`resolve_jwt_secret` never yields an empty secret), so the seeded root is
+/// always usable. An empty value from env or db is treated as absent, mirroring
+/// `resolve_jwt_secret` — an empty string is never a usable encryption root.
+pub fn resolve_encryption_secret(
+    env_secret: Option<&str>,
+    db_secret: Option<&str>,
+    jwt_secret_seed: &str,
+) -> (String, bool) {
+    if let Some(s) = env_secret.filter(|s| !s.is_empty()) {
+        return (s.to_owned(), false);
+    }
+    if let Some(s) = db_secret.filter(|s| !s.is_empty()) {
+        return (s.to_owned(), false);
+    }
+    (jwt_secret_seed.to_owned(), true)
 }
 
 /// Generate a cryptographically random 64-byte secret, base64-encoded.
@@ -530,6 +566,63 @@ mod tests {
         let (secret, generated) = resolve_jwt_secret(None, None);
         assert!(!secret.is_empty());
         assert!(generated);
+    }
+
+    #[test]
+    fn resolve_jwt_secret_treats_empty_env_as_absent() {
+        // A set-but-empty JWT_SECRET (a docker-compose footgun) must not become
+        // the encryption root; resolution falls through to the database value.
+        let (secret, generated) = resolve_jwt_secret(Some(""), Some("db_secret"));
+        assert_eq!(secret, "db_secret");
+        assert!(!generated);
+    }
+
+    #[test]
+    fn resolve_jwt_secret_treats_empty_sources_as_absent() {
+        // Empty from both sources → fall through to random generation rather than
+        // deriving a key from "".
+        let (secret, generated) = resolve_jwt_secret(Some(""), Some(""));
+        assert!(!secret.is_empty());
+        assert!(generated);
+    }
+
+    #[test]
+    fn resolve_encryption_secret_env_priority() {
+        let (secret, seeded) = resolve_encryption_secret(Some("env_enc"), Some("db_enc"), "jwt_seed");
+        assert_eq!(secret, "env_enc");
+        assert!(!seeded);
+    }
+
+    #[test]
+    fn resolve_encryption_secret_db_over_seed() {
+        let (secret, seeded) = resolve_encryption_secret(None, Some("db_enc"), "jwt_seed");
+        assert_eq!(secret, "db_enc");
+        assert!(!seeded);
+    }
+
+    #[test]
+    fn resolve_encryption_secret_seeds_from_jwt_when_absent() {
+        // The upgrade path: no dedicated encryption secret yet, so it is seeded
+        // from the effective JWT secret and flagged for persistence.
+        let (secret, seeded) = resolve_encryption_secret(None, None, "jwt_seed");
+        assert_eq!(secret, "jwt_seed");
+        assert!(seeded);
+    }
+
+    #[test]
+    fn resolve_encryption_secret_treats_empty_env_as_absent() {
+        // A set-but-empty AIONUI_ENCRYPTION_SECRET must not become the root;
+        // resolution falls through to the persisted database value.
+        let (secret, seeded) = resolve_encryption_secret(Some(""), Some("db_enc"), "jwt_seed");
+        assert_eq!(secret, "db_enc");
+        assert!(!seeded);
+    }
+
+    #[test]
+    fn resolve_encryption_secret_empty_sources_seed_from_jwt() {
+        let (secret, seeded) = resolve_encryption_secret(Some(""), Some(""), "jwt_seed");
+        assert_eq!(secret, "jwt_seed");
+        assert!(seeded);
     }
 
     #[test]
