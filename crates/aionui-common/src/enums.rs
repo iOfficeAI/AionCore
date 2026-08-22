@@ -283,6 +283,12 @@ pub enum AgentKillReason {
     /// The owning user's Core session was revoked, so foreground runtime state
     /// and agent processes for that user must be torn down.
     SessionRevoked,
+    /// The owning conversation (or its team) was archived. Like
+    /// `ConversationDeleted` the agent process is torn down so it stops
+    /// streaming for a unit the user moved out of the active workspace, but the
+    /// conversation row and history are preserved — unarchiving cold-starts a
+    /// fresh agent.
+    Archived,
 }
 
 /// File change operation type.

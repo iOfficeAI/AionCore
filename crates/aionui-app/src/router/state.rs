@@ -6,12 +6,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use aionui_ai_agent::{AgentRouterState, AgentService, RemoteAgentRouterState, RemoteAgentService};
+use aionui_ai_agent::{AgentRouterState, AgentService, IWorkerTaskManager, RemoteAgentRouterState, RemoteAgentService};
 use aionui_assistant::{
     AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
 };
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
+use aionui_common::AgentKillReason;
 use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
@@ -40,7 +41,7 @@ use aionui_session_message::drainer::Drainer;
 use aionui_session_message::state::SessionMessageRouterState;
 use aionui_session_message::targets::MentionableTargets;
 use aionui_shell::ShellRouterState;
-use aionui_sidebar::{SidebarRouterState, SidebarService};
+use aionui_sidebar::{ArchiveTeardownPorts, SidebarRouterState, SidebarService};
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
     ProtocolDetectionService, ProviderService, RuntimePrepareService, SettingsService, SystemRouterState,
@@ -346,6 +347,17 @@ pub async fn build_module_states(
             team: states.team.service.clone(),
             project: services.project_service.clone(),
         }));
+    // Same late-injection as above: the archive paths release the agent runtime
+    // via the worker task manager (per-conversation kill) and the team service
+    // (team runtime + member kills), neither of which exists when the sidebar
+    // state is built. `set_archive_teardown_ports` is set-once.
+    states
+        .sidebar
+        .service
+        .set_archive_teardown_ports(Arc::new(ArchiveTeardownAdapter {
+            task_manager: services.worker_task_manager.clone(),
+            team: states.team.service.clone(),
+        }));
     states
         .conversation
         .service
@@ -595,6 +607,36 @@ impl aionui_sidebar::RemoveProjectPorts for RemoveProjectAdapter {
     async fn delete_project_record(&self, user_id: &str, project_id: &str) -> Result<(), String> {
         self.project
             .delete_project(user_id, project_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
+/// Adapts the process-teardown paths to the sidebar's
+/// [`aionui_sidebar::ArchiveTeardownPorts`] trait so the archive flip can
+/// release the agent runtime the same way delete does — kill the conversation's
+/// agent process, tear down the team runtime — without deleting any data and
+/// without the sidebar crate depending on the ai-agent / team crates.
+struct ArchiveTeardownAdapter {
+    task_manager: Arc<dyn IWorkerTaskManager>,
+    team: Arc<TeamSessionService>,
+}
+
+#[async_trait::async_trait]
+impl ArchiveTeardownPorts for ArchiveTeardownAdapter {
+    async fn stop_conversation(&self, _user_id: &str, conversation_id: &str) -> Result<(), String> {
+        // Ownership was already verified by the owner-scoped archive flip; this
+        // is a pure process kill (no DB write). `kill_and_wait` is a no-op for a
+        // conversation with no live runtime, so an already-idle agent is fine.
+        self.task_manager
+            .kill_and_wait(conversation_id, Some(AgentKillReason::Archived))
+            .await;
+        Ok(())
+    }
+
+    async fn stop_team(&self, user_id: &str, team_id: &str) -> Result<(), String> {
+        self.team
+            .stop_team_processes(user_id, team_id)
             .await
             .map_err(|err| err.to_string())
     }

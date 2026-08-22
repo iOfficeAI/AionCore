@@ -2930,6 +2930,85 @@ async fn tc1_create_team_with_multiple_agents() {
     assert_eq!(resp.leader_assistant_id, Some(resp.assistants[0].slot_id.clone()));
 }
 
+/// Archive-time teardown: `stop_team_processes` kills every member agent with
+/// the `Archived` reason and stops the runtime, but deletes NOTHING — the team
+/// and its members are still readable afterward (unarchiving cold-starts fresh).
+/// Mirrors the process-stopping half of `remove_team` without the deletes.
+#[tokio::test]
+async fn stop_team_processes_kills_members_but_keeps_rows() {
+    let (svc, _team_repo, task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Teardown Team".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    task_manager.reset_calls();
+
+    svc.stop_team_processes("user1", &created.id)
+        .await
+        .expect("stop team processes");
+
+    // Every member agent was killed with the Archived reason.
+    let killed = task_manager.snapshot().kill;
+    for agent in &created.assistants {
+        assert!(
+            killed
+                .iter()
+                .any(|(id, reason)| id == &agent.conversation_id && matches!(reason, Some(AgentKillReason::Archived))),
+            "member {} killed with Archived reason; kills = {killed:?}",
+            agent.conversation_id
+        );
+    }
+
+    // Nothing was deleted: the team and its members are still readable.
+    let still_there = svc.get_team("user1", &created.id).await.expect("team row preserved");
+    assert_eq!(
+        still_there.assistants.len(),
+        created.assistants.len(),
+        "all member rows preserved"
+    );
+}
+
+/// Teardown is owner-scoped: an unknown or foreign team is `TeamNotFound` and
+/// kills nothing (no cross-user process teardown).
+#[tokio::test]
+async fn stop_team_processes_rejects_unknown_or_foreign_team() {
+    let (svc, _team_repo, task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Owned".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    task_manager.reset_calls();
+
+    let err = svc.stop_team_processes("other-user", &created.id).await.unwrap_err();
+    assert!(matches!(err, TeamError::TeamNotFound(_)), "foreign team → 404: {err:?}");
+    let err = svc.stop_team_processes("user1", "no-such-team").await.unwrap_err();
+    assert!(matches!(err, TeamError::TeamNotFound(_)), "unknown team → 404: {err:?}");
+    assert!(
+        task_manager.snapshot().kill.is_empty(),
+        "no agent killed on a rejected teardown"
+    );
+}
+
 #[tokio::test]
 async fn create_team_rejects_existing_conversation_id_request_side_adoption() {
     let svc = setup();

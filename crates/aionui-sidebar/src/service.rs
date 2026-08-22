@@ -31,7 +31,7 @@ use aionui_db::{
 };
 use aionui_project::canonical;
 
-use crate::ports::RemoveProjectPorts;
+use crate::ports::{ArchiveTeardownPorts, RemoveProjectPorts};
 use crate::types::{
     Cursor, DEFAULT_ITEMS_LIMIT, DEFAULT_LIMIT, ScopeToken, SidebarError, canonical_to_dir_key, validate_limit,
 };
@@ -54,6 +54,11 @@ pub struct SidebarService {
     /// team service they wrap is built after this service — see
     /// `build_module_states`). Empty in the read/pin paths, which never touch it.
     remove_project_ports: Arc<OnceLock<Arc<dyn RemoveProjectPorts>>>,
+    /// Process-teardown ports the archive paths drive (stop-only, no delete),
+    /// injected once after startup like `remove_project_ports`. Empty in the
+    /// read/pin paths. Absent → archive still flips `archived_at`; only the
+    /// best-effort process teardown is skipped.
+    archive_teardown_ports: Arc<OnceLock<Arc<dyn ArchiveTeardownPorts>>>,
 }
 
 impl SidebarService {
@@ -63,6 +68,7 @@ impl SidebarService {
             user_order,
             work_dir,
             remove_project_ports: Arc::new(OnceLock::new()),
+            archive_teardown_ports: Arc::new(OnceLock::new()),
         }
     }
 
@@ -72,6 +78,13 @@ impl SidebarService {
     /// clone makes it visible everywhere.
     pub fn set_remove_project_ports(&self, ports: Arc<dyn RemoveProjectPorts>) {
         let _ = self.remove_project_ports.set(ports);
+    }
+
+    /// Install the process-teardown ports the archive paths drive. Called once,
+    /// after the conversation / team services exist (set-once, `Arc`-shared like
+    /// [`set_remove_project_ports`](Self::set_remove_project_ports)).
+    pub fn set_archive_teardown_ports(&self, ports: Arc<dyn ArchiveTeardownPorts>) {
+        let _ = self.archive_teardown_ports.set(ports);
     }
 
     // -- Write side (pin / unpin) --------------------------------------------
@@ -106,6 +119,9 @@ impl SidebarService {
         {
             return Err(SidebarError::ScopeGone);
         }
+        // The archive flip is now committed; release the agent process the same
+        // way delete does (best-effort — the row already moved slice).
+        self.stop_conversation_best_effort(user_id, id).await;
         self.unpin_item(user_id, OrderItemType::Conversation, id).await
     }
 
@@ -126,6 +142,9 @@ impl SidebarService {
         if !self.sidebar.set_team_archived(user_id, id, Some(now_ms())).await? {
             return Err(SidebarError::ScopeGone);
         }
+        // Flip committed (store already cascaded members); tear down the team
+        // runtime and member agents the same way delete does (best-effort).
+        self.stop_team_best_effort(user_id, id).await;
         self.unpin_item(user_id, OrderItemType::Team, id).await
     }
 
@@ -144,6 +163,30 @@ impl SidebarService {
         let item = OrderItemRef::new(item_type, id.to_owned());
         self.user_order.unpin(user_id, OrderScene::Pinned, &item).await?;
         Ok(())
+    }
+
+    /// Stop an archived conversation's agent process (best-effort). A missing
+    /// port (not yet wired) or a teardown error only warns: the archive flip has
+    /// already committed, so a lingering process is a leak to log, not a reason
+    /// to fail the archive.
+    async fn stop_conversation_best_effort(&self, user_id: &str, id: &str) {
+        let Some(ports) = self.archive_teardown_ports.get() else {
+            return;
+        };
+        if let Err(err) = ports.stop_conversation(user_id, id).await {
+            tracing::warn!(conversation_id = %id, error = %err, "archive: conversation teardown failed");
+        }
+    }
+
+    /// Stop an archived team's runtime and member agents (best-effort; same
+    /// rationale as [`stop_conversation_best_effort`](Self::stop_conversation_best_effort)).
+    async fn stop_team_best_effort(&self, user_id: &str, id: &str) {
+        let Some(ports) = self.archive_teardown_ports.get() else {
+            return;
+        };
+        if let Err(err) = ports.stop_team(user_id, id).await {
+            tracing::warn!(team_id = %id, error = %err, "archive: team teardown failed");
+        }
     }
 
     /// Reposition a pinned item by drag-drop (`POST /api/order/{scene}/move`).
