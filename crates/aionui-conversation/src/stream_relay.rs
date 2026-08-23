@@ -6,7 +6,9 @@ use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::Thinki
 
 use crate::response_middleware::{ISkillLoadService, MessageMiddleware, MiddlewareResult};
 use crate::skill_resolver::{LoadedAgentSkill, SkillResolver};
-use aionui_api_types::{AgentErrorCode, ConversationInputStatus, InputChangedEvent, WebSocketMessage};
+use aionui_api_types::{
+    AgentErrorCode, ConversationInputStatus, ConversationTrajectoryChangedEvent, InputChangedEvent, WebSocketMessage,
+};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
 use crate::runtime_persistence::RuntimePersistenceCoordinator;
@@ -399,7 +401,7 @@ impl StreamRelay {
                         let seed = format!("{}:{}:{}", self.turn_id, self.msg_id, journal_event_index);
                         let event_id = canonical_event_id(&seed, &payload);
                         let kind = Self::event_kind(&event);
-                        if let Err(error) = journal
+                        match journal
                             .append(
                                 &self.user_id,
                                 &self.conversation_id,
@@ -409,18 +411,30 @@ impl StreamRelay {
                             )
                             .await
                         {
-                            let terminal = matches!(event, AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_));
-                            warn!(
-                                error = %error,
-                                event_type = Self::event_kind(&event),
-                                terminal,
-                                "Failed to append canonical event before projection"
-                            );
-                            if !terminal {
-                                continue;
+                            Err(error) => {
+                                let terminal =
+                                    matches!(event, AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_));
+                                warn!(
+                                    error = %error,
+                                    event_type = Self::event_kind(&event),
+                                    terminal,
+                                    "Failed to append canonical event before projection"
+                                );
+                                if !terminal {
+                                    continue;
+                                }
                             }
-                        } else {
-                            self.record_permission_audit(journal, kind, &payload).await;
+                            Ok(journal_event) => {
+                                self.record_permission_audit(journal, kind, &payload).await;
+                                self.broadcaster.broadcast(WebSocketMessage::new(
+                                    "conversation.trajectoryChanged",
+                                    serde_json::json!(ConversationTrajectoryChangedEvent {
+                                        conversation_id: self.conversation_id.clone(),
+                                        last_sequence: journal_event.sequence,
+                                        log_revision: journal_event.sequence,
+                                    }),
+                                ));
+                            }
                         }
                     }
                     let deleting = self.is_deleting();
@@ -761,6 +775,13 @@ impl StreamRelay {
                             attempt.saw_tool_or_side_effect = true;
                             self.forward_to_websocket(&event);
                         }
+                        AgentStreamEvent::System(payload)
+                            if payload.get("event").and_then(serde_json::Value::as_str)
+                                == Some("attachment_delivery") =>
+                        {
+                            // Journal-only diagnostic. The trajectory change notification
+                            // above tells the client to fetch the compact semantic record.
+                        }
                         // NOTE: AcpSessionInfo (agent session titles) is deliberately
                         // NOT consumed here. Titles arrive at session-open and at the
                         // turn's final instant (pi/omp race the relay's exit by ~1ms;
@@ -1055,6 +1076,11 @@ impl StreamRelay {
             AgentStreamEvent::AvailableCommands(_) => "AvailableCommands",
             AgentStreamEvent::Finish(_) => "Finish",
             AgentStreamEvent::Error(_) => "Error",
+            AgentStreamEvent::System(payload)
+                if payload.get("event").and_then(serde_json::Value::as_str) == Some("attachment_delivery") =>
+            {
+                "AttachmentDelivery"
+            }
             AgentStreamEvent::System(_) => "System",
             AgentStreamEvent::RequestTrace(_) => "RequestTrace",
             AgentStreamEvent::SessionAssigned(_) => "SessionAssigned",
@@ -1355,6 +1381,19 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, f);
         String::from_utf8(buffer.lock().expect("log buffer lock").clone()).expect("utf8 logs")
+    }
+
+    #[test]
+    fn attachment_delivery_system_frame_has_a_dedicated_journal_kind() {
+        let event = AgentStreamEvent::System(serde_json::json!({
+            "event": "attachment_delivery",
+            "attachment": { "attachment_id": "attachment:1" },
+        }));
+        assert_eq!(StreamRelay::event_kind(&event), "AttachmentDelivery");
+        assert_eq!(
+            StreamRelay::event_kind(&AgentStreamEvent::System(serde_json::json!({ "message": "notice" }))),
+            "System"
+        );
     }
 
     #[derive(Default)]

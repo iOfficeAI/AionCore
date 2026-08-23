@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use crate::ProjectService;
 use crate::canonical::to_file_uri;
 use crate::types::ProjectError;
-use aionui_api_types::ChatFileRef;
+use aionui_api_types::{ChatFileRef, PromptAttachmentDelivery, PromptAttachmentMediaType};
 
 /// Build a service with a tempdir standard project. Returns (service, pe_id,
 /// workspace dir, upload_root dir).
@@ -50,6 +50,145 @@ async fn resolves_project_file_and_inlines_marker() {
     assert!(std::path::Path::new(abs).is_file());
     assert!(abs.ends_with("note.txt"));
     assert_eq!(out.content, format!("please review\n\n{AIONUI_FILES_MARKER}\n{abs}"));
+    assert_eq!(out.attachments.len(), 1);
+    assert_eq!(out.attachments[0].filename, "note.txt");
+    assert_eq!(out.attachments[0].media_type, PromptAttachmentMediaType::File);
+    assert_eq!(out.attachments[0].delivery, PromptAttachmentDelivery::PathFallback);
+    assert!(!out.attachments[0].sha256.is_empty());
+    assert!(!serde_json::to_string(&out.attachments).unwrap().contains(abs));
+}
+
+#[tokio::test]
+async fn describes_valid_image_from_content_without_exposing_its_path() {
+    let (service, pe_id, dir, upload_root) = setup().await;
+    let path = dir.path().join("pixel.png");
+    image::DynamicImage::new_rgba8(2, 3).save(&path).unwrap();
+
+    let out = service
+        .resolve_chat_message(
+            "system_default_user",
+            "inspect",
+            &[ChatFileRef::Project {
+                pe_id,
+                relative_path: "pixel.png".into(),
+            }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap();
+
+    let attachment = &out.attachments[0];
+    assert_eq!(attachment.mime_type, "image/png");
+    assert_eq!((attachment.width, attachment.height), (Some(2), Some(3)));
+    assert_eq!(attachment.delivery, PromptAttachmentDelivery::Pending);
+    assert_eq!(attachment.media_type, PromptAttachmentMediaType::Image);
+    assert!(
+        !serde_json::to_string(attachment)
+            .unwrap()
+            .contains(path.to_string_lossy().as_ref())
+    );
+}
+
+#[tokio::test]
+async fn damaged_image_degrades_to_path_with_an_explicit_reason() {
+    let (service, pe_id, dir, upload_root) = setup().await;
+    std::fs::write(dir.path().join("broken.png"), b"not an image").unwrap();
+
+    let out = service
+        .resolve_chat_message(
+            "system_default_user",
+            "inspect",
+            &[ChatFileRef::Project {
+                pe_id,
+                relative_path: "broken.png".into(),
+            }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.attachments[0].delivery, PromptAttachmentDelivery::PathFallback);
+    assert_eq!(out.attachments[0].reason.as_deref(), Some("invalid_image"));
+}
+
+#[tokio::test]
+async fn image_content_with_a_mismatched_extension_degrades_to_path() {
+    let (service, pe_id, dir, upload_root) = setup().await;
+    let path = dir.path().join("disguised.jpg");
+    image::DynamicImage::new_rgba8(2, 3)
+        .save_with_format(&path, image::ImageFormat::Png)
+        .unwrap();
+
+    let out = service
+        .resolve_chat_message(
+            "system_default_user",
+            "inspect",
+            &[ChatFileRef::Project {
+                pe_id,
+                relative_path: "disguised.jpg".into(),
+            }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.attachments[0].mime_type, "image/png");
+    assert_eq!(out.attachments[0].delivery, PromptAttachmentDelivery::PathFallback);
+    assert_eq!(out.attachments[0].reason.as_deref(), Some("mime_mismatch"));
+}
+
+#[tokio::test]
+async fn image_over_native_byte_limit_degrades_to_path() {
+    let (service, pe_id, dir, upload_root) = setup().await;
+    let path = dir.path().join("large-wire.png");
+    image::DynamicImage::new_rgba8(1, 1).save(&path).unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_len(5 * 1024 * 1024 + 1).unwrap();
+
+    let out = service
+        .resolve_chat_message(
+            "system_default_user",
+            "inspect",
+            &[ChatFileRef::Project {
+                pe_id,
+                relative_path: "large-wire.png".into(),
+            }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.attachments[0].delivery, PromptAttachmentDelivery::PathFallback);
+    assert_eq!(out.attachments[0].reason.as_deref(), Some("native_size_limit"));
+    assert_eq!(out.attachments[0].size, 5 * 1024 * 1024 + 1);
+    assert_eq!(out.attachments[0].sha256.len(), 64);
+}
+
+#[tokio::test]
+async fn image_over_pixel_limit_degrades_without_native_delivery() {
+    let (service, pe_id, dir, upload_root) = setup().await;
+    let path = dir.path().join("too-many-pixels.png");
+    image::DynamicImage::new_luma8(8000, 5001).save(&path).unwrap();
+
+    let out = service
+        .resolve_chat_message(
+            "system_default_user",
+            "inspect",
+            &[ChatFileRef::Project {
+                pe_id,
+                relative_path: "too-many-pixels.png".into(),
+            }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (out.attachments[0].width, out.attachments[0].height),
+        (Some(8000), Some(5001))
+    );
+    assert_eq!(out.attachments[0].delivery, PromptAttachmentDelivery::PathFallback);
+    assert_eq!(out.attachments[0].reason.as_deref(), Some("image_pixel_limit"));
 }
 
 #[tokio::test]

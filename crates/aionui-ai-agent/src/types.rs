@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use aion_config::compat::OpenAiApiMode;
 use aion_types::message::ImageInputCapability;
+use aionui_api_types::PromptAttachmentV1;
 use serde::{Deserialize, Serialize};
 
 use crate::session_context::AgentSessionContext;
@@ -20,6 +21,9 @@ pub struct SendMessageData {
     /// File paths attached to the message.
     #[serde(default)]
     pub files: Vec<String>,
+    /// Path-free attachment descriptors prepared at the conversation send edge.
+    #[serde(default)]
+    pub attachments: Vec<PromptAttachmentV1>,
     /// Skills to inject into this message turn.
     #[serde(default)]
     pub inject_skills: Vec<String>,
@@ -331,6 +335,7 @@ mod tests {
             msg_id: "msg-001".into(),
             turn_id: Some("turn-001".into()),
             files: vec!["/tmp/a.txt".into()],
+            attachments: vec![],
             inject_skills: vec!["review".into()],
         };
         let json = serde_json::to_value(&data).unwrap();
@@ -352,6 +357,7 @@ mod tests {
         let data: SendMessageData = serde_json::from_value(json).unwrap();
         assert!(data.turn_id.is_none());
         assert!(data.files.is_empty());
+        assert!(data.attachments.is_empty());
         assert!(data.inject_skills.is_empty());
     }
 

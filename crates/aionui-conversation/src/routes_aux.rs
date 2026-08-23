@@ -3,8 +3,9 @@
 use crate::state::ConversationRouterState;
 use aionui_api_types::{
     ApiResponse, CanonicalReplayProjectionResponse, HostPolicyResponse, JournalTranscriptResponse,
-    RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse, SetHostPolicyRequest, SideQuestionRequest,
-    SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
+    RawTrajectoryProjectionV1, RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse,
+    SetHostPolicyRequest, SideQuestionRequest, SideQuestionResponse, SlashCommandItem, TrajectoryProjectionV1,
+    TrajectoryQuery, TrajectoryRecordV1, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -23,6 +24,12 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
         .route("/api/usage", get(list_usage_events).delete(clear_usage_events))
         .route("/api/conversations/{id}/event-replay", get(replay_event_projection))
         .route("/api/conversations/{id}/transcript", get(get_event_transcript))
+        .route("/api/conversations/{id}/trajectory", get(get_trajectory))
+        .route("/api/conversations/{id}/trajectory/raw", get(get_raw_trajectory))
+        .route(
+            "/api/conversations/{id}/trajectory/{record_id}",
+            get(get_trajectory_record),
+        )
         .route("/api/conversations/{id}/host-policy", put(set_host_policy))
         .route("/api/conversations/{id}/outputs/{reference}", get(get_retained_output))
         .route(
@@ -68,6 +75,50 @@ async fn get_event_transcript(
         state
             .service
             .derive_event_transcript(&user.id, &id, query.visibility.as_deref())
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn get_trajectory(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Query(query): Query<TrajectoryQuery>,
+) -> Result<Json<ApiResponse<TrajectoryProjectionV1>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .derive_trajectory(&user.id, &id, query)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn get_raw_trajectory(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Query(query): Query<TrajectoryQuery>,
+) -> Result<Json<ApiResponse<RawTrajectoryProjectionV1>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .derive_raw_trajectory(&user.id, &id, query)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn get_trajectory_record(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, record_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<TrajectoryRecordV1>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .trajectory_record(&user.id, &id, &record_id)
             .await
             .map_err(ApiError::from)?,
     )))

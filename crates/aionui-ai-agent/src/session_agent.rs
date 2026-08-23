@@ -1237,7 +1237,9 @@ impl IAgentTask for SessionAgentTask {
         // resource link — the path also remains in the original text because
         // partition already ran, which the adapters tolerate (they resolve
         // links independently of the text).
-        let partition = crate::media::partition_media(&data.content, &data.files, self.prompt_media_caps());
+        let mut partition =
+            crate::media::partition_media(&data.content, &data.files, &data.attachments, self.prompt_media_caps())
+                .await;
         let mut content: Vec<ContentBlock> = Vec::new();
         if !partition.content.is_empty() {
             content.push(ContentBlock::Text(partition.content));
@@ -1262,12 +1264,19 @@ impl IAgentTask for SessionAgentTask {
                         media_type: attachment.mime.clone(),
                     },
                 }),
-                None => content.push(ContentBlock::ResourceLink {
-                    uri: attachment.path.clone(),
-                    mime_type: Some(attachment.mime.clone()),
-                }),
+                None => {
+                    if let Some(delivery) = partition.deliveries.get_mut(attachment.attachment_index) {
+                        delivery.delivery = aionui_api_types::PromptAttachmentDelivery::PathFallback;
+                        delivery.reason = Some("native_read_failed".to_owned());
+                    }
+                    content.push(ContentBlock::ResourceLink {
+                        uri: attachment.path.clone(),
+                        mime_type: Some(attachment.mime.clone()),
+                    });
+                }
             }
         }
+        let deliveries = std::mem::take(&mut partition.deliveries);
         if !partition.media.is_empty() {
             let (images, audios) = content.iter().fold((0usize, 0usize), |(i, a), b| match b {
                 ContentBlock::Image { .. } => (i + 1, a),
@@ -1304,6 +1313,12 @@ impl IAgentTask for SessionAgentTask {
         let _ = self.runtime.tx.send(AgentStreamEvent::Start(StartEventData {
             session_id: self.runtime.session_id(),
         }));
+        for delivery in deliveries {
+            let _ = self.runtime.tx.send(AgentStreamEvent::System(serde_json::json!({
+                "event": "attachment_delivery",
+                "attachment": delivery,
+            })));
+        }
         self.runtime.set_status(ConversationStatus::Running);
         match self.backend.dispatch(cmd).await {
             Ok(_receipt) => Ok(()),
@@ -6272,6 +6287,7 @@ mod persist_tests {
                 msg_id: "m1".into(),
                 turn_id: None,
                 files: Vec::new(),
+                attachments: Vec::new(),
                 inject_skills: Vec::new(),
             },
         )
@@ -6711,7 +6727,12 @@ mod pump_tests {
         let dir = std::env::temp_dir().join("aionui-session-media-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let img = dir.join("cat.png");
-        std::fs::write(&img, b"catbytes").unwrap();
+        let mut image_bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut image_bytes, image::ImageFormat::Png)
+            .unwrap();
+        let image_bytes = image_bytes.into_inner();
+        std::fs::write(&img, &image_bytes).unwrap();
         let img = img.to_string_lossy().into_owned();
         let pdf = dir.join("doc.pdf");
         std::fs::write(&pdf, b"pdfbytes").unwrap();
@@ -6743,6 +6764,7 @@ mod pump_tests {
                 msg_id: "m-media".into(),
                 turn_id: None,
                 files: vec![img.clone(), pdf.clone()],
+                attachments: Vec::new(),
                 inject_skills: Vec::new(),
             },
         )
@@ -6765,7 +6787,7 @@ mod pump_tests {
         let ContentBlock::Image { data, media_type } = &content[2] else {
             panic!("expected image block third: {content:?}");
         };
-        assert_eq!(data, b"catbytes");
+        assert_eq!(data, &image_bytes);
         assert_eq!(media_type, "image/png");
     }
 
@@ -7431,6 +7453,7 @@ mod pump_tests {
                 msg_id: "m1".into(),
                 turn_id: None,
                 files: Vec::new(),
+                attachments: Vec::new(),
                 inject_skills: Vec::new(),
             },
         )
@@ -7484,6 +7507,7 @@ mod pump_tests {
                 msg_id: "m-1".into(),
                 turn_id: None,
                 files: Vec::new(),
+                attachments: Vec::new(),
                 inject_skills: Vec::new(),
             },
         )
@@ -7563,6 +7587,7 @@ mod pump_tests {
                 msg_id: "m-2".into(),
                 turn_id: None,
                 files: Vec::new(),
+                attachments: Vec::new(),
                 inject_skills: Vec::new(),
             },
         )
@@ -9735,6 +9760,7 @@ mod force_kill_tests {
                 msg_id: "m1".into(),
                 turn_id: None,
                 files: Vec::new(),
+                attachments: Vec::new(),
                 inject_skills: Vec::new(),
             },
         )

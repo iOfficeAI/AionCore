@@ -38,12 +38,14 @@ mod websocket;
 
 pub use acp::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AcpEnvResponse, AgentModeResponse, CanonicalReplayProjectionResponse,
-    ConfigOptionConfirmation, DetectCliRequest, DetectCliResponse, GetConfigOptionsResponse, GetModelInfoResponse,
-    HostPolicyResponse, JournalTranscriptItem, JournalTranscriptResponse, JournalTranscriptTokenNode,
-    JournalTranscriptTokens, ModelInfoEntry, ModelInfoPayload, ProbeModelRequest, RetainedOutputResponse,
-    SetConfigOptionRequest, SetConfigOptionResponse, SetHostPolicyRequest, SetModeRequest, SetModelRequest,
-    SideQuestionRequest, SideQuestionResponse, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
-    WorkspaceBrowseQuery, WorkspaceEntry,
+    ConfigOptionConfirmation, ConversationTrajectoryChangedEvent, DetectCliRequest, DetectCliResponse,
+    GetConfigOptionsResponse, GetModelInfoResponse, HostPolicyResponse, JournalTranscriptItem,
+    JournalTranscriptResponse, JournalTranscriptTokenNode, JournalTranscriptTokens, ModelInfoEntry, ModelInfoPayload,
+    ProbeModelRequest, RawTrajectoryEventV1, RawTrajectoryProjectionV1, RetainedOutputResponse, SetConfigOptionRequest,
+    SetConfigOptionResponse, SetHostPolicyRequest, SetModeRequest, SetModelRequest, SideQuestionRequest,
+    SideQuestionResponse, TrajectoryOverviewV1, TrajectoryProjectionV1, TrajectoryQuery, TrajectoryRecordV1,
+    TrajectoryTokenUsage, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse, WorkspaceBrowseQuery,
+    WorkspaceEntry,
 };
 pub use acp_prompt_hook::AcpPromptHookWarningPayload;
 pub use agent_build_extra::{
@@ -87,7 +89,9 @@ pub use channel::{
     PluginStatusChangedPayload, PluginStatusResponse, RejectPairingRequest, RevokeUserRequest,
     SyncChannelSettingsRequest, TestPluginExtraConfig, TestPluginRequest, TestPluginResponse, UserAuthorizedPayload,
 };
-pub use chat_file::ChatFileRef;
+pub use chat_file::{
+    ChatFileRef, PromptAttachmentDelivery, PromptAttachmentMediaType, PromptAttachmentSource, PromptAttachmentV1,
+};
 pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse};
 pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::{

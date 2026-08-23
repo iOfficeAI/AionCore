@@ -13,8 +13,9 @@ use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
     CanonicalReplayProjectionResponse, CapabilitiesChangedEvent, ConfigOptionConfirmation, GetConfigOptionsResponse,
     HostPolicyResponse, InputChangedEvent, JournalTranscriptResponse, RETIRED_DEEPSEEK_HARNESS_BACKEND,
-    RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse, SetHostPolicyRequest, SideQuestionRequest,
-    SideQuestionResponse, SlashCommandItem, SubmitConversationInputRequest, ToolEnforcementLevel, WorkspaceBrowseQuery,
+    RawTrajectoryProjectionV1, RetainedOutputResponse, SetConfigOptionRequest, SetConfigOptionResponse,
+    SetHostPolicyRequest, SideQuestionRequest, SideQuestionResponse, SlashCommandItem, SubmitConversationInputRequest,
+    ToolEnforcementLevel, TrajectoryProjectionV1, TrajectoryQuery, TrajectoryRecordV1, WorkspaceBrowseQuery,
     WorkspaceEntry,
 };
 use aionui_api_types::{
@@ -32,6 +33,9 @@ use crate::ConversationError;
 use crate::journal_transcript::{RequestedVisibility, derive_transcript};
 use crate::service::{
     AssistantRuntimePreferenceUpdate, ConversationService, reject_deprecated_runtime_row, team_id_from_extra,
+};
+use crate::trajectory_projection::{
+    derive_raw_trajectory, find_trajectory_record, load_cached_records, page_trajectory, validate_query,
 };
 
 const MAX_DIR_DEPTH: usize = 10;
@@ -215,6 +219,55 @@ impl ConversationService {
             model_surface_reconstructible,
             approval_policy: transcript.approval_policy.to_owned(),
             compaction_keep_n: transcript.compaction_keep_n as u32,
+        })
+    }
+
+    pub async fn derive_trajectory(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        query: TrajectoryQuery,
+    ) -> Result<TrajectoryProjectionV1, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        validate_query(&query).map_err(|reason| ConversationError::BadRequest { reason })?;
+        let journal = self.canonical_event_journal();
+        let (records, log_revision) = load_cached_records(&journal, user_id, conversation_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to build trajectory projection: {error}")))?;
+        page_trajectory(conversation_id, records, log_revision, &query)
+            .map_err(|reason| ConversationError::BadRequest { reason })
+    }
+
+    pub async fn derive_raw_trajectory(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        query: TrajectoryQuery,
+    ) -> Result<RawTrajectoryProjectionV1, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        let events = self
+            .canonical_event_journal()
+            .replay(user_id, conversation_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to replay canonical events: {error}")))?;
+        derive_raw_trajectory(conversation_id, &events, &query)
+            .map_err(|reason| ConversationError::BadRequest { reason })
+    }
+
+    pub async fn trajectory_record(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        record_id: &str,
+    ) -> Result<TrajectoryRecordV1, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        let events = self
+            .canonical_event_journal()
+            .replay(user_id, conversation_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to replay canonical events: {error}")))?;
+        find_trajectory_record(&events, record_id).ok_or_else(|| ConversationError::NotFoundReason {
+            reason: "Trajectory record not found".to_owned(),
         })
     }
 

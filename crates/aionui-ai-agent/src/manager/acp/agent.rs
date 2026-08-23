@@ -1911,6 +1911,7 @@ mod tests {
             msg_id: "msg-acp-final".into(),
             turn_id: Some("turn-acp-final".into()),
             files: Vec::new(),
+            attachments: Vec::new(),
             inject_skills: Vec::new(),
         };
         let resolved_context = serde_json::json!({

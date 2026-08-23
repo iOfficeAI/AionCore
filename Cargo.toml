@@ -59,12 +59,12 @@ aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
-aion-agent = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.19" }
-aion-providers = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.19" }
-aion-types = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.19" }
-aion-protocol = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.19" }
-aion-config = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.19" }
-aion-mcp = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.19" }
+aion-agent = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.20" }
+aion-providers = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.20" }
+aion-types = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.20" }
+aion-protocol = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.20" }
+aion-config = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.20" }
+aion-mcp = { git = "https://github.com/suoak/aionrs.git", tag = "v0.2.20" }
 
 # Core framework
 tokio = { version = "1", features = ["full"] }
@@ -141,6 +141,7 @@ git2 = { version = "0.21.0", default-features = false }
 # unlinking them (mac/win/linux, x64 + arm64).
 trash = "5"
 mime_guess = "2"
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 rust-embed = "8"
 
 # Runtime embedding

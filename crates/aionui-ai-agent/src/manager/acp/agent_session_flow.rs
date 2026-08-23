@@ -353,7 +353,7 @@ impl AcpAgentManager {
             .ok_or_else(|| AgentError::internal("Cannot prompt: no session ID available"))
             .map_err(AcpSendFailure::from)?;
 
-        let prompt_blocks = {
+        let prompt = {
             use crate::agent_task::IAgentTask as _;
             build_prompt_blocks(data, self.prompt_media_caps()).await
         };
@@ -368,6 +368,12 @@ impl AcpAgentManager {
         self.runtime.emit(AgentStreamEvent::Start(StartEventData {
             session_id: Some(sid.to_owned()),
         }));
+        for delivery in prompt.deliveries {
+            self.runtime.emit(AgentStreamEvent::System(serde_json::json!({
+                "event": "attachment_delivery",
+                "attachment": delivery,
+            })));
+        }
 
         // Scope stderr classification to this prompt so stale lines from an
         // earlier turn cannot override a later benign empty turn.
@@ -376,7 +382,7 @@ impl AcpAgentManager {
 
         let prompt_response = self
             .protocol
-            .prompt(PromptRequest::new(SessionId::new(sid), prompt_blocks))
+            .prompt(PromptRequest::new(SessionId::new(sid), prompt.blocks))
             .await
             .map_err(AcpSendFailure::from)?;
 
@@ -525,12 +531,20 @@ fn should_retry_session_new(managed_runtime: bool, retries: u8, error: &AcpError
 /// accept. Attachments the agent cannot take (or that fail to read) stay in
 /// the text block's `[[AION_FILES]]` path list, byte-identical to the
 /// pre-multimodal wire form.
-async fn build_prompt_blocks(data: &SendMessageData, caps: crate::types::PromptMediaCaps) -> Vec<ContentBlock> {
+struct PromptBlocks {
+    blocks: Vec<ContentBlock>,
+    deliveries: Vec<aionui_api_types::PromptAttachmentV1>,
+}
+
+async fn build_prompt_blocks(data: &SendMessageData, caps: crate::types::PromptMediaCaps) -> PromptBlocks {
     use base64::Engine as _;
 
-    let partition = crate::media::partition_media(&data.content, &data.files, caps);
+    let mut partition = crate::media::partition_media(&data.content, &data.files, &data.attachments, caps).await;
     if partition.media.is_empty() {
-        return vec![ContentBlock::from(partition.content)];
+        return PromptBlocks {
+            blocks: vec![ContentBlock::from(partition.content)],
+            deliveries: partition.deliveries,
+        };
     }
 
     let mut media_blocks = Vec::with_capacity(partition.media.len());
@@ -540,8 +554,17 @@ async fn build_prompt_blocks(data: &SendMessageData, caps: crate::types::PromptM
         // second time, and a file vanishing between classify and read is too
         // rare to warrant that complexity.
         let Some(bytes) = crate::media::read_media_bytes(attachment).await else {
-            warn!(path = %attachment.path, "media attachment read failed; falling back to path-only prompt");
-            return vec![ContentBlock::from(data.content.clone())];
+            warn!("media attachment read failed; falling back to path-only prompt");
+            for delivery in &mut partition.deliveries {
+                if delivery.delivery == aionui_api_types::PromptAttachmentDelivery::Native {
+                    delivery.delivery = aionui_api_types::PromptAttachmentDelivery::PathFallback;
+                    delivery.reason = Some("native_read_failed".to_owned());
+                }
+            }
+            return PromptBlocks {
+                blocks: vec![ContentBlock::from(data.content.clone())],
+                deliveries: partition.deliveries,
+            };
         };
         let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
         media_blocks.push(match attachment.kind {
@@ -569,7 +592,10 @@ async fn build_prompt_blocks(data: &SendMessageData, caps: crate::types::PromptM
     let mut blocks = Vec::with_capacity(media_blocks.len() + 1);
     blocks.push(ContentBlock::from(partition.content));
     blocks.extend(media_blocks);
-    blocks
+    PromptBlocks {
+        blocks,
+        deliveries: partition.deliveries,
+    }
 }
 
 /// Thin wrapper retained for the existing empty-turn detection tests; the
@@ -1620,9 +1646,11 @@ mod tests {
             msg_id: "m1".into(),
             turn_id: None,
             files: vec![img],
+            attachments: vec![],
             inject_skills: vec![],
         };
-        let blocks = super::build_prompt_blocks(&data, crate::types::PromptMediaCaps::default()).await;
+        let prompt = super::build_prompt_blocks(&data, crate::types::PromptMediaCaps::default()).await;
+        let blocks = prompt.blocks;
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             ContentBlock::Text(text) => assert_eq!(text.text, content),
@@ -1636,7 +1664,12 @@ mod tests {
         let dir = std::env::temp_dir().join("aionui-acp-prompt-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let img = dir.join("native.png");
-        std::fs::write(&img, b"fakepng").unwrap();
+        let mut image_bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut image_bytes, image::ImageFormat::Png)
+            .unwrap();
+        let image_bytes = image_bytes.into_inner();
+        std::fs::write(&img, &image_bytes).unwrap();
         let img = img.to_string_lossy().into_owned();
         let pdf = dir.join("doc.pdf");
         std::fs::write(&pdf, b"fakepdf").unwrap();
@@ -1650,13 +1683,15 @@ mod tests {
             msg_id: "m2".into(),
             turn_id: None,
             files: vec![img.clone(), pdf.clone()],
+            attachments: vec![],
             inject_skills: vec![],
         };
         let caps = crate::types::PromptMediaCaps {
             image: true,
             audio: false,
         };
-        let blocks = super::build_prompt_blocks(&data, caps).await;
+        let prompt = super::build_prompt_blocks(&data, caps).await;
+        let blocks = prompt.blocks;
         assert_eq!(blocks.len(), 2);
         match &blocks[0] {
             ContentBlock::Text(text) => {
@@ -1671,7 +1706,10 @@ mod tests {
         match &blocks[1] {
             ContentBlock::Image(image) => {
                 assert_eq!(image.mime_type, "image/png");
-                assert_eq!(image.data, base64::engine::general_purpose::STANDARD.encode(b"fakepng"));
+                assert_eq!(
+                    image.data,
+                    base64::engine::general_purpose::STANDARD.encode(&image_bytes)
+                );
                 assert_eq!(image.uri.as_deref(), Some(format!("file://{img}").as_str()));
             }
             other => panic!("expected image block, got {other:?}"),
@@ -1691,6 +1729,7 @@ mod tests {
             msg_id: "m3".into(),
             turn_id: None,
             files: vec![img_path.clone()],
+            attachments: vec![],
             inject_skills: vec![],
         };
         let caps = crate::types::PromptMediaCaps {
@@ -1701,7 +1740,8 @@ mod tests {
         // inside build_prompt_blocks — so remove the file first and verify the
         // whole prompt degrades to the original text form.
         std::fs::remove_file(&img).unwrap();
-        let blocks = super::build_prompt_blocks(&data, caps).await;
+        let prompt = super::build_prompt_blocks(&data, caps).await;
+        let blocks = prompt.blocks;
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             ContentBlock::Text(text) => assert_eq!(text.text, content),

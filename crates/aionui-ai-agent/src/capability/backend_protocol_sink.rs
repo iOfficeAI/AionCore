@@ -75,6 +75,23 @@ impl BackendProtocolSink {
         })
         .to_string()
     }
+
+    fn result_description(
+        execution_id: &str,
+        structured_content: &Option<serde_json::Value>,
+        error_code: &Option<aion_types::tool::ToolExecutionErrorCode>,
+        truncation: &Option<aion_types::tool::ToolResultTruncation>,
+    ) -> String {
+        json!({
+            "execution_id": execution_id,
+            "phase": "finalize",
+            "enforcement": "native",
+            "structured_content": structured_content,
+            "error_code": error_code,
+            "truncation": truncation,
+        })
+        .to_string()
+    }
 }
 
 impl ProtocolEmitter for BackendProtocolSink {
@@ -149,6 +166,10 @@ impl ProtocolEmitter for BackendProtocolSink {
                 execution_id,
                 tool_name,
                 status,
+                output,
+                structured_content,
+                error_code,
+                truncation,
                 ..
             } => {
                 let status = match status {
@@ -161,8 +182,13 @@ impl ProtocolEmitter for BackendProtocolSink {
                     args: serde_json::Value::Null,
                     status,
                     input: None,
-                    output: None,
-                    description: Some(Self::execution_description(execution_id, "finalize")),
+                    output: Some(output.clone()),
+                    description: Some(Self::result_description(
+                        execution_id,
+                        structured_content,
+                        error_code,
+                        truncation,
+                    )),
                 }));
             }
 
@@ -170,6 +196,7 @@ impl ProtocolEmitter for BackendProtocolSink {
                 call_id,
                 execution_id,
                 reason,
+                error_code,
                 ..
             } => {
                 if let Ok(mut confs) = self.confirmations.write() {
@@ -183,7 +210,15 @@ impl ProtocolEmitter for BackendProtocolSink {
                     status: ToolCallStatus::Error,
                     input: None,
                     output: None,
-                    description: Some(Self::execution_description(execution_id, "cancelled")),
+                    description: Some(
+                        json!({
+                            "execution_id": execution_id,
+                            "phase": "cancelled",
+                            "enforcement": "native",
+                            "error_code": error_code,
+                        })
+                        .to_string(),
+                    ),
                 }));
             }
 
@@ -346,22 +381,31 @@ mod tests {
             call_id: "c1".into(),
             execution_id: "exec-1".into(),
             tool_name: "Read".into(),
-            status: ToolStatus::Success,
-            output: "ok".into(),
+            status: ToolStatus::Error,
+            output: "partial output".into(),
             output_type: aion_protocol::events::OutputType::Text,
             metadata: None,
             content_blocks: None,
-            structured_content: None,
-            error_code: None,
-            truncation: None,
+            structured_content: Some(json!({ "rows": 2 })),
+            error_code: Some(aion_types::tool::ToolExecutionErrorCode::ExecutionFailed),
+            truncation: Some(aion_types::tool::ToolResultTruncation {
+                original_bytes: 20,
+                output_bytes: 10,
+                limit_bytes: 10,
+            }),
         })
         .unwrap();
 
         match rx.try_recv().unwrap() {
             AgentStreamEvent::ToolCall(data) => {
                 assert_eq!(data.call_id, "aionrs-c1");
-                assert_eq!(data.status, ToolCallStatus::Completed);
-                assert!(data.description.as_deref().unwrap().contains("finalize"));
+                assert_eq!(data.status, ToolCallStatus::Error);
+                assert_eq!(data.output.as_deref(), Some("partial output"));
+                let diagnostics: serde_json::Value =
+                    serde_json::from_str(data.description.as_deref().unwrap()).unwrap();
+                assert_eq!(diagnostics["structured_content"], json!({ "rows": 2 }));
+                assert_eq!(diagnostics["error_code"], "execution_failed");
+                assert_eq!(diagnostics["truncation"]["original_bytes"], 20);
             }
             other => panic!("Expected ToolCall result, got {:?}", other),
         }

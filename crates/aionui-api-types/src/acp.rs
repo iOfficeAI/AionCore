@@ -211,6 +211,110 @@ pub struct JournalTranscriptResponse {
     pub compaction_keep_n: u32,
 }
 
+/// Cursor query for the human-facing trajectory projection.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrajectoryQuery {
+    pub before_sequence: Option<u64>,
+    pub after_sequence: Option<u64>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TrajectoryTokenUsage {
+    pub input: Option<u64>,
+    pub output: Option<u64>,
+    pub cached: Option<u64>,
+    pub thinking: Option<u64>,
+}
+
+/// One stable, semantic execution record derived from canonical journal events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TrajectoryRecordV1 {
+    pub record_id: String,
+    pub category: String,
+    pub status: String,
+    pub visibility: String,
+    pub turn_id: Option<String>,
+    pub step_id: Option<String>,
+    pub parent_record_id: Option<String>,
+    pub input_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub started_at_ms: Option<i64>,
+    pub completed_at_ms: Option<i64>,
+    pub duration_ms: Option<u64>,
+    pub title: String,
+    pub summary: String,
+    pub input_preview: Option<String>,
+    pub output_preview: Option<String>,
+    pub retained_output_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<serde_json::Value>,
+    pub tokens: TrajectoryTokenUsage,
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    pub source_sequences: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TrajectoryOverviewV1 {
+    pub turns: u64,
+    pub steps: u64,
+    pub tools: u64,
+    pub errors: u64,
+    pub total_duration_ms: Option<u64>,
+    pub first_output_ms: Option<u64>,
+    pub tokens: TrajectoryTokenUsage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TrajectoryProjectionV1 {
+    pub schema_version: u32,
+    pub conversation_id: String,
+    pub records: Vec<TrajectoryRecordV1>,
+    pub overview: TrajectoryOverviewV1,
+    pub has_more: bool,
+    pub oldest_sequence: Option<u64>,
+    pub newest_sequence: Option<u64>,
+    pub next_before_sequence: Option<u64>,
+    pub log_revision: u64,
+}
+
+/// Raw journal event exposed only through the explicit diagnostics endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RawTrajectoryEventV1 {
+    pub event_id: String,
+    pub sequence: u64,
+    pub timestamp_ms: i64,
+    pub kind: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RawTrajectoryProjectionV1 {
+    pub schema_version: u32,
+    pub conversation_id: String,
+    pub events: Vec<RawTrajectoryEventV1>,
+    pub has_more: bool,
+    pub oldest_sequence: Option<u64>,
+    pub newest_sequence: Option<u64>,
+    pub next_before_sequence: Option<u64>,
+    pub log_revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationTrajectoryChangedEvent {
+    pub conversation_id: String,
+    pub last_sequence: u64,
+    pub log_revision: u64,
+}
+
 fn default_approval_policy() -> String {
     "ask".to_owned()
 }

@@ -18,6 +18,7 @@ use crate::service::{
 use crate::stream_relay::{RelayOutcome, StreamRelay, SupersedingTipTotals, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
 use crate::turn_recovery_policy::{TurnRecoveryDecision, TurnRecoveryPolicy};
+use aionui_api_types::PromptAttachmentV1;
 use aionui_api_types::{AgentErrorCode, SessionLifetime};
 
 fn acp_backend_from_build_options(options: &BuildTaskOptions) -> Option<&str> {
@@ -37,6 +38,7 @@ pub(crate) struct TurnStartInput {
     pub content: String,
     /// Attachment absolute paths, already resolved.
     pub files: Vec<String>,
+    pub attachments: Vec<PromptAttachmentV1>,
     pub inject_skills: Vec<String>,
     pub required_runtime_mode: Option<String>,
     pub build_options: BuildTaskOptions,
@@ -442,6 +444,7 @@ impl ConversationTurnOrchestrator {
                             msg_id: next_turn_msg_id.clone(),
                             turn_id: Some(input.turn_id.clone()),
                             files: vec![],
+                            attachments: vec![],
                             inject_skills: vec![],
                         },
                         next_turn_msg_id,
@@ -475,6 +478,7 @@ impl ConversationTurnOrchestrator {
             msg_id: first_turn_msg_id.clone(),
             turn_id: Some(turn_id.clone()),
             files: input.files,
+            attachments: input.attachments,
             inject_skills: input.inject_skills,
         };
         let mut replayed = false;

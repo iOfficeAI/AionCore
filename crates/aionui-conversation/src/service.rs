@@ -15,7 +15,6 @@ use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
 use crate::stream_persistence::canonical_event_id;
-use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
     ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CancellationChangedEvent,
     CancellationState, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind,
@@ -28,6 +27,7 @@ use aionui_api_types::{
     TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
     assistant_avatar_response_value, assistant_avatar_response_value_with_version,
 };
+use aionui_api_types::{ChatFileRef, PromptAttachmentV1};
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
     PaginatedResult, WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
@@ -46,6 +46,7 @@ use aionui_project::{ProjectService, ResolvedChatMessage, canonical};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
 use chrono::Datelike;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -66,6 +67,13 @@ const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
+
+pub(crate) fn scope_prompt_attachment_ids(msg_id: &str, attachments: &mut [PromptAttachmentV1]) {
+    for attachment in attachments {
+        let digest = Sha256::digest(format!("{msg_id}\0{}", attachment.attachment_id).as_bytes());
+        attachment.attachment_id = format!("attachment:{}", hex::encode(digest));
+    }
+}
 
 fn cancellation_event_suffix(state: CancellationState) -> &'static str {
     match state {
@@ -561,6 +569,7 @@ impl ConversationService {
             return Ok(ResolvedChatMessage {
                 content: content.to_owned(),
                 files: Vec::new(),
+                attachments: Vec::new(),
             });
         }
         let project = self
@@ -826,6 +835,36 @@ impl ConversationService {
             ),
         }
         Ok(())
+    }
+
+    async fn journal_prompt_attachments(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        msg_id: &str,
+        attachments: &[aionui_api_types::PromptAttachmentV1],
+    ) {
+        if attachments.is_empty() {
+            return;
+        }
+        let result = self
+            .canonical_event_journal()
+            .append(
+                user_id,
+                conversation_id,
+                format!("attachments:{msg_id}"),
+                "AttachmentPrepared".to_owned(),
+                serde_json::json!({
+                    "data": {
+                        "msg_id": msg_id,
+                        "attachments": attachments,
+                    }
+                }),
+            )
+            .await;
+        if let Err(error) = result {
+            warn!(conversation_id, msg_id, error = %error, "failed to journal attachment diagnostics");
+        }
     }
 
     async fn publish_cancellation_state(
@@ -3619,7 +3658,7 @@ impl ConversationService {
         // Resolve file attachments at the send boundary before any persist/claim
         // (atomic: a bad reference fails the whole send). Produces the inlined
         // `[[AION_FILES]]` content used for persistence, broadcast, and the turn.
-        let resolved = self
+        let mut resolved = self
             .resolve_message_attachments(user_id, &req.content, &req.files)
             .await?;
 
@@ -3631,6 +3670,7 @@ impl ConversationService {
         // key. We reuse the same value for `id` (primary key) and `msg_id`
         // to preserve legacy callers that still rely on `id == msg_id`.
         let user_msg_id = Self::mint_msg_id();
+        scope_prompt_attachment_ids(&user_msg_id, &mut resolved.attachments);
         let user_msg = aionui_db::models::MessageRow {
             id: user_msg_id.clone(),
             conversation_id: conversation_id.to_owned(),
@@ -3663,6 +3703,8 @@ impl ConversationService {
                 .await;
             return Err(error);
         }
+        self.journal_prompt_attachments(user_id, conversation_id, &user_msg_id, &resolved.attachments)
+            .await;
         if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
             warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
             return Err(e.into());
@@ -3720,6 +3762,7 @@ impl ConversationService {
             conversation: row,
             content: resolved.content,
             files: resolved.files,
+            attachments: resolved.attachments,
             inject_skills: req.inject_skills,
             required_runtime_mode: None,
             build_options: build_opts,
@@ -3858,6 +3901,7 @@ impl ConversationService {
                 conversation: row,
                 content: request.content,
                 files: request.files,
+                attachments: Vec::new(),
                 inject_skills: request.inject_skills,
                 required_runtime_mode: request.required_runtime_mode,
                 build_options: build_opts,

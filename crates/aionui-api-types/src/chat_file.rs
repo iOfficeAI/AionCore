@@ -31,3 +31,56 @@ pub enum ChatFileRef {
     /// the path through its own filesystem tools.
     Local { path: String },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptAttachmentSource {
+    Project,
+    Upload,
+    Local,
+    Internal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptAttachmentMediaType {
+    Image,
+    Audio,
+    File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptAttachmentDelivery {
+    Pending,
+    Native,
+    PathFallback,
+    Rejected,
+}
+
+/// Canonical, path-free attachment descriptor recorded at the model-send edge.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PromptAttachmentV1 {
+    pub attachment_id: String,
+    pub source: PromptAttachmentSource,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub sha256: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub media_type: PromptAttachmentMediaType,
+    pub delivery: PromptAttachmentDelivery,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl ChatFileRef {
+    pub fn attachment_source(&self) -> PromptAttachmentSource {
+        match self {
+            Self::Project { .. } => PromptAttachmentSource::Project,
+            Self::Upload { .. } => PromptAttachmentSource::Upload,
+            Self::Local { .. } => PromptAttachmentSource::Local,
+        }
+    }
+}

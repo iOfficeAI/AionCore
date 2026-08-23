@@ -50,9 +50,37 @@ use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::{Notify, broadcast};
 
-use crate::service::ConversationService;
+use crate::service::{ConversationService, scope_prompt_attachment_ids};
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
 use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
+
+#[test]
+fn attachment_ids_are_stable_within_a_message_and_distinct_between_messages() {
+    let descriptor = aionui_api_types::PromptAttachmentV1 {
+        attachment_id: "attachment:file-hash".to_owned(),
+        source: aionui_api_types::PromptAttachmentSource::Project,
+        filename: "diagram.png".to_owned(),
+        mime_type: "image/png".to_owned(),
+        size: 1,
+        sha256: "abc".to_owned(),
+        width: Some(1),
+        height: Some(1),
+        media_type: aionui_api_types::PromptAttachmentMediaType::Image,
+        delivery: aionui_api_types::PromptAttachmentDelivery::Pending,
+        reason: None,
+    };
+    let mut first = vec![descriptor.clone()];
+    let mut replay = vec![descriptor.clone()];
+    let mut second = vec![descriptor];
+
+    scope_prompt_attachment_ids("message-1", &mut first);
+    scope_prompt_attachment_ids("message-1", &mut replay);
+    scope_prompt_attachment_ids("message-2", &mut second);
+
+    assert_eq!(first[0].attachment_id, replay[0].attachment_id);
+    assert_ne!(first[0].attachment_id, second[0].attachment_id);
+    assert!(first[0].attachment_id.starts_with("attachment:"));
+}
 
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
@@ -8256,6 +8284,97 @@ async fn set_host_policy_journals_never_and_keep_n() {
         ConversationError::BadRequest { reason } => assert!(reason.contains("required")),
         other => panic!("expected BadRequest, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn trajectory_service_supports_latest_incremental_raw_and_detail_views() {
+    let root = tempfile::tempdir().unwrap();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(root.path().to_path_buf());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let journal = svc.canonical_event_journal();
+    journal
+        .append(
+            "user_1",
+            &conv.id,
+            "start-1".to_owned(),
+            "Start".to_owned(),
+            json!({ "data": { "turn_id": "turn-1" } }),
+        )
+        .await
+        .unwrap();
+    journal
+        .append(
+            "user_1",
+            &conv.id,
+            "tool-1".to_owned(),
+            "ToolCall".to_owned(),
+            json!({ "data": { "call_id": "call-1", "name": "Search", "status": "running", "input": { "q": "x" } } }),
+        )
+        .await
+        .unwrap();
+    journal
+        .append(
+            "user_1",
+            &conv.id,
+            "legacy-1".to_owned(),
+            "LegacyNoise".to_owned(),
+            json!({ "data": { "debug": true } }),
+        )
+        .await
+        .unwrap();
+
+    let latest = svc
+        .derive_trajectory(
+            "user_1",
+            &conv.id,
+            aionui_api_types::TrajectoryQuery {
+                limit: Some(100),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(latest.records.len(), 2);
+    assert_eq!(latest.log_revision, 3);
+
+    let incremental = svc
+        .derive_trajectory(
+            "user_1",
+            &conv.id,
+            aionui_api_types::TrajectoryQuery {
+                after_sequence: Some(1),
+                limit: Some(100),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(incremental.records.len(), 1);
+    assert_eq!(incremental.records[0].record_id, "tool:call-1");
+
+    let raw = svc
+        .derive_raw_trajectory("user_1", &conv.id, aionui_api_types::TrajectoryQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(raw.events.len(), 3);
+
+    let detail = svc.trajectory_record("user_1", &conv.id, "tool:call-1").await.unwrap();
+    assert_eq!(detail.input_preview.as_deref(), Some(r#"{"q":"x"}"#));
+    assert!(detail.detail.is_some());
+}
+
+#[tokio::test]
+async fn trajectory_service_rejects_cross_user_access() {
+    let root = tempfile::tempdir().unwrap();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(root.path().to_path_buf());
+    let conv = svc.create("owner", make_create_req()).await.unwrap();
+
+    let error = svc
+        .derive_trajectory("other-user", &conv.id, aionui_api_types::TrajectoryQuery::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ConversationError::NotFound { .. }));
 }
 
 #[tokio::test]

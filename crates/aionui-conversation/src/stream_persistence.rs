@@ -745,6 +745,18 @@ impl CanonicalEventJournal {
         Ok(path)
     }
 
+    pub(crate) fn trajectory_projection_path(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<PathBuf, std::io::Error> {
+        let path = self
+            .path(user_id, conversation_id)?
+            .with_extension("trajectory-v1.json");
+        ensure_contained(&self.root, &path)?;
+        Ok(path)
+    }
+
     async fn replay_unlocked(&self, path: &Path) -> Result<Vec<CanonicalJournalEvent>, std::io::Error> {
         let bytes = match tokio::fs::read(path).await {
             Ok(bytes) => bytes,

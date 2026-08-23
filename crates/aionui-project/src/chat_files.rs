@@ -9,9 +9,12 @@
 //! this backend edge.
 
 use std::path::Path;
+use std::time::Duration;
 
-use aionui_api_types::ChatFileRef;
+use aionui_api_types::{ChatFileRef, PromptAttachmentDelivery, PromptAttachmentMediaType, PromptAttachmentV1};
 use aionui_common::constants::AIONUI_FILES_MARKER;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 
 use crate::canonical;
 use crate::service::ProjectService;
@@ -28,6 +31,20 @@ pub struct ResolvedChatMessage {
     /// aionrs's `build_content_blocks` strips the marker (files match) and
     /// re-adds its own; clearing this would leak the raw marker to aionrs.
     pub files: Vec<String>,
+    /// Path-free descriptors safe for the canonical journal and diagnostics.
+    pub attachments: Vec<PromptAttachmentV1>,
+}
+
+const ATTACHMENT_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_NATIVE_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_IMAGE_PIXELS: u64 = 40_000_000;
+const ATTACHMENT_INSPECTION_BYTES: usize = 256 * 1024;
+
+struct AttachmentRead {
+    inspection_bytes: Vec<u8>,
+    size: u64,
+    sha256: String,
+    complete: bool,
 }
 
 impl ProjectService {
@@ -57,7 +74,15 @@ impl ProjectService {
         } else {
             format!("{content}\n\n{AIONUI_FILES_MARKER}\n{}", paths.join("\n"))
         };
-        Ok(ResolvedChatMessage { content, files: paths })
+        let mut attachments = Vec::with_capacity(paths.len());
+        for (index, (file, path)) in files.iter().zip(&paths).enumerate() {
+            attachments.push(describe_attachment(file, path, index).await);
+        }
+        Ok(ResolvedChatMessage {
+            content,
+            files: paths,
+            attachments,
+        })
     }
 
     /// Resolve a single [`ChatFileRef`] to an absolute device path.
@@ -247,6 +272,226 @@ impl ProjectService {
 
         Ok(None)
     }
+}
+
+async fn describe_attachment(file: &ChatFileRef, path: &str, index: usize) -> PromptAttachmentV1 {
+    let filename = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment")
+        .to_owned();
+    let rejected = |reason: &str| PromptAttachmentV1 {
+        attachment_id: attachment_id(index, path.as_bytes()),
+        source: file.attachment_source(),
+        filename: filename.clone(),
+        mime_type: "application/octet-stream".to_owned(),
+        size: 0,
+        sha256: String::new(),
+        width: None,
+        height: None,
+        media_type: PromptAttachmentMediaType::File,
+        delivery: PromptAttachmentDelivery::Rejected,
+        reason: Some(reason.to_owned()),
+    };
+    let read = match tokio::time::timeout(ATTACHMENT_READ_TIMEOUT, read_attachment(path)).await {
+        Ok(Ok(read)) => read,
+        Ok(Err(_)) => return rejected("attachment_read_failed"),
+        Err(_) => return rejected("attachment_read_timeout"),
+    };
+    let bytes = &read.inspection_bytes;
+    let size = read.size;
+    let sha256 = read.sha256;
+    let id = attachment_id(index, sha256.as_bytes());
+    let extension_mime = mime_guess::from_path(path).first_raw();
+
+    if let Ok(format) = image::guess_format(bytes) {
+        let detected_mime = match format {
+            image::ImageFormat::Png => Some("image/png"),
+            image::ImageFormat::Jpeg => Some("image/jpeg"),
+            image::ImageFormat::Gif => Some("image/gif"),
+            image::ImageFormat::WebP => Some("image/webp"),
+            _ => None,
+        };
+        if let Some(mime_type) = detected_mime {
+            let dimensions = image::ImageReader::with_format(std::io::Cursor::new(bytes), format).into_dimensions();
+            if !read.complete && dimensions.is_err() {
+                return PromptAttachmentV1 {
+                    attachment_id: id,
+                    source: file.attachment_source(),
+                    filename,
+                    mime_type: mime_type.to_owned(),
+                    size,
+                    sha256,
+                    width: None,
+                    height: None,
+                    media_type: PromptAttachmentMediaType::Image,
+                    delivery: PromptAttachmentDelivery::PathFallback,
+                    reason: Some("native_size_limit".to_owned()),
+                };
+            }
+            let Ok((width, height)) = dimensions else {
+                return PromptAttachmentV1 {
+                    attachment_id: id,
+                    source: file.attachment_source(),
+                    filename,
+                    mime_type: mime_type.to_owned(),
+                    size,
+                    sha256,
+                    width: None,
+                    height: None,
+                    media_type: PromptAttachmentMediaType::Image,
+                    delivery: PromptAttachmentDelivery::Rejected,
+                    reason: Some("invalid_image".to_owned()),
+                };
+            };
+            let pixels = u64::from(width).saturating_mul(u64::from(height));
+            let extension_matches = extension_mime == Some(mime_type)
+                || matches!((extension_mime, mime_type), (Some("image/jpg"), "image/jpeg"));
+            let (delivery, reason) = if !extension_matches {
+                (PromptAttachmentDelivery::PathFallback, Some("mime_mismatch".to_owned()))
+            } else if pixels > MAX_IMAGE_PIXELS {
+                (
+                    PromptAttachmentDelivery::PathFallback,
+                    Some("image_pixel_limit".to_owned()),
+                )
+            } else if !read.complete {
+                (
+                    PromptAttachmentDelivery::PathFallback,
+                    Some("native_size_limit".to_owned()),
+                )
+            } else if image::load_from_memory_with_format(bytes, format).is_err() {
+                (PromptAttachmentDelivery::PathFallback, Some("invalid_image".to_owned()))
+            } else {
+                (PromptAttachmentDelivery::Pending, None)
+            };
+            return PromptAttachmentV1 {
+                attachment_id: id,
+                source: file.attachment_source(),
+                filename,
+                mime_type: mime_type.to_owned(),
+                size,
+                sha256,
+                width: Some(width),
+                height: Some(height),
+                media_type: PromptAttachmentMediaType::Image,
+                delivery,
+                reason,
+            };
+        }
+    }
+
+    if let Some(mime_type) = inspect_audio(bytes) {
+        let extension_matches = extension_mime == Some(mime_type)
+            || matches!(
+                (extension_mime, mime_type),
+                (Some("audio/x-wav"), "audio/wav") | (Some("audio/x-m4a"), "audio/mp4")
+            );
+        let (delivery, reason) = if !extension_matches {
+            (PromptAttachmentDelivery::PathFallback, Some("mime_mismatch".to_owned()))
+        } else if !read.complete {
+            (
+                PromptAttachmentDelivery::PathFallback,
+                Some("native_size_limit".to_owned()),
+            )
+        } else {
+            (PromptAttachmentDelivery::Pending, None)
+        };
+        return PromptAttachmentV1 {
+            attachment_id: id,
+            source: file.attachment_source(),
+            filename,
+            mime_type: mime_type.to_owned(),
+            size,
+            sha256,
+            width: None,
+            height: None,
+            media_type: PromptAttachmentMediaType::Audio,
+            delivery,
+            reason,
+        };
+    }
+
+    let looks_like_image = extension_mime.is_some_and(|mime| mime.starts_with("image/"));
+    PromptAttachmentV1 {
+        attachment_id: id,
+        source: file.attachment_source(),
+        filename,
+        mime_type: extension_mime.unwrap_or("application/octet-stream").to_owned(),
+        size,
+        sha256,
+        width: None,
+        height: None,
+        media_type: if looks_like_image {
+            PromptAttachmentMediaType::Image
+        } else {
+            PromptAttachmentMediaType::File
+        },
+        delivery: PromptAttachmentDelivery::PathFallback,
+        reason: looks_like_image.then(|| "invalid_image".to_owned()),
+    }
+}
+
+async fn read_attachment(path: &str) -> std::io::Result<AttachmentRead> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let metadata_size = file.metadata().await?.len();
+    let mut complete = metadata_size <= MAX_NATIVE_ATTACHMENT_BYTES;
+    let mut inspection_bytes = Vec::with_capacity(if complete {
+        usize::try_from(metadata_size).unwrap_or(0)
+    } else {
+        ATTACHMENT_INSPECTION_BYTES
+    });
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut size = 0_u64;
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        size = size.saturating_add(read as u64);
+        digest.update(&buffer[..read]);
+        if complete && size > MAX_NATIVE_ATTACHMENT_BYTES {
+            complete = false;
+            inspection_bytes.truncate(ATTACHMENT_INSPECTION_BYTES);
+        }
+        let remaining = if complete {
+            usize::MAX
+        } else {
+            ATTACHMENT_INSPECTION_BYTES.saturating_sub(inspection_bytes.len())
+        };
+        inspection_bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+    Ok(AttachmentRead {
+        inspection_bytes,
+        size,
+        sha256: hex::encode(digest.finalize()),
+        complete,
+    })
+}
+
+fn inspect_audio(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"ID3") || bytes.starts_with(b"\xff\xfb") || bytes.starts_with(b"\xff\xf3") {
+        Some("audio/mpeg")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        Some("audio/wav")
+    } else if bytes.starts_with(b"OggS") {
+        Some("audio/ogg")
+    } else if bytes.starts_with(b"fLaC") {
+        Some("audio/flac")
+    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        Some("audio/mp4")
+    } else if bytes.starts_with(b"\xff\xf1") || bytes.starts_with(b"\xff\xf9") {
+        Some("audio/aac")
+    } else {
+        None
+    }
+}
+
+fn attachment_id(index: usize, identity: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(index.to_le_bytes());
+    digest.update(identity);
+    format!("attachment:{}", hex::encode(digest.finalize()))
 }
 
 /// Whether `target` resolves inside `root` (both canonicalized, so `..` and
