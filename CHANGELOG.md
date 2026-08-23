@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.83](https://github.com/suoak/AionCore/compare/v0.1.82...v0.1.83) (2026-08-23)
+
+### Features
+
+* **conversation:** add journal-backed semantic trajectory projection with stable paging, details, raw events, overview, and change notifications
+* **media:** validate and normalize prompt attachments with safe native-image delivery and explicit fallback outcomes
+* **tools:** consume hardened ViewImage metadata and delivery behavior from aionrs v0.2.20
+
+### Bug Fixes
+
+* **trajectory:** preserve folded records across paging and incremental cursor boundaries
+
 ## [0.1.82](https://github.com/suoak/AionCore/compare/v0.1.81...v0.1.82) (2026-08-21)
 
 ### Bug Fixes
