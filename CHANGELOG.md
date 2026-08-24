@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.84](https://github.com/suoak/AionCore/compare/v0.1.83...v0.1.84) (2026-08-24)
+
+### Bug Fixes
+
+* **auth:** harden CSRF validation for pre-tool hooks and provider status checks
+* **runtime:** improve graceful shutdown, watchdog handling, PATH diagnostics, and Windows backend launching
+* **session:** preserve hidden messages, developer instructions, presets, titles, and ACP error diagnostics
+* **realtime:** isolate filesystem subscriptions and tolerate malformed replacement characters
+* **services:** reuse cron services and bound skill-lock and login-path waits
+
+### Dependencies
+
+* **aionrs:** update all agent, provider, protocol, configuration, type, and MCP crates to v0.2.21
+
 ## [0.1.83](https://github.com/suoak/AionCore/compare/v0.1.82...v0.1.83) (2026-08-23)
 
 ### Features
