@@ -37,7 +37,7 @@ use crate::event::{LocalizedText, NoticeLevel};
 /// on does complete turns and passes the suite, so the gate walks forward over
 /// 0.147.0 and leaves it unverified rather than a floor anyone can install into.
 pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.235";
-pub const VERIFIED_CODEX_VERSION: &str = "0.149.0";
+pub const VERIFIED_CODEX_VERSION: &str = "0.149.1";
 pub const VERIFIED_AGY_VERSION: &str = "1.1.19";
 
 /// The verified release for a direct-CLI backend, keyed by the program name the
@@ -456,10 +456,10 @@ mod tests {
 
     #[test]
     fn components_compare_numerically_not_lexically() {
-        // The bug a string compare would introduce: "0.149.0" < "0.99.0"
+        // The bug a string compare would introduce: "0.149.1" < "0.99.0"
         // lexically, but 149 > 99.
         assert_eq!(classify("0.99.0", VERIFIED_CODEX_VERSION), VersionVerdict::Older);
-        assert_eq!(classify("0.149.1", VERIFIED_CODEX_VERSION), VersionVerdict::Newer);
+        assert_eq!(classify("0.149.2", VERIFIED_CODEX_VERSION), VersionVerdict::Newer);
     }
 
     #[test]
@@ -578,10 +578,10 @@ mod tests {
         // verified release is told nothing, and this breaks if a bump lands
         // without re-verifying against that exact binary.
         assert_eq!(
-            classify("codex-cli 0.149.0", VERIFIED_CODEX_VERSION),
+            classify("codex-cli 0.149.1", VERIFIED_CODEX_VERSION),
             VersionVerdict::Verified
         );
-        assert!(drift_notice("codex", "codex-cli 0.149.0", VERIFIED_CODEX_VERSION).is_none());
+        assert!(drift_notice("codex", "codex-cli 0.149.1", VERIFIED_CODEX_VERSION).is_none());
     }
 
     #[test]
