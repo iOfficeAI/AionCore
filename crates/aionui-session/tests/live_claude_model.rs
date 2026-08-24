@@ -179,17 +179,20 @@ async fn selection_is_the_model_that_actually_runs() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "LIVE: spawns the real claude CLI and spends tokens"]
 async fn default_row_defers_to_the_user_config_instead_of_pinning_a_model() {
-    // Default sends no set_model, so the reconcile stays silent by design — the
-    // observable is that an explicit selection DOES move the model, i.e. Default is not
-    // silently forcing the same one.
-    assert_eq!(
-        running_model_for(Some("default")).await,
-        None,
-        "the Default row must send no set_model at all (nothing to reconcile)"
-    );
-
-    let explicit = running_model_for(Some("haiku"))
+    let via_default_row = running_model_for(Some("default"))
         .await
-        .expect("an explicit selection must be observable");
-    println!("explicit selection ran: {explicit}");
+        .expect("every run reports its model, selection or not");
+    let via_no_selection = running_model_for(None)
+        .await
+        .expect("every run reports its model, selection or not");
+    println!("Default row ran: {via_default_row} | no selection ran: {via_no_selection}");
+
+    // The invariant, independent of whose machine this runs on: our Default row must be
+    // INDISTINGUISHABLE from making no selection at all. `--model default` broke exactly
+    // this — it pinned the account default and ignored the user's ANTHROPIC_MODEL, so the
+    // two diverged (probed: claude-opus-4-8[1m] vs claude-opus-5[1m]).
+    assert_eq!(
+        via_default_row, via_no_selection,
+        "the Default row must defer to the user's config, not pin a model"
+    );
 }

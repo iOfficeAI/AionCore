@@ -2171,28 +2171,33 @@ fn register_or_clear_pending(
     }
 }
 
-/// Check that the in-band `set_model` we sent at spawn/wake actually took effect.
+/// Report the model this process run is ACTUALLY on, and check it against the in-band
+/// `set_model` we sent at spawn/wake.
 ///
-/// claude does NOT validate a model id: neither `--model <bogus>` nor
-/// `set_model{<bogus>}` fails at spawn — the id is echoed back in `system.init.model`
-/// verbatim and the turn only dies with `result{is_error:true}` once the user sends a
-/// message (LIVE-PROBED 2.1.231 for BOTH paths, so this is pre-existing behaviour, not
-/// a cost of going in-band). The primary guard is upstream: the app layer drops a
-/// selection that is not in the catalog before it is ever sent. This is the backstop
-/// for what upstream cannot see — a row that exists but resolves elsewhere, or a
-/// `set_model` claude silently ignored — so a "the model I picked is not the one
-/// running" report is diagnosable from an `info`-level production log.
+/// Every claude process run gets exactly one `info` line naming the concrete model it is
+/// running. That line is the only production-visible answer to "which model did this
+/// conversation actually use": the picker shows our ROW id (`opus`, `default`), the
+/// `--model` flag is gone, and a "Default" session sends nothing at all — so without it,
+/// the most common case (no explicit selection) would leave no trace whatsoever.
+///
+/// The check on top is needed because claude does NOT validate a model id: neither
+/// `--model <bogus>` nor `set_model{<bogus>}` fails at spawn — the id is echoed back in
+/// `system.init.model` verbatim and the turn only dies with `result{is_error:true}` once
+/// the user sends a message (LIVE-PROBED 2.1.231 for BOTH paths, so this is pre-existing
+/// behaviour, not a cost of going in-band). The primary guard is upstream: the app layer
+/// drops a selection that is not in the catalog before it is ever sent. This is the
+/// backstop for what upstream cannot see — a row that exists but resolves elsewhere, or a
+/// `set_model` claude silently ignored.
 ///
 /// Compares against `resolved_models[selection]`, NOT the selection itself:
 /// `system.init.model` reports the RESOLVED concrete id (selection `haiku` → init
 /// `claude-haiku-4-5`).
 ///
-/// Runs ONLY when we sent a `set_model` (`desired` is `Some`). This is load-bearing,
-/// not an optimization: for the "Default" row we send nothing, and its own
-/// `resolvedModel` does NOT account for `ANTHROPIC_MODEL` (LIVE-PROBED 2.1.231: the
-/// `default` row reports `resolvedModel: claude-opus-4-8[1m]` while the process
-/// actually runs `claude-opus-5[1m]` from the env), so checking it would fire a false
-/// mismatch on every default session.
+/// A run with NO selection sent is reported but never compared. That is load-bearing,
+/// not an optimization: the `default` row's own `resolvedModel` does NOT account for
+/// `ANTHROPIC_MODEL` (LIVE-PROBED 2.1.231 — the row reports
+/// `resolvedModel: claude-opus-4-8[1m]` while the process runs `claude-opus-5[1m]` from
+/// the env), so comparing against it would fire a false mismatch on every such session.
 fn reconcile_init_model(
     frame: &serde_json::Value,
     desired_model: &Arc<std::sync::Mutex<Option<String>>>,
@@ -2207,11 +2212,26 @@ fn reconcile_init_model(
         .clone();
     match check_init_model(frame, desired.as_deref(), &resolved) {
         InitModelCheck::NotChecked => {}
+        // No selection was sent, so claude resolved the model from the user's own config
+        // (`ANTHROPIC_MODEL` / account default) exactly as the terminal CLI does.
+        InitModelCheck::ResolvedByCli { running } => tracing::info!(
+            session_id = %session_id,
+            running_model = %running,
+            "claude session model resolved from the user's claude config (no selection sent)"
+        ),
         InitModelCheck::Applied { requested, running } => tracing::info!(
             session_id = %session_id,
             requested_model = %requested,
             running_model = %running,
             "claude set_model applied"
+        ),
+        // Reported, but the catalog row is missing (or carries no `resolvedModel`), so
+        // there is nothing to compare against — still worth naming the running model.
+        InitModelCheck::Unverified { requested, running } => tracing::info!(
+            session_id = %session_id,
+            requested_model = %requested,
+            running_model = %running,
+            "claude session running model (selection not verifiable: no catalog row yet)"
         ),
         InitModelCheck::Mismatch {
             requested,
@@ -2231,10 +2251,18 @@ fn reconcile_init_model(
 /// are unit-testable without a live reader.
 #[derive(Debug, PartialEq, Eq)]
 enum InitModelCheck {
-    /// Not an init frame, no `set_model` was sent, no reported model, or no catalog row
-    /// to compare against.
+    /// Not an init frame, or an init frame that names no model — nothing to report.
     NotChecked,
+    /// No selection was sent; the CLI resolved the model from the user's config.
+    ResolvedByCli {
+        running: String,
+    },
     Applied {
+        requested: String,
+        running: String,
+    },
+    /// A selection was sent but cannot be checked (no catalog row to resolve it).
+    Unverified {
         requested: String,
         running: String,
     },
@@ -2256,16 +2284,19 @@ fn check_init_model(
     {
         return InitModelCheck::NotChecked;
     }
-    let Some(desired) = desired else {
-        return InitModelCheck::NotChecked;
-    };
     let Some(reported) = frame.get("model").and_then(Value::as_str) else {
         return InitModelCheck::NotChecked;
     };
-    // No catalog row (or a row without `resolvedModel`) → nothing to compare against.
-    // Silent: the catalog may simply not have landed on this process yet.
+    let Some(desired) = desired else {
+        return InitModelCheck::ResolvedByCli {
+            running: reported.to_owned(),
+        };
+    };
     let Some(expected) = resolved_models.get(desired) else {
-        return InitModelCheck::NotChecked;
+        return InitModelCheck::Unverified {
+            requested: desired.to_owned(),
+            running: reported.to_owned(),
+        };
     };
     // A selection may be the concrete id itself, in which case the reported id equals it
     // directly rather than going through the row's resolution.
@@ -5776,23 +5807,33 @@ mod tests {
                 running: "claude-opus-5[1m]".into()
             }
         );
-        // The Default row sends nothing, so there is nothing to check — and checking it
-        // WOULD misfire: its resolvedModel ignores ANTHROPIC_MODEL, so a default session
-        // legitimately runs `claude-opus-5[1m]` while the row says `claude-opus-4-8[1m]`
-        // (LIVE-PROBED 2.1.231).
+        // No selection sent (the Default row): REPORTED but never compared. Comparing
+        // would misfire — the `default` row's resolvedModel ignores ANTHROPIC_MODEL, so
+        // such a session legitimately runs `claude-opus-5[1m]` while the row says
+        // `claude-opus-4-8[1m]` (LIVE-PROBED 2.1.231). Reporting it is the ONLY trace of
+        // what the most common case actually ran.
         assert_eq!(
             check_init_model(&init("claude-opus-5[1m]"), None, &resolved),
-            InitModelCheck::NotChecked,
-            "no set_model sent ⇒ no verdict"
+            InitModelCheck::ResolvedByCli {
+                running: "claude-opus-5[1m]".into()
+            },
+            "no set_model sent ⇒ report the running model, do not judge it"
         );
-        // Catalog not landed yet / row unknown → silent, not a false alarm.
+        // Catalog not landed yet / row unknown → report without a verdict, never a false
+        // alarm.
         assert_eq!(
             check_init_model(&init("whatever"), Some("haiku"), &std::collections::HashMap::new()),
-            InitModelCheck::NotChecked
+            InitModelCheck::Unverified {
+                requested: "haiku".into(),
+                running: "whatever".into()
+            }
         );
         assert_eq!(
             check_init_model(&init("whatever"), Some("not-a-row"), &resolved),
-            InitModelCheck::NotChecked
+            InitModelCheck::Unverified {
+                requested: "not-a-row".into(),
+                running: "whatever".into()
+            }
         );
         // Non-init frames and init frames without a model are ignored.
         assert_eq!(
