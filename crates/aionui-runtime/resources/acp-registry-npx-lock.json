@@ -9,7 +9,7 @@
     "codebuddy": {
       "registry_json_id": "codebuddy-code",
       "package": "@tencent-ai/codebuddy-code",
-      "version": "2.137.1"
+      "version": "2.138.0"
     },
     "deepagents": {
       "registry_json_id": "deepagents",
@@ -19,7 +19,7 @@
     "dimcode": {
       "registry_json_id": "dimcode",
       "package": "dimcode",
-      "version": "0.3.18"
+      "version": "0.3.19"
     },
     "dirac": {
       "registry_json_id": "dirac",
