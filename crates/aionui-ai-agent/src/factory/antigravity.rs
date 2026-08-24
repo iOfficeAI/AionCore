@@ -123,6 +123,15 @@ pub(super) async fn build(
     let mut runtime_env = ctx.runtime_env.clone();
     runtime_env.extend(hook_env);
 
+    let delivery = crate::factory::resolve_skill_delivery(
+        deps.as_ref(),
+        &ctx.user_id,
+        &ctx.conversation_id,
+        &config.skills,
+        &meta,
+    )
+    .await;
+
     let instance = crate::session_agent::build_antigravity_instance(
         crate::session_agent::SessionBuildInputs {
             conversation_id: ctx.conversation_id.clone(),
@@ -130,6 +139,7 @@ pub(super) async fn build(
             workspace: ctx.workspace.clone(),
             config: &config,
             metadata: &meta,
+            skill_delivery: delivery,
             session_snapshot: build_context.session_snapshot.as_ref(),
             backend_session_id: build_context.session_id.clone(),
             mcp_server_repo: deps.mcp_server_repo.as_ref(),

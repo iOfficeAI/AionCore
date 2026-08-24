@@ -37,6 +37,19 @@ pub struct SkillDeliveryPlan {
     pub unknown_placeholders: Vec<String>,
 }
 
+/// "Deliver nothing", which is what the safe default mode with an empty snapshot
+/// produces. Used by tests that do not exercise skill delivery.
+impl Default for SkillDeliveryPlan {
+    fn default() -> Self {
+        Self {
+            mode: SkillDeliveryMode::Injected,
+            extra_args: Vec::new(),
+            protocol_skills_root: None,
+            unknown_placeholders: Vec::new(),
+        }
+    }
+}
+
 pub fn plan_skill_delivery(input: SkillDeliveryPlanInput) -> SkillDeliveryPlan {
     let delivery = input.delivery.unwrap_or_else(SkillDelivery::injected_default);
     let mode = delivery.mode.clone();
