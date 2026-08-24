@@ -1130,6 +1130,7 @@ mod tests {
                 .map(|name| LoadedAgentSkill {
                     name: name.clone(),
                     body: format!("{name} body"),
+                    source_path: std::path::PathBuf::from(format!("/src/{name}")),
                 })
                 .collect()
         }

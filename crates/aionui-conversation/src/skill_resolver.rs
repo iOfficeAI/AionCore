@@ -14,6 +14,14 @@ use tracing::warn;
 pub struct LoadedAgentSkill {
     pub name: String,
     pub body: String,
+    /// Absolute skill root.
+    ///
+    /// Load-bearing, not decoration: skill bodies reference their own files
+    /// relatively (`references/workflows.md`, `scripts/init_skill.py`), and
+    /// without a stated root the agent resolves those against its CWD -- the
+    /// workspace. That either fails silently or, worse, reads an unrelated
+    /// same-named user file.
+    pub source_path: std::path::PathBuf,
 }
 
 #[async_trait]
@@ -92,6 +100,7 @@ async fn load_resolved_skill_bodies(skills: &[ResolvedAgentSkill]) -> Vec<Loaded
             Ok(content) => loaded.push(LoadedAgentSkill {
                 name: skill.name.clone(),
                 body: extract_skill_body(&content),
+                source_path: skill.source_path.clone(),
             }),
             Err(e) => {
                 warn!(
