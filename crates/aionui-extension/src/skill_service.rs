@@ -3423,6 +3423,50 @@ mod tests {
         }
     }
 
+    /// Auto-inject descriptions are a per-session resident cost: they are
+    /// injected into every conversation's skills index and count toward a
+    /// native CLI's always-on catalog. Keep each one inside the budget so
+    /// no description is ever truncated mid-sentence.
+    const MAX_AUTO_INJECT_DESCRIPTION_CHARS: usize = 200;
+
+    #[test]
+    fn auto_inject_skill_descriptions_stay_within_injection_budget() {
+        let auto_dir = BUILTIN_SKILLS
+            .get_dir(BUILTIN_AUTO_SKILLS_SUBDIR)
+            .expect("embedded corpus must contain the auto-inject subdirectory");
+
+        let mut checked = 0;
+        let mut failures = Vec::new();
+
+        for subdir in auto_dir.dirs() {
+            let location = subdir.path().join(SKILL_MANIFEST_FILE);
+            let Some(file) = BUILTIN_SKILLS.get_file(&location) else {
+                failures.push(format!("{}: missing {SKILL_MANIFEST_FILE}", subdir.path().display()));
+                continue;
+            };
+
+            let content = std::str::from_utf8(file.contents())
+                .unwrap_or_else(|err| panic!("{}: not UTF-8: {err}", location.display()));
+            // Measure the parsed value, not the raw YAML: a folded block
+            // scalar is what gets injected, not the `>-` source text.
+            let (_, description) = parse_frontmatter_fields(content)
+                .unwrap_or_else(|| panic!("{}: invalid frontmatter or missing description", location.display()));
+
+            checked += 1;
+            let length = description.chars().count();
+            if length > MAX_AUTO_INJECT_DESCRIPTION_CHARS {
+                failures.push(format!("{}: description is {length} chars", location.display()));
+            }
+        }
+
+        assert!(checked >= 5, "expected at least 5 auto-inject skills, got {checked}");
+        assert!(
+            failures.is_empty(),
+            "auto-inject skill descriptions must stay within {MAX_AUTO_INJECT_DESCRIPTION_CHARS} chars:\n{}",
+            failures.join("\n")
+        );
+    }
+
     #[tokio::test]
     async fn embedded_lists_auto_inject_from_corpus() {
         let tmp = TempDir::new().unwrap();
