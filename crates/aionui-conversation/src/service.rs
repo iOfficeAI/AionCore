@@ -1324,6 +1324,22 @@ impl ConversationService {
             }
         }
 
+        // Build the per-conversation skill VIEW under AionUi's own data dir.
+        //
+        // Unconditional on the delivery mode, unlike the workspace wiring above:
+        // the view is our own tree, so building it for every conversation means a
+        // mode flipped in the registry (a data-only change) needs no
+        // per-conversation backfill to take effect.
+        if !initial_skills.is_empty() {
+            let resolved = self
+                .skill_resolver
+                .resolve_skills_for_user(user_id, &initial_skills)
+                .await;
+            if !resolved.is_empty() {
+                self.skill_resolver.sync_skill_view(user_id, &id, &resolved).await;
+            }
+        }
+
         if let Some(obj) = extra.as_object_mut() {
             obj.insert(
                 "skills".to_owned(),
@@ -2627,6 +2643,11 @@ impl ConversationService {
         for hook in hooks {
             hook.on_conversation_deleted(user_id, id).await;
         }
+
+        // Drop the skill view while the row still exists: nothing downstream
+        // knows the (user, conversation) pair once it is gone, and a leaked view
+        // then waits for the next startup sweep.
+        self.skill_resolver.remove_skill_view(user_id, id).await;
 
         if let Err(err) = self.conversation_repo.delete(user_id, id).await {
             self.runtime_state.clear_deleting(id);
@@ -4854,6 +4875,13 @@ impl ConversationService {
         let context = &build_opts.context;
         let backend = context_backend_value(context);
 
+        // Re-sync the skill VIEW first, and unconditionally: build-task runs on
+        // every session open, so this is where a view deleted out-of-band (or
+        // never built, on a conversation created before this feature) comes back.
+        // Deliberately outside the auto-workspace guard below -- that guard is
+        // about writing into the workspace, which the view does not do.
+        self.ensure_session_skill_view(context).await;
+
         let workspace = PathBuf::from(context.workspace.path.trim());
         if !context.workspace.is_custom {
             let expected_workspace = expected_auto_workspace_path(
@@ -4907,6 +4935,29 @@ impl ConversationService {
             links = n,
             "ensured skill symlinks in auto workspace"
         );
+    }
+
+    /// Rebuild this conversation's skill view directory from its snapshot.
+    ///
+    /// Idempotent and independent of the workspace: the view lives under
+    /// AionUi's data dir, so unlike the workspace wiring this needs no
+    /// auto-workspace-path guard and runs for every agent regardless of the
+    /// vendor's declared delivery mode.
+    pub(crate) async fn ensure_session_skill_view(&self, context: &AgentSessionContext) {
+        let skill_names = context_skill_names(context);
+        if skill_names.is_empty() {
+            return;
+        }
+        let resolved = self
+            .skill_resolver
+            .resolve_skills_for_user(&context.conversation.user_id, &skill_names)
+            .await;
+        if resolved.is_empty() {
+            return;
+        }
+        self.skill_resolver
+            .sync_skill_view(&context.conversation.user_id, context.conversation_id(), &resolved)
+            .await;
     }
 
     /// Write the resolved workspace back to `conversation.extra.workspace` when

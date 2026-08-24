@@ -64,9 +64,17 @@ struct SkillLinkCall {
     skill_names: Vec<String>,
 }
 
+struct RecordedViewSync {
+    user_id: String,
+    conversation_id: String,
+    skill_names: Vec<String>,
+}
+
 struct RecordingSkillResolver {
     names: Vec<String>,
     links: Arc<Mutex<Vec<SkillLinkCall>>>,
+    views: Arc<Mutex<Vec<RecordedViewSync>>>,
+    view_removals: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 struct StaticAssistantDispatcher {
@@ -117,6 +125,8 @@ impl RecordingSkillResolver {
         Self {
             names,
             links: Arc::new(Mutex::new(Vec::new())),
+            views: Arc::new(Mutex::new(Vec::new())),
+            view_removals: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -157,6 +167,22 @@ impl SkillResolver for RecordingSkillResolver {
             }
         }
         linked
+    }
+
+    async fn sync_skill_view(&self, user_id: &str, conversation_id: &str, skills: &[ResolvedAgentSkill]) -> usize {
+        self.views.lock().unwrap().push(RecordedViewSync {
+            user_id: user_id.to_owned(),
+            conversation_id: conversation_id.to_owned(),
+            skill_names: skills.iter().map(|skill| skill.name.clone()).collect(),
+        });
+        skills.len()
+    }
+
+    async fn remove_skill_view(&self, user_id: &str, conversation_id: &str) {
+        self.view_removals
+            .lock()
+            .unwrap()
+            .push((user_id.to_owned(), conversation_id.to_owned()));
     }
 }
 
@@ -8675,6 +8701,119 @@ async fn warmup_restores_skill_links_for_custom_workspace() {
     assert_eq!(calls[0].skill_names, vec!["cron"]);
 }
 
+/// The view directory is the new landing site. This asserts it is built from the
+/// snapshot; it says nothing about the workspace yet -- both paths coexist
+/// deliberately until the workspace delivery is removed.
+#[tokio::test]
+async fn create_builds_the_session_skill_view_from_the_snapshot() {
+    let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
+    let views = resolver.views.clone();
+    let (svc, _broadcaster, _repo, _task_mgr) =
+        make_service_with_resolver_and_agent_metadata_repo(resolver, Arc::new(ClaudeNativeSkillMetadataRepo));
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": ensure_test_workspace_path(), "backend": "claude" },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    let calls = views.lock().unwrap();
+    assert_eq!(calls.len(), 1, "exactly one view rebuild per created conversation");
+    assert_eq!(calls[0].user_id, "user-1");
+    assert_eq!(calls[0].conversation_id, resp.id);
+    assert_eq!(calls[0].skill_names, vec!["cron"]);
+}
+
+/// The view is built for EVERY agent, not only for vendors that consume it, so
+/// flipping a delivery mode in the registry needs no per-conversation backfill.
+/// This agent has no `native_skills_dirs` at all, which used to mean "no skill
+/// wiring happens".
+#[tokio::test]
+async fn create_builds_the_view_even_for_an_agent_without_native_skill_dirs() {
+    let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
+    let views = resolver.views.clone();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_resolver(resolver);
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": ensure_test_workspace_path(), "backend": "opencode" },
+    }))
+    .unwrap();
+    svc.create("user-1", req).await.unwrap();
+
+    assert_eq!(views.lock().unwrap().len(), 1);
+}
+
+/// An empty snapshot must not produce a view rebuild: there is nothing to link,
+/// and an empty plugin root would still cost the agent an always-on token line.
+#[tokio::test]
+async fn create_with_no_skills_does_not_build_a_view() {
+    let resolver = Arc::new(RecordingSkillResolver::new(Vec::new()));
+    let views = resolver.views.clone();
+    let (svc, _broadcaster, _repo, _task_mgr) =
+        make_service_with_resolver_and_agent_metadata_repo(resolver, Arc::new(ClaudeNativeSkillMetadataRepo));
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": ensure_test_workspace_path(), "backend": "claude" },
+    }))
+    .unwrap();
+    svc.create("user-1", req).await.unwrap();
+
+    assert!(views.lock().unwrap().is_empty());
+}
+
+/// Deleting a conversation must drop its view -- nothing else will, and the
+/// owner is only knowable while the row still exists.
+#[tokio::test]
+async fn deleting_a_conversation_removes_its_skill_view() {
+    let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
+    let removals = resolver.view_removals.clone();
+    let (svc, _broadcaster, _repo, _task_mgr) =
+        make_service_with_resolver_and_agent_metadata_repo(resolver, Arc::new(ClaudeNativeSkillMetadataRepo));
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": ensure_test_workspace_path(), "backend": "claude" },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+    svc.delete("user-1", &resp.id).await.unwrap();
+
+    let calls = removals.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0], ("user-1".to_owned(), resp.id.clone()));
+}
+
+/// Warmup re-syncs the view idempotently: build-task runs on every session open,
+/// and a view removed out-of-band must come back.
+#[tokio::test]
+async fn warmup_resyncs_the_skill_view() {
+    let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
+    let views = resolver.views.clone();
+    let (svc, _broadcaster, _repo, _task_mgr) =
+        make_service_with_resolver_and_agent_metadata_repo(resolver, Arc::new(ClaudeNativeSkillMetadataRepo));
+    let workspace = unique_test_workspace_path("view-warmup");
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace, "backend": "claude" },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+    views.lock().unwrap().clear();
+
+    let task_mgr: Arc<dyn IWorkerTaskManager> =
+        Arc::new(MockTaskManagerWithWorkspace::new(workspace.to_str().unwrap()));
+    svc.warmup("user-1", &resp.id, &task_mgr).await.unwrap();
+
+    let calls = views.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].conversation_id, resp.id);
+    assert_eq!(calls[0].skill_names, vec!["cron"]);
+}
+
 #[tokio::test]
 async fn update_rejects_extra_skills() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
@@ -9216,10 +9355,7 @@ async fn a_deferred_cancel_does_not_leak_into_a_later_turn() {
 async fn session_not_found_clears_the_persisted_session_id() {
     let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("df6f811c-dead-session"));
     let (svc, _broadcaster, _repo, task_mgr) = make_service_with_resolver_and_acp_session_repo(
-        Arc::new(RecordingSkillResolver {
-            names: Vec::new(),
-            links: Arc::new(Mutex::new(Vec::new())),
-        }),
+        Arc::new(RecordingSkillResolver::new(Vec::new())),
         acp_repo.clone(),
     );
 
@@ -9254,10 +9390,7 @@ async fn other_terminal_errors_keep_the_session_id_for_replay() {
     ] {
         let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-live"));
         let (svc, _b, _r, task_mgr) = make_service_with_resolver_and_acp_session_repo(
-            Arc::new(RecordingSkillResolver {
-                names: Vec::new(),
-                links: Arc::new(Mutex::new(Vec::new())),
-            }),
+            Arc::new(RecordingSkillResolver::new(Vec::new())),
             acp_repo.clone(),
         );
 
@@ -9285,10 +9418,7 @@ async fn other_terminal_errors_keep_the_session_id_for_replay() {
 async fn a_clean_finish_leaves_the_session_id_alone() {
     let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("live-session"));
     let (svc, _b, _r, task_mgr) = make_service_with_resolver_and_acp_session_repo(
-        Arc::new(RecordingSkillResolver {
-            names: Vec::new(),
-            links: Arc::new(Mutex::new(Vec::new())),
-        }),
+        Arc::new(RecordingSkillResolver::new(Vec::new())),
         acp_repo.clone(),
     );
 
@@ -9317,10 +9447,7 @@ async fn a_clean_finish_leaves_the_session_id_alone() {
 async fn session_not_found_during_task_build_clears_the_persisted_session_id() {
     let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("deb7c49d-dead"));
     let (svc, _b, _r, _task_mgr) = make_service_with_resolver_and_acp_session_repo(
-        Arc::new(RecordingSkillResolver {
-            names: Vec::new(),
-            links: Arc::new(Mutex::new(Vec::new())),
-        }),
+        Arc::new(RecordingSkillResolver::new(Vec::new())),
         acp_repo.clone(),
     );
 
@@ -9339,10 +9466,7 @@ async fn session_not_found_during_task_build_clears_the_persisted_session_id() {
 async fn other_build_failures_keep_the_persisted_session_id() {
     let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-live"));
     let (svc, _b, _r, _task_mgr) = make_service_with_resolver_and_acp_session_repo(
-        Arc::new(RecordingSkillResolver {
-            names: Vec::new(),
-            links: Arc::new(Mutex::new(Vec::new())),
-        }),
+        Arc::new(RecordingSkillResolver::new(Vec::new())),
         acp_repo.clone(),
     );
 

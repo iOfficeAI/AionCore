@@ -1729,6 +1729,10 @@ pub async fn build_antigravity_instance(
         mcp_servers,
         skills: config.skills.clone(),
         preset_context: config.preset_context.clone(),
+        // agy is a layer-2 vendor: no protocol root, and its skill dirs are
+        // wired in with its injection path.
+        skill_view_skills_dir: None,
+        skill_dirs: Vec::new(),
         session_snapshot: None,
         resume: matches!(spec, aionui_session::SessionSpec::Resume { .. }),
     };
@@ -1855,6 +1859,9 @@ pub async fn build_session_instance(
         mcp_servers,
         skills: config.skills.clone(),
         preset_context: config.preset_context.clone(),
+        // Layer-1 delivery paths, wired in with the per-vendor delivery plan.
+        skill_view_skills_dir: None,
+        skill_dirs: Vec::new(),
         // acp/codex resume via SessionSpec::Resume; no in-band snapshot needed.
         session_snapshot: None,
         resume: matches!(spec, SessionSpec::Resume { .. }),
