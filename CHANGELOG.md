@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.72](https://github.com/iOfficeAI/AionCore/compare/v0.1.71...v0.1.72) (2026-08-24)
+
+
+### Features
+
+* **auth:** account/secret CLI and decoupled encryption root ([#917](https://github.com/iOfficeAI/AionCore/issues/917)) ([0251be7](https://github.com/iOfficeAI/AionCore/commit/0251be76481c56283edbe067bfac548d7d45d534))
+* **conversation:** persist plan snapshots and expose them for rehydration ([#916](https://github.com/iOfficeAI/AionCore/issues/916)) ([b2f12e9](https://github.com/iOfficeAI/AionCore/commit/b2f12e952ec8e71ed37f6240108998c9d7b016a1))
+* **sidebar:** tear down agent processes on archive ([#925](https://github.com/iOfficeAI/AionCore/issues/925)) ([7ac84f9](https://github.com/iOfficeAI/AionCore/commit/7ac84f93c5f81e1b1cc41f8119c089df72d63afc))
+
+
+### Bug Fixes
+
+* **auth:** extend JWT TTL to 30d to match cookie ([#918](https://github.com/iOfficeAI/AionCore/issues/918)) ([ecbedfa](https://github.com/iOfficeAI/AionCore/commit/ecbedfa622e80b7141cf1f0ab7dd007b23d1714d))
+* **claude:** apply model selection in-band so it matches the claude CLI ([#928](https://github.com/iOfficeAI/AionCore/issues/928)) ([706a2eb](https://github.com/iOfficeAI/AionCore/commit/706a2ebec8bb33f48e6d2a5fd93a72d91c982d01))
+* **cli:** register unindexed top-level subcommands in the capability index ([#929](https://github.com/iOfficeAI/AionCore/issues/929)) ([c490161](https://github.com/iOfficeAI/AionCore/commit/c490161df4ee7ab34830e81a67473d416ca78f03))
+
+
+### Performance Improvements
+
+* slim auto-inject skill descriptions to the injection budget ([#930](https://github.com/iOfficeAI/AionCore/issues/930)) ([9b7e4ce](https://github.com/iOfficeAI/AionCore/commit/9b7e4cee9c14faabb4965bc364e3a093c1813e61))
+
 ## [0.1.71](https://github.com/iOfficeAI/AionCore/compare/v0.1.70...v0.1.71) (2026-08-21)
 
 
