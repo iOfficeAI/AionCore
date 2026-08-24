@@ -144,8 +144,9 @@ fn prepend_args(head: &[String], tail: &[String]) -> Vec<String> {
 ///   ("System prompt to use for the session" vs "Append a system prompt to the default
 ///   system prompt", verified: `claude --help`, 2.1.234), silently stripping the
 ///   harness's own guidance — the same defect class as codex `baseInstructions`.
-/// - `model` → `--model`; `mode` → `--permission-mode` (claude has no in-band
-///   switch at spawn; a UI switch persists + evicts so the rebuild re-applies here).
+/// - `mode` → `--permission-mode` (claude has no in-band switch at spawn; a UI switch
+///   persists + evicts so the rebuild re-applies here). `model` is deliberately NOT
+///   mapped to `--model` — see the comment at the end of this fn.
 ///
 /// claude's `--mcp-config` uses a MAP shape `{"mcpServers":{"<name>":{…}}}` (NOT the
 /// ACP array), so this builds its own JSON rather than reusing `acp_conn`'s array
@@ -242,10 +243,27 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
     // show a single-question permission card — removing the flag is the claude
     // half of P0; the adapter routes the tool to `Ask`, never to `Permission`.
 
-    if let Some(model) = config.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        args.push("--model".to_string());
-        args.push(model.to_string());
-    }
+    // NO `--model` FLAG — the selection is applied in-band via
+    // `control_request{set_model}` after the spawn (see `apply_desired_model`).
+    //
+    // LIVE-PROBED 2.1.231, why the flag cannot carry our selection:
+    //   1. `--model default` is NOT a no-op. Our picker's "Default" row has the wire
+    //      value `default`, and passing it OVERRIDES the user's own `ANTHROPIC_MODEL`
+    //      (`~/.claude/settings.json` env block): with `ANTHROPIC_MODEL=claude-opus-5[1m]`,
+    //      `system.init.model` is `claude-opus-5[1m]` with NO flag but
+    //      `claude-opus-4-8[1m]` with `--model default`. So the flag silently ran a
+    //      DIFFERENT model than the CLI would for the same config.
+    //   2. The `initialize` catalog (`response.models[]`) is a FUNCTION of this flag —
+    //      no flag → 6 rows (incl. the `ANTHROPIC_MODEL` row, e.g. "Opus 5 (1M context)"),
+    //      `--model default` → 6 rows but that row becomes "Opus 4.8 (1M context)",
+    //      `--model opus` → 5 rows (the row is dropped). Since the catalog is persisted
+    //      per-AGENT (last write wins), a session spawned with an alias ERASED a model
+    //      the picker was offering everyone else. Spawning flagless makes the catalog
+    //      constant AND identical to what `/model` shows in the terminal.
+    // `set_model` applies before the first turn (init reports the switched model) and
+    // is re-applied on every `--resume` respawn, because claude does NOT restore a
+    // session's model on resume (LIVE-PROBED: resume without the flag reports the
+    // default model, not the one the session was set to).
 
     args
 }
@@ -350,6 +368,10 @@ impl BackendConnection for ClaudeConnection {
         // first `capabilities()` read; a late response is merged on the next read
         // (same late-discovery contract as codex `model/list`).
         backend.request_initialize().await;
+        // Apply the model selection in-band (the removed `--model` flag's replacement).
+        // Ordered AFTER initialize purely for log readability — both are written before
+        // any prompt, which is all the ordering the CLI requires.
+        backend.apply_desired_model().await;
         // Report a claude whose version differs from the release AionUi
         // verified. claude runs from the user's own install (nothing is
         // bundled), so this is the same situation agy has always been in.
@@ -475,7 +497,34 @@ pub struct ClaudeSessionBackend {
     /// One-shot first-turn title generation (spec 2026-08-04). Shared with the
     /// reader via `reader_state`; `dispatch(Send)` records the first prompt text.
     title_gen: Arc<TitleGenState>,
+    /// The model row id to ask claude for via in-band `set_model`, `None` for the
+    /// "Default" row (expressed by sending nothing — see `build_claude_init_args` for
+    /// why the `--model` flag cannot express our selection). Applied after the
+    /// initialize request at open, RE-APPLIED after every F-4 wake (claude does NOT
+    /// restore a session's model on `--resume`, LIVE-PROBED 2.1.231), and rewritten by
+    /// `dispatch(SetModel)` so a wake re-applies the user's CURRENT pick. Shared with
+    /// the reader, which checks it against `system/init` (`reconcile_init_model`).
+    desired_model: Arc<std::sync::Mutex<Option<String>>>,
 }
+
+/// The `set_model` target for a config selection, or `None` when nothing should be
+/// sent.
+///
+/// Our model picker's first row is claude's own `default` row, meaning "use whatever
+/// the user's config resolves to". That intent is expressed by sending NO model at
+/// all: passing the literal `default` is NOT a no-op — it OVERRIDES the user's
+/// `ANTHROPIC_MODEL` (LIVE-PROBED 2.1.231; see `build_claude_init_args`), which
+/// silently ran a different model than the terminal CLI would for the same config.
+fn desired_model_from_config(model: Option<&str>) -> Option<String> {
+    model
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != CLAUDE_DEFAULT_MODEL_ROW)
+        .map(str::to_owned)
+}
+
+/// claude's own wire id for the "use my configured default" row of `models[]`
+/// (LIVE-PROBED 2.1.231: `{"value":"default","displayName":"Default"}`).
+const CLAUDE_DEFAULT_MODEL_ROW: &str = "default";
 
 /// First-turn session-title generation state (spec 2026-08-04, retry semantics
 /// 2026-08-13).
@@ -697,6 +746,16 @@ struct ClaudeWakeRecipe {
 struct DiscoveredCaps {
     models: Vec<crate::capability::ModelInfo>,
     slash_commands: Vec<crate::capability::SlashCommandInfo>,
+    /// Row id → the CONCRETE model that row resolves to, from the initialize
+    /// reply's `models[].resolvedModel` (LIVE-PROBED 2.1.231:
+    /// `{"value":"haiku","resolvedModel":"claude-haiku-4-5"}`).
+    ///
+    /// This is the ONLY basis for checking that an in-band `set_model` landed:
+    /// `system.init.model` reports the RESOLVED id, while our selection is the ROW
+    /// id, and no other field bridges the two (`displayName` is "Default" / "Fable"
+    /// for those rows). Kept private to this module — the reconcile is the only
+    /// consumer today, so it does not need to ride `ModelInfo` across the seam.
+    resolved_models: std::collections::HashMap<String, String>,
 }
 
 /// Session-cumulative cost ledger. claude's `result.total_cost_usd` is
@@ -755,6 +814,12 @@ struct ClaudeReaderState {
     /// reader overwrites it from `system/init` so a post-fork / post-rotation
     /// wake resumes the sid claude actually reported, never the stale spawn id.
     wake_session_slot: Arc<std::sync::Mutex<String>>,
+    /// The model row id we ask claude for via in-band `set_model`, or `None` for the
+    /// "Default" row (which is expressed by sending NOTHING — see
+    /// `build_claude_init_args`). Shared Arc with the backend, which re-applies it on
+    /// every wake and rewrites it on a user switch; the reader only reads it, to check
+    /// the applied model against `system/init` (`reconcile_init_model`).
+    desired_model: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Spawn a claude stdout reader over `stdout`/`io` using the shared state. Used
@@ -799,6 +864,7 @@ fn start_claude_reader(
             state.cost_ledger,
             state.title_gen,
             state.wake_session_slot,
+            state.desired_model,
         )
         .await;
     })
@@ -879,6 +945,15 @@ impl ClaudeSessionBackend {
             last_raw: 0.0,
         }));
 
+        // The selection to apply in-band, `None` for "Default" (see
+        // `desired_model_from_config`). Shared with the reader (landed-check) and
+        // rewritten by dispatch(SetModel) so a later wake re-applies the CURRENT pick,
+        // not the open-time one — which the old `--model` arg could not do, since the
+        // wake recipe replays the spawn args verbatim.
+        let desired_model = Arc::new(std::sync::Mutex::new(desired_model_from_config(
+            config.model.as_deref(),
+        )));
+
         let reader_state = ClaudeReaderState {
             session_id: session_id.clone(),
             turn_gen: turn_gen.clone(),
@@ -893,6 +968,7 @@ impl ClaudeSessionBackend {
             cost_ledger,
             title_gen: title_gen.clone(),
             wake_session_slot: wake.claude_session_id.clone(),
+            desired_model: desired_model.clone(),
         };
         let reader = start_claude_reader(&reader_state, stdout, io.clone());
 
@@ -949,6 +1025,7 @@ impl ClaudeSessionBackend {
             current_mode_override,
             pending_set_config,
             title_gen,
+            desired_model,
         }
     }
 
@@ -991,6 +1068,11 @@ impl ClaudeSessionBackend {
         // writes to the woken process (the old stdin dropped with the old io).
         *self.stdin.lock().await = stdin;
         let reader = start_claude_reader(&self.reader_state, stdout, io.clone());
+        // Re-apply the model selection to the FRESH process: `--resume` does not carry
+        // it (LIVE-PROBED 2.1.231 — a resumed session reports the default model), and it
+        // is no longer in `wake.extra_args` either. Reads the shared slot, so a
+        // mid-session switch is what gets re-applied, not the open-time pick.
+        self.apply_desired_model().await;
         Ok(ProcHandle::new(reader, io))
     }
 
@@ -1322,6 +1404,45 @@ impl ClaudeSessionBackend {
         }
     }
 
+    /// Apply the session's model selection in-band, the replacement for the removed
+    /// `--model` spawn flag (see `build_claude_init_args` for why the flag had to go).
+    ///
+    /// No-op for the "Default" row (`desired_model` is `None`) — that intent IS "send
+    /// nothing", so claude resolves the model from the user's own config exactly as the
+    /// terminal CLI does.
+    ///
+    /// Must be called on EVERY process run — open AND each F-4 wake — because
+    /// `--resume` does NOT restore the model a session was set to (LIVE-PROBED 2.1.231:
+    /// a resume with no flag and no `set_model` reports the default model in
+    /// `system.init.model`, not the one the previous run had switched to).
+    ///
+    /// Written BEFORE the first prompt, which is what makes it take effect for turn 1:
+    /// claude processes it ahead of `system/init`, so the init frame already reports the
+    /// switched model (LIVE-PROBED 2.1.231) and there is no window where a turn runs on
+    /// the default model. Best-effort like `request_initialize` — a write failure leaves
+    /// the run on the default model, which `reconcile_init_model` then reports.
+    async fn apply_desired_model(&self) {
+        let Some(model) = self.desired_model.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return;
+        };
+        tracing::info!(
+            session_id = %self.session_id,
+            requested_model = %model,
+            "claude applying model selection via in-band set_model"
+        );
+        if let Err(e) = self
+            .write_or_queue_control(serde_json::json!({ "subtype": "set_model", "model": model }))
+            .await
+        {
+            tracing::warn!(
+                session_id = %self.session_id,
+                requested_model = %model,
+                error = %e,
+                "claude set_model write failed — the run stays on the default model"
+            );
+        }
+    }
+
     /// Frame + flush one control_request over the retained stdin (same NDJSON path
     /// as a control_response). The CLI's success control_response is observed by the
     /// reader, not awaited here (the switch applies to the next turn).
@@ -1528,6 +1649,7 @@ async fn reader_task(
     cost_ledger: Arc<std::sync::Mutex<CostLedger>>,
     title_gen: Arc<TitleGenState>,
     wake_session_slot: Arc<std::sync::Mutex<String>>,
+    desired_model: Arc<std::sync::Mutex<Option<String>>>,
 ) {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
@@ -1600,6 +1722,12 @@ async fn reader_task(
                     cur_gen,
                     &wake_session_slot,
                 );
+                // Confirm the in-band `set_model` we sent at spawn/wake landed. The
+                // init frame is the ONLY signal for this (a `set_model` sent mid-turn
+                // has no confirmation channel at all — see dispatch(SetModel)), and it
+                // arrives with the first turn of every process run, so a wake's
+                // re-apply is covered too.
+                reconcile_init_model(v, &desired_model, &discovered_caps, &session_id);
                 // #98/#101: sniff the `control_request{initialize}` RESPONSE for the
                 // selectable model list + slash commands (claude's only catalog
                 // channel — the data init frame above carries neither). Fills
@@ -2043,6 +2171,117 @@ fn register_or_clear_pending(
     }
 }
 
+/// Check that the in-band `set_model` we sent at spawn/wake actually took effect.
+///
+/// claude does NOT validate a model id: neither `--model <bogus>` nor
+/// `set_model{<bogus>}` fails at spawn — the id is echoed back in `system.init.model`
+/// verbatim and the turn only dies with `result{is_error:true}` once the user sends a
+/// message (LIVE-PROBED 2.1.231 for BOTH paths, so this is pre-existing behaviour, not
+/// a cost of going in-band). The primary guard is upstream: the app layer drops a
+/// selection that is not in the catalog before it is ever sent. This is the backstop
+/// for what upstream cannot see — a row that exists but resolves elsewhere, or a
+/// `set_model` claude silently ignored — so a "the model I picked is not the one
+/// running" report is diagnosable from an `info`-level production log.
+///
+/// Compares against `resolved_models[selection]`, NOT the selection itself:
+/// `system.init.model` reports the RESOLVED concrete id (selection `haiku` → init
+/// `claude-haiku-4-5`).
+///
+/// Runs ONLY when we sent a `set_model` (`desired` is `Some`). This is load-bearing,
+/// not an optimization: for the "Default" row we send nothing, and its own
+/// `resolvedModel` does NOT account for `ANTHROPIC_MODEL` (LIVE-PROBED 2.1.231: the
+/// `default` row reports `resolvedModel: claude-opus-4-8[1m]` while the process
+/// actually runs `claude-opus-5[1m]` from the env), so checking it would fire a false
+/// mismatch on every default session.
+fn reconcile_init_model(
+    frame: &serde_json::Value,
+    desired_model: &Arc<std::sync::Mutex<Option<String>>>,
+    discovered_caps: &Arc<std::sync::Mutex<DiscoveredCaps>>,
+    session_id: &str,
+) {
+    let desired = desired_model.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let resolved = discovered_caps
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .resolved_models
+        .clone();
+    match check_init_model(frame, desired.as_deref(), &resolved) {
+        InitModelCheck::NotChecked => {}
+        InitModelCheck::Applied { requested, running } => tracing::info!(
+            session_id = %session_id,
+            requested_model = %requested,
+            running_model = %running,
+            "claude set_model applied"
+        ),
+        InitModelCheck::Mismatch {
+            requested,
+            expected,
+            running,
+        } => tracing::warn!(
+            session_id = %session_id,
+            requested_model = %requested,
+            expected_model = %expected,
+            running_model = %running,
+            "claude set_model did NOT take effect — the session is running a different model"
+        ),
+    }
+}
+
+/// The pure verdict behind [`reconcile_init_model`], split out so the comparison rules
+/// are unit-testable without a live reader.
+#[derive(Debug, PartialEq, Eq)]
+enum InitModelCheck {
+    /// Not an init frame, no `set_model` was sent, no reported model, or no catalog row
+    /// to compare against.
+    NotChecked,
+    Applied {
+        requested: String,
+        running: String,
+    },
+    Mismatch {
+        requested: String,
+        expected: String,
+        running: String,
+    },
+}
+
+fn check_init_model(
+    frame: &serde_json::Value,
+    desired: Option<&str>,
+    resolved_models: &std::collections::HashMap<String, String>,
+) -> InitModelCheck {
+    use serde_json::Value;
+    if frame.get("type").and_then(Value::as_str) != Some("system")
+        || frame.get("subtype").and_then(Value::as_str) != Some("init")
+    {
+        return InitModelCheck::NotChecked;
+    }
+    let Some(desired) = desired else {
+        return InitModelCheck::NotChecked;
+    };
+    let Some(reported) = frame.get("model").and_then(Value::as_str) else {
+        return InitModelCheck::NotChecked;
+    };
+    // No catalog row (or a row without `resolvedModel`) → nothing to compare against.
+    // Silent: the catalog may simply not have landed on this process yet.
+    let Some(expected) = resolved_models.get(desired) else {
+        return InitModelCheck::NotChecked;
+    };
+    // A selection may be the concrete id itself, in which case the reported id equals it
+    // directly rather than going through the row's resolution.
+    if reported == expected || reported == desired {
+        return InitModelCheck::Applied {
+            requested: desired.to_owned(),
+            running: reported.to_owned(),
+        };
+    }
+    InitModelCheck::Mismatch {
+        requested: desired.to_owned(),
+        expected: expected.clone(),
+        running: reported.to_owned(),
+    }
+}
+
 /// B-CLAUDE-INIT: sniff a raw `system/init` frame for discovery data the legacy
 /// `parse_system` drops. Captures `model` into `discovered_model` (only when
 /// `want_init_model`, i.e. config supplied none) and emits a `Provisioning` event
@@ -2252,6 +2491,21 @@ fn sniff_control_initialize(
                 .collect()
         })
         .unwrap_or_default();
+    // Row id → concrete model, for the `set_model` landed-check (see
+    // `DiscoveredCaps::resolved_models`). Rows without the field are simply absent,
+    // which makes the check skip them rather than report a false mismatch.
+    let resolved_models: std::collections::HashMap<String, String> = models
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| {
+                    let id = m.get("value").and_then(Value::as_str)?.to_string();
+                    let resolved = m.get("resolvedModel").and_then(Value::as_str)?.to_string();
+                    Some((id, resolved))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let parsed_commands: Vec<SlashCommandInfo> = commands
         .map(|commands| {
             commands
@@ -2270,6 +2524,7 @@ fn sniff_control_initialize(
         let mut caps = discovered_caps.lock().unwrap_or_else(|e| e.into_inner());
         if models.is_some() {
             caps.models = parsed_models.clone();
+            caps.resolved_models = resolved_models;
         }
         if commands.is_some() {
             caps.slash_commands = parsed_commands.clone();
@@ -3051,6 +3306,13 @@ impl SessionBackend for ClaudeSessionBackend {
                 // model id surfaces only when the NEXT turn actually tries to use it (API
                 // 404). There is deliberately NO reader-side set_model response parser
                 // (it would be permanently inert + self-confirming — README discipline #9).
+                // Record the new pick so a later F-4 wake re-applies THIS model, not the
+                // open-time one. (Under the old `--model` flag a mid-session switch was
+                // silently lost on wake, because the wake recipe replays the open-time
+                // spawn args verbatim.) `default` maps to None — "send nothing" — so a
+                // woken process resolves the model from the user's config again.
+                *self.desired_model.lock().unwrap_or_else(|e| e.into_inner()) =
+                    desired_model_from_config(Some(model.as_str()));
                 let _ = self
                     .write_or_queue_control(serde_json::json!({ "subtype": "set_model", "model": model.clone() }))
                     .await?;
@@ -3531,8 +3793,10 @@ mod tests {
         );
     }
 
-    /// preset_context → `--append-system-prompt`; model → `--model`; mode →
-    /// `--permission-mode`; each omitted independently when its source is empty.
+    /// preset_context → `--append-system-prompt`; mode → `--permission-mode`; each
+    /// omitted independently when its source is empty. `model` is deliberately NOT
+    /// mapped to a flag — it is applied in-band via `set_model` (see
+    /// `desired_model_from_config` / `apply_desired_model`).
     #[test]
     fn build_claude_init_args_threads_preset_model_mode() {
         let config = SessionConfig {
@@ -3554,8 +3818,19 @@ mod tests {
             pair("--append-system-prompt").as_deref(),
             Some("[Assistant Rules] be precise")
         );
-        assert_eq!(pair("--model").as_deref(), Some("global.anthropic.claude-opus-4-8"));
         assert_eq!(pair("--permission-mode").as_deref(), Some("plan"));
+        // The model must NOT reach the command line: `--model default` overrides the
+        // user's own ANTHROPIC_MODEL, and any `--model` value reshapes the initialize
+        // catalog we persist for the picker (both LIVE-PROBED 2.1.231). A concrete id is
+        // no exception — the selection travels in-band for every value.
+        assert!(
+            !args.iter().any(|a| a == "--model"),
+            "the model selection must never be a spawn flag, got {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "global.anthropic.claude-opus-4-8"),
+            "no bare model value should leak into the args either, got {args:?}"
+        );
 
         // Whitespace-only / empty model & preset are omitted (not emitted as blank
         // flags), but `--permission-mode` is the SECURITY exception: a blank/missing
@@ -5305,6 +5580,236 @@ mod tests {
         assert!(
             set_model_at < second_prompt_at,
             "the queued set_model must be drained BEFORE the next prompt (else it truncates the turn), got: {written}"
+        );
+    }
+
+    /// The "Default" picker row means "send NO model" — because `--model default` (and,
+    /// by the same wire value, `set_model{default}`) OVERRIDES the user's own
+    /// `ANTHROPIC_MODEL` instead of deferring to it (LIVE-PROBED 2.1.231: with
+    /// `ANTHROPIC_MODEL=claude-opus-5[1m]`, `system.init.model` is `claude-opus-5[1m]`
+    /// with no flag but `claude-opus-4-8[1m]` with `--model default`).
+    #[test]
+    fn desired_model_from_config_suppresses_only_the_default_row() {
+        assert_eq!(desired_model_from_config(Some("default")), None, "the sentinel row");
+        assert_eq!(desired_model_from_config(Some("  default  ")), None, "trimmed sentinel");
+        assert_eq!(desired_model_from_config(None), None, "no selection at all");
+        assert_eq!(desired_model_from_config(Some("")), None, "empty");
+        assert_eq!(desired_model_from_config(Some("   ")), None, "whitespace only");
+        // Everything else travels in-band verbatim — aliases AND concrete ids.
+        assert_eq!(desired_model_from_config(Some("opus")), Some("opus".to_string()));
+        assert_eq!(desired_model_from_config(Some("haiku")), Some("haiku".to_string()));
+        assert_eq!(
+            desired_model_from_config(Some("claude-opus-4-8[1m]")),
+            Some("claude-opus-4-8[1m]".to_string())
+        );
+        assert_eq!(
+            desired_model_from_config(Some(" claude-opus-5[1m] ")),
+            Some("claude-opus-5[1m]".to_string()),
+            "trimmed, not dropped"
+        );
+    }
+
+    /// A selection travels as a `set_model` control_request on the spawn's stdin — the
+    /// replacement for the removed `--model` flag.
+    #[tokio::test]
+    async fn apply_desired_model_writes_set_model_for_a_real_selection() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
+
+        *backend.desired_model.lock().unwrap() = Some("haiku".into());
+        backend.apply_desired_model().await;
+
+        // The fake drains stdin into the capture buffer from a spawned task, so poll.
+        let written = poll_captured(&captured, |s| s.contains("set_model")).await;
+        assert!(
+            written.contains("set_model") && written.contains("haiku"),
+            "the selection must reach the wire as set_model, got: {written}"
+        );
+    }
+
+    /// Read the fake's captured stdin until `done` is satisfied (or a short deadline
+    /// passes), returning whatever was captured. The fake drains its stdin duplex from a
+    /// spawned task, so an immediate read races the write.
+    async fn poll_captured(captured: &Arc<tokio::sync::Mutex<Vec<u8>>>, done: impl Fn(&str) -> bool) -> String {
+        let mut seen = String::new();
+        for _ in 0..40 {
+            seen = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+            if done(&seen) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        seen
+    }
+
+    /// The Default row writes NOTHING: sending `set_model{default}` would override the
+    /// user's `ANTHROPIC_MODEL`, which is exactly the bug this path exists to avoid.
+    #[tokio::test]
+    async fn apply_desired_model_writes_nothing_for_the_default_row() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
+
+        *backend.desired_model.lock().unwrap() = desired_model_from_config(Some("default"));
+        backend.apply_desired_model().await;
+
+        // Absence needs a barrier, not a sleep: write a prompt AFTER the (expected)
+        // no-op and wait for it, so "no set_model" is observed on a wire that has
+        // provably flushed everything apply_desired_model could have written.
+        backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("SENTINEL".into())],
+                metadata: CommandMeta::default(),
+            })
+            .await
+            .expect("Send accepted");
+        let written = poll_captured(&captured, |s| s.contains("SENTINEL")).await;
+        assert!(
+            written.contains("SENTINEL"),
+            "the barrier prompt must reach the wire, got: {written}"
+        );
+        assert!(
+            !written.contains("set_model"),
+            "the Default row must not send any model, got: {written}"
+        );
+    }
+
+    /// A mid-session switch must update the slot the WAKE path re-applies from,
+    /// otherwise an idle-reaped session silently reverts to the open-time model (which
+    /// is what the old `--model` flag did: the wake recipe replays the open-time args).
+    #[tokio::test]
+    async fn set_model_dispatch_updates_the_slot_the_wake_reapplies() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
+
+        backend
+            .dispatch(Command::SetModel { model: "haiku".into() })
+            .await
+            .expect("SetModel accepted");
+        assert_eq!(
+            backend.desired_model.lock().unwrap().clone(),
+            Some("haiku".to_string()),
+            "a wake must re-apply the user's CURRENT pick"
+        );
+
+        // Switching back to Default clears it, so a woken process resolves the model
+        // from the user's own config again rather than re-pinning the old pick.
+        backend
+            .dispatch(Command::SetModel {
+                model: "default".into(),
+            })
+            .await
+            .expect("SetModel(default) accepted");
+        assert_eq!(
+            backend.desired_model.lock().unwrap().clone(),
+            None,
+            "Default must clear the slot, not pin the literal sentinel"
+        );
+    }
+
+    /// The initialize catalog carries `resolvedModel` per row — the only bridge between
+    /// our row-id selection and the concrete id `system/init` reports.
+    #[test]
+    fn initialize_response_captures_resolved_models() {
+        let caps = Arc::new(std::sync::Mutex::new(DiscoveredCaps::default()));
+        let (event_tx, _rx) = broadcast::channel(8);
+        // Shape live-captured from claude 2.1.231's initialize reply.
+        let frame = serde_json::json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": "ctl-1", "response": { "models": [
+                {"value": "default", "resolvedModel": "claude-opus-4-8[1m]", "displayName": "Default"},
+                {"value": "haiku", "resolvedModel": "claude-haiku-4-5", "displayName": "claude-haiku-4-5"},
+                {"value": "global.anthropic.claude-fable-5", "resolvedModel": "global.anthropic.claude-fable-5", "displayName": "Fable"},
+                {"value": "no-resolved-field", "displayName": "Odd row"}
+            ]}}
+        });
+        sniff_control_initialize(&frame, &caps, &event_tx, "s", 0);
+
+        let resolved = caps.lock().unwrap().resolved_models.clone();
+        assert_eq!(resolved.get("default").map(String::as_str), Some("claude-opus-4-8[1m]"));
+        assert_eq!(resolved.get("haiku").map(String::as_str), Some("claude-haiku-4-5"));
+        assert_eq!(
+            resolved.get("global.anthropic.claude-fable-5").map(String::as_str),
+            Some("global.anthropic.claude-fable-5")
+        );
+        assert!(
+            !resolved.contains_key("no-resolved-field"),
+            "a row without resolvedModel is absent, so the check skips it instead of \
+             reporting a false mismatch"
+        );
+        assert_eq!(
+            caps.lock().unwrap().models.len(),
+            4,
+            "the picker still gets every row, resolvedModel or not"
+        );
+    }
+
+    /// The landed-check compares `system.init.model` against the SELECTED ROW's
+    /// `resolvedModel`, and stays silent whenever it has no ground to stand on.
+    #[test]
+    fn init_model_check_verdicts() {
+        let resolved: std::collections::HashMap<String, String> = [
+            ("default", "claude-opus-4-8[1m]"),
+            ("haiku", "claude-haiku-4-5"),
+            ("opus", "claude-opus-4-8[1m]"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let init = |model: &str| serde_json::json!({"type": "system", "subtype": "init", "model": model});
+
+        // Applied: the row id resolves to exactly what claude reports running.
+        assert_eq!(
+            check_init_model(&init("claude-haiku-4-5"), Some("haiku"), &resolved),
+            InitModelCheck::Applied {
+                requested: "haiku".into(),
+                running: "claude-haiku-4-5".into()
+            }
+        );
+        // Mismatch: we asked for haiku, claude is running something else.
+        assert_eq!(
+            check_init_model(&init("claude-opus-5[1m]"), Some("haiku"), &resolved),
+            InitModelCheck::Mismatch {
+                requested: "haiku".into(),
+                expected: "claude-haiku-4-5".into(),
+                running: "claude-opus-5[1m]".into()
+            }
+        );
+        // The Default row sends nothing, so there is nothing to check — and checking it
+        // WOULD misfire: its resolvedModel ignores ANTHROPIC_MODEL, so a default session
+        // legitimately runs `claude-opus-5[1m]` while the row says `claude-opus-4-8[1m]`
+        // (LIVE-PROBED 2.1.231).
+        assert_eq!(
+            check_init_model(&init("claude-opus-5[1m]"), None, &resolved),
+            InitModelCheck::NotChecked,
+            "no set_model sent ⇒ no verdict"
+        );
+        // Catalog not landed yet / row unknown → silent, not a false alarm.
+        assert_eq!(
+            check_init_model(&init("whatever"), Some("haiku"), &std::collections::HashMap::new()),
+            InitModelCheck::NotChecked
+        );
+        assert_eq!(
+            check_init_model(&init("whatever"), Some("not-a-row"), &resolved),
+            InitModelCheck::NotChecked
+        );
+        // Non-init frames and init frames without a model are ignored.
+        assert_eq!(
+            check_init_model(
+                &serde_json::json!({"type": "system", "subtype": "status", "model": "x"}),
+                Some("haiku"),
+                &resolved
+            ),
+            InitModelCheck::NotChecked
+        );
+        assert_eq!(
+            check_init_model(
+                &serde_json::json!({"type": "system", "subtype": "init"}),
+                Some("haiku"),
+                &resolved
+            ),
+            InitModelCheck::NotChecked
         );
     }
 

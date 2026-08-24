@@ -1651,11 +1651,58 @@ fn spec_mode_model(
     // through unchanged. Runs BEFORE the codex sandbox/approval derivation downstream
     // (which matches both the alias and the native id, so ordering is safe).
     let mode = resolved_session_mode(config, session_snapshot, metadata);
-    let model = session_snapshot
-        .and_then(|s| s.current_model_id.as_ref().map(|m| m.as_str().to_owned()))
-        .or_else(|| config.current_model_id.clone())
-        .filter(|s| !s.is_empty());
+    // Same drop-if-not-in-catalog discipline the mode path applies: a persisted
+    // selection outlives the catalog it came from, and no backend validates a model id
+    // at spawn — claude in particular ACCEPTS a bogus id and only fails once the user
+    // sends a message (LIVE-PROBED 2.1.231: both `--model <bogus>` and
+    // `set_model{<bogus>}` echo the id into `system.init.model`, then the turn dies with
+    // `result{is_error:true}`). Dropping it here turns that into a silent fall back to
+    // the agent's default, which is the difference between "my old pick quietly stopped
+    // applying" and "every message errors".
+    let model = clear_stale_model(
+        metadata,
+        session_snapshot
+            .and_then(|s| s.current_model_id.as_ref().map(|m| m.as_str().to_owned()))
+            .or_else(|| config.current_model_id.clone())
+            .filter(|s| !s.is_empty()),
+        conversation_id,
+    );
     (spec, mode, model)
+}
+
+/// Drop a model selection the agent's advertised catalog does not contain.
+///
+/// Pass-through when the catalog is absent or empty — that is the first-ever open of an
+/// agent (nothing handshaked yet), NOT evidence that the selection is invalid. Only a
+/// non-empty catalog that lacks the id is proof, and the id can legitimately go stale:
+/// the concrete rows depend on the user's `ANTHROPIC_DEFAULT_*` / provider env and on
+/// the CLI version, so an id stored months ago may simply no longer exist.
+fn clear_stale_model(
+    metadata: &aionui_api_types::AgentMetadata,
+    model: Option<String>,
+    conversation_id: &str,
+) -> Option<String> {
+    use crate::manager::acp::config_option_catalog::extract_models_from_value;
+    let model = model?;
+    let Some(catalog) = metadata
+        .handshake
+        .available_models
+        .as_ref()
+        .and_then(extract_models_from_value)
+    else {
+        return Some(model);
+    };
+    if catalog.available_models.is_empty() || catalog.available_models.iter().any(|entry| entry.model_id == model) {
+        return Some(model);
+    }
+    tracing::warn!(
+        conversation_id,
+        agent_id = %metadata.id,
+        requested_model = %model,
+        "persisted model selection is absent from the agent's catalog — falling back to \
+         the agent default for this session"
+    );
+    None
 }
 
 /// Build a claude/codex `SessionAgentTask` (the session-model port's `IAgentTask`)
@@ -5006,6 +5053,71 @@ mod build_mapping_tests {
         ));
         assert_eq!(mode.as_deref(), Some("plan"));
         assert_eq!(model.as_deref(), Some("claude-x"));
+    }
+
+    // A catalog row carrying the persisted `{available_models:[{id,label}]}` shape the
+    // handshake write-back stores, for the stale-selection guard.
+    fn metadata_with_models(ids: &[&str]) -> aionui_api_types::AgentMetadata {
+        let mut md = test_metadata(Some("claude"), None);
+        md.handshake.available_models = Some(serde_json::json!({
+            "available_models": ids.iter().map(|id| serde_json::json!({"id": id, "label": id})).collect::<Vec<_>>(),
+            "current_model_id": ids.first().copied().unwrap_or_default(),
+        }));
+        md
+    }
+
+    /// A persisted selection the agent no longer advertises is DROPPED at build time,
+    /// so the session falls back to the agent default instead of failing on the user's
+    /// first message. No backend validates a model id at spawn — claude echoes a bogus
+    /// one into `system.init.model` and only dies at turn time (LIVE-PROBED 2.1.231 for
+    /// both `--model` and in-band `set_model`) — so this is the only guard that runs
+    /// before the user is affected.
+    #[test]
+    fn stale_model_selection_is_dropped_before_it_reaches_the_backend() {
+        let cfg = AcpBuildExtra {
+            // A concrete id that only existed under a previous ANTHROPIC_DEFAULT_* /
+            // provider env or CLI version.
+            current_model_id: Some("claude-opus-4-8[1m]".into()),
+            ..Default::default()
+        };
+        let md = metadata_with_models(&["default", "sonnet", "opus", "haiku"]);
+        let (_spec, _mode, model) = spec_mode_model("conv_stale", None, &cfg, None, &md);
+        assert_eq!(model, None, "an id absent from the catalog must not be sent");
+
+        // A selection the catalog DOES advertise survives untouched.
+        let live = AcpBuildExtra {
+            current_model_id: Some("haiku".into()),
+            ..Default::default()
+        };
+        let (_spec, _mode, model) = spec_mode_model("conv_live", None, &live, None, &md);
+        assert_eq!(model.as_deref(), Some("haiku"));
+
+        // `default` is a real catalog row, so it survives here; suppressing it is the
+        // claude backend's job (`desired_model_from_config`), not this guard's.
+        let default_row = AcpBuildExtra {
+            current_model_id: Some("default".into()),
+            ..Default::default()
+        };
+        let (_spec, _mode, model) = spec_mode_model("conv_default", None, &default_row, None, &md);
+        assert_eq!(model.as_deref(), Some("default"));
+    }
+
+    /// No catalog (first-ever open, nothing handshaked) is NOT evidence the selection is
+    /// invalid — dropping it there would break the very first session of every agent,
+    /// including codex/ACP backends that share this path.
+    #[test]
+    fn model_selection_passes_through_when_no_catalog_is_known_yet() {
+        let cfg = AcpBuildExtra {
+            current_model_id: Some("gpt-5.6-terra".into()),
+            ..Default::default()
+        };
+        // handshake.available_models = None
+        let (_spec, _mode, model) = spec_mode_model("conv_a", None, &cfg, None, &test_metadata(Some("codex"), None));
+        assert_eq!(model.as_deref(), Some("gpt-5.6-terra"), "absent catalog ⇒ pass through");
+
+        // An EMPTY catalog is equally uninformative.
+        let (_spec, _mode, model) = spec_mode_model("conv_b", None, &cfg, None, &metadata_with_models(&[]));
+        assert_eq!(model.as_deref(), Some("gpt-5.6-terra"), "empty catalog ⇒ pass through");
     }
 
     /// Fork-spec quadrant matrix (sid x fork): a bound sid ALWAYS resumes (the
