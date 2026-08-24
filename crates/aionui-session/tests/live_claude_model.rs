@@ -107,9 +107,9 @@ where
     }
 }
 
-/// Open a claude session with `model`, run one tiny turn, and report the concrete model
-/// it actually ran (`None` when nothing was observed).
-async fn running_model_for(model: Option<&str>) -> Option<String> {
+/// Open a claude session with `model`, run one tiny turn, and report
+/// `(reconcile message, concrete model it actually ran)`.
+async fn observe_run(model: Option<&str>) -> Option<(String, String)> {
     let spy = global_spy();
     spy.clear();
 
@@ -145,12 +145,17 @@ async fn running_model_for(model: Option<&str>) -> Option<String> {
 
     // The reconcile fires on `system/init`, which claude emits once the turn starts.
     for _ in 0..120 {
-        if let Some((_, running)) = spy.seen().into_iter().next_back() {
-            return Some(running);
+        if let Some(seen) = spy.seen().into_iter().next_back() {
+            return Some(seen);
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     None
+}
+
+/// Just the concrete model a run ended up on.
+async fn running_model_for(model: Option<&str>) -> Option<String> {
+    observe_run(model).await.map(|(_, running)| running)
 }
 
 /// The model AionUi asks for is the model claude runs — end to end, through the real
@@ -170,29 +175,35 @@ async fn selection_is_the_model_that_actually_runs() {
     );
 }
 
-/// The "Default" row must NOT pin a model: it sends nothing, so claude resolves the user
-/// config exactly as the terminal CLI does. Asserted as a DIFFERENCE against an explicit
-/// selection, so it holds for any user's env.
+/// "No selection" and "the `default` row" are two DIFFERENT intents, and both must land
+/// where the terminal CLI lands:
 ///
-/// This is the regression that started all of this: mapping Default to `--model default`
-/// overrode the user's own `ANTHROPIC_MODEL` and silently ran a different model.
+/// - no selection  → whatever the user's config resolves to (CLI startup state)
+/// - `default` row → the ACCOUNT default, overriding `ANTHROPIC_MODEL` (CLI's row 1,
+///   whose own description reads "Use the default model (currently ...)")
+///
+/// Asserted through the reconcile VERDICT rather than a hard-coded id, so it holds on any
+/// machine: a `default` run must be CONFIRMED against that row's `resolvedModel`, while a
+/// no-selection run is only reported (no row predicts it).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "LIVE: spawns the real claude CLI and spends tokens"]
-async fn default_row_defers_to_the_user_config_instead_of_pinning_a_model() {
-    let via_default_row = running_model_for(Some("default"))
+async fn default_row_and_no_selection_are_different_intents() {
+    let (default_msg, default_model) = observe_run(Some("default"))
         .await
         .expect("every run reports its model, selection or not");
-    let via_no_selection = running_model_for(None)
+    let (none_msg, none_model) = observe_run(None)
         .await
         .expect("every run reports its model, selection or not");
-    println!("Default row ran: {via_default_row} | no selection ran: {via_no_selection}");
+    println!("`default` row ran: {default_model} ({default_msg})");
+    println!("no selection ran:  {none_model} ({none_msg})");
 
-    // The invariant, independent of whose machine this runs on: our Default row must be
-    // INDISTINGUISHABLE from making no selection at all. `--model default` broke exactly
-    // this — it pinned the account default and ignored the user's ANTHROPIC_MODEL, so the
-    // two diverged (probed: claude-opus-4-8[1m] vs claude-opus-5[1m]).
-    assert_eq!(
-        via_default_row, via_no_selection,
-        "the Default row must defer to the user's config, not pin a model"
+    assert!(
+        default_msg.contains("set_model applied"),
+        "picking `default` must be SENT and confirmed against that row's resolvedModel, \
+         got: {default_msg}"
+    );
+    assert!(
+        none_msg.contains("resolved from the user's claude config"),
+        "making no pick must send nothing and be reported as config-resolved, got: {none_msg}"
     );
 }

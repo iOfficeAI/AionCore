@@ -246,24 +246,24 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
     // NO `--model` FLAG — the selection is applied in-band via
     // `control_request{set_model}` after the spawn (see `apply_desired_model`).
     //
-    // LIVE-PROBED 2.1.231, why the flag cannot carry our selection:
-    //   1. `--model default` is NOT a no-op. Our picker's "Default" row has the wire
-    //      value `default`, and passing it OVERRIDES the user's own `ANTHROPIC_MODEL`
-    //      (`~/.claude/settings.json` env block): with `ANTHROPIC_MODEL=claude-opus-5[1m]`,
-    //      `system.init.model` is `claude-opus-5[1m]` with NO flag but
-    //      `claude-opus-4-8[1m]` with `--model default`. So the flag silently ran a
-    //      DIFFERENT model than the CLI would for the same config.
-    //   2. The `initialize` catalog (`response.models[]`) is a FUNCTION of this flag —
-    //      no flag → 6 rows (incl. the `ANTHROPIC_MODEL` row, e.g. "Opus 5 (1M context)"),
-    //      `--model default` → 6 rows but that row becomes "Opus 4.8 (1M context)",
-    //      `--model opus` → 5 rows (the row is dropped). Since the catalog is persisted
-    //      per-AGENT (last write wins), a session spawned with an alias ERASED a model
-    //      the picker was offering everyone else. Spawning flagless makes the catalog
-    //      constant AND identical to what `/model` shows in the terminal.
-    // `set_model` applies before the first turn (init reports the switched model) and
-    // is re-applied on every `--resume` respawn, because claude does NOT restore a
-    // session's model on resume (LIVE-PROBED: resume without the flag reports the
-    // default model, not the one the session was set to).
+    // The flag would carry the model itself just fine. It is disqualified because it ALSO
+    // reshapes the catalog we persist for the picker (LIVE-PROBED 2.1.231): the
+    // `initialize` reply's `models[]` is a FUNCTION of this flag —
+    //   no flag          → 6 rows, the last being the `ANTHROPIC_MODEL` one
+    //                      (e.g. `claude-opus-5[1m]` / "Opus 5 (1M context)")
+    //   --model default  → 6 rows, but that last row becomes "Opus 4.8 (1M context)"
+    //   --model opus     → 5 rows, the last row is gone entirely
+    // The catalog is persisted per-AGENT (last write wins), so a session spawned on an
+    // alias ERASED a model the picker was offering every other conversation, and the
+    // `ANTHROPIC_MODEL` row was unreachable no matter what the user picked. Spawning
+    // flagless makes the catalog constant AND identical to what `/model` lists in the
+    // terminal; `set_model` then carries the selection without touching it (probed: the
+    // catalog is still those 6 rows after a set_model).
+    //
+    // `set_model` applies before the first turn (init reports the switched model) and is
+    // re-applied on every `--resume` respawn, because claude does NOT restore a session's
+    // model on resume (LIVE-PROBED: resume with neither flag nor set_model reports the
+    // config-resolved model, not the one the session had been switched to).
 
     args
 }
@@ -497,9 +497,8 @@ pub struct ClaudeSessionBackend {
     /// One-shot first-turn title generation (spec 2026-08-04). Shared with the
     /// reader via `reader_state`; `dispatch(Send)` records the first prompt text.
     title_gen: Arc<TitleGenState>,
-    /// The model row id to ask claude for via in-band `set_model`, `None` for the
-    /// "Default" row (expressed by sending nothing — see `build_claude_init_args` for
-    /// why the `--model` flag cannot express our selection). Applied after the
+    /// The model row id to ask claude for via in-band `set_model`, `None` when the
+    /// session carries NO selection (see `desired_model_from_config`). Applied after the
     /// initialize request at open, RE-APPLIED after every F-4 wake (claude does NOT
     /// restore a session's model on `--resume`, LIVE-PROBED 2.1.231), and rewritten by
     /// `dispatch(SetModel)` so a wake re-applies the user's CURRENT pick. Shared with
@@ -507,24 +506,27 @@ pub struct ClaudeSessionBackend {
     desired_model: Arc<std::sync::Mutex<Option<String>>>,
 }
 
-/// The `set_model` target for a config selection, or `None` when nothing should be
-/// sent.
+/// The `set_model` target for a config selection, or `None` when nothing should be sent.
 ///
-/// Our model picker's first row is claude's own `default` row, meaning "use whatever
-/// the user's config resolves to". That intent is expressed by sending NO model at
-/// all: passing the literal `default` is NOT a no-op — it OVERRIDES the user's
-/// `ANTHROPIC_MODEL` (LIVE-PROBED 2.1.231; see `build_claude_init_args`), which
-/// silently ran a different model than the terminal CLI would for the same config.
+/// EVERY row of claude's catalog is sent verbatim, `default` included. The two states are
+/// distinguished by PRESENCE, not by value:
+///
+/// - **no selection** (`None`/empty) → send nothing → claude resolves the model from the
+///   user's own config (`ANTHROPIC_MODEL`, else the account default), which is exactly
+///   what the terminal CLI does on startup.
+/// - **`default`** → send it → claude runs the ACCOUNT default, overriding
+///   `ANTHROPIC_MODEL` (LIVE-PROBED 2.1.231: with `ANTHROPIC_MODEL=claude-opus-5[1m]`,
+///   `set_model{default}` and `--model default` both report `claude-opus-4-8[1m]` in
+///   `system.init.model`). That IS the semantic of the CLI's own `Default` row — its
+///   description reads "Use the default model (currently Opus 4.8 (1M context))" — so
+///   suppressing it made the picker contradict itself: the row promised 4.8 and the
+///   session ran opus-5.
+///
+/// Do NOT re-add a `default` special case here. The distinction belongs upstream: a
+/// session with no user pick must carry no model at all, not the literal `default`.
 fn desired_model_from_config(model: Option<&str>) -> Option<String> {
-    model
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != CLAUDE_DEFAULT_MODEL_ROW)
-        .map(str::to_owned)
+    model.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
 }
-
-/// claude's own wire id for the "use my configured default" row of `models[]`
-/// (LIVE-PROBED 2.1.231: `{"value":"default","displayName":"Default"}`).
-const CLAUDE_DEFAULT_MODEL_ROW: &str = "default";
 
 /// First-turn session-title generation state (spec 2026-08-04, retry semantics
 /// 2026-08-13).
@@ -1407,9 +1409,10 @@ impl ClaudeSessionBackend {
     /// Apply the session's model selection in-band, the replacement for the removed
     /// `--model` spawn flag (see `build_claude_init_args` for why the flag had to go).
     ///
-    /// No-op for the "Default" row (`desired_model` is `None`) — that intent IS "send
-    /// nothing", so claude resolves the model from the user's own config exactly as the
-    /// terminal CLI does.
+    /// No-op when the session carries NO selection (`desired_model` is `None`) — that
+    /// intent IS "send nothing", so claude resolves the model from the user's own config
+    /// exactly as the terminal CLI does on startup. A session that DID pick the `default`
+    /// row sends it like any other row (see `desired_model_from_config`).
     ///
     /// Must be called on EVERY process run — open AND each F-4 wake — because
     /// `--resume` does NOT restore the model a session was set to (LIVE-PROBED 2.1.231:
@@ -2193,11 +2196,13 @@ fn register_or_clear_pending(
 /// `system.init.model` reports the RESOLVED concrete id (selection `haiku` → init
 /// `claude-haiku-4-5`).
 ///
-/// A run with NO selection sent is reported but never compared. That is load-bearing,
-/// not an optimization: the `default` row's own `resolvedModel` does NOT account for
-/// `ANTHROPIC_MODEL` (LIVE-PROBED 2.1.231 — the row reports
-/// `resolvedModel: claude-opus-4-8[1m]` while the process runs `claude-opus-5[1m]` from
-/// the env), so comparing against it would fire a false mismatch on every such session.
+/// A run with NO selection sent is reported but never compared, because there is no
+/// catalog row that predicts it: with `ANTHROPIC_MODEL=claude-opus-5[1m]` such a run
+/// reports `claude-opus-5[1m]`, while the closest-looking row (`default`) carries
+/// `resolvedModel: claude-opus-4-8[1m]` — that row describes what happens when `default`
+/// is REQUESTED (it overrides the env), not what an unrequested run resolves to
+/// (LIVE-PROBED 2.1.231, both directions). Comparing the two would fire a false mismatch
+/// on every session that made no pick.
 fn reconcile_init_model(
     frame: &serde_json::Value,
     desired_model: &Arc<std::sync::Mutex<Option<String>>>,
@@ -5614,19 +5619,27 @@ mod tests {
         );
     }
 
-    /// The "Default" picker row means "send NO model" — because `--model default` (and,
-    /// by the same wire value, `set_model{default}`) OVERRIDES the user's own
-    /// `ANTHROPIC_MODEL` instead of deferring to it (LIVE-PROBED 2.1.231: with
-    /// `ANTHROPIC_MODEL=claude-opus-5[1m]`, `system.init.model` is `claude-opus-5[1m]`
-    /// with no flag but `claude-opus-4-8[1m]` with `--model default`).
+    /// "no selection" and "the `default` row" are distinguished by PRESENCE, never by
+    /// value. `default` is a REAL choice — claude runs the account default for it,
+    /// overriding `ANTHROPIC_MODEL` (LIVE-PROBED 2.1.231), which is exactly what the CLI's
+    /// own `Default` row promises ("Use the default model (currently ...)"). Suppressing
+    /// it made the picker contradict itself, so it must travel like any other row.
     #[test]
-    fn desired_model_from_config_suppresses_only_the_default_row() {
-        assert_eq!(desired_model_from_config(Some("default")), None, "the sentinel row");
-        assert_eq!(desired_model_from_config(Some("  default  ")), None, "trimmed sentinel");
+    fn desired_model_from_config_sends_every_row_and_only_drops_absence() {
         assert_eq!(desired_model_from_config(None), None, "no selection at all");
         assert_eq!(desired_model_from_config(Some("")), None, "empty");
         assert_eq!(desired_model_from_config(Some("   ")), None, "whitespace only");
-        // Everything else travels in-band verbatim — aliases AND concrete ids.
+        // Every catalog row travels in-band verbatim — `default`, aliases, concrete ids.
+        assert_eq!(
+            desired_model_from_config(Some("default")),
+            Some("default".to_string()),
+            "the `default` row is a real pick, NOT a synonym for 'no selection'"
+        );
+        assert_eq!(
+            desired_model_from_config(Some("  default  ")),
+            Some("default".to_string()),
+            "trimmed, not dropped"
+        );
         assert_eq!(desired_model_from_config(Some("opus")), Some("opus".to_string()));
         assert_eq!(desired_model_from_config(Some("haiku")), Some("haiku".to_string()));
         assert_eq!(
@@ -5674,15 +5687,15 @@ mod tests {
         seen
     }
 
-    /// The Default row writes NOTHING: sending `set_model{default}` would override the
-    /// user's `ANTHROPIC_MODEL`, which is exactly the bug this path exists to avoid.
+    /// A session with NO selection writes nothing, so claude resolves the model from the
+    /// user's own config (`ANTHROPIC_MODEL` / account default) like the terminal CLI.
     #[tokio::test]
-    async fn apply_desired_model_writes_nothing_for_the_default_row() {
+    async fn apply_desired_model_writes_nothing_without_a_selection() {
         let fake = FakeAgentIo::never_exits(Vec::new());
         let captured = fake.captured_stdin();
         let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
 
-        *backend.desired_model.lock().unwrap() = desired_model_from_config(Some("default"));
+        *backend.desired_model.lock().unwrap() = desired_model_from_config(None);
         backend.apply_desired_model().await;
 
         // Absence needs a barrier, not a sleep: write a prompt AFTER the (expected)
@@ -5702,7 +5715,7 @@ mod tests {
         );
         assert!(
             !written.contains("set_model"),
-            "the Default row must not send any model, got: {written}"
+            "a session with no selection must not send any model, got: {written}"
         );
     }
 
@@ -5724,8 +5737,9 @@ mod tests {
             "a wake must re-apply the user's CURRENT pick"
         );
 
-        // Switching back to Default clears it, so a woken process resolves the model
-        // from the user's own config again rather than re-pinning the old pick.
+        // Switching to the `default` row is a REAL pick (claude runs the account default
+        // for it), so the slot keeps it and a wake re-applies it — clearing the slot here
+        // would silently turn "I want the account default" back into "follow my env".
         backend
             .dispatch(Command::SetModel {
                 model: "default".into(),
@@ -5734,8 +5748,8 @@ mod tests {
             .expect("SetModel(default) accepted");
         assert_eq!(
             backend.desired_model.lock().unwrap().clone(),
-            None,
-            "Default must clear the slot, not pin the literal sentinel"
+            Some("default".to_string()),
+            "the `default` row must be re-applied on wake like any other pick"
         );
     }
 
@@ -5807,11 +5821,19 @@ mod tests {
                 running: "claude-opus-5[1m]".into()
             }
         );
-        // No selection sent (the Default row): REPORTED but never compared. Comparing
-        // would misfire — the `default` row's resolvedModel ignores ANTHROPIC_MODEL, so
-        // such a session legitimately runs `claude-opus-5[1m]` while the row says
-        // `claude-opus-4-8[1m]` (LIVE-PROBED 2.1.231). Reporting it is the ONLY trace of
-        // what the most common case actually ran.
+        // The `default` row IS checked, because we send it and claude then honours it:
+        // its resolvedModel is the account default and that is what init reports.
+        assert_eq!(
+            check_init_model(&init("claude-opus-4-8[1m]"), Some("default"), &resolved),
+            InitModelCheck::Applied {
+                requested: "default".into(),
+                running: "claude-opus-4-8[1m]".into()
+            }
+        );
+        // NO selection sent: REPORTED but never compared. No row predicts this run — the
+        // `default` row describes what happens when `default` is REQUESTED (it overrides
+        // ANTHROPIC_MODEL), so comparing an unrequested run against it would misfire
+        // (LIVE-PROBED 2.1.231). Reporting it is the ONLY trace of what such a session ran.
         assert_eq!(
             check_init_model(&init("claude-opus-5[1m]"), None, &resolved),
             InitModelCheck::ResolvedByCli {
