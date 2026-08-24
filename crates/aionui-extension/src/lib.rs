@@ -21,6 +21,7 @@ pub mod resolvers;
 pub mod routes;
 pub mod skill_routes;
 pub mod skill_service;
+pub mod skill_view;
 pub mod startup_materialize;
 pub mod state;
 pub mod template;

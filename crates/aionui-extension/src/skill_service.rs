@@ -2293,12 +2293,12 @@ mod test_overrides {
 
 /// Create a symlink (platform-aware).
 #[cfg(unix)]
-async fn create_symlink(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
+pub(crate) async fn create_symlink(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
     tokio::fs::symlink(src, dst).await.map_err(ExtensionError::Io)
 }
 
 #[cfg(windows)]
-async fn create_symlink(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
+pub(crate) async fn create_symlink(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
     // On Windows, directory symlinks require `SeCreateSymbolicLink`
     // (Developer Mode or Admin), which most users don't have — this is
     // the source of the Sentry I1 family of `os error 1314` failures.
