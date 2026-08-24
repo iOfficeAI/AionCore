@@ -29,10 +29,10 @@ If `officecli` is not installed:
 
 ```bash
 # macOS / Linux
-curl -fsSL https://d.officecli.ai/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/suoak/OfficeCLI/main/install.sh | bash
 
 # Windows (PowerShell)
-irm https://d.officecli.ai/install.ps1 | iex
+irm https://raw.githubusercontent.com/suoak/OfficeCLI/main/install.ps1 | iex
 ```
 
 Verify with `officecli --version`. If still not found after install, open a new terminal.

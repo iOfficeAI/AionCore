@@ -25,6 +25,7 @@ impl From<OfficeError> for ApiError {
     fn from(err: OfficeError) -> Self {
         match err {
             OfficeError::OfficecliNotFound => ApiError::BadRequest("officecli not found".into()),
+            OfficeError::BundledOfficecliUnavailable => ApiError::Internal("bundled officecli is unavailable".into()),
             OfficeError::InstallFailed(_) => ApiError::Internal("officecli install failed".into()),
             OfficeError::StartFailed(msg) => ApiError::Internal(format!("preview start failed: {msg}")),
             OfficeError::PortTimeout(path) => {
@@ -400,6 +401,7 @@ fn file_error_to_api_error(error: FileError) -> ApiError {
 fn preview_error_code(error: &OfficeError) -> &'static str {
     match error {
         OfficeError::OfficecliNotFound => "OFFICECLI_NOT_FOUND",
+        OfficeError::BundledOfficecliUnavailable => "OFFICECLI_BUNDLED_UNAVAILABLE",
         OfficeError::InstallFailed(_) => "OFFICECLI_INSTALL_FAILED",
         OfficeError::PortTimeout(_) => "OFFICECLI_PORT_TIMEOUT",
         OfficeError::StartFailed(_)
@@ -513,6 +515,20 @@ mod tests {
     fn officecli_not_found_maps_to_bad_request() {
         let err = ApiError::from(OfficeError::OfficecliNotFound);
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn bundled_officecli_unavailable_maps_to_internal() {
+        let err = ApiError::from(OfficeError::BundledOfficecliUnavailable);
+        assert!(matches!(err, ApiError::Internal(msg) if msg == "bundled officecli is unavailable"));
+    }
+
+    #[test]
+    fn bundled_officecli_unavailable_has_a_stable_preview_error_code() {
+        assert_eq!(
+            preview_error_code(&OfficeError::BundledOfficecliUnavailable),
+            "OFFICECLI_BUNDLED_UNAVAILABLE"
+        );
     }
 
     #[test]

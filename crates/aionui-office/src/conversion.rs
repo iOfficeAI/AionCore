@@ -13,7 +13,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::error::OfficeError;
-use crate::officecli_runtime::resolve_officecli_path;
+use crate::officecli_runtime::{is_bundled_officecli_mode, resolve_officecli_path};
 
 pub struct ConversionService {
     officecli_path: Option<String>,
@@ -233,13 +233,17 @@ fn find_executable(name: &str) -> Option<String> {
 }
 
 async fn resolve_officecli(configured_path: &Option<String>) -> Result<String, OfficeError> {
+    if is_bundled_officecli_mode() {
+        return resolve_officecli_path().map(|path| path.to_string_lossy().into_owned());
+    }
+
     if let Some(path) = configured_path
         && Path::new(path).exists()
     {
         return Ok(path.clone());
     }
 
-    if let Some(path) = resolve_officecli_path() {
+    if let Ok(path) = resolve_officecli_path() {
         return Ok(path.to_string_lossy().into_owned());
     }
 

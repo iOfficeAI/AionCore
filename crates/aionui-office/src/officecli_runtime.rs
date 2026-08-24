@@ -5,9 +5,14 @@ use std::path::PathBuf;
 
 use aionui_runtime::resolve_command_path;
 
+use crate::error::OfficeError;
+
 pub(crate) const OFFICECLI_INSTALL_SH_URL: &str = "https://raw.githubusercontent.com/suoak/OfficeCLI/main/install.sh";
 pub(crate) const OFFICECLI_INSTALL_PS1_URL: &str = "https://raw.githubusercontent.com/suoak/OfficeCLI/main/install.ps1";
 pub(crate) const OFFICECLI_LATEST_RELEASE_URL: &str = "https://github.com/suoak/OfficeCLI/releases/latest";
+pub(crate) const OFFICECLI_MODE_ENV: &str = "CSBU_WORKMATE_OFFICECLI_MODE";
+pub(crate) const OFFICECLI_PATH_ENV: &str = "CSBU_WORKMATE_OFFICECLI_PATH";
+const BUNDLED_MODE: &str = "bundled";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OfficecliInstallPlatform {
@@ -21,8 +26,62 @@ pub(crate) struct OfficecliInstallCommand {
     pub args: Vec<OsString>,
 }
 
-pub(crate) fn resolve_officecli_path() -> Option<PathBuf> {
-    resolve_command_path("officecli").or_else(resolve_known_officecli_install_path)
+pub(crate) fn is_bundled_officecli_mode() -> bool {
+    std::env::var_os(OFFICECLI_MODE_ENV).is_some_and(|mode| mode == OsStr::new(BUNDLED_MODE))
+}
+
+pub(crate) fn resolve_officecli_path() -> Result<PathBuf, OfficeError> {
+    if let Some(result) = resolve_bundled_officecli_path(
+        std::env::var_os(OFFICECLI_MODE_ENV).as_deref(),
+        std::env::var_os(OFFICECLI_PATH_ENV).as_deref(),
+    ) {
+        return result;
+    }
+
+    resolve_command_path("officecli")
+        .or_else(resolve_known_officecli_install_path)
+        .ok_or(OfficeError::OfficecliNotFound)
+}
+
+fn resolve_bundled_officecli_path(
+    mode: Option<&OsStr>,
+    configured_path: Option<&OsStr>,
+) -> Option<Result<PathBuf, OfficeError>> {
+    if mode != Some(OsStr::new(BUNDLED_MODE)) {
+        return None;
+    }
+
+    Some(
+        configured_path
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute() && is_executable_file(path))
+            .ok_or(OfficeError::BundledOfficecliUnavailable),
+    )
+}
+
+fn is_executable_file(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+pub(crate) fn officecli_unavailable_error() -> OfficeError {
+    if is_bundled_officecli_mode() {
+        OfficeError::BundledOfficecliUnavailable
+    } else {
+        OfficeError::OfficecliNotFound
+    }
 }
 
 pub(crate) fn install_command() -> OfficecliInstallCommand {
@@ -172,6 +231,33 @@ mod tests {
         let resolved = resolve_officecli_path_from_env_for_test(None, None, Some(&local_app_data));
 
         assert_eq!(resolved, Some(officecli_exe));
+    }
+
+    #[test]
+    fn bundled_resolution_accepts_only_the_configured_absolute_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let officecli = tmp.path().join("officecli");
+        write_marker_file(&officecli);
+
+        let resolved = resolve_bundled_officecli_path(Some(OsStr::new("bundled")), Some(officecli.as_os_str()));
+
+        assert!(matches!(resolved, Some(Ok(path)) if path == officecli));
+    }
+
+    #[test]
+    fn bundled_resolution_fails_closed_for_missing_or_relative_paths() {
+        let missing = resolve_bundled_officecli_path(Some(OsStr::new("bundled")), None);
+        let relative = resolve_bundled_officecli_path(Some(OsStr::new("bundled")), Some(OsStr::new("officecli")));
+
+        assert!(matches!(missing, Some(Err(OfficeError::BundledOfficecliUnavailable))));
+        assert!(matches!(relative, Some(Err(OfficeError::BundledOfficecliUnavailable))));
+    }
+
+    #[test]
+    fn unmanaged_resolution_does_not_consume_the_bundled_path() {
+        let resolved = resolve_bundled_officecli_path(None, Some(OsStr::new("/tmp/officecli")));
+
+        assert!(resolved.is_none());
     }
 
     #[test]

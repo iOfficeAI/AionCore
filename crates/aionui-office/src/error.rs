@@ -3,6 +3,9 @@ pub enum OfficeError {
     #[error("officecli not found")]
     OfficecliNotFound,
 
+    #[error("bundled officecli is unavailable")]
+    BundledOfficecliUnavailable,
+
     #[error("officecli install failed: {0}")]
     InstallFailed(String),
 
@@ -35,6 +38,10 @@ mod tests {
     #[test]
     fn display_messages() {
         assert_eq!(OfficeError::OfficecliNotFound.to_string(), "officecli not found");
+        assert_eq!(
+            OfficeError::BundledOfficecliUnavailable.to_string(),
+            "bundled officecli is unavailable"
+        );
         assert_eq!(
             OfficeError::InstallFailed("installer error".into()).to_string(),
             "officecli install failed: installer error"

@@ -25,10 +25,10 @@ description: "Use this skill any time a .xlsx file is involved -- as input, outp
 
 If `officecli` is missing:
 
-- **macOS / Linux**: `curl -fsSL https://d.officecli.ai/install.sh | bash`
-- **Windows (PowerShell)**: `irm https://d.officecli.ai/install.ps1 | iex`
+- **macOS / Linux**: `curl -fsSL https://raw.githubusercontent.com/suoak/OfficeCLI/main/install.sh | bash`
+- **Windows (PowerShell)**: `irm https://raw.githubusercontent.com/suoak/OfficeCLI/main/install.ps1 | iex`
 
-Verify with `officecli --version` (open a new terminal if PATH hasn't picked up). If install fails, download a binary from https://github.com/iOfficeAI/OfficeCLI/releases.
+Verify with `officecli --version` first; CSBU WorkMate desktop already includes it. On a standalone server, if installation fails, download a binary from https://github.com/suoak/OfficeCLI/releases.
 
 ## ⚠️ Help-First Rule
 

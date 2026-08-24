@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use aionui_api_types::{PreviewState, PreviewStatusEvent, WebSocketMessage};
@@ -9,7 +12,10 @@ use dashmap::DashMap;
 use tokio::sync::Mutex;
 
 use crate::error::OfficeError;
-use crate::officecli_runtime::{OFFICECLI_LATEST_RELEASE_URL, install_command, resolve_officecli_path};
+use crate::officecli_runtime::{
+    OFFICECLI_LATEST_RELEASE_URL, install_command, is_bundled_officecli_mode, officecli_unavailable_error,
+    resolve_officecli_path,
+};
 use crate::port::{allocate_port, is_port_listening};
 use crate::types::DocType;
 
@@ -132,6 +138,7 @@ impl OfficecliWatchManager {
                 );
                 Err(match e {
                     OfficeError::OfficecliNotFound => OfficeError::OfficecliNotFound,
+                    OfficeError::BundledOfficecliUnavailable => OfficeError::BundledOfficecliUnavailable,
                     OfficeError::InstallFailed(m) => OfficeError::InstallFailed(m.clone()),
                     OfficeError::StartFailed(m) => OfficeError::StartFailed(m.clone()),
                     OfficeError::PortTimeout(m) => OfficeError::PortTimeout(m.clone()),
@@ -408,9 +415,9 @@ impl ProcessSpawner for DefaultProcessSpawner {
         port: u16,
         _doc_type: DocType,
     ) -> Result<Box<dyn ProcessHandle>, OfficeError> {
-        let officecli = resolve_officecli_path().ok_or(OfficeError::OfficecliNotFound)?;
+        let officecli = resolve_officecli_path()?;
         if !officecli_supports_watch(&officecli).await {
-            return Err(OfficeError::OfficecliNotFound);
+            return Err(officecli_unavailable_error());
         }
 
         let mut builder = CmdBuilder::new(&officecli);
@@ -424,7 +431,7 @@ impl ProcessSpawner for DefaultProcessSpawner {
             .stderr(std::process::Stdio::null());
         let child = builder.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                OfficeError::OfficecliNotFound
+                officecli_unavailable_error()
             } else {
                 OfficeError::StartFailed(e.to_string())
             }
@@ -436,6 +443,13 @@ impl ProcessSpawner for DefaultProcessSpawner {
     }
 
     async fn install_officecli(&self) -> Result<(), OfficeError> {
+        if is_bundled_officecli_mode() {
+            tracing::warn!(
+                mode = "bundled",
+                "bundled officecli is unavailable; automatic installation is disabled"
+            );
+            return Err(OfficeError::BundledOfficecliUnavailable);
+        }
         let command = install_command();
         tracing::info!(
             platform = std::env::consts::OS,
@@ -471,7 +485,7 @@ impl ProcessSpawner for DefaultProcessSpawner {
     }
 
     async fn is_officecli_installed(&self) -> bool {
-        let Some(officecli) = resolve_officecli_path() else {
+        let Ok(officecli) = resolve_officecli_path() else {
             return false;
         };
 
@@ -479,9 +493,17 @@ impl ProcessSpawner for DefaultProcessSpawner {
     }
 
     async fn check_update(&self, _doc_type: DocType) -> Result<(), OfficeError> {
-        let officecli = resolve_officecli_path().ok_or(OfficeError::OfficecliNotFound)?;
+        if is_bundled_officecli_mode() {
+            tracing::info!(
+                mode = "bundled",
+                "officecli update check skipped; version is managed by CSBU WorkMate"
+            );
+            return Ok(());
+        }
+
+        let officecli = resolve_officecli_path()?;
         if !officecli_supports_watch(&officecli).await {
-            return Err(OfficeError::OfficecliNotFound);
+            return Err(officecli_unavailable_error());
         }
 
         let mut builder = CmdBuilder::clean_cli(&officecli);
@@ -558,7 +580,24 @@ fn normalize_officecli_version(raw: &str) -> String {
 async fn officecli_supports_watch(officecli: &Path) -> bool {
     let mut version = CmdBuilder::clean_cli(officecli);
     version.arg("--version");
-    if !version.output().await.is_ok_and(|o| o.status.success()) {
+    let Ok(version_output) = version.output().await else {
+        if is_bundled_officecli_mode() {
+            tracing::warn!(
+                mode = "bundled",
+                reason = "version_probe_failed",
+                "bundled officecli validation failed"
+            );
+        }
+        return false;
+    };
+    if !version_output.status.success() {
+        if is_bundled_officecli_mode() {
+            tracing::warn!(
+                mode = "bundled",
+                reason = "version_probe_rejected",
+                "bundled officecli validation failed"
+            );
+        }
         return false;
     }
 
@@ -566,7 +605,24 @@ async fn officecli_supports_watch(officecli: &Path) -> bool {
     watch_help.args(["watch", "--help"]);
     let ok = watch_help.output().await.is_ok_and(|o| o.status.success());
     if !ok {
-        tracing::warn!("officecli exists but does not expose watch command");
+        tracing::warn!(
+            mode = if is_bundled_officecli_mode() {
+                "bundled"
+            } else {
+                "external"
+            },
+            reason = "watch_unsupported",
+            "officecli exists but does not expose watch command"
+        );
+    } else if is_bundled_officecli_mode() {
+        static BUNDLED_RUNTIME_LOGGED: AtomicBool = AtomicBool::new(false);
+        if !BUNDLED_RUNTIME_LOGGED.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                mode = "bundled",
+                version = %normalize_officecli_version(&String::from_utf8_lossy(&version_output.stdout)),
+                "bundled officecli runtime validated"
+            );
+        }
     }
     ok
 }
@@ -575,6 +631,7 @@ fn public_preview_error_message(error: &OfficeError) -> String {
     match error {
         OfficeError::InstallFailed(_) => "officecli install failed".to_owned(),
         OfficeError::OfficecliNotFound => "officecli not found".to_owned(),
+        OfficeError::BundledOfficecliUnavailable => "bundled officecli is unavailable".to_owned(),
         _ => error.to_string(),
     }
 }
@@ -619,6 +676,7 @@ mod tests {
         install_count: AtomicU32,
         update_count: AtomicU32,
         fail_spawn: AtomicBool,
+        bundled_unavailable: AtomicBool,
         fail_with_address_in_use_once: AtomicBool,
         start_listener: AtomicBool,
     }
@@ -631,6 +689,7 @@ mod tests {
                 install_count: AtomicU32::new(0),
                 update_count: AtomicU32::new(0),
                 fail_spawn: AtomicBool::new(false),
+                bundled_unavailable: AtomicBool::new(false),
                 fail_with_address_in_use_once: AtomicBool::new(false),
                 start_listener: AtomicBool::new(true),
             }
@@ -646,6 +705,10 @@ mod tests {
             _doc_type: DocType,
         ) -> Result<Box<dyn ProcessHandle>, OfficeError> {
             self.spawn_count.fetch_add(1, Ordering::SeqCst);
+
+            if self.bundled_unavailable.load(Ordering::SeqCst) {
+                return Err(OfficeError::BundledOfficecliUnavailable);
+            }
 
             if self.fail_spawn.load(Ordering::SeqCst) {
                 return Err(OfficeError::StartFailed("mock spawn failure".into()));
@@ -1002,6 +1065,23 @@ mod tests {
         assert_eq!(spawner.install_count.load(Ordering::SeqCst), 1);
         // First spawn fails (not installed), then install, then second spawn succeeds
         assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn bundled_unavailable_never_triggers_auto_install() {
+        let spawner = Arc::new(MockSpawner::new());
+        spawner.bundled_unavailable.store(true, Ordering::SeqCst);
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let mgr = make_manager(Arc::clone(&spawner), broadcaster);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.docx");
+        std::fs::write(&file, b"test").unwrap();
+
+        let result = mgr.start(file.to_str().unwrap(), DocType::Word).await;
+
+        assert!(matches!(result, Err(OfficeError::BundledOfficecliUnavailable)));
+        assert_eq!(spawner.install_count.load(Ordering::SeqCst), 0);
+        assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -31,7 +31,7 @@ description: "Use this skill to create fillable Word forms (.docx) with real Con
 
 ```bash
 if ! command -v officecli >/dev/null 2>&1; then
-    curl -fsSL https://d.officecli.ai/install.sh | bash
+    curl -fsSL https://raw.githubusercontent.com/suoak/OfficeCLI/main/install.sh | bash
 fi
 ```
 
@@ -39,7 +39,7 @@ fi
 
 ```powershell
 if (-not (Get-Command officecli -ErrorAction SilentlyContinue)) {
-    irm https://d.officecli.ai/install.ps1 | iex
+    irm https://raw.githubusercontent.com/suoak/OfficeCLI/main/install.ps1 | iex
 }
 ```
 
@@ -47,7 +47,7 @@ Verify: `officecli --version`
 
 If `officecli` is still not found after first install, open a new terminal and run the verify command again.
 
-If the install command above fails (e.g. blocked by security policy, no network access, or insufficient permissions), install manually — download the binary for your platform from https://github.com/iOfficeAI/OfficeCLI/releases — then re-run the verify command.
+CSBU WorkMate desktop already includes OfficeCLI. On a standalone server, if the install command above fails, download the binary for your platform from https://github.com/suoak/OfficeCLI/releases and re-run the verify command.
 
 ## Help-First Rule
 
