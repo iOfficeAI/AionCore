@@ -497,7 +497,7 @@ mod tests {
     use crate::types::DocType;
     use crate::watch_manager::{OfficecliWatchManager, ProcessHandle, ProcessSpawner};
 
-    use super::{ApiError, file_error_to_api_error, office_proxy_routes, office_routes};
+    use super::{ApiError, file_error_to_api_error, office_proxy_routes, office_routes, preview_error_code};
 
     #[tokio::test]
     async fn office_routes_builds_without_panic() {
