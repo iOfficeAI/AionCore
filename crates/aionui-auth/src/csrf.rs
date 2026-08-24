@@ -41,10 +41,27 @@ pub async fn csrf_middleware(
     // cannot attach cross-site without a CORS preflight. The token itself is
     // still fully validated by the auth middleware behind this layer.
     let is_runtime_token_request = request.headers().contains_key(crate::middleware::RUNTIME_TOKEN_HEADER);
+    // agy's PreToolUse callback. A local `aioncore antigravity-hook` process
+    // posts here for every tool the agent wants to run; it has no user session
+    // and no CSRF token to present. The route is already deliberately outside
+    // `auth_middleware` for that reason, and the handler authenticates it with a
+    // per-conversation token instead (`x-aionui-hook-token`) — but the CSRF
+    // layer is global, so it rejected what auth had been told to let through.
+    //
+    // Exempting it is safe on CSRF's own terms: this layer stops a browser
+    // attaching AMBIENT COOKIES to a cross-site request, and the endpoint reads
+    // no cookie. A forged call still has to carry a token minted per
+    // conversation and held in memory.
+    //
+    // Without this, every agy tool call is answered 403 CSRF_INVALID and the
+    // hook reads that as "no answer" and denies (measured 2026-08-14: 9/9 then
+    // 12/12 calls rejected across two live runs).
+    let is_antigravity_hook = path.starts_with("/internal/antigravity-hook/");
     let is_exempt = path == "/login"
         || path == "/api/auth/qr-login"
         || path.starts_with("/api/auth/internal/external-users/")
         || path.starts_with("/api/auth/internal/external-sessions")
+        || is_antigravity_hook
         || is_runtime_token_request;
 
     if needs_validation && !is_exempt {

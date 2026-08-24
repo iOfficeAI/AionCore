@@ -310,15 +310,72 @@ where
     unreachable!("version probe retry loop always returns on the final attempt")
 }
 
+/// Character cap applied to captured child stderr before it reaches the log.
+/// `npm --version` stderr is normally empty and at worst a few lines; the cap only
+/// keeps a pathological blob (e.g. a corrupt executable dumping bytes) out of the log.
+const PROBE_STDERR_LOG_LIMIT: usize = 512;
+
+/// Flatten raw child stderr into one bounded log field: lossy UTF-8 decode (a corrupt
+/// executable can emit arbitrary bytes), collapse every whitespace run so a multi-line
+/// npm error stays a single line, then truncate to `limit` characters with a marker.
+fn sanitize_probe_stderr(stderr: &[u8], limit: usize) -> String {
+    let decoded = String::from_utf8_lossy(stderr);
+    let collapsed = decoded.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_for_log(&collapsed, limit)
+}
+
+/// Truncate on a char boundary and record the original length, so a truncated field is
+/// never mistaken for the whole story.
+fn truncate_for_log(text: &str, limit: usize) -> String {
+    let total = text.chars().count();
+    if total <= limit {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(limit).collect();
+    format!("{head}...[truncated, {total} chars total]")
+}
+
 async fn command_version_once(command: ResolvedCommand, label: &str) -> Result<semver::Version, NodeRuntimeError> {
     let mut builder = crate::Builder::from_resolved(&command);
     builder.arg("--version");
-    let output = builder
-        .output()
-        .await
-        .map_err(|error| NodeRuntimeError::managed_invalid(format!("{label} failed to start: {error}")))?;
+
+    // AIONUI-62: the failure detail below is logged as structured fields ONLY and is
+    // deliberately kept out of the returned error message. `classify_error` (managed.rs)
+    // derives the user-facing failure kind — and its Sentry tag — by lowercased substring
+    // matching on the stringified error, and this message is embedded verbatim into
+    // "bundled Node runtime failed validation under {}: {}" (managed.rs
+    // `activate_local_runtime_source`). Appending arbitrary npm stderr there could match
+    // "timed out" / "unsupported" / "http <status>" and silently reclassify the failure.
+    //
+    // This fires once per attempt (at most VERSION_PROBE_ATTEMPTS), including the final
+    // one. `probe_command_version_with_retry` intentionally does not log the
+    // budget-exhausted verdict because its caller already warns — which left the actual
+    // recurring production shape (every attempt failing) with no captured detail at all.
+    // Logging per attempt here is what makes that case diagnosable.
+    let output = match builder.output().await {
+        Ok(output) => output,
+        Err(error) => {
+            warn!(
+                label,
+                program = %command.program.display(),
+                io_kind = ?error.kind(),
+                os_error = ?error.raw_os_error(),
+                "node runtime --version probe failed to start"
+            );
+            return Err(NodeRuntimeError::managed_invalid(format!(
+                "{label} failed to start: {error}"
+            )));
+        }
+    };
 
     if !output.status.success() {
+        warn!(
+            label,
+            program = %command.program.display(),
+            exit_code = ?output.status.code(),
+            stderr = %sanitize_probe_stderr(&output.stderr, PROBE_STDERR_LOG_LIMIT),
+            "node runtime --version probe exited unsuccessfully"
+        );
         return Err(NodeRuntimeError::managed_invalid(format!(
             "{label} exited with {}",
             output.status
@@ -616,6 +673,162 @@ mod tests {
                 Duration::from_millis(500),
                 Duration::from_millis(1000),
             ]
+        );
+    }
+
+    #[test]
+    fn sanitize_probe_stderr_returns_empty_for_no_stderr() {
+        assert_eq!(sanitize_probe_stderr(b"", PROBE_STDERR_LOG_LIMIT), "");
+        assert_eq!(sanitize_probe_stderr(b"   \n\n ", PROBE_STDERR_LOG_LIMIT), "");
+    }
+
+    #[test]
+    fn sanitize_probe_stderr_collapses_multi_line_output_into_one_line() {
+        let stderr = b"npm ERR! code ENOENT\r\nnpm ERR! syscall spawn\n\nnpm ERR! path /opt/node\n";
+
+        let sanitized = sanitize_probe_stderr(stderr, PROBE_STDERR_LOG_LIMIT);
+
+        assert_eq!(
+            sanitized,
+            "npm ERR! code ENOENT npm ERR! syscall spawn npm ERR! path /opt/node"
+        );
+        assert!(
+            !sanitized.contains('\n'),
+            "log field must stay single-line: {sanitized}"
+        );
+        assert!(
+            !sanitized.contains('\r'),
+            "log field must stay single-line: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn sanitize_probe_stderr_truncates_oversized_output_with_marker() {
+        let stderr = "x".repeat(600);
+
+        let sanitized = sanitize_probe_stderr(stderr.as_bytes(), PROBE_STDERR_LOG_LIMIT);
+
+        assert!(
+            sanitized.starts_with(&"x".repeat(PROBE_STDERR_LOG_LIMIT)),
+            "truncation must keep the head: {sanitized}"
+        );
+        assert!(
+            sanitized.contains("[truncated, 600 chars total]"),
+            "truncation marker must record the original length: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn sanitize_probe_stderr_handles_non_utf8_bytes_without_panicking() {
+        let sanitized = sanitize_probe_stderr(&[0xff, 0xfe, b'n', b'p', b'm'], PROBE_STDERR_LOG_LIMIT);
+
+        assert_eq!(sanitized, "\u{fffd}\u{fffd}npm");
+    }
+
+    #[test]
+    fn truncate_for_log_keeps_char_boundaries() {
+        let text = "ünïcødé";
+
+        let truncated = truncate_for_log(text, 3);
+
+        assert!(truncated.starts_with("ünï"), "must cut on char boundaries: {truncated}");
+        assert!(
+            truncated.contains("[truncated, 7 chars total]"),
+            "must report the char length, not the byte length: {truncated}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_version_probe_logs_stderr_but_keeps_error_message_clean() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = tmp.path().join("npm");
+        // "unsupported" here is the hazard `classify_error` (managed.rs) would match on if
+        // stderr were ever appended to the error message.
+        write_executable(
+            &script,
+            "#!/bin/sh\nprintf 'npm ERR! code ENOENT\\nnpm ERR! unsupported\\n' >&2\nexit 7\n",
+        );
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let subscriber = {
+            let buffer = Arc::clone(&buffer);
+            fmt::Subscriber::builder()
+                .with_max_level(Level::WARN)
+                .with_writer(move || SharedBuf(Arc::clone(&buffer)))
+                .with_ansi(false)
+                .finish()
+        };
+
+        let error = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            command_version_once(ResolvedCommand::plain(script), "npm")
+                .await
+                .expect_err("non-zero exit must fail the probe")
+        };
+        let captured = String::from_utf8(buffer.lock().expect("lock").clone()).expect("utf8");
+
+        let message = error.to_string();
+        assert!(
+            message.starts_with("npm exited with "),
+            "error message must keep its existing shape: {message}"
+        );
+        assert!(
+            !message.contains("ENOENT") && !message.contains("unsupported"),
+            "stderr must never leak into the error message classify_error matches on: {message}"
+        );
+        assert!(
+            captured.contains("node runtime --version probe exited unsuccessfully"),
+            "missing probe failure log: {captured}"
+        );
+        assert!(
+            captured.contains("npm ERR! code ENOENT npm ERR! unsupported"),
+            "stderr detail must be captured in the log: {captured}"
+        );
+        assert!(
+            captured.contains("exit_code=Some(7)"),
+            "exit code must be captured as its own field: {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_probe_spawn_failure_logs_os_error_detail() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("definitely-missing-node");
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let subscriber = {
+            let buffer = Arc::clone(&buffer);
+            fmt::Subscriber::builder()
+                .with_max_level(Level::WARN)
+                .with_writer(move || SharedBuf(Arc::clone(&buffer)))
+                .with_ansi(false)
+                .finish()
+        };
+
+        let error = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            command_version_once(ResolvedCommand::plain(missing), "node")
+                .await
+                .expect_err("missing program must fail to start")
+        };
+        let captured = String::from_utf8(buffer.lock().expect("lock").clone()).expect("utf8");
+
+        assert!(
+            error.to_string().starts_with("node failed to start: "),
+            "error message must keep its existing shape: {error}"
+        );
+        assert!(
+            captured.contains("node runtime --version probe failed to start"),
+            "missing spawn failure log: {captured}"
+        );
+        assert!(
+            captured.contains("io_kind=NotFound"),
+            "io error kind must be captured as its own field: {captured}"
+        );
+        assert!(
+            captured.contains("os_error=Some("),
+            "raw OS error code must be captured as its own field: {captured}"
         );
     }
 

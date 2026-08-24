@@ -1668,9 +1668,10 @@ async fn agent_title_applies_to_default_named_conversation() {
 
     let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
     let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
-    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Fix login bug")
-        .await
-        .unwrap();
+    let applied =
+        crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Fix login bug", "test")
+            .await
+            .unwrap();
 
     assert!(applied);
     let row = get_row(&repo, "user_1", &id).await;
@@ -1695,9 +1696,10 @@ async fn agent_title_overwrites_previous_agent_title() {
 
     let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
     let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
-    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Newer agent title")
-        .await
-        .unwrap();
+    let applied =
+        crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Newer agent title", "test")
+            .await
+            .unwrap();
 
     assert!(applied);
     assert_eq!(get_row(&repo, "user_1", &id).await.name, "Newer agent title");
@@ -1711,7 +1713,7 @@ async fn agent_title_never_overwrites_user_rename() {
 
     let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
     let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
-    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Agent title")
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Agent title", "test")
         .await
         .unwrap();
 
@@ -1736,7 +1738,7 @@ async fn agent_title_unchanged_is_noop() {
 
     let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
     let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
-    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Same title")
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Same title", "test")
         .await
         .unwrap();
 
@@ -1756,7 +1758,7 @@ async fn agent_title_ignores_unknown_conversation() {
 
     let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
     let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
-    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", "missing", "Title")
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", "missing", "Title", "test")
         .await
         .unwrap();
 
@@ -8836,4 +8838,153 @@ async fn a_deferred_cancel_does_not_leak_into_a_later_turn() {
     assert!(svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
     // Consumed exactly once.
     assert!(!svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
+}
+
+/// The agent has declared the persisted id dead, so it MUST be dropped. Keeping
+/// it made the failure permanent: every later turn replayed the same dead id and
+/// failed at warmup with `Session not found`, before the prompt was ever sent —
+/// so the real cause (a missing provider API key, reported exactly once) became
+/// unreachable and no amount of retrying could clear it.
+#[tokio::test]
+async fn session_not_found_clears_the_persisted_session_id() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("df6f811c-dead-session"));
+    let (svc, _broadcaster, _repo, task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(RecordingSkillResolver {
+            names: Vec::new(),
+            links: Arc::new(Mutex::new(Vec::new())),
+        }),
+        acp_repo.clone(),
+    );
+
+    let outcome = crate::stream_relay::RelayOutcome {
+        system_responses: Vec::new(),
+        terminal: crate::stream_relay::RelayTerminal::Error {
+            code: Some(AgentErrorCode::UserAgentSessionNotFound),
+            retryable: Some(true),
+        },
+        attempt: Default::default(),
+    };
+
+    let evicted = svc
+        .evict_acp_task_after_terminal_error("user-1", "conv-1", AgentType::Acp, &outcome, &task_mgr)
+        .await;
+
+    assert!(evicted, "an ACP terminal error must evict the task");
+    assert!(
+        acp_repo.session_id.lock().unwrap().is_none(),
+        "an id the agent no longer recognises must not survive"
+    );
+}
+
+/// The clear is deliberately NOT unconditional. A retryable failure triggers an
+/// auto-replay rebuild that carries the session id forward on purpose, so the
+/// replay resumes the same session rather than losing the conversation context.
+#[tokio::test]
+async fn other_terminal_errors_keep_the_session_id_for_replay() {
+    for code in [
+        AgentErrorCode::UserLlmProviderAuthFailed,
+        AgentErrorCode::UnknownUpstreamError,
+    ] {
+        let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-live"));
+        let (svc, _b, _r, task_mgr) = make_service_with_resolver_and_acp_session_repo(
+            Arc::new(RecordingSkillResolver {
+                names: Vec::new(),
+                links: Arc::new(Mutex::new(Vec::new())),
+            }),
+            acp_repo.clone(),
+        );
+
+        let outcome = crate::stream_relay::RelayOutcome {
+            system_responses: Vec::new(),
+            terminal: crate::stream_relay::RelayTerminal::Error {
+                code: Some(code),
+                retryable: Some(true),
+            },
+            attempt: Default::default(),
+        };
+        svc.evict_acp_task_after_terminal_error("user-1", "conv-1", AgentType::Acp, &outcome, &task_mgr)
+            .await;
+
+        assert_eq!(
+            acp_repo.session_id.lock().unwrap().as_deref(),
+            Some("sess-live"),
+            "session id must survive {code:?} so auto-replay can resume it"
+        );
+    }
+}
+
+/// A clean finish must not evict or touch anything.
+#[tokio::test]
+async fn a_clean_finish_leaves_the_session_id_alone() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("live-session"));
+    let (svc, _b, _r, task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(RecordingSkillResolver {
+            names: Vec::new(),
+            links: Arc::new(Mutex::new(Vec::new())),
+        }),
+        acp_repo.clone(),
+    );
+
+    let outcome = crate::stream_relay::RelayOutcome {
+        system_responses: Vec::new(),
+        terminal: crate::stream_relay::RelayTerminal::Finish,
+        attempt: Default::default(),
+    };
+
+    let evicted = svc
+        .evict_acp_task_after_terminal_error("user-1", "conv-1", AgentType::Acp, &outcome, &task_mgr)
+        .await;
+
+    assert!(!evicted, "a clean finish must not evict");
+    assert_eq!(
+        acp_repo.session_id.lock().unwrap().as_deref(),
+        Some("live-session"),
+        "a live session must survive a clean turn"
+    );
+}
+
+/// The BUILD path is where the reported loop actually lived: warmup fails, so the
+/// terminal-error eviction never runs. This calls the shared helper directly with
+/// the code that path reports, pinning that a disowned id is dropped there too.
+#[tokio::test]
+async fn session_not_found_during_task_build_clears_the_persisted_session_id() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("deb7c49d-dead"));
+    let (svc, _b, _r, _task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(RecordingSkillResolver {
+            names: Vec::new(),
+            links: Arc::new(Mutex::new(Vec::new())),
+        }),
+        acp_repo.clone(),
+    );
+
+    svc.clear_persisted_acp_session_after_disown("user-1", "conv-1", Some(AgentErrorCode::UserAgentSessionNotFound))
+        .await;
+
+    assert!(
+        acp_repo.session_id.lock().unwrap().is_none(),
+        "a build failure that disowns the session must clear the id"
+    );
+}
+
+/// A build failure for any other reason keeps the id — the session may still be
+/// resumable and dropping it would lose the conversation's context.
+#[tokio::test]
+async fn other_build_failures_keep_the_persisted_session_id() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-live"));
+    let (svc, _b, _r, _task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(RecordingSkillResolver {
+            names: Vec::new(),
+            links: Arc::new(Mutex::new(Vec::new())),
+        }),
+        acp_repo.clone(),
+    );
+
+    svc.clear_persisted_acp_session_after_disown("user-1", "conv-1", Some(AgentErrorCode::UnknownUpstreamError))
+        .await;
+
+    assert_eq!(
+        acp_repo.session_id.lock().unwrap().as_deref(),
+        Some("sess-live"),
+        "an unrelated build failure must not drop a resumable session"
+    );
 }

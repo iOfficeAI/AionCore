@@ -86,18 +86,95 @@ pub struct LogGuards {
 
 const LOGGING_INIT_MESSAGE: &str = "failed to initialize logging";
 
-pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> Result<LogGuards, BootstrapError> {
-    let active_log_dir = dated_log_dir(log_dir);
+/// Outcome of picking the log root: which root is active plus, when the
+/// requested custom directory was unusable, the details needed to report the
+/// degradation once the tracing subscriber is ready.
+#[derive(Debug)]
+struct LogDirSelection {
+    root: PathBuf,
+    active_dir: PathBuf,
+    fallback: Option<LogDirFallback>,
+}
 
-    std::fs::create_dir_all(&active_log_dir).map_err(|e| {
-        BootstrapError::new(
-            BootstrapErrorCode::LoggingInitFailed,
-            "logging.dir",
-            LOGGING_INIT_MESSAGE,
-        )
-        .with_source(e)
-        .with_field("logDir", active_log_dir.display().to_string())
-    })?;
+/// Custom log-dir failure that triggered the default-dir fallback. Held until
+/// the subscriber is initialized, then emitted as a structured warn.
+#[derive(Debug)]
+struct LogDirFallback {
+    requested_dir: PathBuf,
+    error_kind: io::ErrorKind,
+}
+
+fn logging_dir_error(active_log_dir: &Path, error: io::Error) -> BootstrapError {
+    // ErrorKind is the enum name only (no path, no OS message), so it can ride
+    // the stable stderr boundary line while the raw source stays private.
+    let error_kind = format!("{:?}", error.kind());
+    BootstrapError::new(
+        BootstrapErrorCode::LoggingInitFailed,
+        "logging.dir",
+        LOGGING_INIT_MESSAGE,
+    )
+    .with_source(error)
+    .with_field("logDir", active_log_dir.display().to_string())
+    .with_field("errorKind", error_kind)
+}
+
+/// Pick the log root directory, creating today's dated partition.
+///
+/// A custom directory that cannot be created (permissions, AV interference,
+/// path occupied by a file — Jira AIONUI-231) must not permanently brick
+/// bootstrap: fall back to the default directory instead. Failure to create
+/// the default directory itself remains fatal.
+fn select_log_root(custom_log_dir: Option<&Path>, default_log_dir: &Path) -> Result<LogDirSelection, BootstrapError> {
+    if let Some(custom) = custom_log_dir
+        && custom != default_log_dir
+    {
+        let custom_active = dated_log_dir(custom);
+        match std::fs::create_dir_all(&custom_active) {
+            Ok(()) => {
+                return Ok(LogDirSelection {
+                    root: custom.to_path_buf(),
+                    active_dir: custom_active,
+                    fallback: None,
+                });
+            }
+            Err(custom_error) => {
+                let custom_kind = custom_error.kind();
+                let default_active = dated_log_dir(default_log_dir);
+                std::fs::create_dir_all(&default_active).map_err(|default_error| {
+                    logging_dir_error(&default_active, default_error)
+                        .with_field("requestedLogDir", custom.display().to_string())
+                        .with_field("requestedErrorKind", format!("{custom_kind:?}"))
+                })?;
+                return Ok(LogDirSelection {
+                    root: default_log_dir.to_path_buf(),
+                    active_dir: default_active,
+                    fallback: Some(LogDirFallback {
+                        requested_dir: custom.to_path_buf(),
+                        error_kind: custom_kind,
+                    }),
+                });
+            }
+        }
+    }
+
+    let root = custom_log_dir.unwrap_or(default_log_dir);
+    let active_dir = dated_log_dir(root);
+    std::fs::create_dir_all(&active_dir).map_err(|e| logging_dir_error(&active_dir, e))?;
+    Ok(LogDirSelection {
+        root: root.to_path_buf(),
+        active_dir,
+        fallback: None,
+    })
+}
+
+pub fn init_tracing(
+    custom_log_dir: Option<&Path>,
+    default_log_dir: &Path,
+    log_level: Option<&str>,
+) -> Result<LogGuards, BootstrapError> {
+    let selection = select_log_root(custom_log_dir, default_log_dir)?;
+    let log_dir = selection.root.as_path();
+    let active_log_dir = selection.active_dir.as_path();
 
     let console_layer = fmt::layer().with_target(true).with_filter(build_env_filter(log_level));
 
@@ -147,6 +224,19 @@ pub fn init_tracing(log_dir: &Path, log_level: Option<&str>) -> Result<LogGuards
             .with_source(e)
             .with_field("logDir", active_log_dir.display().to_string())
         })?;
+
+    if let Some(fallback) = &selection.fallback {
+        // Production-visible degradation marker (AIONUI-231): the requested
+        // custom log dir was unusable and logging continues in the default dir.
+        tracing::warn!(
+            code = "BOOTSTRAP_DEGRADED_LOG_DIR",
+            stage = "logging.dir.fallback",
+            requested_log_dir = %fallback.requested_dir.display(),
+            active_log_dir = %active_log_dir.display(),
+            error_kind = ?fallback.error_kind,
+            "custom log directory is unusable; falling back to default log directory"
+        );
+    }
 
     Ok(LogGuards {
         _backend: backend_guard,
@@ -365,5 +455,86 @@ mod tests {
             "july 3\n"
         );
         assert!(!tmp.path().join("2026/07/02/2026-07-03.aioncore.log").exists());
+    }
+
+    #[test]
+    fn select_log_root_uses_creatable_custom_dir_without_fallback() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let custom = tmp.path().join("custom-logs");
+        let default = tmp.path().join("default-logs");
+
+        let selection = select_log_root(Some(&custom), &default).expect("creatable custom dir should be selected");
+
+        assert_eq!(selection.root, custom);
+        assert!(selection.fallback.is_none());
+        assert!(selection.active_dir.starts_with(&custom));
+        assert!(selection.active_dir.is_dir());
+    }
+
+    #[test]
+    fn select_log_root_falls_back_to_default_when_custom_dir_is_unusable() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        // A file occupying the custom path makes create_dir_all fail the same
+        // way an unwritable path does (AIONUI-231 repro without root).
+        let custom = tmp.path().join("occupied");
+        std::fs::write(&custom, b"not a directory").expect("occupy custom path");
+        let default = tmp.path().join("default-logs");
+
+        let selection = select_log_root(Some(&custom), &default).expect("unusable custom dir must degrade, not fail");
+
+        assert_eq!(selection.root, default);
+        assert!(selection.active_dir.starts_with(&default));
+        assert!(selection.active_dir.is_dir());
+        let fallback = selection
+            .fallback
+            .expect("fallback details must be recorded for the warn log");
+        assert_eq!(fallback.requested_dir, custom);
+    }
+
+    #[test]
+    fn select_log_root_stays_fatal_with_error_kind_when_default_dir_is_unusable() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let default = tmp.path().join("occupied");
+        std::fs::write(&default, b"not a directory").expect("occupy default path");
+
+        let err = select_log_root(None, &default).expect_err("default dir failure must stay fatal");
+
+        assert_eq!(err.code(), BootstrapErrorCode::LoggingInitFailed);
+        assert_eq!(err.stage(), "logging.dir");
+        let stderr = err.stderr_line();
+        assert!(stderr.contains("BOOTSTRAP_LOGGING_INIT_FAILED"), "{stderr}");
+        assert!(stderr.contains("errorKind="), "{stderr}");
+    }
+
+    #[test]
+    fn select_log_root_stays_fatal_when_both_custom_and_default_dirs_are_unusable() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let custom = tmp.path().join("custom-occupied");
+        let default = tmp.path().join("default-occupied");
+        std::fs::write(&custom, b"not a directory").expect("occupy custom path");
+        std::fs::write(&default, b"not a directory").expect("occupy default path");
+
+        let err = select_log_root(Some(&custom), &default).expect_err("both dirs failing must stay fatal");
+
+        assert_eq!(err.code(), BootstrapErrorCode::LoggingInitFailed);
+        assert_eq!(err.stage(), "logging.dir");
+        let stderr = err.stderr_line();
+        assert!(stderr.contains("errorKind="), "{stderr}");
+        assert!(stderr.contains("requestedErrorKind="), "{stderr}");
+    }
+
+    /// The only test allowed to call `init_tracing`: it registers the
+    /// process-global subscriber, and a second registration would fail.
+    #[test]
+    fn init_tracing_survives_unusable_custom_dir_by_falling_back_to_default() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let custom = tmp.path().join("occupied");
+        std::fs::write(&custom, b"not a directory").expect("occupy custom path");
+        let default = tmp.path().join("default-logs");
+
+        let _guards = init_tracing(Some(&custom), &default, Some("info"))
+            .expect("bootstrap must survive an unusable custom log dir");
+
+        assert!(dated_log_dir(&default).is_dir());
     }
 }

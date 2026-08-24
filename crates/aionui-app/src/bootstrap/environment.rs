@@ -2,10 +2,11 @@
 
 use std::time::Instant;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use aionui_app::{AppConfig, IdentityMode};
 use aionui_db::Database;
+use aionui_runtime::ShellProbeStatus;
 
 use crate::cli::Cli;
 
@@ -26,14 +27,37 @@ pub struct ServerEnvironment {
 /// Cheap, synchronous, no IO beyond creating the log directory.
 /// All subcommands that need logging and config should call this first.
 pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironment, BootstrapError> {
-    let log_dir = cli.log_dir.clone().unwrap_or_else(|| cli.data_dir.join("logs"));
-    let log_guard = init_tracing(&log_dir, cli.log_level.as_deref())?;
+    // A custom --log-dir that cannot be created must not permanently brick
+    // bootstrap (AIONUI-231): init_tracing falls back to the default dir.
+    let default_log_dir = cli.data_dir.join("logs");
+    let log_guard = init_tracing(cli.log_dir.as_deref(), &default_log_dir, cli.log_level.as_deref())?;
 
     info!(
         path_segments = merged_path.split(if cfg!(windows) { ';' } else { ':' }).count(),
         path_len = merged_path.len(),
         "startup: PATH ready"
     );
+
+    // The login-shell PATH probe runs in `main`, before `init_tracing`, so its
+    // own logging goes nowhere. Replay the outcome here: a probe that timed out
+    // used to leave no trace on either log sink, which made a hung startup
+    // indistinguishable from a crash (AIONUI-150). Status and duration only —
+    // never the PATH itself.
+    match aionui_runtime::login_shell_probe_report() {
+        // A timed-out probe is the AIONUI-150 signature and must be visible at
+        // production's default `info` threshold.
+        Some(probe) if probe.status == ShellProbeStatus::TimedOut => warn!(
+            probe_status = probe.status.as_str(),
+            probe_elapsed_ms = probe.elapsed_ms,
+            "startup: login-shell PATH probe timed out; continuing with the inherited PATH"
+        ),
+        Some(probe) => info!(
+            probe_status = probe.status.as_str(),
+            probe_elapsed_ms = probe.elapsed_ms,
+            "startup: login-shell PATH probe finished"
+        ),
+        None => {}
+    }
 
     let work_dir = resolve_work_dir(cli.work_dir.clone(), &cli.data_dir);
 
