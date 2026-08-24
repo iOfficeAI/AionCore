@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.85](https://github.com/suoak/AionCore/compare/v0.1.84...v0.1.85) (2026-08-24)
+
+### Features
+
+* **office:** support the CSBU WorkMate managed OfficeCLI runtime with fail-closed executable validation
+
+### Bug Fixes
+
+* **office:** disable PATH fallback, online installation, and independent updates for bundled OfficeCLI
+* **skills:** use the branded suoak/OfficeCLI distribution for built-in document workflows
+
 ## [0.1.84](https://github.com/suoak/AionCore/compare/v0.1.83...v0.1.84) (2026-08-24)
 
 ### Bug Fixes
