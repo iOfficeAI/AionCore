@@ -106,6 +106,7 @@ fn custom_agent_params<'a>(id: &'a str, name: &'a str, backend: &'a str) -> Upse
         args: Some("[]"),
         env: Some("[]"),
         native_skills_dirs: Some("[]"),
+        skill_delivery: None,
         behavior_policy: Some("{}"),
         yolo_id: None,
         agent_capabilities: None,

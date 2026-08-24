@@ -31,6 +31,7 @@ mod session_tools;
 mod shell;
 mod sidebar;
 mod skill;
+mod skill_delivery;
 mod system;
 mod team;
 mod team_mcp;
@@ -180,6 +181,7 @@ pub use skill::{
     SkillImportRecordResponse, SkillListItemResponse, SkillPathsResponse, SkillSourceResponse,
     WriteAssistantRuleRequest,
 };
+pub use skill_delivery::{SkillDelivery, SkillDeliveryMode, SkillDeliveryParse, parse_skill_delivery};
 pub use system::{
     ClientPreferencesResponse, CurrentUserResponse, FeedbackDiagnosticsContextResponse,
     FeedbackDiagnosticsPrivacyResponse, FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery,

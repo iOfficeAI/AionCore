@@ -2806,6 +2806,7 @@ async fn create_for_conversation_helper_uses_codex_canonical_full_auto_mode_from
             args: codex.args.as_deref(),
             env: codex.env.as_deref(),
             native_skills_dirs: codex.native_skills_dirs.as_deref(),
+            skill_delivery: None,
             behavior_policy: codex.behavior_policy.as_deref(),
             yolo_id: None,
             agent_capabilities: codex.agent_capabilities.as_deref(),

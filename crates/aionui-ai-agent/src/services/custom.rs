@@ -184,6 +184,7 @@ impl AgentService {
             args: Some(&args_json),
             env: Some(&env_json),
             native_skills_dirs: native_skills_dirs_json.as_deref(),
+            skill_delivery: None,
             behavior_policy: behavior_policy_json.as_deref(),
             yolo_id: advanced.yolo_id.as_deref(),
             agent_capabilities: None,
