@@ -72,10 +72,15 @@ pub struct UserInfoResponse {
 }
 
 /// Refresh token response for `POST /api/auth/refresh`.
+///
+/// `token` is the new access token; `refresh_token` is the rotated refresh
+/// token. Native clients persist both and renew via the request body; browsers
+/// ignore `refresh_token` and rely on the `Set-Cookie`d refresh cookie instead.
 #[derive(Debug, Serialize)]
 pub struct RefreshResponse {
     pub success: bool,
     pub token: String,
+    pub refresh_token: String,
 }
 
 /// WebSocket token response for `GET /api/ws-token`.
@@ -384,5 +389,20 @@ mod tests {
         let raw = r#"{}"#;
         let result = serde_json::from_str::<RefreshTokenRequest>(raw);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_refresh_response_carries_both_tokens() {
+        // Native clients migrating to the dual-token model must be able to read
+        // the rotated refresh token out of the JSON body.
+        let resp = RefreshResponse {
+            success: true,
+            token: "access.jwt".into(),
+            refresh_token: "refresh.jwt".into(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["success"], true);
+        assert_eq!(json["token"], "access.jwt");
+        assert_eq!(json["refresh_token"], "refresh.jwt");
     }
 }

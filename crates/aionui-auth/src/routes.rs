@@ -7,7 +7,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::from_fn_with_state;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{AppendHeaders, Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Extension, Router};
 use serde::{Deserialize, Serialize};
@@ -20,11 +20,11 @@ use aionui_api_types::{
     WebuiResetPasswordResponse, WsTokenResponse,
 };
 use aionui_common::ApiError;
-use aionui_common::constants::COOKIE_MAX_AGE_DAYS;
+use aionui_common::constants::{COOKIE_MAX_AGE_DAYS, REFRESH_COOKIE_NAME};
 use aionui_db::{DbError, IUserRepository, UserStatus, UserType, models::User};
 
 use crate::error::AuthError;
-use crate::extract::extract_token_from_headers;
+use crate::extract::{extract_cookie_value, extract_token_from_headers};
 use crate::middleware::{AuthIdentityMode, AuthState, CurrentUser, auth_middleware};
 use crate::password::{dummy_password_hash, generate_password, hash_password, verify_password_timed};
 use crate::qr_token::QrTokenStore;
@@ -32,6 +32,7 @@ use crate::rate_limit::{
     RateLimiter, api_rate_limit_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware,
 };
 use crate::service::{AuthProvisionService, ProvisionError};
+use crate::singleflight::{RefreshCoalescer, RefreshError, RefreshedTokens};
 use crate::validation::{validate_password, validate_username};
 use crate::{CookieConfig, JwtService};
 
@@ -54,6 +55,16 @@ impl From<AuthError> for ApiError {
     }
 }
 
+impl From<RefreshError> for ApiError {
+    fn from(err: RefreshError) -> Self {
+        match err {
+            RefreshError::Unauthorized(msg) => ApiError::Unauthorized(msg.into()),
+            RefreshError::UserContextRequired => user_context_required(),
+            RefreshError::Internal(msg) => ApiError::Internal(msg.into()),
+        }
+    }
+}
+
 fn db_error_to_api_error(err: DbError) -> ApiError {
     match err {
         DbError::NotFound(msg) => ApiError::NotFound(msg),
@@ -68,6 +79,8 @@ fn db_error_to_api_error(err: DbError) -> ApiError {
 #[derive(Clone)]
 pub struct AuthRouterState {
     pub jwt_service: Arc<JwtService>,
+    /// Coalesces concurrent refreshes for the same token (refresh-storm guard).
+    pub refresh_coalescer: RefreshCoalescer,
     pub user_repo: Arc<dyn IUserRepository>,
     /// Optional on-disk adoption side-effect (AionUi → AionPro upgrade).
     pub fs_adopter: Option<Arc<dyn crate::service::SystemDefaultFilesystemAdopter>>,
@@ -403,8 +416,16 @@ async fn create_external_session_handler(
         user_id = %exchange.response.user.id,
         "external core session exchange succeeded"
     );
-    let cookie = state.cookie_config.build_session_cookie(&exchange.token);
-    Ok(([(header::SET_COOKIE, cookie)], Json(ApiResponse::ok(exchange.response))).into_response())
+    let session_cookie = state.cookie_config.build_session_cookie(&exchange.token);
+    let refresh_cookie = state.cookie_config.build_refresh_cookie(&exchange.refresh_token);
+    Ok((
+        AppendHeaders([
+            (header::SET_COOKIE, session_cookie),
+            (header::SET_COOKIE, refresh_cookie),
+        ]),
+        Json(ApiResponse::ok(exchange.response)),
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -500,13 +521,22 @@ async fn login_handler(
             user.session_generation,
         )
         .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
+    let refresh_token = state
+        .jwt_service
+        .sign_refresh(
+            &user.id,
+            user.username.as_deref().unwrap_or("external_user"),
+            user.session_generation,
+        )
+        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
 
     // Update last login (best-effort)
     if let Err(e) = state.user_repo.update_last_login(&user.id).await {
         tracing::warn!("Failed to update last login for {}: {e}", user.id);
     }
 
-    let cookie = state.cookie_config.build_session_cookie(&token);
+    let session_cookie = state.cookie_config.build_session_cookie(&token);
+    let refresh_cookie = state.cookie_config.build_refresh_cookie(&refresh_token);
     let resp = LoginResponse::new(
         PublicUser {
             id: user.id,
@@ -515,7 +545,14 @@ async fn login_handler(
         token,
     );
 
-    Ok(([(header::SET_COOKIE, cookie)], Json(resp)).into_response())
+    Ok((
+        AppendHeaders([
+            (header::SET_COOKIE, session_cookie),
+            (header::SET_COOKIE, refresh_cookie),
+        ]),
+        Json(resp),
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -527,10 +564,22 @@ async fn logout_handler(State(state): State<AuthRouterState>, headers: HeaderMap
         state.jwt_service.blacklist_token(&token);
     }
 
-    let cookie = state.cookie_config.clear_session_cookie();
+    // Clear both credential cookies. The refresh cookie is path-scoped to the
+    // refresh endpoint, so the browser does not send it here to be blacklisted;
+    // clearing it drops it client-side, and full server-side revocation is via
+    // the user's session generation (password change / session revoke).
+    let session_cookie = state.cookie_config.clear_session_cookie();
+    let refresh_cookie = state.cookie_config.clear_refresh_cookie();
     let resp = ApiResponse::message("Logged out successfully");
 
-    Ok(([(header::SET_COOKIE, cookie)], Json(resp)).into_response())
+    Ok((
+        AppendHeaders([
+            (header::SET_COOKIE, session_cookie),
+            (header::SET_COOKIE, refresh_cookie),
+        ]),
+        Json(resp),
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -553,9 +602,10 @@ async fn status_handler(
         .await
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
-    // Check authentication without requiring it
+    // Check authentication without requiring it. Only an access token counts as
+    // "authenticated" — a refresh token is not a request credential.
     let is_authenticated = extract_token_from_headers(&headers)
-        .and_then(|token| state.jwt_service.verify(&token).ok())
+        .and_then(|token| state.jwt_service.verify_access(&token).ok())
         .is_some();
 
     Ok(Json(AuthStatusResponse {
@@ -776,14 +826,63 @@ async fn change_password_handler(
 
 async fn refresh_handler(
     State(state): State<AuthRouterState>,
+    headers: HeaderMap,
     body: Result<Json<RefreshTokenRequest>, JsonRejection>,
-) -> Result<Json<RefreshResponse>, ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
+) -> Result<Response, ApiError> {
+    // Prefer the HttpOnly refresh cookie; fall back to the request body for
+    // legacy clients that posted the token explicitly.
+    let (raw_token, from_cookie) = match extract_cookie_value(&headers, REFRESH_COOKIE_NAME) {
+        Some(cookie_token) => (cookie_token, true),
+        None => {
+            let Json(req) = body.map_err(ApiError::from)?;
+            (req.token, false)
+        }
+    };
 
-    let payload = state
-        .jwt_service
-        .verify(&req.token)
-        .map_err(|_| ApiError::Unauthorized("Invalid or expired token".into()))?;
+    // Coalesce concurrent refreshes carrying the same token: one expired access
+    // token can fail many in-flight requests at once, and without this each
+    // would independently hit the database and re-sign, stampeding the hottest
+    // auth path. Same token -> one execution, shared result.
+    let tokens = state
+        .refresh_coalescer
+        .run(&raw_token, || refresh_tokens(&state, &raw_token, from_cookie))
+        .await?;
+
+    let session_cookie = state.cookie_config.build_session_cookie(&tokens.access);
+    let refresh_cookie = state.cookie_config.build_refresh_cookie(&tokens.refresh);
+    Ok((
+        AppendHeaders([
+            (header::SET_COOKIE, session_cookie),
+            (header::SET_COOKIE, refresh_cookie),
+        ]),
+        Json(RefreshResponse {
+            success: true,
+            token: tokens.access,
+            refresh_token: tokens.refresh,
+        }),
+    )
+        .into_response())
+}
+
+/// Verify a refresh request and mint a fresh access + refresh token pair.
+///
+/// A cookie-borne token must be a refresh token (`verify_refresh`); the legacy
+/// body path stays lenient (`verify`) because older clients posted their access
+/// session token here. Runs behind [`RefreshCoalescer`] so an expiry storm
+/// collapses into a single execution — hence the crate-owned [`RefreshError`]:
+/// it is `Clone`, so one execution's outcome (success *or* failure) can be
+/// shared by every coalesced caller, and the route layer maps it to `ApiError`.
+async fn refresh_tokens(
+    state: &AuthRouterState,
+    raw_token: &str,
+    from_cookie: bool,
+) -> Result<RefreshedTokens, RefreshError> {
+    let payload = if from_cookie {
+        state.jwt_service.verify_refresh(raw_token)
+    } else {
+        state.jwt_service.verify(raw_token)
+    }
+    .map_err(|_| RefreshError::Unauthorized("Invalid or expired token"))?;
 
     let user = state
         .user_repo
@@ -791,31 +890,42 @@ async fn refresh_handler(
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "refresh token user lookup failed");
-            ApiError::Internal("Authentication service unavailable".into())
+            RefreshError::Internal("Authentication service unavailable")
         })?
-        .ok_or_else(|| ApiError::Unauthorized("Invalid authentication subject".into()))?;
+        .ok_or(RefreshError::Unauthorized("Invalid authentication subject"))?;
 
-    if state.aionpro_mode && user.user_type != aionui_db::UserType::Aionpro {
-        return Err(user_context_required());
+    if state.aionpro_mode && user.user_type != UserType::Aionpro {
+        return Err(RefreshError::UserContextRequired);
     }
 
     if payload.session_generation != user.session_generation {
-        return Err(ApiError::Unauthorized("Invalid authentication session".into()));
+        return Err(RefreshError::Unauthorized("Invalid authentication session"));
     }
 
-    let new_token = state
+    let access = state
         .jwt_service
         .sign_with_session_generation(
             &user.id,
             user.username.as_deref().unwrap_or("external_user"),
             user.session_generation,
         )
-        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "refresh access-token signing failed");
+            RefreshError::Internal("Token signing error")
+        })?;
+    let refresh = state
+        .jwt_service
+        .sign_refresh(
+            &user.id,
+            user.username.as_deref().unwrap_or("external_user"),
+            user.session_generation,
+        )
+        .map_err(|e| {
+            tracing::error!(error = %e, "refresh token signing failed");
+            RefreshError::Internal("Token signing error")
+        })?;
 
-    Ok(Json(RefreshResponse {
-        success: true,
-        token: new_token,
-    }))
+    Ok(RefreshedTokens { access, refresh })
 }
 
 // ---------------------------------------------------------------------------
@@ -881,13 +991,22 @@ async fn qr_login_handler(
             user.session_generation,
         )
         .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
+    let refresh_token = state
+        .jwt_service
+        .sign_refresh(
+            &user.id,
+            user.username.as_deref().unwrap_or("external_user"),
+            user.session_generation,
+        )
+        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
 
     // Update last login (best-effort)
     if let Err(e) = state.user_repo.update_last_login(&user.id).await {
         tracing::warn!("Failed to update last login for {}: {e}", user.id);
     }
 
-    let cookie = state.cookie_config.build_session_cookie(&token);
+    let session_cookie = state.cookie_config.build_session_cookie(&token);
+    let refresh_cookie = state.cookie_config.build_refresh_cookie(&refresh_token);
     let resp = LoginResponse::new(
         PublicUser {
             id: user.id,
@@ -896,7 +1015,14 @@ async fn qr_login_handler(
         token,
     );
 
-    Ok(([(header::SET_COOKIE, cookie)], Json(resp)).into_response())
+    Ok((
+        AppendHeaders([
+            (header::SET_COOKIE, session_cookie),
+            (header::SET_COOKIE, refresh_cookie),
+        ]),
+        Json(resp),
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------

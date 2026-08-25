@@ -105,7 +105,9 @@ pub async fn auth_middleware(
         return runtime_token_channel(&state, request, next).await;
     };
 
-    let payload = state.jwt_service.verify(&token).map_err(|e| {
+    // Require an *access* token here: a refresh token must never authenticate an
+    // ordinary request — it is accepted only at the refresh endpoint.
+    let payload = state.jwt_service.verify_access(&token).map_err(|e| {
         tracing::debug!("Token verification failed: {e}");
         ApiError::Unauthorized("Invalid or expired token".into())
     })?;
