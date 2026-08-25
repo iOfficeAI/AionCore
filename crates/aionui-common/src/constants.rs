@@ -34,6 +34,19 @@ pub const COOKIE_MAX_AGE_DAYS: u32 = 30;
 pub const CSRF_COOKIE_NAME: &str = "aionui-csrf-token";
 pub const CSRF_HEADER_NAME: &str = "x-csrf-token";
 
+/// Cookie carrying the refresh token.
+///
+/// Distinct from the access-token session cookie so the two credential roles
+/// never share a container.
+pub const REFRESH_COOKIE_NAME: &str = "aionui-refresh";
+/// Path the refresh cookie is scoped to. The browser attaches it only when
+/// calling the refresh endpoint, keeping the long-lived credential off every
+/// ordinary API/WebSocket request.
+pub const REFRESH_COOKIE_PATH: &str = "/api/auth/refresh";
+/// Refresh-token / refresh-cookie lifetime in days. This is the window in which
+/// a session can be renewed without re-authenticating.
+pub const REFRESH_COOKIE_MAX_AGE_DAYS: u32 = 30;
+
 // --- Server ---
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";
