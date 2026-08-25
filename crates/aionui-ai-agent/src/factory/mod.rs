@@ -86,6 +86,14 @@ pub struct ResolvedSkillDelivery {
     /// `SessionInit` for backends that need name+path without touching the
     /// workspace.
     pub skill_dirs: Vec<aionui_session::SkillDirSpec>,
+    /// The composed `[Assistant Rules]` block for an `injected`-mode vendor.
+    ///
+    /// Populated only by factory branches whose backend has NO prompt pipeline of
+    /// its own — agy and aionrs. The ACP lane leaves this `None` because its
+    /// `SessionNewPreludeHook` composes the same block at prompt time (through
+    /// the same function, so the wording cannot diverge); computing it here too
+    /// would be dead work.
+    pub injected_prefix: Option<String>,
 }
 
 /// Resolve the per-vendor delivery for one session build.
@@ -140,7 +148,36 @@ pub(crate) async fn resolve_skill_delivery(
         "skill_delivery: resolved delivery plan for session"
     );
 
-    ResolvedSkillDelivery { plan, skill_dirs }
+    ResolvedSkillDelivery {
+        plan,
+        skill_dirs,
+        injected_prefix: None,
+    }
+}
+
+/// Compose the `[Assistant Rules]` block for a backend with no prompt pipeline.
+///
+/// Only agy and aionrs need this: index injection has always lived in the ACP
+/// prompt pipeline, and those two backends never run it — which is why, before
+/// this existed, an `injected`-mode agy or aionrs session received no skills
+/// index at all and (for agy) not even its preset context.
+pub(crate) async fn compose_injected_prefix_for(
+    deps: &AgentFactoryDeps,
+    user_id: &str,
+    preset_context: Option<&str>,
+    skills: &[String],
+    mode: &aionui_api_types::SkillDeliveryMode,
+) -> Option<String> {
+    crate::capability::first_message_injector::compose_injected_prefix(
+        &deps.skill_manager,
+        crate::capability::first_message_injector::InjectionConfig {
+            user_id,
+            preset_context,
+            skills,
+            delivery_mode: mode.clone(),
+        },
+    )
+    .await
 }
 
 async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> Result<AgentInstance, AgentError> {

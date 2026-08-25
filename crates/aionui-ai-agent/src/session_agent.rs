@@ -1734,7 +1734,14 @@ pub async fn build_antigravity_instance(
     let init = SessionInit {
         mcp_servers,
         skills: config.skills.clone(),
-        preset_context: config.preset_context.clone(),
+        // The COMPOSED block (preset context + skills index + dual-channel
+        // instructions), not the raw preset context: agy has no prompt pipeline,
+        // so this is its only injection channel. Falls back to the raw context so
+        // a layer-1 agy (should one ever exist) still gets its assistant rules.
+        preset_context: skill_delivery
+            .injected_prefix
+            .clone()
+            .or_else(|| config.preset_context.clone()),
         // agy is a layer-2 vendor, so no protocol root. The skill dirs still
         // travel: agy needs name+path to build its slash-command list, which it
         // used to get by scanning the workspace.

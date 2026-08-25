@@ -658,6 +658,13 @@ impl AntigravitySessionBackend {
             workspace: self.config.cwd.clone(),
             model: self.effective_model(),
             mode: self.effective_mode(),
+            // agy has no prompt pipeline of its own, so the composed rules block
+            // rides in through `init.preset_context` and `build_argv` prepends it
+            // on the first invocation only. Before this, the backend read nothing
+            // from `init` except `mcp_servers` — dropping both the assistant's
+            // preset context and its skills index.
+            injected_prefix: self.config.init.preset_context.clone(),
+            extra_args: self.config.extra_args.clone(),
         };
         let mut spawn_env = self.config.spawn_env.clone();
         if let Some(cwd) = self.config.cwd.as_deref() {

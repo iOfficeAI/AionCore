@@ -35,6 +35,18 @@ pub(crate) struct ArgvInput {
     /// An AionUi mode id, not necessarily an agy one. `accept-edits` / `plan` reach agy;
     /// `yolo` and `default` are host-side and filtered out (see the constants above).
     pub mode: Option<String>,
+    /// The composed `[Assistant Rules]` block (preset context + skills index +
+    /// dual-channel instructions), prepended to the prompt on the FIRST
+    /// invocation only.
+    ///
+    /// agy is a layer-2 vendor with no prompt pipeline of its own, and until this
+    /// existed the backend consumed only `init.mcp_servers` — so both the
+    /// assistant's preset context AND its skills index were dropped, leaving an
+    /// `injected`-mode agy session with no skills at all.
+    pub injected_prefix: Option<String>,
+    /// Skill-delivery args (allow-list entries). agy ignored `extra_args`
+    /// entirely before this.
+    pub extra_args: Vec<String>,
 }
 
 /// How long agy may wait in print mode before abandoning the turn.
@@ -66,7 +78,17 @@ fn non_blank(value: &Option<String>) -> Option<&str> {
 pub(crate) fn build_argv(input: &ArgvInput) -> Vec<String> {
     let mut a: Vec<String> = Vec::with_capacity(12);
     a.push("-p".into());
-    a.push(input.prompt.clone());
+    // First invocation only. A resumed run carries agy's own history, so
+    // re-injecting would repeat the whole rules block on every single turn.
+    a.push(
+        match (
+            non_blank(&input.injected_prefix),
+            non_blank(&input.resume_conversation_id),
+        ) {
+            (Some(prefix), None) => format!("{prefix}\n\n{}", input.prompt),
+            _ => input.prompt.clone(),
+        },
+    );
     a.push("--output-format".into());
     a.push("stream-json".into());
     // agy cannot prompt for permission in headless mode; with the gate shut it
@@ -110,6 +132,8 @@ pub(crate) fn build_argv(input: &ArgvInput) -> Vec<String> {
             a.push(v.to_owned());
         }
     }
+    // Skill-delivery args last, so they cannot displace anything above.
+    a.extend(input.extra_args.iter().cloned());
     a
 }
 
@@ -124,7 +148,58 @@ mod tests {
             workspace: Some("/w".into()),
             model: None,
             mode: None,
+            injected_prefix: None,
+            extra_args: Vec::new(),
         }
+    }
+
+    /// agy spawns a fresh `-p` per turn and resumes with `--conversation`, so the
+    /// injected rules belong on the FIRST invocation only — afterwards agy carries
+    /// its own history and re-injecting would repeat the block every turn.
+    #[test]
+    fn the_first_invocation_prepends_the_injected_rules_to_the_prompt() {
+        let mut input = base();
+        input.injected_prefix =
+            Some("[Assistant Rules]\n## Available Skills\n- **cron**: d\n[/Assistant Rules]".into());
+        input.resume_conversation_id = None;
+
+        let prompt = flag_value(&build_argv(&input), "-p").unwrap().to_owned();
+        assert!(prompt.starts_with("[Assistant Rules]"), "{prompt}");
+        assert!(prompt.contains("## Available Skills"));
+        assert!(prompt.ends_with("hello"), "the user's own text stays last: {prompt}");
+    }
+
+    #[test]
+    fn a_resumed_invocation_does_not_re_inject_the_rules() {
+        let mut input = base();
+        input.injected_prefix = Some("[Assistant Rules]\nrules\n[/Assistant Rules]".into());
+        input.resume_conversation_id = Some("conv-1".into());
+
+        assert_eq!(flag_value(&build_argv(&input), "-p").unwrap(), "hello");
+    }
+
+    #[test]
+    fn a_blank_prefix_is_treated_as_absent() {
+        let mut input = base();
+        input.injected_prefix = Some("   \n".into());
+        assert_eq!(flag_value(&build_argv(&input), "-p").unwrap(), "hello");
+    }
+
+    /// Skill allow-listing rides on `extra_args`, which this backend previously
+    /// ignored. The workspace `--add-dir` must survive alongside it.
+    #[test]
+    fn caller_extra_args_reach_the_spawn_alongside_the_workspace_add_dir() {
+        let mut input = base();
+        input.extra_args = vec!["--add-dir".into(), "/src/cron".into()];
+        let a = build_argv(&input);
+
+        assert_eq!(
+            a.iter().filter(|arg| *arg == "--add-dir").count(),
+            2,
+            "the workspace entry plus the allow-listed skill source: {a:?}"
+        );
+        assert!(a.windows(2).any(|w| w == ["--add-dir", "/w"]));
+        assert!(a.windows(2).any(|w| w == ["--add-dir", "/src/cron"]));
     }
 
     fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
