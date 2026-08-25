@@ -115,20 +115,10 @@ async fn load_resolved_skill_bodies(skills: &[ResolvedAgentSkill]) -> Vec<Loaded
     loaded
 }
 
-fn extract_skill_body(content: &str) -> String {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        return content.to_string();
-    }
-
-    let after_open = &trimmed[3..];
-    if let Some(close_idx) = after_open.find("---") {
-        let after_close = &after_open[close_idx + 3..];
-        after_close.trim_start_matches('\n').to_string()
-    } else {
-        content.to_string()
-    }
-}
+// Frontmatter stripping lives in `aionui-extension` so this channel and the
+// `aioncore skills show` command return byte-identical bodies. A local copy is
+// how the two would quietly drift.
+use aionui_extension::skill_service::extract_skill_body;
 
 #[async_trait]
 impl SkillResolver for ExtensionSkillResolver {

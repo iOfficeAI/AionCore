@@ -117,6 +117,10 @@ pub(crate) enum Command {
     /// Cross-session messaging: list deliverable conversations and deliver a
     /// message to one of them.
     Session(SessionArgs),
+    /// Agent-facing read-only runtime CLI for THIS conversation's skills.
+    /// Channel A of skill delivery: a normal tool call instead of the
+    /// `[LOAD_SKILL]` text-protocol round trip.
+    Skills(SkillsArgs),
     /// PreToolUse permission gate for the Antigravity CLI (spawned by agy).
     /// Reads the tool request on stdin, asks the running AionUi backend, and
     /// writes agy's decision to stdout.
@@ -142,6 +146,7 @@ impl Command {
             Self::Diagnose(_) => "diagnose",
             Self::Team(_) => "team",
             Self::Session(_) => "session",
+            Self::Skills(_) => "skills",
             Self::AntigravityHook => "antigravity-hook",
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::Doctor => "doctor",
@@ -219,6 +224,26 @@ pub(crate) enum SessionCommand {
     Capabilities,
     List,
     SendMessage,
+    #[command(external_subcommand)]
+    Unknown(Vec<OsString>),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SkillsArgs {
+    #[command(subcommand)]
+    pub command: SkillsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum SkillsCommand {
+    /// Print the agent-readable skills CLI capability contract.
+    Capabilities,
+    /// List the skills enabled in THIS conversation.
+    List,
+    /// Print a skill's full body plus its absolute directory.
+    Show,
+    /// Read one of a skill's supplementary files.
+    Cat,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
 }

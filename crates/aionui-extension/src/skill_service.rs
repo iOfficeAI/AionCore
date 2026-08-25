@@ -1460,6 +1460,30 @@ async fn path_is_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Strip a `SKILL.md`'s YAML frontmatter, returning just the body.
+///
+/// Lives here rather than in a consumer because BOTH skill-delivery channels
+/// hand a body to the agent -- the `[LOAD_SKILL]` text protocol and the
+/// `aioncore skills show` command -- and the two must return identical content.
+/// A second copy is how they would quietly drift apart.
+///
+/// Content without a leading `---`, or with an unterminated block, is returned
+/// unchanged: a malformed skill should still deliver something readable.
+pub fn extract_skill_body(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return content.to_string();
+    }
+
+    let after_open = &trimmed[3..];
+    if let Some(close_idx) = after_open.find("---") {
+        let after_close = &after_open[close_idx + 3..];
+        after_close.trim_start_matches('\n').to_string()
+    } else {
+        content.to_string()
+    }
+}
+
 /// Resolve a skill name to its on-disk source directory using the same
 /// search order as [`materialize_skills_for_agent`]. Returns `None` if
 /// no matching directory exists in any known source.
@@ -2126,7 +2150,13 @@ fn zip_error(err: zip::result::ZipError) -> ExtensionError {
 /// ---
 /// Body content here...
 /// ```
-fn parse_frontmatter_fields(content: &str) -> Option<(String, String)> {
+/// Parse a `SKILL.md`'s `name` + `description` frontmatter fields.
+///
+/// Public so the runtime skills domain can build its listing from the SAME
+/// on-disk source `show` reads, rather than from the DB catalog. That keeps the
+/// two commands consistent by construction and independent of whether a startup
+/// catalog sync has run yet.
+pub fn parse_frontmatter_fields(content: &str) -> Option<(String, String)> {
     #[derive(serde::Deserialize)]
     struct SkillFrontmatter {
         #[serde(default)]
