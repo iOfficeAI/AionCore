@@ -38,7 +38,7 @@ use crate::event::{LocalizedText, NoticeLevel};
 /// 0.147.0 and leaves it unverified rather than a floor anyone can install into.
 pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.235";
 pub const VERIFIED_CODEX_VERSION: &str = "0.149.1";
-pub const VERIFIED_AGY_VERSION: &str = "1.1.19";
+pub const VERIFIED_AGY_VERSION: &str = "1.1.20";
 
 /// The verified release for a direct-CLI backend, keyed by the program name the
 /// backend spawns. `None` for anything not version-gated here.
@@ -475,13 +475,13 @@ mod tests {
         // The literal the other two CLIs already pin, which agy was missing: a
         // user on exactly the verified release is told nothing, and a bump that
         // lands without re-verifying against that exact binary breaks here.
-        assert_eq!(classify("1.1.19", VERIFIED_AGY_VERSION), VersionVerdict::Verified);
-        assert!(drift_notice("agy", "1.1.19", VERIFIED_AGY_VERSION).is_none());
+        assert_eq!(classify("1.1.20", VERIFIED_AGY_VERSION), VersionVerdict::Verified);
+        assert!(drift_notice("agy", "1.1.20", VERIFIED_AGY_VERSION).is_none());
 
         // agy prints a bare version, so the older/newer paths are worth pinning
         // on that exact shape rather than only on a decorated one.
-        assert_eq!(classify("1.1.18", VERIFIED_AGY_VERSION), VersionVerdict::Older);
-        assert_eq!(classify("1.1.20", VERIFIED_AGY_VERSION), VersionVerdict::Newer);
+        assert_eq!(classify("1.1.19", VERIFIED_AGY_VERSION), VersionVerdict::Older);
+        assert_eq!(classify("1.1.21", VERIFIED_AGY_VERSION), VersionVerdict::Newer);
     }
 
     /// Both drift directions are `Info` — the tier the frontend draws as a quiet
