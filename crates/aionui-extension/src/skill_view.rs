@@ -98,6 +98,14 @@ pub async fn rebuild_view(
     let view = view_dir(data_dir, user_id, conversation_id)?;
     let skills_dir = view.join(SKILLS_SUBDIR);
 
+    // Names already linked, captured BEFORE the tree is replaced, so a mid-session
+    // addition can be reported. Allow-listing (`--add-dir`) is a SPAWN argument:
+    // a skill added while the agent is running gets into the view and the index,
+    // but its supplementary files stay unreadable to the already-started process
+    // until the runtime restarts. Silence here would present as "the agent can
+    // see the skill but cannot open its references", with nothing to point at.
+    let previously_linked = existing_link_names(&skills_dir).await;
+
     tokio::fs::create_dir_all(view.join(PLUGIN_MANIFEST_DIR)).await?;
     tokio::fs::write(
         view.join(PLUGIN_MANIFEST_DIR).join(PLUGIN_MANIFEST_FILE),
@@ -140,6 +148,23 @@ pub async fn rebuild_view(
         }
     }
 
+    if !previously_linked.is_empty() {
+        let added = skills
+            .iter()
+            .filter(|skill| !previously_linked.contains(&skill.name))
+            .count();
+        if added > 0 {
+            warn!(
+                user_id = %user_id,
+                conversation_id = %conversation_id,
+                added,
+                "skill_view: skills added to a conversation that already had a view; their \
+                 supplementary files stay unreadable to an already-running agent until the \
+                 runtime restarts (directory allow-listing is a spawn argument)"
+            );
+        }
+    }
+
     info!(
         user_id = %user_id,
         conversation_id = %conversation_id,
@@ -148,6 +173,22 @@ pub async fn rebuild_view(
         "skill_view: rebuilt session skill view"
     );
     Ok(created)
+}
+
+/// Skill names currently linked in the view. Empty when the view does not exist
+/// yet, which is indistinguishable from "no skills" on purpose: both mean there
+/// is no previous state to diff against.
+async fn existing_link_names(skills_dir: &Path) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let Ok(mut entries) = tokio::fs::read_dir(skills_dir).await else {
+        return names;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Some(name) = entry.file_name().to_str() {
+            names.insert(name.to_owned());
+        }
+    }
+    names
 }
 
 /// Drop this conversation's view. `Ok(false)` means there was nothing to remove.
@@ -340,6 +381,31 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(entries, vec!["cron"]);
+    }
+
+    /// Adding a skill mid-session is the R12 case: the view and index pick it up,
+    /// but its supplementary files stay unreadable to an already-running agent
+    /// because directory allow-listing is a spawn argument. The rebuild must still
+    /// succeed and link the new skill -- the limitation is reported, not enforced.
+    #[tokio::test]
+    async fn adding_a_skill_to_an_existing_view_still_links_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let sources = tmp.path().join("sources");
+        let cron = write_source_skill(&sources, "cron");
+        let pdf = write_source_skill(&sources, "pdf");
+
+        rebuild_view(&data_dir, "user_a", "conv_1", std::slice::from_ref(&cron))
+            .await
+            .unwrap();
+        assert_eq!(
+            rebuild_view(&data_dir, "user_a", "conv_1", &[cron, pdf]).await.unwrap(),
+            2
+        );
+
+        let skills_dir = view_skills_dir(&data_dir, "user_a", "conv_1").unwrap();
+        assert!(skills_dir.join("cron").exists());
+        assert!(skills_dir.join("pdf").exists(), "the added skill is linked regardless");
     }
 
     #[tokio::test]

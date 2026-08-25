@@ -58,12 +58,6 @@ use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, Conversat
 mod acp_error_recovery_test;
 
 #[derive(Clone, Debug)]
-struct SkillLinkCall {
-    workspace: PathBuf,
-    rel_dirs: Vec<String>,
-    skill_names: Vec<String>,
-}
-
 struct RecordedViewSync {
     user_id: String,
     conversation_id: String,
@@ -72,7 +66,6 @@ struct RecordedViewSync {
 
 struct RecordingSkillResolver {
     names: Vec<String>,
-    links: Arc<Mutex<Vec<SkillLinkCall>>>,
     views: Arc<Mutex<Vec<RecordedViewSync>>>,
     view_removals: Arc<Mutex<Vec<(String, String)>>>,
 }
@@ -124,7 +117,6 @@ impl RecordingSkillResolver {
     fn new(names: Vec<String>) -> Self {
         Self {
             names,
-            links: Arc::new(Mutex::new(Vec::new())),
             views: Arc::new(Mutex::new(Vec::new())),
             view_removals: Arc::new(Mutex::new(Vec::new())),
         }
@@ -145,28 +137,6 @@ impl SkillResolver for RecordingSkillResolver {
                 source_path: std::env::temp_dir().join(format!("skill-source-{name}")),
             })
             .collect()
-    }
-
-    async fn link_workspace_skills(&self, workspace: &Path, rel_dirs: &[&str], skills: &[ResolvedAgentSkill]) -> usize {
-        self.links.lock().unwrap().push(SkillLinkCall {
-            workspace: workspace.to_path_buf(),
-            rel_dirs: rel_dirs.iter().map(|s| (*s).to_owned()).collect(),
-            skill_names: skills.iter().map(|skill| skill.name.clone()).collect(),
-        });
-
-        let mut linked = 0;
-        for rel_dir in rel_dirs {
-            let target_dir = workspace.join(rel_dir);
-            if std::fs::create_dir_all(&target_dir).is_err() {
-                continue;
-            }
-            for skill in skills {
-                if std::fs::create_dir_all(target_dir.join(&skill.name)).is_ok() {
-                    linked += 1;
-                }
-            }
-        }
-        linked
     }
 
     async fn sync_skill_view(&self, user_id: &str, conversation_id: &str, skills: &[ResolvedAgentSkill]) -> usize {
@@ -8609,10 +8579,14 @@ async fn create_writes_empty_skills_when_no_auto_inject_and_no_preset() {
     assert_eq!(resp.extra["skills"], json!([]));
 }
 
+/// Rewritten from `create_links_skills_into_custom_workspace_for_native_acp_agent`.
+/// The old assertion (`workspace.join(".claude/skills/cron").is_dir()`) encoded
+/// exactly the behaviour this refactor removes, so the SAME scenario now asserts
+/// its replacement: nothing in the workspace, everything in the view.
 #[tokio::test]
-async fn create_links_skills_into_custom_workspace_for_native_acp_agent() {
+async fn create_puts_skills_in_the_view_not_in_a_custom_workspace() {
     let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
-    let links = resolver.links.clone();
+    let views = resolver.views.clone();
     let (svc, _broadcaster, _repo, _task_mgr) =
         make_service_with_resolver_and_agent_metadata_repo(resolver, Arc::new(ClaudeNativeSkillMetadataRepo));
     let workspace = unique_test_workspace_path("custom-create");
@@ -8627,19 +8601,26 @@ async fn create_links_skills_into_custom_workspace_for_native_acp_agent() {
     .unwrap();
     let resp = svc.create("user-1", req).await.unwrap();
 
-    assert_eq!(resp.extra["skills"], json!(["cron"]));
-    assert!(workspace.join(".claude/skills/cron").is_dir());
-    let calls = links.lock().unwrap();
+    assert_eq!(
+        resp.extra["skills"],
+        json!(["cron"]),
+        "snapshot semantics are unchanged"
+    );
+    assert!(
+        !workspace.join(".claude").exists(),
+        "G1: skill delivery must create nothing in a user-selected workspace"
+    );
+    let calls = views.lock().unwrap();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].workspace, workspace);
-    assert_eq!(calls[0].rel_dirs, vec![".claude/skills"]);
     assert_eq!(calls[0].skill_names, vec!["cron"]);
 }
 
+/// Rewritten from `warmup_restores_skill_links_for_recreated_auto_workspace`.
+/// The recovery property is preserved -- it now recovers the VIEW.
 #[tokio::test]
-async fn warmup_restores_skill_links_for_recreated_auto_workspace() {
+async fn warmup_rebuilds_the_skill_view_for_a_recreated_auto_workspace() {
     let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
-    let links = resolver.links.clone();
+    let views = resolver.views.clone();
     let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_resolver(resolver);
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
@@ -8649,28 +8630,29 @@ async fn warmup_restores_skill_links_for_recreated_auto_workspace() {
     .unwrap();
     let resp = svc.create("user-1", req).await.unwrap();
     let workspace = PathBuf::from(resp.extra["workspace"].as_str().unwrap());
-    assert!(workspace.join(".aionrs/skills/cron").is_dir());
+    assert!(
+        !workspace.join(".aionrs").exists(),
+        "G1 holds for auto-provisioned workspaces too, not only user-selected ones"
+    );
 
     std::fs::remove_dir_all(&workspace).unwrap();
-    assert!(!workspace.exists());
-    links.lock().unwrap().clear();
+    views.lock().unwrap().clear();
 
     let task_mgr: Arc<dyn IWorkerTaskManager> =
         Arc::new(MockTaskManagerWithWorkspace::new(workspace.to_str().unwrap()));
     svc.warmup("user-1", &resp.id, &task_mgr).await.unwrap();
 
-    assert!(workspace.join(".aionrs/skills/cron").is_dir());
-    let calls = links.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].workspace, workspace);
-    assert_eq!(calls[0].rel_dirs, vec![".aionrs/skills"]);
+    let calls = views.lock().unwrap();
+    assert_eq!(calls.len(), 1, "warmup re-syncs the view");
     assert_eq!(calls[0].skill_names, vec!["cron"]);
+    assert!(!workspace.join(".aionrs").exists(), "and still writes nothing there");
 }
 
+/// Rewritten from `warmup_restores_skill_links_for_custom_workspace`.
 #[tokio::test]
-async fn warmup_restores_skill_links_for_custom_workspace() {
+async fn warmup_rebuilds_the_skill_view_for_a_custom_workspace() {
     let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
-    let links = resolver.links.clone();
+    let views = resolver.views.clone();
     let (svc, _broadcaster, _repo, _task_mgr) =
         make_service_with_resolver_and_agent_metadata_repo(resolver, Arc::new(ClaudeNativeSkillMetadataRepo));
     let workspace = unique_test_workspace_path("custom-warmup");
@@ -8684,21 +8666,173 @@ async fn warmup_restores_skill_links_for_custom_workspace() {
     }))
     .unwrap();
     let resp = svc.create("user-1", req).await.unwrap();
-
-    std::fs::remove_dir_all(workspace.join(".claude")).unwrap();
-    assert!(!workspace.join(".claude/skills/cron").exists());
-    links.lock().unwrap().clear();
+    views.lock().unwrap().clear();
 
     let task_mgr: Arc<dyn IWorkerTaskManager> =
         Arc::new(MockTaskManagerWithWorkspace::new(workspace.to_str().unwrap()));
     svc.warmup("user-1", &resp.id, &task_mgr).await.unwrap();
 
-    assert!(workspace.join(".claude/skills/cron").is_dir());
-    let calls = links.lock().unwrap();
+    let calls = views.lock().unwrap();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].workspace, workspace);
-    assert_eq!(calls[0].rel_dirs, vec![".claude/skills"]);
     assert_eq!(calls[0].skill_names, vec!["cron"]);
+    assert!(
+        !workspace.join(".claude").exists(),
+        "G1: still nothing in the workspace"
+    );
+}
+
+// ── G1 regression: the workspace is never written to ────────────────
+//
+// The single most important assertion in this refactor. AionUi's skill delivery
+// used to symlink into `{workspace}/.claude/skills` and friends -- for BOTH
+// temp and user-selected workspaces, the latter frequently being a git
+// repository. The directories were never cleaned up, a manual delete was
+// re-created on the next build, and a failed symlink degraded into copying real
+// files in.
+//
+// Scope: the SKILL DELIVERY path. There is exactly one acknowledged exception,
+// `.agents/hooks.json`, written by `aionui-ai-agent`'s antigravity hook -- it is
+// agy's PreToolUse permission gate and load-bearing, so removing it would
+// silently downgrade agy's security. It is whitelisted BY NAME below, so any
+// OTHER new workspace write still fails these tests.
+
+const G1_ALLOWED_WORKSPACE_PATHS: &[&str] = &[".agents", ".agents/hooks.json"];
+
+fn workspace_snapshot(root: &Path) -> std::collections::BTreeSet<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let rel = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+            out.insert(rel);
+            // `symlink_metadata`, never `metadata`: descending THROUGH a link
+            // would pull a linked skill's own files into the snapshot and make
+            // this test report changes that are not the workspace's.
+            if path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false) {
+                walk(root, &path, out);
+            }
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    walk(root, root, &mut out);
+    out
+}
+
+fn assert_workspace_unchanged(before: &std::collections::BTreeSet<String>, after: &std::collections::BTreeSet<String>) {
+    let added: Vec<&String> = after
+        .difference(before)
+        .filter(|path| !G1_ALLOWED_WORKSPACE_PATHS.contains(&path.as_str()))
+        .collect();
+    let removed: Vec<&String> = before.difference(after).collect();
+    assert!(added.is_empty(), "AionUi created files in the workspace: {added:?}");
+    assert!(
+        removed.is_empty(),
+        "AionUi removed files from the workspace: {removed:?}"
+    );
+}
+
+/// A USER-SELECTED workspace with pre-existing content, including the user's OWN
+/// `.claude/skills/` -- the git-repository case that motivated G1.
+#[tokio::test]
+async fn workspace_is_untouched_for_a_user_selected_workspace() {
+    let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into(), "officecli".into()]));
+    let (svc, _broadcaster, _repo, _task_mgr) =
+        make_service_with_resolver_and_agent_metadata_repo(resolver, Arc::new(ClaudeNativeSkillMetadataRepo));
+    let workspace = unique_test_workspace_path("g1-user-selected");
+    for rel in [
+        "src/main.rs",
+        ".claude/skills/my-own-skill/SKILL.md",
+        "references/workflows.md",
+    ] {
+        let target = workspace.join(rel);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "user content").unwrap();
+    }
+    let before = workspace_snapshot(&workspace);
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace, "backend": "claude" },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+    let task_mgr: Arc<dyn IWorkerTaskManager> =
+        Arc::new(MockTaskManagerWithWorkspace::new(workspace.to_str().unwrap()));
+    svc.warmup("user-1", &resp.id, &task_mgr).await.unwrap();
+
+    assert_workspace_unchanged(&before, &workspace_snapshot(&workspace));
+}
+
+/// The AUTO-PROVISIONED workspace must be covered too. The removed code took it
+/// as licence to write ("applies to both temp and user-selected workspaces"), so
+/// testing only the user-selected case would miss half the defect.
+#[tokio::test]
+async fn workspace_is_untouched_for_an_auto_provisioned_workspace() {
+    let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_resolver(resolver);
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({ "type": "aionrs", "extra": {} })).unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+    let workspace = PathBuf::from(resp.extra["workspace"].as_str().unwrap());
+    let before = workspace_snapshot(&workspace);
+
+    let task_mgr: Arc<dyn IWorkerTaskManager> =
+        Arc::new(MockTaskManagerWithWorkspace::new(workspace.to_str().unwrap()));
+    svc.warmup("user-1", &resp.id, &task_mgr).await.unwrap();
+
+    assert_workspace_unchanged(&before, &workspace_snapshot(&workspace));
+}
+
+/// Team members share ONE workspace (the leader's), and the removed code stacked
+/// a directory per member per vendor into it. Five conversations of different
+/// vendors over one directory is the shape that used to accumulate.
+#[tokio::test]
+async fn workspace_is_untouched_when_five_vendors_share_one_workspace() {
+    let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
+    let (svc, _broadcaster, _repo, _task_mgr) =
+        make_service_with_resolver_and_agent_metadata_repo(resolver, Arc::new(ClaudeNativeSkillMetadataRepo));
+    let workspace = unique_test_workspace_path("g1-team-shared");
+    std::fs::write(workspace.join("shared.txt"), "leader content").unwrap();
+    let before = workspace_snapshot(&workspace);
+
+    for backend in ["claude", "codex", "codebuddy", "antigravity", "opencode"] {
+        let req: CreateConversationRequest = serde_json::from_value(json!({
+            "type": "acp",
+            "extra": { "workspace": workspace, "backend": backend },
+        }))
+        .unwrap();
+        let resp = svc.create("user-1", req).await.unwrap();
+        let task_mgr: Arc<dyn IWorkerTaskManager> =
+            Arc::new(MockTaskManagerWithWorkspace::new(workspace.to_str().unwrap()));
+        svc.warmup("user-1", &resp.id, &task_mgr).await.unwrap();
+    }
+
+    assert_workspace_unchanged(&before, &workspace_snapshot(&workspace));
+}
+
+/// A second build must not resurrect the links either: the removed code ran on
+/// every build-task, which is why deleting the directories by hand never stuck.
+#[tokio::test]
+async fn workspace_is_untouched_on_a_second_build() {
+    let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
+    let (svc, _broadcaster, _repo, _task_mgr) =
+        make_service_with_resolver_and_agent_metadata_repo(resolver, Arc::new(ClaudeNativeSkillMetadataRepo));
+    let workspace = unique_test_workspace_path("g1-second-build");
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace, "backend": "claude" },
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+    let task_mgr: Arc<dyn IWorkerTaskManager> =
+        Arc::new(MockTaskManagerWithWorkspace::new(workspace.to_str().unwrap()));
+    svc.warmup("user-1", &resp.id, &task_mgr).await.unwrap();
+    let before = workspace_snapshot(&workspace);
+
+    svc.warmup("user-1", &resp.id, &task_mgr).await.unwrap();
+
+    assert_workspace_unchanged(&before, &workspace_snapshot(&workspace));
 }
 
 /// The view directory is the new landing site. This asserts it is built from the

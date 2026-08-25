@@ -1134,15 +1134,6 @@ mod tests {
                 })
                 .collect()
         }
-
-        async fn link_workspace_skills(
-            &self,
-            _workspace: &std::path::Path,
-            _rel_dirs: &[&str],
-            _skills: &[aionui_extension::ResolvedAgentSkill],
-        ) -> usize {
-            0
-        }
     }
 
     #[tokio::test]

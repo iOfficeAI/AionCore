@@ -1127,7 +1127,10 @@ impl ConversationService {
                 .map(str::to_owned)
         });
 
-        let auto_provisioned_workspace = if user_supplied_workspace.is_none() {
+        // Statement, not a binding: the path itself is no longer needed now that
+        // skill delivery does not write into the workspace. The side effects still
+        // are -- creating the directory and recording it in `extra.workspace`.
+        if user_supplied_workspace.is_none() {
             // Per-conversation temp workspaces live under
             // `{data_dir}/conversations/YYYY/MM/DD/{label}-temp-{id}/`.
             // The label lets operators eyeball the agent type; the
@@ -1143,10 +1146,7 @@ impl ConversationService {
             std::fs::create_dir_all(&ws_path)
                 .map_err(|e| ConversationError::internal(format!("Failed to create workspace: {e}")))?;
             extra["workspace"] = serde_json::Value::String(ws_path.to_string_lossy().into_owned());
-            Some(ws_path)
-        } else {
-            None
-        };
+        }
 
         // Strip the request-only custom_workspace toggle — it was read above
         // and must not be persisted as an extra field.
@@ -1285,51 +1285,18 @@ impl ConversationService {
         let auto_inject_names = self.skill_resolver.auto_inject_names().await;
         let initial_skills = compute_initial_skills(&auto_inject_names, &preset_enabled, &exclude_auto_inject);
 
-        // Wire skill links into the runtime workspace so the agent CLI picks
-        // them up via its native skills dir (e.g. `.claude/skills/`). This
-        // applies to both temp and user-selected workspaces.
-        let skill_link_workspace = user_supplied_workspace
-            .as_ref()
-            .map(PathBuf::from)
-            .or_else(|| auto_provisioned_workspace.clone());
-        if let Some(ws_path) = skill_link_workspace.as_ref()
-            && !initial_skills.is_empty()
-            && let Some(rel_dirs) = native_skills_dirs(
-                &self.agent_metadata_repo,
-                user_id,
-                &effective_type,
-                effective_backend
-                    .as_ref()
-                    .map(|backend| serde_json::Value::String(backend.clone()))
-                    .as_ref(),
-            )
-            .await
-        {
-            let resolved = self
-                .skill_resolver
-                .resolve_skills_for_user(user_id, &initial_skills)
-                .await;
-            if !resolved.is_empty() {
-                let rel_dirs_refs: Vec<&str> = rel_dirs.iter().map(String::as_str).collect();
-                let n = self
-                    .skill_resolver
-                    .link_workspace_skills(ws_path, &rel_dirs_refs, &resolved)
-                    .await;
-                debug!(
-                    conversation_id = %id,
-                    workspace = %ws_path.display(),
-                    links = n,
-                    "wired skill symlinks into workspace"
-                );
-            }
-        }
-
         // Build the per-conversation skill VIEW under AionUi's own data dir.
         //
-        // Unconditional on the delivery mode, unlike the workspace wiring above:
-        // the view is our own tree, so building it for every conversation means a
-        // mode flipped in the registry (a data-only change) needs no
-        // per-conversation backfill to take effect.
+        // This REPLACED a step that symlinked the resolved skills into the
+        // workspace's native skills dir (`.claude/skills/` and friends) for both
+        // temp and user-selected workspaces. AionUi no longer writes there at
+        // all: the workspace may be a git repository, the directories were never
+        // cleaned up, and a failed symlink used to degrade into copying real
+        // files in. See `workspace_is_untouched_*` in service_test.rs.
+        //
+        // Unconditional on the delivery mode: the view is our own tree, so
+        // building it for every conversation means a mode flipped in the registry
+        // (a data-only change) needs no per-conversation backfill to take effect.
         if !initial_skills.is_empty() {
             let resolved = self
                 .skill_resolver
@@ -4019,7 +3986,7 @@ impl ConversationService {
             }
         };
         self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
-        self.ensure_workspace_skill_links(&row, &build_opts).await;
+        self.ensure_session_skill_view(&build_opts.context).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
 
         let user_msg_id_ret = user_msg_id.clone();
@@ -4141,7 +4108,7 @@ impl ConversationService {
         };
 
         self.apply_conversation_runtime_context(&mut build_opts, &request.user_id, &request.conversation_id);
-        self.ensure_workspace_skill_links(&row, &build_opts).await;
+        self.ensure_session_skill_view(&build_opts.context).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let conversation_id = request.conversation_id.clone();
         let result = ConversationTurnOrchestrator::new(self.clone(), self.task_manager.clone())
@@ -4661,7 +4628,7 @@ impl ConversationService {
 
         let mut build_opts = self.build_task_options(&row).await?;
         self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
-        self.ensure_workspace_skill_links(&row, &build_opts).await;
+        self.ensure_session_skill_view(&build_opts.context).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let backend = build_options_backend(&build_opts).map(str::to_owned);
         let agent = match task_manager.get_or_build_task(conversation_id, build_opts).await {
@@ -4866,75 +4833,6 @@ impl ConversationService {
         }
         let issue = service.issue(user_id, conversation_id, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, scopes);
         Some(issue.token)
-    }
-
-    /// Ensure native skill links exist in the runtime workspace. Auto
-    /// workspaces are constrained to AionUi's generated path; custom
-    /// workspaces were validated when the session context was built.
-    pub(crate) async fn ensure_workspace_skill_links(&self, row: &ConversationRow, build_opts: &BuildTaskOptions) {
-        let context = &build_opts.context;
-        let backend = context_backend_value(context);
-
-        // Re-sync the skill VIEW first, and unconditionally: build-task runs on
-        // every session open, so this is where a view deleted out-of-band (or
-        // never built, on a conversation created before this feature) comes back.
-        // Deliberately outside the auto-workspace guard below -- that guard is
-        // about writing into the workspace, which the view does not do.
-        self.ensure_session_skill_view(context).await;
-
-        let workspace = PathBuf::from(context.workspace.path.trim());
-        if !context.workspace.is_custom {
-            let expected_workspace = expected_auto_workspace_path(
-                &self.workspace_root,
-                &row.user_id,
-                &row.id,
-                &context.conversation.agent_type,
-                backend.as_ref(),
-            );
-
-            if workspace != expected_workspace {
-                return;
-            }
-        }
-
-        let skill_names = context_skill_names(context);
-        if skill_names.is_empty() {
-            return;
-        }
-
-        let Some(rel_dirs) = native_skills_dirs(
-            &self.agent_metadata_repo,
-            &context.conversation.user_id,
-            &context.conversation.agent_type,
-            backend.as_ref(),
-        )
-        .await
-        else {
-            return;
-        };
-        if rel_dirs.is_empty() {
-            return;
-        }
-
-        let resolved = self
-            .skill_resolver
-            .resolve_skills_for_user(&context.conversation.user_id, &skill_names)
-            .await;
-        if resolved.is_empty() {
-            return;
-        }
-
-        let rel_dirs_refs: Vec<&str> = rel_dirs.iter().map(String::as_str).collect();
-        let n = self
-            .skill_resolver
-            .link_workspace_skills(&workspace, &rel_dirs_refs, &resolved)
-            .await;
-        debug!(
-            conversation_id = %row.id,
-            workspace = %workspace.display(),
-            links = n,
-            "ensured skill symlinks in auto workspace"
-        );
     }
 
     /// Rebuild this conversation's skill view directory from its snapshot.
@@ -5174,19 +5072,6 @@ fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value
     agent_type.serde_name().to_owned()
 }
 
-fn expected_auto_workspace_path(
-    workspace_root: &std::path::Path,
-    user_id: &str,
-    conversation_id: &str,
-    agent_type: &AgentType,
-    backend: Option<&serde_json::Value>,
-) -> PathBuf {
-    auto_workspace_parent(workspace_root, user_id).join(format!(
-        "{}-temp-{conversation_id}",
-        conversation_label(agent_type, backend)
-    ))
-}
-
 fn auto_workspace_parent(workspace_root: &Path, user_id: &str) -> PathBuf {
     let dir = aionui_common::user_dir_name(user_id).unwrap_or_else(|_| user_id.to_owned());
     let now = chrono::Local::now();
@@ -5366,18 +5251,6 @@ fn is_dated_auto_workspace_relative_path(relative: &Path) -> bool {
     )
 }
 
-fn context_backend_value(context: &AgentSessionContext) -> Option<serde_json::Value> {
-    match &context.kind {
-        AgentSessionKind::Acp(acp) => acp
-            .config
-            .backend
-            .as_ref()
-            .filter(|value| !value.is_empty())
-            .map(|value| serde_json::Value::String(value.clone())),
-        _ => None,
-    }
-}
-
 fn build_options_backend(options: &BuildTaskOptions) -> Option<&str> {
     match &options.context.kind {
         AgentSessionKind::Acp(ctx) => ctx.config.backend.as_deref(),
@@ -5388,36 +5261,6 @@ fn build_options_backend(options: &BuildTaskOptions) -> Option<&str> {
 
 fn context_skill_names(context: &AgentSessionContext) -> Vec<String> {
     context.skills.clone()
-}
-
-/// Resolve the native skills directory list for an agent by looking it
-/// up in the `agent_metadata` catalog (ACP vendors) or the bundled
-/// `AgentType` table (non-ACP built-ins).
-///
-/// Returns `None` when the agent does not support native skill
-/// discovery — callers should then skip the workspace-symlink step and
-/// rely on prompt injection instead.
-async fn native_skills_dirs(
-    repo: &Arc<dyn IAgentMetadataRepository>,
-    user_id: &str,
-    agent_type: &AgentType,
-    backend: Option<&serde_json::Value>,
-) -> Option<Vec<String>> {
-    if *agent_type == AgentType::Acp
-        && let Some(serde_json::Value::String(vendor)) = backend
-        && !vendor.is_empty()
-    {
-        let row = repo
-            .find_builtin_by_backend_for_user(user_id, vendor)
-            .await
-            .ok()
-            .flatten()?;
-        let raw = row.native_skills_dirs?;
-        return serde_json::from_str::<Vec<String>>(&raw).ok();
-    }
-    agent_type
-        .native_skills_dirs()
-        .map(|dirs| dirs.iter().map(|s| (*s).to_owned()).collect())
 }
 
 impl ConversationService {

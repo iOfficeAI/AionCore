@@ -1,17 +1,20 @@
-//! Slash commands derived from the workspace's agy skills.
+//! Slash commands derived from this session's agy skills.
 //!
 //! agy exposes no way to LIST its commands: `agy commands` / `agy skills` drop
 //! into the TUI, and headless mode has no equivalent. But `-p "/<skill-name>"`
-//! does invoke a skill (verified), and AionUi provisions those skills itself
-//! under `.agents/skills/`. So the command list is read off the skill files
-//! rather than asked for.
+//! does invoke a skill (verified), so the command list is read off the skill
+//! files rather than asked for.
+//!
+//! The files are the session's RESOLVED skill directories. This used to scan
+//! `{workspace}/.agents/skills`, which AionUi no longer creates. The resolved
+//! dirs are a strictly better source anyway: they are exactly this
+//! conversation's enabled skills, so a stale residue left in the workspace by
+//! an older build can no longer show up in the picker.
 
 use std::path::Path;
 
+use crate::backend::SkillDirSpec;
 use crate::capability::SlashCommandInfo;
-
-/// Where agy looks for workspace skills, and where AionUi provisions them.
-const SKILLS_DIR: &str = ".agents/skills";
 
 /// Pull `name` / `description` out of a `SKILL.md` YAML frontmatter block.
 ///
@@ -69,21 +72,17 @@ fn parse_frontmatter(md: &str) -> Option<SlashCommandInfo> {
     })
 }
 
-/// Scan `<workspace>/.agents/skills/*/SKILL.md` for invokable skills.
+/// Read `{skill_dir}/SKILL.md` for each of the session's skills.
 ///
-/// Never fails: an unreadable or malformed skill is skipped, because a bad
+/// Never fails: an unreadable or malformed skill is skipped, because one bad
 /// file must not cost the user their whole command list.
-pub(crate) fn scan_skill_commands(workspace: &Path) -> Vec<SlashCommandInfo> {
-    let Ok(entries) = std::fs::read_dir(workspace.join(SKILLS_DIR)) else {
-        return Vec::new();
-    };
-    let mut out: Vec<SlashCommandInfo> = entries
-        .flatten()
-        .filter_map(|e| std::fs::read_to_string(e.path().join("SKILL.md")).ok())
+pub(crate) fn skill_commands_from_dirs(skills: &[SkillDirSpec]) -> Vec<SlashCommandInfo> {
+    let mut out: Vec<SlashCommandInfo> = skills
+        .iter()
+        .filter_map(|skill| std::fs::read_to_string(Path::new(&skill.path).join("SKILL.md")).ok())
         .filter_map(|md| parse_frontmatter(&md))
         .collect();
-    // Directory order is filesystem-dependent; a stable list keeps the picker
-    // from reshuffling between sessions.
+    // A stable list keeps the picker from reshuffling between sessions.
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
@@ -92,25 +91,48 @@ pub(crate) fn scan_skill_commands(workspace: &Path) -> Vec<SlashCommandInfo> {
 mod tests {
     use super::*;
 
-    fn write_skill(root: &Path, dir: &str, body: &str) {
-        let d = root.join(SKILLS_DIR).join(dir);
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("SKILL.md"), body).unwrap();
+    /// Write a skill as a standalone SOURCE directory (what the resolver hands
+    /// us), not under a workspace `.agents/skills` tree.
+    fn write_skill(root: &Path, name: &str, body: &str) -> SkillDirSpec {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), body).unwrap();
+        SkillDirSpec {
+            name: name.to_owned(),
+            path: dir.to_string_lossy().into_owned(),
+        }
     }
 
     #[test]
     fn reads_name_and_description_from_frontmatter() {
         let dir = tempfile::tempdir().unwrap();
-        write_skill(
+        let skill = write_skill(
             dir.path(),
             "aionui-probe",
             "---\nname: aionui-probe\ndescription: Probe skill.\n---\n\n# body\n",
         );
 
-        let cmds = scan_skill_commands(dir.path());
+        let cmds = skill_commands_from_dirs(&[skill]);
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].name, "aionui-probe");
         assert_eq!(cmds[0].description.as_deref(), Some("Probe skill."));
+    }
+
+    /// The command list must come from the session's resolved skills, NOT from
+    /// the workspace: AionUi no longer writes there, and a residue left by an
+    /// older build must not reappear in the picker.
+    #[test]
+    fn a_stale_workspace_residue_is_not_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cron = write_skill(dir.path(), "cron", "---\nname: cron\ndescription: Schedule.\n---\n");
+
+        let workspace = dir.path().join("workspace");
+        let residue = workspace.join(".agents").join("skills").join("residue");
+        std::fs::create_dir_all(&residue).unwrap();
+        std::fs::write(residue.join("SKILL.md"), "---\nname: residue\n---\n").unwrap();
+
+        let cmds = skill_commands_from_dirs(&[cron]);
+        assert_eq!(cmds.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["cron"]);
     }
 
     #[test]
@@ -118,34 +140,38 @@ mod tests {
         // agy's builtin skills (e.g. agy-customizations) write `description: >-`
         // followed by indented lines.
         let dir = tempfile::tempdir().unwrap();
-        write_skill(
+        let skill = write_skill(
             dir.path(),
             "folded",
             "---\nname: folded\ndescription: >-\n  First part\n  second part.\n---\n\nbody\n",
         );
 
-        let cmds = scan_skill_commands(dir.path());
+        let cmds = skill_commands_from_dirs(&[skill]);
         assert_eq!(cmds[0].description.as_deref(), Some("First part second part."));
     }
 
     #[test]
-    fn a_malformed_skill_is_skipped_not_fatal() {
+    fn a_malformed_or_missing_skill_is_skipped_not_fatal() {
         // One broken file must not cost the user the whole command list.
         let dir = tempfile::tempdir().unwrap();
-        write_skill(dir.path(), "broken", "no frontmatter here");
-        write_skill(dir.path(), "good", "---\nname: good\n---\n");
+        let broken = write_skill(dir.path(), "broken", "no frontmatter here");
+        let good = write_skill(dir.path(), "good", "---\nname: good\n---\n");
+        let missing = SkillDirSpec {
+            name: "ghost".to_owned(),
+            path: dir.path().join("ghost").to_string_lossy().into_owned(),
+        };
 
-        let cmds = scan_skill_commands(dir.path());
+        let cmds = skill_commands_from_dirs(&[broken, good, missing]);
         assert_eq!(cmds.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["good"]);
     }
 
     #[test]
     fn results_are_sorted_so_the_picker_does_not_reshuffle() {
         let dir = tempfile::tempdir().unwrap();
-        write_skill(dir.path(), "zeta", "---\nname: zeta\n---\n");
-        write_skill(dir.path(), "alpha", "---\nname: alpha\n---\n");
+        let zeta = write_skill(dir.path(), "zeta", "---\nname: zeta\n---\n");
+        let alpha = write_skill(dir.path(), "alpha", "---\nname: alpha\n---\n");
 
-        let cmds = scan_skill_commands(dir.path());
+        let cmds = skill_commands_from_dirs(&[zeta, alpha]);
         assert_eq!(
             cmds.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
             vec!["alpha", "zeta"]
@@ -153,8 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn a_workspace_without_skills_yields_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(scan_skill_commands(dir.path()).is_empty());
+    fn a_session_without_skills_yields_nothing() {
+        assert!(skill_commands_from_dirs(&[]).is_empty());
     }
 }

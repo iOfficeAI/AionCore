@@ -88,13 +88,20 @@ WHERE backend = 'codex';
 -- install surface, not a session one; `opencode debug config` shows no external
 -- skill root among its resolved top-level keys).
 --
--- agy DOES take `--add-dir` and its own help marks it "(repeatable)", so the
--- allow-listing shape applies. Note agy's argv already passes
--- `--dangerously-skip-permissions` unconditionally (`antigravity/argv.rs`), so
--- this may well be a no-op there; the parameter is idempotent and harmless
--- either way, and the live check is tracked as an acceptance item.
+-- agy gets NO allow-listing, measured rather than assumed. It does take a
+-- repeatable `--add-dir`, but our argv passes `--dangerously-skip-permissions`
+-- unconditionally (`antigravity/argv.rs`), which puts the session in
+-- `permission_mode: "always-proceed"`. A live probe under exactly that argv read
+-- a file well outside the cwd with the containing directory NOT allow-listed, so
+-- the flag would add one argument per skill for no effect.
+--
+-- Worse than useless: a config that lists allow_dir_args reads as "agy is
+-- allow-listed", which is a claim this measurement contradicts.
+--
+-- If agy ever gains a real permission mode we stop bypassing, allow-listing
+-- becomes necessary and this is a one-row change.
 UPDATE agent_metadata SET
-    skill_delivery = '{"mode":"injected","allow_dir_args":["--add-dir","{skill_dir}"]}',
+    skill_delivery = '{"mode":"injected","allow_dir_args":[]}',
     updated_at = CAST(strftime('%s','now') AS INTEGER) * 1000
 WHERE backend = 'antigravity';
 

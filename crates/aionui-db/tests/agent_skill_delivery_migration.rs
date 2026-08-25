@@ -76,16 +76,18 @@ async fn codex_gets_protocol_delivery() {
     assert_eq!(delivery["method"], "skills/extraRoots/set");
 }
 
+/// agy gets no allow-listing, and that is a MEASURED result rather than an
+/// omission: our argv always passes `--dangerously-skip-permissions`, and a live
+/// probe under exactly that argv read a file outside the cwd with its directory
+/// not allow-listed. Declaring the flag anyway would add one argument per skill
+/// for no effect, and would read as a guarantee the measurement contradicts.
 #[tokio::test]
-async fn antigravity_is_injected_with_allow_dir_args() {
+async fn antigravity_is_injected_with_no_allow_listing() {
     let pool = migrated_pool().await;
     let delivery = delivery_json(&pool, "antigravity").await;
 
     assert_eq!(delivery["mode"], "injected");
-    assert_eq!(
-        delivery["allow_dir_args"],
-        serde_json::json!(["--add-dir", "{skill_dir}"])
-    );
+    assert_eq!(delivery["allow_dir_args"], serde_json::json!([]));
 }
 
 #[tokio::test]

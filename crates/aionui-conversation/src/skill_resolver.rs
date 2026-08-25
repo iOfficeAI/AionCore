@@ -2,11 +2,14 @@
 //! `ConversationService` can compute the initial snapshot without forcing
 //! every test setup to stand up a real `SkillPaths` and skill repository.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use aionui_db::ISkillRepository;
 pub use aionui_extension::ResolvedAgentSkill;
+// Frontmatter stripping lives in `aionui-extension` so this channel and the
+// `aioncore skills show` command return byte-identical bodies. A local copy is
+// how the two would quietly drift.
+use aionui_extension::skill_service::extract_skill_body;
 use async_trait::async_trait;
 use tracing::warn;
 
@@ -51,12 +54,6 @@ pub trait SkillResolver: Send + Sync {
         let resolved = self.resolve_skills_for_user(user_id, names).await;
         load_resolved_skill_bodies(&resolved).await
     }
-
-    /// Create symlinks pointing at each resolved skill inside the given
-    /// workspace's per-backend native skills directories. `rel_dirs` is
-    /// the list of relative paths (e.g. `.claude/skills`) to populate.
-    /// Returns the number of symlinks successfully created.
-    async fn link_workspace_skills(&self, workspace: &Path, rel_dirs: &[&str], skills: &[ResolvedAgentSkill]) -> usize;
 
     /// Rebuild this conversation's skill VIEW directory under AionUi's own data
     /// dir, so the agent CLI can be pointed at it instead of at the user's
@@ -115,11 +112,6 @@ async fn load_resolved_skill_bodies(skills: &[ResolvedAgentSkill]) -> Vec<Loaded
     loaded
 }
 
-// Frontmatter stripping lives in `aionui-extension` so this channel and the
-// `aioncore skills show` command return byte-identical bodies. A local copy is
-// how the two would quietly drift.
-use aionui_extension::skill_service::extract_skill_body;
-
 #[async_trait]
 impl SkillResolver for ExtensionSkillResolver {
     async fn auto_inject_names(&self) -> Vec<String> {
@@ -163,7 +155,7 @@ impl SkillResolver for ExtensionSkillResolver {
             &self.paths,
             self.skill_repo.as_ref(),
             user_id,
-            "workspace-link",
+            "skill-resolve",
             names,
         )
         .await
@@ -175,23 +167,6 @@ impl SkillResolver for ExtensionSkillResolver {
                     "resolve_skills failed; returning empty list"
                 );
                 Vec::new()
-            }
-        }
-    }
-
-    async fn link_workspace_skills(&self, workspace: &Path, rel_dirs: &[&str], skills: &[ResolvedAgentSkill]) -> usize {
-        if rel_dirs.is_empty() || skills.is_empty() {
-            return 0;
-        }
-        match aionui_extension::link_workspace_skills(workspace, rel_dirs, skills).await {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(
-                    workspace = %workspace.display(),
-                    error = %e,
-                    "link_workspace_skills failed"
-                );
-                0
             }
         }
     }
@@ -243,21 +218,13 @@ impl SkillResolver for FixedSkillResolver {
     async fn resolve_skills(&self, _names: &[String]) -> Vec<ResolvedAgentSkill> {
         Vec::new()
     }
-
-    async fn link_workspace_skills(
-        &self,
-        _workspace: &Path,
-        _rel_dirs: &[&str],
-        _skills: &[ResolvedAgentSkill],
-    ) -> usize {
-        0
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use aionui_db::{SqliteSkillRepository, UpsertSkillParams};
+    use std::path::Path;
 
     fn write_skill(dir: &Path, name: &str, description: &str) {
         let skill_dir = dir.join(name);

@@ -80,15 +80,6 @@ impl SkillResolver for EmptySkillResolver {
     async fn resolve_skills(&self, _names: &[String]) -> Vec<aionui_extension::ResolvedAgentSkill> {
         Vec::new()
     }
-
-    async fn link_workspace_skills(
-        &self,
-        _workspace: &std::path::Path,
-        _rel_dirs: &[&str],
-        _skills: &[aionui_extension::ResolvedAgentSkill],
-    ) -> usize {
-        0
-    }
 }
 
 async fn setup() -> (ConversationService, Arc<TestBroadcaster>, Arc<dyn IWorkerTaskManager>) {
