@@ -77,6 +77,18 @@ WHERE backend = 'codebuddy';
 -- That `scope: "user"` is a HARD CONSTRAINT on the consumer side: the request
 -- is process-scoped, so codex layer-1 delivery is mutually exclusive with
 -- thread multiplexing. See the enforcing comment in `codex_conn.rs`.
+--
+-- No `allow_dir_args`, and that is measured rather than assumed. A full
+-- app-server turn probe (initialize -> extraRoots/set -> thread/start ->
+-- turn/start) had the agent read a SYMLINKED skill's `references/` file living
+-- outside the thread cwd, under `sandbox: workspace-write`, and it succeeded --
+-- reaching the real source path. So codex needs no directory allow-listing for
+-- reads, unlike claude.
+--
+-- Caveat worth knowing: that probe ran with `approvalPolicy: "never"`. Under
+-- the `on-request` default an out-of-cwd read may surface an approval request
+-- instead of being refused outright, which is the same "the user confirms"
+-- behaviour claude has and which AionUi already renders a permission card for.
 UPDATE agent_metadata SET
     skill_delivery = '{"mode":"protocol","method":"skills/extraRoots/set"}',
     updated_at = CAST(strftime('%s','now') AS INTEGER) * 1000
