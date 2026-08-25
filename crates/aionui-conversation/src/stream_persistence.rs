@@ -498,6 +498,58 @@ impl StreamPersistenceAdapter {
         }
     }
 
+    /// Persist a plan / to-do snapshot.
+    ///
+    /// One row per turn (`plan:{msg_id}`), upserted: a plan is a
+    /// FULL-REPLACEMENT snapshot (ACP spec — "the Agent MUST send a complete
+    /// list of all plan entries in each update"), so every frame overwrites the
+    /// previous entries instead of stacking rows.
+    ///
+    /// `msg_id` stores the BARE turn msg_id, not the `plan:` form: the live WS
+    /// frame carries the bare id, and the renderer dedupes history against live
+    /// frames on `${type}:${msg_id}`. Storing the prefixed form here would make
+    /// a reloaded conversation show one live card plus one history card.
+    ///
+    /// Gated as `ToolCallPersist` — the same "mid-turn content write" lifecycle
+    /// class; a plan needs no gating rule of its own.
+    #[tracing::instrument(skip_all)]
+    pub async fn persist_plan(
+        &self,
+        data: &aionui_ai_agent::protocol::events::session_updates::PlanEventData,
+        turn_id: &str,
+    ) {
+        if !self.allows_write(RuntimeWriteKind::ToolCallPersist) {
+            return;
+        }
+
+        // `turn_id` rides INSIDE the content JSON: the column set is fixed and
+        // this feature deliberately ships without a migration. The frontend
+        // gates the plan bar on it matching the running turn, so a finished
+        // turn's checklist cannot linger over the next one.
+        let mut value = serde_json::to_value(data).unwrap_or_default();
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("turn_id".into(), serde_json::Value::String(turn_id.to_owned()));
+        }
+        let content = value.to_string();
+
+        let row = MessageRow {
+            id: format!("plan:{}", self.msg_id),
+            conversation_id: self.conversation_id.clone(),
+            msg_id: Some(self.msg_id.clone()),
+            r#type: "plan".into(),
+            content,
+            position: Some("left".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: now_ms(),
+            backend_turn_id: self.current_backend_turn_id(),
+        };
+
+        if let Err(e) = self.repo.upsert_message(&self.user_id, &row).await {
+            log_persist_error(&e, "Failed to upsert plan message");
+        }
+    }
+
     /// Persist an ACP (Claude CLI) tool call event.
     #[tracing::instrument(skip_all)]
     pub async fn persist_acp_tool_call(

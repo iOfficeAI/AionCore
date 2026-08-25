@@ -209,6 +209,26 @@ pub trait IConversationRepository: Send + Sync {
         ))
     }
 
+    /// Newest message of one type in a conversation, or `None`.
+    ///
+    /// Exists for the plan bar: `upsert_message` does not refresh `created_at`,
+    /// so a plan row stays anchored at the start of its turn and a busy turn
+    /// buries it outside the default message page. Deliberately NOT a filter on
+    /// the shared paginator — that has four SQL variants and cursor semantics
+    /// (`has_more_before` / `has_more_after`) that a type filter would muddy.
+    ///
+    /// Default is unsupported so test doubles that never need it can skip it.
+    async fn latest_message_of_type(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _message_type: &str,
+    ) -> Result<Option<MessageRow>, DbError> {
+        Err(DbError::Init(
+            "latest_message_of_type is not supported by this repository".into(),
+        ))
+    }
+
     /// Resolves the backend turn anchor for a fork point: the `backend_turn_id`
     /// of the nearest row at or before the `(created_at, id)` cursor that has
     /// one. `Ok(None)` when no row up to the fork point carries an anchor

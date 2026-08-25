@@ -136,6 +136,20 @@ pub(crate) enum Command {
     Doctor,
     /// Prepare current-platform managed runtime resources under a bundle output root.
     PrepareManagedResources(PrepareManagedResourcesArgs),
+    /// Manage local user accounts. Short-lived: opens the data-dir database
+    /// directly and exits without starting the server. Bootstrap path for
+    /// self-hosted deployments where the HTTP set-password endpoints are
+    /// unreachable without `--local` (which disables auth entirely).
+    User(UserArgs),
+    /// Inspect and provision the storage-encryption secret — the root key that
+    /// encrypts at-rest credentials (provider API keys, remote-agent tokens,
+    /// channel config). Short-lived like `user`: opens the data-dir database
+    /// directly and exits. Lets a self-hosted node persist its encryption
+    /// secret so it survives a restart, instead of relying on an
+    /// `AIONUI_ENCRYPTION_SECRET` env var that is used but never stored. This
+    /// is independent of the JWT *signing* secret, which change-password may
+    /// rotate freely without affecting decryption.
+    Secret(SecretArgs),
 }
 
 impl Command {
@@ -151,6 +165,8 @@ impl Command {
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::Doctor => "doctor",
             Self::PrepareManagedResources(_) => "prepare-managed-resources",
+            Self::User(_) => "user",
+            Self::Secret(_) => "secret",
         }
     }
 
@@ -656,6 +672,127 @@ pub(crate) struct PrepareManagedResourcesArgs {
     pub bundle_out: PathBuf,
 }
 
+#[derive(Args, Debug, Clone)]
+pub(crate) struct UserArgs {
+    #[command(subcommand)]
+    pub command: UserCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum UserCommand {
+    /// Set (or create) a local user's login password. With no `--username`,
+    /// targets the built-in `system_default_user` (login name `admin`) — the
+    /// bootstrap path for a fresh deployment. Does not revoke existing
+    /// sessions; restart the server after a hot password change.
+    SetPassword(SetPasswordArgs),
+    /// Create a NEW local user with a login password. `--username` is required
+    /// and must not already exist — a conflict (including the built-in `admin`
+    /// seed) fails with `CLI_USER_ALREADY_EXISTS` and never overwrites the
+    /// existing account. Use `set-password` to change an existing user's password.
+    Create(CreateUserArgs),
+    /// List all users with non-sensitive fields (id, type, username, status,
+    /// timestamps). Never prints password hashes, JWT secrets, or
+    /// encryption secrets.
+    List,
+    /// Disable a local user account: blocks future logins and revokes any live
+    /// sessions (bumps the account's session generation). Reversible with
+    /// `user enable`. `--username` is required — there is no default target, so
+    /// the built-in admin cannot be disabled by accident. Only local password
+    /// accounts can be disabled; external identity-provider users are managed
+    /// upstream.
+    Disable(UserStatusArgs),
+    /// Re-enable a previously disabled local user account, restoring login.
+    /// `--username` is required. Does not create sessions or reset the password.
+    Enable(UserStatusArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct UserStatusArgs {
+    /// Target username (required). Must name an existing local password
+    /// account; unknown names fail with `CLI_USER_NOT_FOUND`.
+    #[arg(long)]
+    pub username: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SetPasswordArgs {
+    /// Target username. Omit to set the password of the built-in
+    /// `system_default_user` (login name `admin`).
+    #[arg(long)]
+    pub username: Option<String>,
+
+    /// Read the new password from stdin (one line) instead of prompting
+    /// interactively. Use for scripted/containerized bootstrap:
+    /// `echo "$PW" | aioncore user set-password --password-stdin`.
+    #[arg(long)]
+    pub password_stdin: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct CreateUserArgs {
+    /// Username for the new account (required). Must not already exist as a
+    /// local user — the built-in `admin` seed counts — or the command fails
+    /// with `CLI_USER_ALREADY_EXISTS`.
+    #[arg(long)]
+    pub username: String,
+
+    /// Read the new password from stdin (one line) instead of prompting
+    /// interactively. Use for scripted/containerized bootstrap:
+    /// `echo "$PW" | aioncore user create --username alice --password-stdin`.
+    #[arg(long)]
+    pub password_stdin: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SecretArgs {
+    #[command(subcommand)]
+    pub command: SecretCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum SecretCommand {
+    /// Report where the storage-encryption secret comes from (environment vs
+    /// database), whether it is persisted, and warn about an env/database
+    /// mismatch. Prints only presence and non-reversible fingerprints — never
+    /// the secret itself.
+    Status,
+    /// Generate a random secret and persist it to the database. Refuses to
+    /// clobber an already-effective secret unless `--force`, since a new
+    /// secret changes the derived encryption key and orphans stored
+    /// credentials. Use on a fresh install.
+    Generate(GenerateArgs),
+    /// Persist an operator-supplied secret to the database. The value is read
+    /// from stdin or an interactive no-echo prompt, never from argv. Refuses
+    /// to replace a different effective secret unless `--force`. Persisting
+    /// the value that is already effective (e.g. an env-only secret) is the
+    /// way to make it survive a restart.
+    Set(SetSecretArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct GenerateArgs {
+    /// Overwrite an existing effective secret. This changes the storage
+    /// encryption key and makes every already-stored credential undecryptable
+    /// — only use on a fresh install or when intentionally rotating.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SetSecretArgs {
+    /// Read the secret from stdin (one line) instead of prompting
+    /// interactively. Use for scripted bootstrap:
+    /// `echo "$AIONUI_ENCRYPTION_SECRET" | aioncore secret set --secret-stdin`.
+    #[arg(long)]
+    pub secret_stdin: bool,
+
+    /// Overwrite a different existing effective secret. This changes the
+    /// storage encryption key and makes every already-stored credential
+    /// undecryptable — omit unless you intend to rotate.
+    #[arg(long)]
+    pub force: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -664,8 +801,8 @@ mod tests {
     use clap::error::ErrorKind;
 
     use super::{
-        Cli, Command, ConfigArgs, ConfigCommand, ManagedResourcesModeArg, PrepareManagedResourcesArgs, SessionCommand,
-        TeamCommand,
+        Cli, Command, ConfigArgs, ConfigCommand, ManagedResourcesModeArg, PrepareManagedResourcesArgs, SecretArgs,
+        SecretCommand, SessionCommand, TeamCommand, UserArgs, UserCommand, UserStatusArgs,
     };
 
     #[test]
@@ -788,6 +925,18 @@ mod tests {
             (
                 Command::PrepareManagedResources(prepare_args),
                 "prepare-managed-resources",
+            ),
+            (
+                Command::User(UserArgs {
+                    command: UserCommand::List,
+                }),
+                "user",
+            ),
+            (
+                Command::Secret(SecretArgs {
+                    command: SecretCommand::Status,
+                }),
+                "secret",
             ),
         ];
 
@@ -988,5 +1137,156 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn user_set_password_parses_without_username() {
+        let cli = Cli::parse_from(["aioncore", "user", "set-password"]);
+        match cli.command {
+            Some(Command::User(UserArgs {
+                command: UserCommand::SetPassword(args),
+            })) => {
+                assert_eq!(args.username, None);
+                assert!(!args.password_stdin);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_set_password_parses_username_and_stdin() {
+        let cli = Cli::parse_from([
+            "aioncore",
+            "user",
+            "set-password",
+            "--username",
+            "alice",
+            "--password-stdin",
+        ]);
+        match cli.command {
+            Some(Command::User(UserArgs {
+                command: UserCommand::SetPassword(args),
+            })) => {
+                assert_eq!(args.username.as_deref(), Some("alice"));
+                assert!(args.password_stdin);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_list_parses() {
+        let cli = Cli::parse_from(["aioncore", "user", "list"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::User(UserArgs {
+                command: UserCommand::List,
+            }))
+        ));
+    }
+
+    #[test]
+    fn user_disable_parses_username() {
+        let cli = Cli::parse_from(["aioncore", "user", "disable", "--username", "alice"]);
+        match cli.command {
+            Some(Command::User(UserArgs {
+                command: UserCommand::Disable(UserStatusArgs { username }),
+            })) => assert_eq!(username, "alice"),
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_enable_parses_username() {
+        let cli = Cli::parse_from(["aioncore", "user", "enable", "--username", "bob"]);
+        match cli.command {
+            Some(Command::User(UserArgs {
+                command: UserCommand::Enable(UserStatusArgs { username }),
+            })) => assert_eq!(username, "bob"),
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_disable_requires_username() {
+        let err = match Cli::try_parse_from(["aioncore", "user", "disable"]) {
+            Ok(_) => panic!("user disable should require --username"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn user_create_parses_username_and_stdin() {
+        let cli = Cli::parse_from(["aioncore", "user", "create", "--username", "alice", "--password-stdin"]);
+        match cli.command {
+            Some(Command::User(UserArgs {
+                command: UserCommand::Create(args),
+            })) => {
+                assert_eq!(args.username, "alice");
+                assert!(args.password_stdin);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    // The required, non-Option `--username` is exactly what separates strict
+    // `create` from the upsert `set-password` (whose username is `Option`).
+    // Lock it: a later change to `Option<String>` that silently loosened
+    // strict-create semantics would turn this red.
+    #[test]
+    fn user_create_requires_username() {
+        let err = match Cli::try_parse_from(["aioncore", "user", "create"]) {
+            Ok(_) => panic!("user create should require --username"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn secret_status_parses() {
+        let cli = Cli::parse_from(["aioncore", "secret", "status"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Secret(SecretArgs {
+                command: SecretCommand::Status,
+            }))
+        ));
+    }
+
+    #[test]
+    fn secret_generate_parses_force() {
+        let cli = Cli::parse_from(["aioncore", "secret", "generate", "--force"]);
+        match cli.command {
+            Some(Command::Secret(SecretArgs {
+                command: SecretCommand::Generate(args),
+            })) => assert!(args.force),
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_generate_defaults_without_force() {
+        let cli = Cli::parse_from(["aioncore", "secret", "generate"]);
+        match cli.command {
+            Some(Command::Secret(SecretArgs {
+                command: SecretCommand::Generate(args),
+            })) => assert!(!args.force),
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_set_parses_stdin_and_force() {
+        let cli = Cli::parse_from(["aioncore", "secret", "set", "--secret-stdin", "--force"]);
+        match cli.command {
+            Some(Command::Secret(SecretArgs {
+                command: SecretCommand::Set(args),
+            })) => {
+                assert!(args.secret_stdin);
+                assert!(args.force);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
     }
 }

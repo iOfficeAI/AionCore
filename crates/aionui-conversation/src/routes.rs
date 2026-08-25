@@ -122,6 +122,9 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/fork", post(fork))
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
+        // MUST precede the `{messageId}` wildcard below: registered after it,
+        // "latest" would be captured as a message id and 404.
+        .route("/api/conversations/{id}/messages/latest", get(latest_msg))
         .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
         .route("/api/conversations/{id}/artifacts", get(list_artifacts))
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
@@ -264,6 +267,25 @@ struct MessagePathParams {
     id: String,
     #[serde(rename = "messageId")]
     message_id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct LatestMessageQuery {
+    r#type: String,
+}
+
+async fn latest_msg(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Query(query): Query<LatestMessageQuery>,
+) -> Result<Json<ApiResponse<Option<MessageResponse>>>, ApiError> {
+    let result = state
+        .service
+        .latest_message_of_type(&user.id, &id, &query.r#type)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(result)))
 }
 
 async fn get_msg(
@@ -604,5 +626,26 @@ mod error_mapping_tests {
         let details = app.error_details().expect("details should be present");
         assert_eq!(details["backend"], "openclaw");
         assert_eq!(details["port"], 18789);
+    }
+}
+
+#[cfg(test)]
+mod route_shape_tests {
+    /// axum builds its route trie eagerly, so an overlapping registration panics
+    /// at construction, not at request time — `cargo check` would never catch it.
+    /// `/messages/latest` deliberately sits before the `{messageId}` wildcard;
+    /// this test is the guard that the pair stays registrable together.
+    #[test]
+    fn latest_message_route_coexists_with_the_message_id_wildcard() {
+        let router: axum::Router<()> = axum::Router::new()
+            .route(
+                "/api/conversations/{id}/messages/latest",
+                axum::routing::get(|| async { "latest" }),
+            )
+            .route(
+                "/api/conversations/{id}/messages/{messageId}",
+                axum::routing::get(|| async { "by-id" }),
+            );
+        let _ = router.into_make_service();
     }
 }

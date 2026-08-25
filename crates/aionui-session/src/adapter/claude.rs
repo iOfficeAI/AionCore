@@ -61,6 +61,12 @@ pub struct ClaudeAdapter {
     /// stale leftover here is harmless (set membership only biases WHICH resolve
     /// event a cancel emits, and ids are unique per control request).
     ask_requests: std::collections::HashSet<String>,
+    /// tool_use_ids of TodoWrite calls this session translated into
+    /// `SessionEvent::Plan`. Their paired `tool_result` must be swallowed:
+    /// with no ToolCall to settle, the terminal frame it would produce makes
+    /// the renderer append a nameless junk card. Cleared at each turn
+    /// terminal, so it never grows across a session.
+    todo_tool_use_ids: std::collections::HashSet<String>,
 }
 
 /// Per-message streaming state for `--include-partial-messages`. Reset on each
@@ -446,8 +452,41 @@ impl ClaudeAdapter {
                         tracing::warn!(item_id = %item_id, "claude tool_use has an empty name; dropping malformed call");
                     } else {
                         let input = b.get("input").cloned().unwrap_or(Value::Null);
+                        let tool_use_id = b.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+
+                        // claude's TodoWrite is a plan SNAPSHOT, not a tool step —
+                        // the same treatment the ACP bridge gives it, so both lanes
+                        // render one plan bar instead of a stray tool card. A
+                        // malformed payload falls through to the tool path: losing
+                        // the plan is acceptable, losing the card is not.
+                        if raw_name == "TodoWrite"
+                            && let Some(todos) = input.get("todos").and_then(Value::as_array)
+                        {
+                            let entries: Vec<crate::event::PlanEntry> = todos
+                                .iter()
+                                .filter_map(|t| {
+                                    let content = t.get("content").and_then(Value::as_str)?.to_string();
+                                    let status = crate::backend::map_plan_status(
+                                        t.get("status").and_then(Value::as_str).unwrap_or(""),
+                                    );
+                                    Some(crate::event::PlanEntry {
+                                        content,
+                                        status,
+                                        // claude's todos carry no priority field.
+                                        priority: None,
+                                    })
+                                })
+                                .collect();
+                            self.todo_tool_use_ids.insert(tool_use_id);
+                            out.push(SessionEvent::Plan {
+                                entries,
+                                explanation: None,
+                            });
+                            continue;
+                        }
+
                         out.push(SessionEvent::ToolCall {
-                            tool_use_id: b.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                            tool_use_id,
                             // Presentation only: a bare tool name ("Bash" × 73% of all
                             // calls) says nothing about what the step is doing. The raw
                             // `input` below is untouched.
@@ -476,7 +515,7 @@ impl ClaudeAdapter {
 
     /// user frames carry synthesized `tool_result` blocks, referring back by
     /// tool_use_id.
-    fn parse_user(&self, v: &Value) -> Vec<SessionEvent> {
+    fn parse_user(&mut self, v: &Value) -> Vec<SessionEvent> {
         // 009 H5: same top-level attribution as parse_assistant — a subagent's
         // tool_result frame carries the parent's tool_use_id beside `message`.
         let parent_tool_use_id = v.get("parent_tool_use_id").and_then(Value::as_str).map(str::to_string);
@@ -489,8 +528,14 @@ impl ClaudeAdapter {
         let mut out = Vec::new();
         for b in &blocks {
             if b.get("type").and_then(Value::as_str) == Some("tool_result") {
+                let tool_use_id = b.get("tool_use_id").and_then(Value::as_str).unwrap_or("").to_string();
+                // The TodoWrite call this answers became a Plan, so there is no
+                // card for this terminal frame to settle (see `todo_tool_use_ids`).
+                if self.todo_tool_use_ids.remove(&tool_use_id) {
+                    continue;
+                }
                 out.push(SessionEvent::ToolResult {
-                    tool_use_id: b.get("tool_use_id").and_then(Value::as_str).unwrap_or("").to_string(),
+                    tool_use_id,
                     // 009 R7/H3: the wire block carries is_error on a failed/rejected
                     // tool (default false = success). Carrying it keeps a red tool red.
                     is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
@@ -535,6 +580,9 @@ impl ClaudeAdapter {
     /// terminal — codex already emits UsageDelta (map_usage); this closes the
     /// claude/codex asymmetry. The wrapping ClaudeConnection inherits both for free.
     fn parse_result(&mut self, v: &Value) -> Vec<SessionEvent> {
+        // Turn terminal: any TodoWrite whose tool_result never arrived is dead
+        // correlation state. Clearing here bounds the set to one turn.
+        self.todo_tool_use_ids.clear();
         let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
         let result_text = match v.get("result").and_then(Value::as_str) {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -1640,7 +1688,7 @@ mod tests {
 
     #[test]
     fn parse_user_tool_result_string_content_to_text() {
-        let a = ClaudeAdapter::new();
+        let mut a = ClaudeAdapter::new();
         let frame = r#"{"type":"user","message":{"role":"user","content":[
             {"type":"tool_result","tool_use_id":"tu1","content":"hello stdout"}]}}"#;
         let v: serde_json::Value = serde_json::from_str(frame).unwrap();
@@ -1681,6 +1729,111 @@ mod tests {
                 .any(|e| matches!(e, SessionEvent::MessageDelta { text, .. } if text == "working")),
             "a valid sibling block in the same frame still emits, got {events:?}"
         );
+    }
+
+    /// claude's TodoWrite is a plan SNAPSHOT, not a tool step. The ACP bridge
+    /// (claude-code-acp) already translates it into a `plan` session update and
+    /// suppresses the tool card; the direct-CLI lane must match, or the same
+    /// conversation shows a to-do bar over ACP and a bare "TodoWrite" tool card
+    /// here.
+    ///
+    /// Wire-pinned against a REAL 2.1.141 frame (captured 2026-08-21), hence the
+    /// `activeForm` and `caller` keys we ignore: never hand-write a shape we have
+    /// not seen on the wire.
+    ///
+    /// VERSION NOTE: claude removed TodoWrite from the headless tool set in
+    /// **2.1.142** (bisected 2026-08-21: 2.1.141 advertises it, 2.1.142 does
+    /// not — the `system:init` frame's `tools` array is the ground truth). On
+    /// 2.1.142+ this arm is dormant: the model has no such tool to call. It is
+    /// kept because the translation is correct and cheap, and the CLI surface
+    /// moves — not because it fires today.
+    #[test]
+    fn todo_write_becomes_a_plan_event_and_no_tool_call() {
+        let mut a = ClaudeAdapter::new();
+        // Verbatim 2.1.141 wire shape, including the `activeForm` / `caller`
+        // keys the translation ignores.
+        let frame = r#"{"type":"assistant","message":{"role":"assistant","content":[
+            {"type":"tool_use","id":"tu_todo_1","name":"TodoWrite","caller":{"type":"direct"},"input":{"todos":[
+                {"content":"read the readme","activeForm":"Reading the readme","status":"completed"},
+                {"content":"count the files","activeForm":"Counting the files","status":"in_progress"},
+                {"content":"summarize","activeForm":"Summarizing","status":"pending"}]}}]}}"#;
+        let v: serde_json::Value = serde_json::from_str(frame).unwrap();
+        let events = a.parse_assistant(&v);
+
+        assert!(
+            !events.iter().any(|e| matches!(e, SessionEvent::ToolCall { .. })),
+            "TodoWrite must not surface as a tool card, got {events:?}"
+        );
+        let [SessionEvent::Plan { entries, explanation }] = events.as_slice() else {
+            panic!("expected exactly one Plan, got {events:?}");
+        };
+        assert_eq!(explanation, &None);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].content, "read the readme");
+        assert_eq!(entries[0].status, crate::event::PlanStatus::Completed);
+        assert_eq!(entries[1].status, crate::event::PlanStatus::InProgress);
+        assert_eq!(entries[2].status, crate::event::PlanStatus::Pending);
+    }
+
+    /// The paired `tool_result` must be swallowed too. It translates to a
+    /// TERMINAL `AgentStreamEvent::ToolCall` downstream, and a terminal frame
+    /// with no card to settle makes the renderer append a nameless junk card.
+    #[test]
+    fn todo_write_tool_result_is_suppressed() {
+        let mut a = ClaudeAdapter::new();
+        let assistant = r#"{"type":"assistant","message":{"role":"assistant","content":[
+            {"type":"tool_use","id":"tu_todo_1","name":"TodoWrite","input":{"todos":[
+                {"content":"step","status":"pending"}]}}]}}"#;
+        a.parse_assistant(&serde_json::from_str(assistant).unwrap());
+
+        let user = r#"{"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"tu_todo_1","content":"ok"}]}}"#;
+        let events = a.parse_user(&serde_json::from_str(user).unwrap());
+
+        assert!(
+            !events.iter().any(|e| matches!(e, SessionEvent::ToolResult { .. })),
+            "the TodoWrite tool_result must not reach the stream, got {events:?}"
+        );
+    }
+
+    /// An unrelated tool's `tool_result` must still flow — the suppression is
+    /// keyed on the TodoWrite tool_use_id, not on the frame shape.
+    #[test]
+    fn other_tool_results_still_flow_after_a_todo_write() {
+        let mut a = ClaudeAdapter::new();
+        let assistant = r#"{"type":"assistant","message":{"role":"assistant","content":[
+            {"type":"tool_use","id":"tu_todo_1","name":"TodoWrite","input":{"todos":[
+                {"content":"step","status":"pending"}]}},
+            {"type":"tool_use","id":"tu_bash_1","name":"Bash","input":{"command":"ls"}}]}}"#;
+        a.parse_assistant(&serde_json::from_str(assistant).unwrap());
+
+        let user = r#"{"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"tu_bash_1","content":"a.txt"}]}}"#;
+        let events = a.parse_user(&serde_json::from_str(user).unwrap());
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::ToolResult { tool_use_id, .. } if tool_use_id == "tu_bash_1")),
+            "a normal tool_result must still emit, got {events:?}"
+        );
+    }
+
+    /// A malformed TodoWrite must not ALSO lose the tool card — degrade to the
+    /// ordinary tool path rather than swallowing the call entirely.
+    #[test]
+    fn todo_write_without_todos_array_falls_back_to_tool_call() {
+        let mut a = ClaudeAdapter::new();
+        let frame = r#"{"type":"assistant","message":{"role":"assistant","content":[
+            {"type":"tool_use","id":"tu_todo_2","name":"TodoWrite","input":{"unexpected":1}}]}}"#;
+        let v: serde_json::Value = serde_json::from_str(frame).unwrap();
+        let events = a.parse_assistant(&v);
+
+        assert!(
+            events.iter().any(|e| matches!(e, SessionEvent::ToolCall { .. })),
+            "a malformed TodoWrite must still produce its tool card, got {events:?}"
+        );
+        assert!(!events.iter().any(|e| matches!(e, SessionEvent::Plan { .. })));
     }
 
     /// Regression guard for the other direction: a well-formed `tool_use` (real
@@ -1798,7 +1951,7 @@ mod tests {
     #[test]
     fn parse_user_tool_result_array_with_image_to_text_and_image() {
         use base64::Engine as _;
-        let a = ClaudeAdapter::new();
+        let mut a = ClaudeAdapter::new();
         let b64 = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
         let frame = format!(
             r#"{{"type":"user","message":{{"role":"user","content":[
@@ -1837,7 +1990,7 @@ mod tests {
     /// (default-false) so the routing bit is pinned on both edges.
     #[test]
     fn parse_user_failed_tool_result_carries_is_error_true() {
-        let a = ClaudeAdapter::new();
+        let mut a = ClaudeAdapter::new();
         // A failed tool: is_error:true + the error text as content.
         let frame = r#"{"type":"user","message":{"role":"user","content":[
             {"type":"tool_result","tool_use_id":"tf1","is_error":true,
@@ -3184,7 +3337,7 @@ mod tests {
                 "type": "user",
                 "message": { "role": "user", "content": content }
             });
-            let a = ClaudeAdapter::new();
+            let mut a = ClaudeAdapter::new();
             let events = a.parse_user(&frame); // (1) must not panic
 
             let results: Vec<&SessionEvent> =
@@ -3213,7 +3366,7 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "big1", "content": big}
             ]}
         });
-        let a = ClaudeAdapter::new();
+        let mut a = ClaudeAdapter::new();
         match a.parse_user(&frame).as_slice() {
             [SessionEvent::ToolResult { content, .. }] => match content.as_slice() {
                 [crate::event::ToolResultContent::Text(t)] => {

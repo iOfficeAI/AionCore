@@ -31,7 +31,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.71"
+version = "0.1.72"
 edition = "2024"
 license = "MIT"
 
@@ -101,6 +101,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "regis
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+# No-echo password prompt for the `user set-password` bootstrap CLI (win/mac/linux).
+rpassword = "7"
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }

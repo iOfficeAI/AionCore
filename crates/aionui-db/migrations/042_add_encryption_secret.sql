@@ -1,0 +1,16 @@
+-- Decouple the storage-encryption root from the JWT signing secret.
+--
+-- Historically `users.jwt_secret` served double duty: it signed JWTs AND was
+-- the root from which the AES-256-GCM key for provider API keys, channel
+-- credentials, and remote-agent tokens was derived. Rotating the signing
+-- secret (e.g. on change-password) therefore silently changed the encryption
+-- key and orphaned every stored credential on the next restart.
+--
+-- This column stores the encryption root independently. On upgrade it is NULL;
+-- the server seeds it from the currently-effective JWT secret on first boot
+-- (see `resolve_encryption_secret`), so all existing ciphertext still decrypts
+-- while the signing secret becomes free to rotate afterwards.
+--
+-- SQLite `ADD COLUMN` does not support `IF NOT EXISTS`; each migration runs
+-- exactly once (tracked in `_sqlx_migrations`), matching the 032 convention.
+ALTER TABLE users ADD COLUMN encryption_secret TEXT;

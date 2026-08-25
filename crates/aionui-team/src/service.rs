@@ -879,22 +879,8 @@ impl TeamSessionService {
     pub async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
 
-        self.stop_session_unchecked(team_id);
-
-        let kill_futures: Vec<_> = team
-            .agents
-            .iter()
-            .map(|agent| {
-                self.task_manager
-                    .kill_and_wait(&agent.conversation_id, Some(AgentKillReason::TeamDeleted))
-            })
-            .collect();
-
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            futures_util::future::join_all(kill_futures),
-        )
-        .await;
+        self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::TeamDeleted)
+            .await;
 
         for agent in &team.agents {
             let _ = self
@@ -918,6 +904,38 @@ impl TeamSessionService {
 
         info!(team_id = %team_id, "Team removed");
         self.broadcast_team_removed(user_id, team_id);
+        Ok(())
+    }
+
+    /// Tear down a team's live runtime and every member agent process WITHOUT
+    /// deleting any data. Shared by `remove_team` (which then drops the rows)
+    /// and `stop_team_processes` (archive, which keeps them). Best-effort: a
+    /// stuck kill is bounded by a 3s timeout, mirroring the delete path.
+    async fn stop_team_runtime_and_agents(&self, team_id: &str, team: &Team, reason: AgentKillReason) {
+        self.stop_session_unchecked(team_id);
+
+        let kill_futures: Vec<_> = team
+            .agents
+            .iter()
+            .map(|agent| self.task_manager.kill_and_wait(&agent.conversation_id, Some(reason)))
+            .collect();
+
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            futures_util::future::join_all(kill_futures),
+        )
+        .await;
+    }
+
+    /// Archive-time teardown: stop the team runtime and kill every member agent
+    /// process, but keep all rows intact (the archive flip lives in the sidebar
+    /// service). Mirrors the process-stopping half of `remove_team` so an
+    /// archived team stops streaming just like a deleted one; unarchiving
+    /// cold-starts a fresh runtime.
+    pub async fn stop_team_processes(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
+        let team = self.load_owned_team(user_id, team_id).await?;
+        self.stop_team_runtime_and_agents(team_id, &team, AgentKillReason::Archived)
+            .await;
         Ok(())
     }
 

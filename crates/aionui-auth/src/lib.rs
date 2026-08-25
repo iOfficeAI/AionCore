@@ -1,6 +1,7 @@
 #![warn(clippy::disallowed_types)]
 
 //! JWT authentication, password hashing, CSRF protection, rate limiting, and auth middleware.
+mod account;
 mod cookie;
 mod csrf;
 mod error;
@@ -11,6 +12,7 @@ mod password;
 pub mod qr_token;
 mod rate_limit;
 mod routes;
+mod secret;
 mod security;
 mod service;
 mod validation;
@@ -18,8 +20,17 @@ mod validation;
 // Error type
 pub use error::AuthError;
 
+// Local-account password provisioning
+pub use account::{AccountError, PasswordOutcome, create_local_user, set_local_password};
+
+// Storage-encryption-secret provisioning and inspection
+pub use secret::{
+    SecretError, SecretSource, SecretStatus, SecretWriteOutcome, generate_secret, read_secret_status,
+    secret_fingerprint, set_secret,
+};
+
 // JWT service
-pub use jwt::{JwtService, TokenPayload, generate_random_secret_string, resolve_jwt_secret};
+pub use jwt::{JwtService, TokenPayload, generate_random_secret_string, resolve_encryption_secret, resolve_jwt_secret};
 
 // Password service
 pub use password::{

@@ -13,8 +13,8 @@ async fn open_old_db_and_decrypt_provider() {
     };
     let db = aionui_db::init_database(std::path::Path::new(&path)).await.unwrap();
     let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
-    let key = aionui_app::derive_encryption_key(&services.jwt_secret_raw);
-    eprintln!("[cur] secret prefix: {}", &services.jwt_secret_raw[..12]);
+    let key = aionui_app::derive_encryption_key(&services.encryption_secret_raw);
+    eprintln!("[cur] secret prefix: {}", &services.encryption_secret_raw[..12]);
     let repo = Arc::new(SqliteProviderRepository::new(services.database.pool().clone()));
     let svc = aionui_system::ProviderService::new(repo, key);
     let list = svc.list("system_default_user").await.expect("list must not fail");

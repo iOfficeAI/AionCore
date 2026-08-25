@@ -767,6 +767,31 @@ impl IConversationRepository for SqliteConversationRepository {
 
     // ── Message operations ──────────────────────────────────────────
 
+    async fn latest_message_of_type(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        message_type: &str,
+    ) -> Result<Option<MessageRow>, DbError> {
+        self.ensure_conversation_for_user(user_id, conversation_id).await?;
+        // Hits idx_messages_type_created (type, created_at DESC).
+        let row = sqlx::query_as::<_, MessageRow>(
+            "SELECT m.* FROM messages m \
+               INNER JOIN conversations c ON c.id = m.conversation_id \
+               WHERE c.user_id = ? \
+                 AND m.conversation_id = ? \
+                 AND m.type = ? \
+               ORDER BY m.created_at DESC, m.id DESC \
+               LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(conversation_id)
+        .bind(message_type)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     async fn list_messages_page(
         &self,
         user_id: &str,
@@ -2347,6 +2372,49 @@ mod tests {
         );
         assert!(page1.has_more_before);
         assert!(!page1.has_more_after);
+    }
+
+    /// The plan bar needs the newest plan row regardless of how many messages the
+    /// turn produced after it: `upsert_message` does not refresh `created_at`, so a
+    /// plan row stays anchored at the START of its turn and a busy turn buries it
+    /// far outside the default 50-message page.
+    #[tokio::test]
+    async fn latest_message_of_type_returns_the_newest_matching_row() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+
+        for created_at in [100, 300] {
+            let mut msg = sample_message(&conv.id);
+            msg.id = format!("plan-{created_at}");
+            msg.r#type = "plan".to_string();
+            msg.content = format!(r#"{{"entries":[],"turn_id":"turn-{created_at}"}}"#);
+            msg.created_at = created_at;
+            repo.insert_message(&conv.user_id, &msg).await.unwrap();
+        }
+        // Bury the plan rows well past any realistic page size.
+        for i in 0..60 {
+            let mut msg = sample_message(&conv.id);
+            msg.id = aionui_common::generate_prefixed_id("msg");
+            msg.created_at = 400 + i;
+            repo.insert_message(&conv.user_id, &msg).await.unwrap();
+        }
+
+        let found = repo
+            .latest_message_of_type(&conv.user_id, &conv.id, "plan")
+            .await
+            .unwrap()
+            .expect("the newest plan row must be reachable");
+        assert_eq!(found.id, "plan-300");
+        assert_eq!(found.created_at, 300);
+
+        assert!(
+            repo.latest_message_of_type(&conv.user_id, &conv.id, "skill_suggest")
+                .await
+                .unwrap()
+                .is_none(),
+            "a type with no rows must return None, not an error"
+        );
     }
 
     #[tokio::test]

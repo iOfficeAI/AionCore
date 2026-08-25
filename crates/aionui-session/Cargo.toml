@@ -37,7 +37,10 @@ test-support = []
 aionui-session = { path = ".", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 proptest.workspace = true
-# live_cli_e2e.rs (#[ignore] LIVE tests): a tempdir-backed FileRegistryStore for
+# live_claude_model.rs (#[ignore] LIVE tests): a tempdir-backed FileRegistryStore for
 # constructing a production RealSpawner without touching the real data dir.
 # Workspace-pinned; dev-only (never shipped). (uuid is a normal dep above.)
 tempfile.workspace = true
+# live_claude_model.rs observes the reconcile log line (the only place a session's
+# CONCRETE model is visible) via a capturing Layer. Dev-only.
+tracing-subscriber.workspace = true

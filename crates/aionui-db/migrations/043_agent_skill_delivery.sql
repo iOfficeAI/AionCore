@@ -48,7 +48,7 @@ WHERE backend = 'claude';
 -- codebuddy stays on layer 2 for now, deliberately.
 --
 -- What IS verified, against the version we actually spawn (`npx --package
--- @tencent-ai/codebuddy-code@2.137.1`, pinned in `registry_npx_lock.rs`; the
+-- @tencent-ai/codebuddy-code@2.138.0`, pinned in `registry_npx_lock.rs`; the
 -- copy on a developer's PATH may be far older and lacks these flags):
 --   * `--help` documents `--plugin-dir <dirs...>` ("Load plugins from local
 --     directories (for development/testing)") and `--add-dir <directories...>`.

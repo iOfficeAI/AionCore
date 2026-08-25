@@ -1,4 +1,4 @@
-//! Migration 042 adds `agent_metadata.skill_delivery` and seeds per-vendor values.
+//! Migration 043 adds `agent_metadata.skill_delivery` and seeds per-vendor values.
 //!
 //! Assertions are on the RAW JSON, deliberately. At this layer the column is an
 //! opaque string (see `models/agent_metadata.rs`) — `aionui-api-types` owns the
@@ -46,7 +46,7 @@ async fn claude_gets_layer_one_argv_delivery_with_allow_dir_args() {
     );
 }
 
-/// codebuddy is deliberately NOT on layer 1 yet. Its pinned build (2.137.1)
+/// codebuddy is deliberately NOT on layer 1 yet. Its pinned build (2.138.0)
 /// documents `--plugin-dir` and accepts it at the argv level, but whether the
 /// flag actually makes skills discoverable is unprobed (it needs an
 /// authenticated account). Declaring `argv` on that basis would be a real

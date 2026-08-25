@@ -1926,7 +1926,7 @@ async fn map_update(
 /// LC-8a: normalize an ACP/codex plan-step status string → canonical `PlanStatus`
 /// (I8). camelCase `inProgress` (codex) AND snake_case `in_progress` (ACP) both map
 /// to `InProgress`; unknown → `Pending` (never panic).
-fn map_plan_status(s: &str) -> crate::event::PlanStatus {
+pub(crate) fn map_plan_status(s: &str) -> crate::event::PlanStatus {
     use crate::event::PlanStatus;
     match s {
         "inProgress" | "in_progress" => PlanStatus::InProgress,

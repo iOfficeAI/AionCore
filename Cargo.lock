@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-ai-agent"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "agent-client-protocol",
  "aion-agent",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-api-types"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-common",
  "serde",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-app"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aion-config",
  "aionui-ai-agent",
@@ -439,6 +439,7 @@ dependencies = [
  "libc",
  "reqwest",
  "rmcp",
+ "rpassword",
  "rust_xlsxwriter",
  "serde",
  "serde_json",
@@ -459,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-assets"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-common",
  "axum",
@@ -474,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-assistant"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -500,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-auth"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -525,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-channel"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -557,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-common"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -574,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-conversation"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -605,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-cron"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -634,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-db"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-common",
  "async-trait",
@@ -650,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-extension"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -683,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-file"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -714,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-mcp"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -742,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-office"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -770,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-process"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-common",
  "aionui-runtime",
@@ -790,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-project"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -817,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-realtime"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-api-types",
  "axum",
@@ -832,7 +833,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-runtime"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "dirs",
  "flate2",
@@ -858,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-session"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-common",
  "aionui-process",
@@ -873,12 +874,13 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
 [[package]]
 name = "aionui-session-message"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -901,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-shell"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -934,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-sidebar"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -959,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-skill-runtime"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -981,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-system"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -1011,7 +1013,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-team"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "agent-client-protocol",
  "aionui-ai-agent",
@@ -1040,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-team-prompts"
-version = "0.1.71"
+version = "0.1.72"
 dependencies = [
  "aionui-api-types",
  "serde",
@@ -4839,6 +4841,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpassword"
+version = "7.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2da316a15f47e3d053de9cb2c439650bd8fa4aaeb9365f2e5f27f492ff73c196"
+dependencies = [
+ "libc",
+ "rtoolbox",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "rsa"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4856,6 +4869,16 @@ dependencies = [
  "spki 0.7.3",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rtoolbox"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50a0e551c1e27e1731aba276dbeaeac73f53c7cd34d1bda485d02bd1e0f36844"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6723,6 +6746,15 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.59.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
 ]
