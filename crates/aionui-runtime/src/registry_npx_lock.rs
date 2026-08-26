@@ -109,6 +109,12 @@ mod tests {
     }
 
     #[test]
+    fn pins_grok_build_to_verified_release() {
+        let args = pin_registry_npx_args("grok", &strings(&["-y", "@xai-official/grok", "agent", "stdio"])).unwrap();
+        assert_eq!(args, ["-y", "@xai-official/grok@1.0.10", "agent", "stdio"]);
+    }
+
+    #[test]
     fn pins_package_selected_with_package_flag() {
         let args = pin_registry_npx_args(
             "codebuddy",
