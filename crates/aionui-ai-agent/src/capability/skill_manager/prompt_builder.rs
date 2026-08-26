@@ -55,11 +55,22 @@ pub fn build_skills_index_text(skills: &[SkillIndex]) -> String {
         ));
     }
     lines.push(String::new());
+    // These command lines are the CONTRACT, not prose: both subcommands read their
+    // arguments as a JSON object on STDIN and reject positional arguments outright
+    // (`aionui-app/src/cli.rs` declares them as argument-less variants). An earlier
+    // wording taught `skills show <name>`, which cost live agents three to five
+    // failed tool calls each before they guessed the real shape -- and `--help` did
+    // not mention stdin either, so the obvious self-service path was a dead end.
+    // `skills_cli_commands_in_the_index_are_parseable` in `aionui-app` pins the two
+    // sides together so they cannot drift apart again.
     lines.push(
         "To get a skill's full content, prefer running \
-         `\"$AIONUI_HELPER_BIN\" skills show <name>` — it also returns the skill's absolute \
-         directory, and `\"$AIONUI_HELPER_BIN\" skills cat <name>/<relative-path>` reads its \
-         supplementary files."
+         `printf '%s' '{\"name\":\"<name>\"}' | \"$AIONUI_HELPER_BIN\" skills show` — it also \
+         returns the skill's absolute directory, and \
+         `printf '%s' '{\"path\":\"<name>/<relative-path>\"}' | \"$AIONUI_HELPER_BIN\" skills cat` \
+         reads its supplementary files. Both read their arguments as a JSON object on stdin and \
+         take no positional arguments; run `\"$AIONUI_HELPER_BIN\" skills capabilities` for the \
+         full contract."
             .to_string(),
     );
     lines.push(
