@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.86](https://github.com/suoak/AionCore/compare/v0.1.85...v0.1.86) (2026-08-26)
+
+### Bug Fixes
+
+* **runtime:** update the pinned Grok Build package to 1.0.10
+
 ## [0.1.85](https://github.com/suoak/AionCore/compare/v0.1.84...v0.1.85) (2026-08-24)
 
 ### Features
