@@ -73,6 +73,19 @@ pub(super) async fn build(
     // reached it only through the workspace `.aionrs/skills` links that this
     // refactor removes, so without this the backend would lose skills outright.
     // `system_prompt` is its one always-present channel.
+    //
+    // Deliberately NOT routed through `resolve_skill_delivery` (unlike the ACP
+    // and Antigravity lanes), and it emits no "resolved delivery plan" anchor
+    // log. That is intentional, not an oversight: aionrs is an in-process agent
+    // compiled into aioncore, so it has neither a launch-argument channel (argv)
+    // nor a wire protocol (protocol) -- `system_prompt` injection is the only
+    // delivery it can physically perform. Its `skill_delivery` column therefore
+    // has no applicable value other than `injected` (its NULL default), so
+    // reading it would only ever fetch a metadata row and compute a plan this
+    // lane cannot use. If aionrs ever gains a real native skill channel (e.g.
+    // reading the session-skills view directory directly), that is a change in
+    // the aionrs crate itself, and this is where it would re-join the shared
+    // delivery decision.
     overrides.system_prompt = merge_skill_index_into_system_prompt(
         overrides.system_prompt.take(),
         &skill_index_text(&deps, &ctx.user_id, &resolved_skills).await,
