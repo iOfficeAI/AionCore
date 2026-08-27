@@ -2,7 +2,7 @@
 //!
 //! agy runs this once per tool call, writing the request to our stdin and
 //! reading the decision from our stdout. We forward the request to the running
-//! AionUi backend, which raises a permission card and blocks until the user
+//! WorkMate backend, which raises a permission card and blocks until the user
 //! answers.
 //!
 //! FAIL-CLOSED: every failure path (missing env, unreachable backend, malformed
@@ -76,7 +76,7 @@ async fn decide() -> AntigravityHookOutput {
             let body = resp.text().await.unwrap_or_default();
             decision_from_response(status, &body)
         }
-        // The user closed AionUi, the turn was cancelled, or nobody answered in
+        // The user closed WorkMate, the turn was cancelled, or nobody answered in
         // time. Denying is the only safe reading of "no answer".
         Err(e) => AntigravityHookOutput::deny(format!("aionui did not answer: {e}")),
     }
@@ -122,7 +122,7 @@ mod tests {
 
     #[tokio::test]
     async fn unconfigured_bridge_denies_instead_of_allowing() {
-        // Safety property: a hook that cannot reach AionUi must never let the
+        // Safety property: a hook that cannot reach WorkMate must never let the
         // tool through.
         unsafe {
             std::env::remove_var(AntigravityHookConfig::ENV_BASE_URL);

@@ -1,6 +1,6 @@
 //! Version-drift detection for direct-CLI backends.
 //!
-//! None of claude / codex / agy ship with AionUi: each is whatever the user
+//! None of claude / codex / agy ship with WorkMate: each is whatever the user
 //! installed. Every wire contract a backend relies on — stream shapes, control
 //! frames, resume flags — was verified against one release, so a drifting
 //! install has to be visible rather than failing in some unexplained way
@@ -8,7 +8,7 @@
 //!
 //! claude and codex used to be exempt because the app bundled a version-pinned
 //! copy of each. That hid a worse problem: the bundled CLI and the user's own
-//! install could differ, so the same prompt behaved differently in AionUi and
+//! install could differ, so the same prompt behaved differently in WorkMate and
 //! in the user's terminal with nothing on screen explaining why. Bundling is
 //! gone; this module gives all three backends the same treatment.
 //!
@@ -139,18 +139,18 @@ pub fn drift_notice(cli: &str, reported: &str, verified: &str) -> Option<(Notice
         VersionVerdict::Older => Some((
             NoticeLevel::Info,
             format!(
-                "The installed {cli} is older than the version AionUi verified; \
+                "The installed {cli} is older than the version WorkMate verified; \
                  some features may be missing. Consider upgrading {cli}. \
-                 (installed {reported} / verified by AionUi: {verified})"
+                 (installed {reported} / verified by WorkMate: {verified})"
             ),
             localized(CODE_CLI_VERSION_OLDER),
         )),
         VersionVerdict::Newer => Some((
             NoticeLevel::Info,
             format!(
-                "The installed {cli} is newer than the version AionUi verified. \
+                "The installed {cli} is newer than the version WorkMate verified. \
                  It should still work; report anything that behaves oddly. \
-                 (installed {reported} / verified by AionUi: {verified})"
+                 (installed {reported} / verified by WorkMate: {verified})"
             ),
             localized(CODE_CLI_VERSION_NEWER),
         )),

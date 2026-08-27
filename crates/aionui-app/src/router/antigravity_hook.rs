@@ -1,6 +1,6 @@
 //! Callback endpoint for the Antigravity permission hook.
 //!
-//! agy cannot prompt for tool permission in headless mode, so AionUi registers
+//! agy cannot prompt for tool permission in headless mode, so WorkMate registers
 //! its own binary as agy's `PreToolUse` hook. That hook process posts here and
 //! blocks; we raise the user's permission card and answer once they choose.
 //!
@@ -90,7 +90,7 @@ async fn handle_hook(
 
     Json(match decision {
         aionui_session::PermissionDecision::Approved | aionui_session::PermissionDecision::AllowAlways => {
-            AntigravityHookOutput::allow("approved in AionUi")
+            AntigravityHookOutput::allow("approved in WorkMate")
         }
         aionui_session::PermissionDecision::Denied => AntigravityHookOutput::deny("rejected in AionUi"),
     })

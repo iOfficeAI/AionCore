@@ -1,4 +1,4 @@
-//! `aioncore config` subcommand: agent-facing automation CLI for AionUi config.
+//! `aioncore config` subcommand: agent-facing automation CLI for CSBU WorkMate config.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};

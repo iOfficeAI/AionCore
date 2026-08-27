@@ -1,9 +1,9 @@
 //! Row models and parameter structs for the `agent_metadata` table.
 //!
 //! JSON-encoded columns (`agent_source_info`, `args`, `env`,
-//! `native_skills_dirs`, `behavior_policy`, plus the ACP handshake
-//! snapshots) stay as opaque strings at this layer. The ai-agent crate
-//! owns the schema of these payloads and decodes them on read.
+//! `native_skills_dirs`, `skill_delivery`, `behavior_policy`, plus the ACP
+//! handshake snapshots) stay as opaque strings at this layer. The ai-agent
+//! crate owns the schema of these payloads and decodes them on read.
 
 use aionui_common::TimestampMs;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,12 @@ pub struct AgentMetadataRow {
     pub args: Option<String>,
     pub env: Option<String>,
     pub native_skills_dirs: Option<String>,
+    /// Per-vendor skill delivery declaration (JSON). `None` is read as
+    /// `{"mode":"injected"}` -- the safe default, so an unprobed vendor works
+    /// with no migration. Opaque at this layer; `aionui-api-types` owns the
+    /// schema and parses it tolerantly (an unknown mode warns and falls back
+    /// rather than failing the row).
+    pub skill_delivery: Option<String>,
 
     pub behavior_policy: Option<String>,
     /// Native mode id that AionUi's legacy `yolo` / `yoloNoSandbox`
@@ -94,6 +100,7 @@ pub struct UpsertAgentMetadataParams<'a> {
     pub args: Option<&'a str>,
     pub env: Option<&'a str>,
     pub native_skills_dirs: Option<&'a str>,
+    pub skill_delivery: Option<&'a str>,
     pub behavior_policy: Option<&'a str>,
     pub yolo_id: Option<&'a str>,
     pub agent_capabilities: Option<&'a str>,

@@ -428,6 +428,7 @@ dependencies = [
  "aionui-session-message",
  "aionui-shell",
  "aionui-sidebar",
+ "aionui-skill-runtime",
  "aionui-system",
  "aionui-team",
  "aionui-team-prompts",
@@ -972,6 +973,28 @@ dependencies = [
  "tower",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "aionui-skill-runtime"
+version = "0.1.72"
+dependencies = [
+ "aionui-ai-agent",
+ "aionui-api-types",
+ "aionui-common",
+ "aionui-db",
+ "aionui-extension",
+ "async-trait",
+ "axum",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

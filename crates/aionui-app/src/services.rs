@@ -310,6 +310,33 @@ impl AppServices {
                 .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
         }
 
+        // Reap per-conversation skill view directories whose conversation is gone.
+        //
+        // A view outlives its conversation only when the delete hook did not run
+        // (crash, forced kill), so this is a startup sweep rather than a timer.
+        // Keyed by the (user, conversation) PAIR: two Core users can hold
+        // same-shaped conversation ids, and reaping by id alone would delete one
+        // user's view because the other's conversation was deleted.
+        match conversation_repo.list_all_conversation_ids().await {
+            Ok(live) => {
+                let live: std::collections::HashSet<(String, String)> = live.into_iter().collect();
+                match aionui_extension::skill_view::cleanup_orphan_views(&data_dir, &live).await {
+                    Ok(removed) if removed > 0 => {
+                        tracing::info!(removed, "startup: reaped orphan skill view directories");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(error = %error, "startup: orphan skill view cleanup failed");
+                    }
+                }
+            }
+            // Reaping nothing is the safe direction: a leaked view costs disk,
+            // a wrongly-deleted one costs a session its skills.
+            Err(error) => {
+                tracing::warn!(error = %error, "startup: could not list conversations; skipped skill view cleanup");
+            }
+        }
+
         // Absolute path to this process's binary. Reused as the `command` for
         // the stdio MCP bridge spawned by ACP CLIs when a team session is
         // attached to a conversation (phase1 mcp.md §4.6 single-binary model).

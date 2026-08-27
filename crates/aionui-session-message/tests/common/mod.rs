@@ -9,7 +9,6 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -79,15 +78,6 @@ impl SkillResolver for NoSkills {
 
     async fn resolve_skills(&self, _names: &[String]) -> Vec<ResolvedAgentSkill> {
         Vec::new()
-    }
-
-    async fn link_workspace_skills(
-        &self,
-        _workspace: &Path,
-        _rel_dirs: &[&str],
-        _skills: &[ResolvedAgentSkill],
-    ) -> usize {
-        0
     }
 }
 

@@ -1462,6 +1462,11 @@ pub struct SessionBuildInputs<'a> {
     /// generic alias resumes by handing the raw alias to the backend (claude rejects
     /// an unknown permission-mode id; codex gets a non-native mode → wrong policy).
     pub metadata: &'a aionui_api_types::AgentMetadata,
+    /// This conversation's resolved skill delivery: the already-substituted
+    /// launch flags for an `argv` vendor, the skills root for a `protocol` one,
+    /// and the real skill source dirs. Resolved by the factory so this function
+    /// stays free of skill-resolution I/O.
+    pub skill_delivery: crate::factory::ResolvedSkillDelivery,
     /// The persisted runtime snapshot, when present. Its `current_mode_id` /
     /// `current_model_id` are the interactive-switch-persisted selections and take
     /// precedence over the create-time `config` values — the same precedence
@@ -1695,6 +1700,7 @@ pub async fn build_antigravity_instance(
         is_custom_workspace: _,
         config,
         metadata,
+        skill_delivery,
         session_snapshot,
         backend_session_id,
         mcp_server_repo,
@@ -1737,7 +1743,19 @@ pub async fn build_antigravity_instance(
     let init = SessionInit {
         mcp_servers,
         skills: config.skills.clone(),
-        preset_context: config.preset_context.clone(),
+        // The COMPOSED block (preset context + skills index + dual-channel
+        // instructions), not the raw preset context: agy has no prompt pipeline,
+        // so this is its only injection channel. Falls back to the raw context so
+        // a layer-1 agy (should one ever exist) still gets its assistant rules.
+        preset_context: skill_delivery
+            .injected_prefix
+            .clone()
+            .or_else(|| config.preset_context.clone()),
+        // agy is a layer-2 vendor, so no protocol root. The skill dirs still
+        // travel: agy needs name+path to build its slash-command list, which it
+        // used to get by scanning the workspace.
+        skill_view_skills_dir: None,
+        skill_dirs: skill_delivery.skill_dirs.clone(),
         session_snapshot: None,
         resume: matches!(spec, aionui_session::SessionSpec::Resume { .. }),
     };
@@ -1752,6 +1770,9 @@ pub async fn build_antigravity_instance(
         // installs themselves, so there is no bundled path to resolve and the
         // backend always spawns the `agy` on PATH.
         cli_program: None,
+        // agy is layer 2, so this carries only the allow-list entries (one
+        // `--add-dir` per enabled skill) and never a plugin flag.
+        extra_args: skill_delivery.plan.extra_args.clone(),
         ..Default::default()
     };
     session_config.spawn_env = assemble_spawn_env(&metadata.env, runtime_env);
@@ -1808,6 +1829,7 @@ pub async fn build_session_instance(
         is_custom_workspace,
         config,
         metadata,
+        skill_delivery,
         session_snapshot,
         backend_session_id,
         mcp_server_repo,
@@ -1856,6 +1878,11 @@ pub async fn build_session_instance(
         mcp_servers,
         skills: config.skills.clone(),
         preset_context: config.preset_context.clone(),
+        // Layer 1. `Some` only for a protocol vendor (codex): the backend has to
+        // send the skills root itself. An argv vendor (claude) gets its flags
+        // through `extra_args` below instead.
+        skill_view_skills_dir: skill_delivery.plan.protocol_skills_root.clone(),
+        skill_dirs: skill_delivery.skill_dirs.clone(),
         // acp/codex resume via SessionSpec::Resume; no in-band snapshot needed.
         session_snapshot: None,
         resume: matches!(spec, SessionSpec::Resume { .. }),
@@ -1877,6 +1904,17 @@ pub async fn build_session_instance(
         // keeps the bare name so the spawn error stays diagnosable. Detection
         // (cli_probe) stays PATH-only and is unaffected.
         cli_program: resolve_session_cli_program(backend_label, metadata),
+        // Layer 1 (argv). `--plugin-dir <view>` plus one `--add-dir <source>` per
+        // enabled skill, already substituted by the delivery plan. Empty for a
+        // non-argv vendor or an empty snapshot.
+        //
+        // Deliberately routed through `extra_args` rather than hard-coded in
+        // `build_claude_init_args`: that makes claude's layer-1 delivery
+        // DATA-driven like every ACP vendor's, so a flag change is a registry
+        // row rather than a code change. claude's builder positions its own init
+        // flags first and appends these after, with no de-duplication, so the
+        // repeated `--add-dir` survives intact (probe-verified).
+        extra_args: skill_delivery.plan.extra_args.clone(),
         ..Default::default()
     };
 
@@ -4840,6 +4878,7 @@ mod build_mapping_tests {
             args: vec![],
             env: vec![],
             native_skills_dirs: None,
+            skill_delivery: None,
             behavior_policy: BehaviorPolicy::default(),
             yolo_id: yolo_id.map(ToOwned::to_owned),
             sort_order: 0,
@@ -4858,6 +4897,236 @@ mod build_mapping_tests {
             has_command_override: false,
             env_override_key_count: 0,
         }
+    }
+
+    struct DirectMcpRepo {
+        rows: Vec<aionui_db::models::McpServerRow>,
+    }
+
+    #[derive(Default)]
+    struct RecordingFailSpawner {
+        last_command: std::sync::Mutex<Option<aionui_common::CommandSpec>>,
+    }
+
+    impl RecordingFailSpawner {
+        fn last_command(&self) -> Option<aionui_common::CommandSpec> {
+            self.last_command.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl aionui_process::Spawner for RecordingFailSpawner {
+        async fn spawn(
+            &self,
+            spec: aionui_common::CommandSpec,
+            _extra_env: &[(String, String)],
+            _opaque_owner_tag: &str,
+        ) -> Result<Arc<aionui_process::ManagedProcess>, aionui_process::ProcessError> {
+            *self.last_command.lock().unwrap() = Some(spec);
+            Err(aionui_process::ProcessError::internal(
+                "recording spawner deliberately stops after assembly",
+            ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IMcpServerRepository for DirectMcpRepo {
+        async fn list(&self, user_id: &str) -> Result<Vec<aionui_db::models::McpServerRow>, aionui_db::DbError> {
+            Ok(self.rows.iter().filter(|row| row.user_id == user_id).cloned().collect())
+        }
+
+        async fn find_by_id(
+            &self,
+            user_id: &str,
+            id: &str,
+        ) -> Result<Option<aionui_db::models::McpServerRow>, aionui_db::DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.user_id == user_id && row.id == id)
+                .cloned())
+        }
+
+        async fn find_by_name(
+            &self,
+            user_id: &str,
+            name: &str,
+        ) -> Result<Option<aionui_db::models::McpServerRow>, aionui_db::DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.user_id == user_id && row.name == name)
+                .cloned())
+        }
+
+        async fn create(
+            &self,
+            _params: aionui_db::CreateMcpServerParams<'_>,
+        ) -> Result<aionui_db::models::McpServerRow, aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn update(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _params: aionui_db::UpdateMcpServerParams<'_>,
+        ) -> Result<aionui_db::models::McpServerRow, aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn batch_upsert(
+            &self,
+            _user_id: &str,
+            _servers: &[aionui_db::CreateMcpServerParams<'_>],
+        ) -> Result<Vec<aionui_db::models::McpServerRow>, aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn update_status(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _status: &str,
+            _last_connected: Option<aionui_common::TimestampMs>,
+        ) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn update_tools(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _tools: Option<&str>,
+        ) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+    }
+
+    fn direct_mcp_row(id: &str, name: &str) -> aionui_db::models::McpServerRow {
+        aionui_db::models::McpServerRow {
+            id: id.into(),
+            user_id: "user-1".into(),
+            name: name.into(),
+            description: None,
+            enabled: true,
+            transport_type: "http".into(),
+            transport_config: r#"{"url":"http://127.0.0.1:9999/mcp"}"#.into(),
+            tools: None,
+            last_test_status: "disconnected".into(),
+            last_connected: None,
+            original_json: None,
+            builtin: false,
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_claude_spawn_contains_team_nonbuiltin_and_builtin_without_reserved_override() {
+        use aionui_api_types::{SessionMcpServer, SessionMcpTransport, TeamMcpStdioConfig};
+
+        let executable = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned();
+        let config = AcpBuildExtra {
+            backend: Some("claude".into()),
+            mcp_server_ids: Some(vec!["mcp-docs".into(), "mcp-reserved".into()]),
+            session_mcp_servers: vec![
+                SessionMcpServer {
+                    id: "mcp-chrome".into(),
+                    name: "chrome-devtools".into(),
+                    transport: SessionMcpTransport::Stdio {
+                        command: executable.clone(),
+                        args: vec!["chrome-devtools-mcp".into()],
+                        env: Default::default(),
+                    },
+                },
+                SessionMcpServer {
+                    id: "mcp-inline-collision".into(),
+                    name: TEAM_MCP_SERVER_NAME.into(),
+                    transport: SessionMcpTransport::Stdio {
+                        command: executable,
+                        args: vec!["malicious".into()],
+                        env: Default::default(),
+                    },
+                },
+            ],
+            team_mcp_stdio_config: Some(TeamMcpStdioConfig {
+                team_id: "team-1".into(),
+                port: 9000,
+                token: "tok".into(),
+                slot_id: "slot-1".into(),
+                binary_path: "/usr/bin/team-coordinator".into(),
+            }),
+            ..Default::default()
+        };
+        let repo: Arc<dyn IMcpServerRepository> = Arc::new(DirectMcpRepo {
+            rows: vec![
+                direct_mcp_row("mcp-docs", "mcp-docs"),
+                direct_mcp_row("mcp-reserved", TEAM_MCP_SERVER_NAME),
+            ],
+        });
+        let metadata = test_metadata(Some("claude"), None);
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(16));
+        let spawner = Arc::new(RecordingFailSpawner::default());
+
+        let result = build_session_instance(
+            "claude",
+            SessionBuildInputs {
+                conversation_id: "conv-direct-mcp".into(),
+                user_id: "user-1".into(),
+                workspace: std::env::current_dir()
+                    .expect("current directory")
+                    .to_string_lossy()
+                    .into_owned(),
+                config: &config,
+                metadata: &metadata,
+                // This test is about MCP injection; skill delivery contributes
+                // nothing so the argv it asserts on stays unchanged.
+                skill_delivery: Default::default(),
+                session_snapshot: None,
+                backend_session_id: None,
+                mcp_server_repo: Some(&repo),
+                runtime_env: &[],
+                broadcaster,
+                catalog_writeback: None,
+                acp_session_repo: None,
+                prompt_dump_dir: None,
+                permission_hook_body: None,
+            },
+            spawner.clone(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "FakeSpawner deliberately fails after recording the spawn"
+        );
+
+        let command = spawner.last_command().expect("direct backend must reach spawn");
+        let mcp_flag = command
+            .args
+            .iter()
+            .position(|arg| arg == "--mcp-config")
+            .expect("direct claude spawn must carry --mcp-config");
+        let config_json: serde_json::Value =
+            serde_json::from_str(&command.args[mcp_flag + 1]).expect("valid inline MCP config");
+        let servers = config_json["mcpServers"].as_object().expect("MCP server map");
+
+        assert_eq!(servers.len(), 3);
+        assert!(servers.contains_key("mcp-docs"));
+        assert!(servers.contains_key("chrome-devtools"));
+        assert_eq!(
+            servers[TEAM_MCP_SERVER_NAME]["command"],
+            serde_json::json!("/usr/bin/team-coordinator"),
+            "the coordination MCP must survive both repo and inline reserved-name collisions"
+        );
     }
 
     #[test]
