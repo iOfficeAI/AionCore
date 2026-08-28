@@ -135,6 +135,10 @@ async fn three_queued_messages_reach_the_target_one_turn_each_in_order() {
     }
 }
 
+/// Same fork skip as delivery_semantics: Core #836 mid-turn interjection is
+/// not implemented (UI also skipped #4012). A busy target whose FakeAgent
+/// claims mid-turn support still queues; the message is not merged into the
+/// running turn.
 #[tokio::test]
 async fn a_midturn_capable_target_takes_the_message_into_its_running_turn() {
     let ctx = setup().await;
@@ -145,17 +149,26 @@ async fn a_midturn_capable_target_takes_the_message_into_its_running_turn() {
 
     let response = ctx.service.send(USER, &a.id, &request(&b.id, "hi")).await.unwrap();
 
-    assert_eq!(response.status, SessionDeliveryStatus::Delivered);
-    assert!(ctx.queue.is_empty(), "mid-turn delivery must not queue");
-    // `status: delivered` alone does NOT prove the message merged into the
-    // running turn — an ordinary new-turn send reports `delivered` too. The
-    // active turn id must be UNCHANGED.
+    assert_eq!(
+        response.status,
+        SessionDeliveryStatus::Queued,
+        "Core #836 was not synced: a busy target queues even if FakeAgent claims mid-turn support"
+    );
+    assert_eq!(ctx.queue.len_for(&b.id), 1);
+    assert_eq!(
+        ctx.user_message_count(&b.id).await,
+        0,
+        "a queued message must not be persisted yet"
+    );
     assert_eq!(
         ctx.active_turn_id(&b.id).as_deref(),
         Some(turn_before.as_str()),
-        "the message must ride the SAME turn, not open a new one"
+        "must not open a new turn and must not merge into the running one"
     );
-    assert_eq!(agent.delivered_midturn.lock().unwrap().len(), 1);
+    assert!(
+        agent.delivered_midturn.lock().unwrap().is_empty(),
+        "must not take the mid-turn path (Core #836 was not synced)"
+    );
 }
 
 /// The branch mid-turn interjection added that is easy to miss: `send_message`

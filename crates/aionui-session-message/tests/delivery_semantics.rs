@@ -290,6 +290,11 @@ async fn a_busy_target_without_midturn_support_is_queued_not_delivered() {
     );
 }
 
+/// WorkMate intentionally skipped upstream Core #836 mid-turn interjection
+/// (UI also skipped #4012). `SessionMessageService::deliver_now` always goes
+/// through `send_message`, which returns Busy for a running turn — even when
+/// `FakeAgent.supports_midturn` is true (leftover from a half-applied test
+/// patch). The message must QUEUE, not merge into the running turn.
 #[tokio::test]
 async fn a_busy_midturn_capable_target_takes_the_message_into_its_running_turn() {
     let ctx = setup().await;
@@ -302,24 +307,27 @@ async fn a_busy_midturn_capable_target_takes_the_message_into_its_running_turn()
         .service
         .send(USER, &from.id, &request("conv_target", "hi"))
         .await
-        .expect("mid-turn delivery succeeds");
+        .expect("busy must not be an error");
 
-    assert_eq!(response.status, SessionDeliveryStatus::Delivered);
-    assert!(ctx.queue.is_empty(), "mid-turn delivery must not queue");
-    // `status: delivered` alone does NOT prove the message merged into the
-    // running turn — an ordinary new-turn send reports `delivered` too. The
-    // active turn id must be UNCHANGED.
+    assert_eq!(
+        response.status,
+        SessionDeliveryStatus::Queued,
+        "Core #836 was not synced: a busy target queues even if FakeAgent claims mid-turn support"
+    );
+    assert_eq!(ctx.queue.len_for("conv_target"), 1);
+    assert_eq!(
+        ctx.user_message_count("conv_target").await,
+        0,
+        "a queued message must not be persisted yet"
+    );
     assert_eq!(
         ctx.active_turn_id("conv_target").as_deref(),
         Some(turn_before.as_str()),
-        "the message must ride the SAME turn, not open a new one"
+        "must not open a new turn and must not merge into the running one"
     );
-    let delivered = agent.delivered_midturn.lock().unwrap().clone();
-    assert_eq!(delivered.len(), 1, "delivered through the mid-turn path exactly once");
     assert!(
-        delivered[0].content.starts_with("[[AION_SESSION_MESSAGE]]"),
-        "{}",
-        delivered[0].content
+        agent.delivered_midturn.lock().unwrap().is_empty(),
+        "must not take the mid-turn path (Core #836 was not synced)"
     );
 }
 
