@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.1](https://github.com/suoak/AionCore/compare/v0.2.0...v0.2.1) (2026-08-29)
+
+### Bug Fixes
+
+* **agent:** pair native media blocks with a link to the same file
+* **team:** map Team coordination MCP spawn correctly
+
+### Dependencies
+
+* **aionrs:** pin agent, provider, protocol, configuration, type, and MCP crates to v0.2.22
+
 ## [0.2.0](https://github.com/suoak/AionCore/compare/v0.1.86...v0.2.0) (2026-08-28)
 
 ### Features
