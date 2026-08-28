@@ -31,13 +31,14 @@ use crate::event::{LocalizedText, NoticeLevel};
 /// is the evidence; a schema diff or a clean changelog is not, because neither
 /// can see a behavioural regression.
 ///
-/// codex is deliberately NOT on the latest release: 0.147.0 never completes a
-/// turn (its response stream disconnects with `httpStatusCode: null`, observed
-/// three times including a back-to-back control after three clean versions), so
-/// the verified release stops at 0.146.0 until upstream fixes it.
-pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.233";
-pub const VERIFIED_CODEX_VERSION: &str = "0.146.0";
-pub const VERIFIED_AGY_VERSION: &str = "1.1.12";
+/// codex skips 0.147.0, which never completes a turn (its response stream
+/// disconnects with `httpStatusCode: null`, observed three times including a
+/// back-to-back control after three clean versions). Every release from 0.148.0
+/// on does complete turns and passes the suite, so the gate walks forward over
+/// 0.147.0 and leaves it unverified rather than a floor anyone can install into.
+pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.235";
+pub const VERIFIED_CODEX_VERSION: &str = "0.150.1";
+pub const VERIFIED_AGY_VERSION: &str = "1.1.22";
 
 /// The verified release for a direct-CLI backend, keyed by the program name the
 /// backend spawns. `None` for anything not version-gated here.
@@ -449,8 +450,8 @@ mod tests {
     fn the_verified_release_says_nothing() {
         // Literal on purpose: this is the exact string a user on the verified
         // release reports, so the test breaks if a bump forgets to re-verify.
-        assert_eq!(classify("2.1.233", VERIFIED_CLAUDE_VERSION), VersionVerdict::Verified);
-        assert!(drift_notice("claude", "2.1.233", VERIFIED_CLAUDE_VERSION).is_none());
+        assert_eq!(classify("2.1.235", VERIFIED_CLAUDE_VERSION), VersionVerdict::Verified);
+        assert!(drift_notice("claude", "2.1.235", VERIFIED_CLAUDE_VERSION).is_none());
     }
 
     #[test]

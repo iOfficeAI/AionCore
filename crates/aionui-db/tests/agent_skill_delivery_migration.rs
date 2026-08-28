@@ -1,4 +1,4 @@
-//! Migration 043 adds `agent_metadata.skill_delivery` and seeds per-vendor values.
+//! Migration 054 adds `agent_metadata.skill_delivery` and seeds per-vendor values.
 //!
 //! Assertions are on the RAW JSON, deliberately. At this layer the column is an
 //! opaque string (see `models/agent_metadata.rs`) — `aionui-api-types` owns the
