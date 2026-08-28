@@ -10,8 +10,8 @@ use crate::models::{
 };
 use crate::repository::conversation::{
     ConversationFilters, ConversationInputInsert, ConversationInputUpdate, ConversationRowUpdate,
-    IConversationRepository, MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult,
-    MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow, MentionableCandidatesParams,
+    IConversationRepository, MentionableCandidatesParams, MessagePageCursor, MessagePageDirection, MessagePageParams,
+    MessagePageResult, MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
 };
 
 /// Bump `conversations.updated_at` so the conversation-list sort

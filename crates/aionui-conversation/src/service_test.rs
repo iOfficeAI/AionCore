@@ -9485,7 +9485,6 @@ mod session_mentions_integration {
     // so the original mid-turn sessions-block test is omitted: it depended
     // on MidturnMockAgent / delivered_midturn.
 
-
     /// `[[AION_FILES]]` MUST remain the last block in the content.
     ///
     /// The front-end's file-chip parser reads every non-empty line after the

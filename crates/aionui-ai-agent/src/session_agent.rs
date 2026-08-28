@@ -32,7 +32,7 @@ use crate::protocol::events::{
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::PersistedSessionState;
 use crate::types::{PromptMediaCaps, SendMessageData};
-use aionui_api_types::AcpBuildExtra;
+use aionui_api_types::{AcpBuildExtra, TEAM_MCP_SERVER_NAME};
 use aionui_common::AgentType;
 use aionui_db::{IAcpSessionRepository, IMcpServerRepository, SaveRuntimeStateParams};
 use aionui_realtime::EventBroadcaster;
@@ -1849,7 +1849,9 @@ pub async fn build_session_instance(
 
     // GAP #3 — MCP init surface: resolve user-configured servers to the neutral
     // spec (clean-slate resolve_session_init), fold in the inline snapshot, then
-    // prepend the team coordination MCP. Same order as the app boundary.
+    // prepend the team coordination MCP. Same order as the app boundary. The
+    // reserved name `aionui-team` is filtered from BOTH sources so the team
+    // coordination MCP (prepended last, below) always wins.
     let mut neutral = match mcp_server_repo {
         Some(repo) => {
             crate::mcp_resolve::resolve_session_mcp_servers(
@@ -1863,7 +1865,14 @@ pub async fn build_session_instance(
         }
         None => Vec::new(),
     };
-    neutral.extend(config.session_mcp_servers.iter().cloned());
+    neutral.retain(|server| server.name != TEAM_MCP_SERVER_NAME);
+    neutral.extend(
+        config
+            .session_mcp_servers
+            .iter()
+            .filter(|server| server.name != TEAM_MCP_SERVER_NAME)
+            .cloned(),
+    );
     let mut mcp_servers: Vec<McpServerSpec> = neutral.iter().map(session_server_to_spec).collect();
     if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
         // Team-MCP is PREPENDED before the user's servers (clean-slate + legacy
