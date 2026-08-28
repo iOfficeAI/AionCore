@@ -456,10 +456,10 @@ mod tests {
 
     #[test]
     fn components_compare_numerically_not_lexically() {
-        // The bug a string compare would introduce: "0.144.6" < "0.99.0"
-        // lexically, but 144 > 99.
+        // The bug a string compare would introduce: "0.150.1" < "0.99.0"
+        // lexically, but 150 > 99.
         assert_eq!(classify("0.99.0", VERIFIED_CODEX_VERSION), VersionVerdict::Older);
-        assert_eq!(classify("0.146.1", VERIFIED_CODEX_VERSION), VersionVerdict::Newer);
+        assert_eq!(classify("0.151.0", VERIFIED_CODEX_VERSION), VersionVerdict::Newer);
     }
 
     #[test]
@@ -552,10 +552,12 @@ mod tests {
 
     #[test]
     fn local_codex_output_is_classified_as_newer() {
-        // Real `codex --version` output on this machine (2026-08-07).
-        assert_eq!(parse_version("codex-cli 0.147.0"), Some(vec![0, 147, 0]));
+        // Prefixed `codex --version` output, with a release actually newer
+        // than the current pin (0.150.1). 0.147.0 used to be Newer when the
+        // pin was 0.144.6; it is Older now.
+        assert_eq!(parse_version("codex-cli 0.151.0"), Some(vec![0, 151, 0]));
         let (level, _, localized) =
-            drift_notice("codex", "codex-cli 0.147.0", VERIFIED_CODEX_VERSION).expect("0.147.0 drifts from 0.144.6");
+            drift_notice("codex", "codex-cli 0.151.0", VERIFIED_CODEX_VERSION).expect("0.151.0 drifts from 0.150.1");
         assert_eq!(level, NoticeLevel::Info);
         assert_eq!(localized.code, CODE_CLI_VERSION_NEWER);
     }
