@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/iOfficeAI/AionCore/compare/v0.1.72...v0.2.0) (2026-08-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* **skills:** deliver skills through an AionUi-owned view instead of the workspace ([#938](https://github.com/iOfficeAI/AionCore/issues/938))
+
+### Features
+
+* **auth:** dual-token refresh with singleflight ([#926](https://github.com/iOfficeAI/AionCore/issues/926)) ([3f5c9f9](https://github.com/iOfficeAI/AionCore/commit/3f5c9f900433dd846798a82353df03dfed8db697))
+* **skills:** deliver skills through an AionUi-owned view instead of the workspace ([#938](https://github.com/iOfficeAI/AionCore/issues/938)) ([7032b3b](https://github.com/iOfficeAI/AionCore/commit/7032b3b410440c0081fb3cfe4a09f2ccfb2dd574))
+
 ## [0.1.72](https://github.com/iOfficeAI/AionCore/compare/v0.1.71...v0.1.72) (2026-08-24)
 
 
