@@ -189,7 +189,7 @@ explicitly:
 ```bash
 "$AIONUI_HELPER_BIN" diagnose logs tail <<'JSON'
 {
-  "log_dir": "/Users/alex/Library/Logs/AionUi",
+  "log_dir": "/Users/alex/Library/Logs/aionui",
   "lines": 100,
   "errors_only": true,
   "conversation_id": "conv_123"

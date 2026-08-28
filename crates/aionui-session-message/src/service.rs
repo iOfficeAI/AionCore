@@ -222,16 +222,13 @@ impl SessionMessageService {
         let content = compose_delivery_content(&block, &req.message);
 
         match self.deliver_now(user_id, to, content.clone()).await {
-            Ok(sent) => {
+            Ok(_sent) => {
                 info!(
                     from_conversation_id,
                     to_conversation_id = to,
                     outcome = "delivered",
-                    // `send_message` may have merged the message into the
-                    // target's already-running turn instead of opening a new
-                    // one. Both map to `delivered` on the wire, but without this
-                    // field the two are indistinguishable in production.
-                    delivered_midturn = sent.delivered_midturn,
+                    // Mid-turn interjection was not synced; delivery always
+                    // opens a new turn (or queues) via send_message.
                     "cross-session delivery accepted"
                 );
                 Ok(SessionSendMessageResponse {

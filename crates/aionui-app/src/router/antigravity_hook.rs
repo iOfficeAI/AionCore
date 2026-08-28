@@ -92,7 +92,7 @@ async fn handle_hook(
         aionui_session::PermissionDecision::Approved | aionui_session::PermissionDecision::AllowAlways => {
             AntigravityHookOutput::allow("approved in WorkMate")
         }
-        aionui_session::PermissionDecision::Denied => AntigravityHookOutput::deny("rejected in AionUi"),
+        aionui_session::PermissionDecision::Denied => AntigravityHookOutput::deny("rejected in WorkMate"),
     })
 }
 

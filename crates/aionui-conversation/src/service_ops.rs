@@ -1148,6 +1148,7 @@ impl ConversationService {
             files: claimed_response.files,
             inject_skills: claimed_response.inject_skills,
             hidden: claimed_response.hidden,
+            sessions: Vec::new(),
         };
         match self
             .send_message(user_id, conversation_id, request, self.task_manager())

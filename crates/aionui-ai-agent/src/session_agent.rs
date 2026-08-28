@@ -5050,7 +5050,7 @@ mod build_mapping_tests {
                 },
                 SessionMcpServer {
                     id: "mcp-inline-collision".into(),
-                    name: TEAM_MCP_SERVER_NAME.into(),
+                    name: aionui_api_types::TEAM_MCP_SERVER_NAME.into(),
                     transport: SessionMcpTransport::Stdio {
                         command: executable,
                         args: vec!["malicious".into()],
@@ -5070,7 +5070,7 @@ mod build_mapping_tests {
         let repo: Arc<dyn IMcpServerRepository> = Arc::new(DirectMcpRepo {
             rows: vec![
                 direct_mcp_row("mcp-docs", "mcp-docs"),
-                direct_mcp_row("mcp-reserved", TEAM_MCP_SERVER_NAME),
+                direct_mcp_row("mcp-reserved", aionui_api_types::TEAM_MCP_SERVER_NAME),
             ],
         });
         let metadata = test_metadata(Some("claude"), None);
@@ -5091,6 +5091,7 @@ mod build_mapping_tests {
                 // This test is about MCP injection; skill delivery contributes
                 // nothing so the argv it asserts on stays unchanged.
                 skill_delivery: Default::default(),
+                is_custom_workspace: false,
                 session_snapshot: None,
                 backend_session_id: None,
                 mcp_server_repo: Some(&repo),
@@ -5123,7 +5124,7 @@ mod build_mapping_tests {
         assert!(servers.contains_key("mcp-docs"));
         assert!(servers.contains_key("chrome-devtools"));
         assert_eq!(
-            servers[TEAM_MCP_SERVER_NAME]["command"],
+            servers[aionui_api_types::TEAM_MCP_SERVER_NAME]["command"],
             serde_json::json!("/usr/bin/team-coordinator"),
             "the coordination MCP must survive both repo and inline reserved-name collisions"
         );

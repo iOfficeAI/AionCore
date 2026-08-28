@@ -9481,56 +9481,10 @@ mod session_mentions_integration {
         assert!(persisted.starts_with("问下他\n\n[[AION_SESSIONS]]"), "{persisted}");
     }
 
-    /// The ordering constraint the plan calls a hard requirement: the block is
-    /// appended BEFORE the mid-turn branch consumes `resolved`. Hooking it
-    /// after would leave every other test green while silently dropping `@@`
-    /// context on the mid-turn path.
-    #[tokio::test]
-    async fn a_midturn_delivery_still_carries_the_sessions_block() {
-        let (svc, _b, repo, _t) = make_service();
-        let sender = svc.create("user_1", make_create_req()).await.unwrap();
-        insert_conv(
-            &repo,
-            "user_1",
-            "conv_target",
-            "重构-鉴权模块",
-            json!({"workspace": "/w/a"}),
-        )
-        .await;
-        let _claim = svc
-            .runtime_state()
-            .try_claim_turn(&sender.id, "turn_active")
-            .expect("claim the active turn");
-        let agent = Arc::new(MidturnMockAgent::new(&sender.id));
-        let task_mgr = Arc::new(MockTaskManager::new());
-        task_mgr.insert_agent(&sender.id, AgentInstance::Mock(agent.clone()));
-        let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+    // Mid-turn interjection was not synced (fork uses journal-backed steer),
+    // so the original mid-turn sessions-block test is omitted: it depended
+    // on MidturnMockAgent / delivered_midturn.
 
-        let request: SendMessageRequest = serde_json::from_value(json!({
-            "content": "问下他",
-            "sessions": [{ "id": "conv_target" }]
-        }))
-        .unwrap();
-
-        let response = svc
-            .send_message("user_1", &sender.id, request, &task_mgr_dyn)
-            .await
-            .expect("mid-turn send must not 409");
-        assert!(response.delivered_midturn, "this test must exercise the mid-turn path");
-
-        let delivered = agent.delivered.lock().unwrap().clone();
-        assert_eq!(delivered.len(), 1);
-        assert!(
-            delivered[0].content.contains("[[AION_SESSIONS]]"),
-            "mid-turn delivery must not drop the @@ block: {}",
-            delivered[0].content
-        );
-        assert!(
-            delivered[0].content.contains("重构-鉴权模块\tconv_target\tworkspace:"),
-            "{}",
-            delivered[0].content
-        );
-    }
 
     /// `[[AION_FILES]]` MUST remain the last block in the content.
     ///

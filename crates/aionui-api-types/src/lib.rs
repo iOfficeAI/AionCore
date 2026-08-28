@@ -111,7 +111,7 @@ pub use conversation::{
     ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse,
     PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
     SubmitConversationInputRequest, ToolEnforcementLevel, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, McpRuntimeSnapshot, MessageStatusChangedPayload, SessionRef,
+    UpdateConversationRequest, SessionRef,
 };
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,
