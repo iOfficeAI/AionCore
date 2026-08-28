@@ -6,13 +6,14 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use aionui_ai_agent::{AgentRouterState, AgentService, RemoteAgentRouterState, RemoteAgentService};
+use aionui_ai_agent::{AgentRouterState, AgentService, IWorkerTaskManager, RemoteAgentRouterState, RemoteAgentService};
 use aionui_assistant::{
     AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
 };
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
-use aionui_conversation::ConversationRouterState;
+use aionui_common::AgentKillReason;
+use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
@@ -34,9 +35,14 @@ use aionui_mcp::{
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
 };
 use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
-use aionui_project::ProjectRouterState;
+use aionui_project::{ProjectRouterState, ProjectService};
 use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
+use aionui_session_message::drainer::Drainer;
+use aionui_session_message::state::SessionMessageRouterState;
+use aionui_session_message::targets::MentionableTargets;
 use aionui_shell::ShellRouterState;
+use aionui_sidebar::{ArchiveTeardownPorts, SidebarRouterState, SidebarService};
+use aionui_skill_runtime::{SkillRuntimeRouterState, SkillRuntimeService};
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
     ProtocolDetectionService, ProviderService, RuntimePrepareService, SettingsService, SystemRouterState,
@@ -130,12 +136,15 @@ pub struct ModuleStates {
     pub connection_test: ConnectionTestRouterState,
     pub file: FileRouterState,
     pub project: ProjectRouterState,
+    pub sidebar: SidebarRouterState,
     pub mcp: McpRouterState,
     pub extension: ExtensionRouterState,
     pub hub: HubRouterState,
     pub skill: SkillRouterState,
     pub channel: ChannelRouterState,
     pub team: TeamRouterState,
+    pub session_message: SessionMessageRouterState,
+    pub skill_runtime: SkillRuntimeRouterState,
     pub cron: CronRouterState,
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
@@ -271,7 +280,7 @@ pub async fn build_module_states(
 
     let pool = services.database.pool().clone();
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
     let agent_service = AgentService::new(
         services.agent_registry.clone(),
         services.event_bus.clone(),
@@ -305,6 +314,7 @@ pub async fn build_module_states(
         connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
         project: build_module_state_phase(&boot, "project", || build_project_state(services)),
+        sidebar: build_module_state_phase(&boot, "sidebar", || build_sidebar_state(services)),
         mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
         extension: ext_state,
         hub: hub_state,
@@ -318,6 +328,8 @@ pub async fn build_module_states(
                 assistant.service.clone(),
             )
         }),
+        session_message: build_module_state_phase(&boot, "session_message", || build_session_message_state(services)),
+        skill_runtime: build_module_state_phase(&boot, "skill_runtime", || build_skill_runtime_state(services)),
         cron,
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
@@ -327,6 +339,28 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module state build completed"
     );
+    // Late-inject the sidebar's remove-project ports: the team service is built
+    // after the sidebar state above, so the wiring cannot happen inside
+    // `build_sidebar_state`. `set_remove_project_ports` is set-once.
+    states
+        .sidebar
+        .service
+        .set_remove_project_ports(Arc::new(RemoveProjectAdapter {
+            conversation: services.conversation_service.clone(),
+            team: states.team.service.clone(),
+            project: services.project_service.clone(),
+        }));
+    // Same late-injection as above: the archive paths release the agent runtime
+    // via the worker task manager (per-conversation kill) and the team service
+    // (team runtime + member kills), neither of which exists when the sidebar
+    // state is built. `set_archive_teardown_ports` is set-once.
+    states
+        .sidebar
+        .service
+        .set_archive_teardown_ports(Arc::new(ArchiveTeardownAdapter {
+            task_manager: services.worker_task_manager.clone(),
+            team: states.team.service.clone(),
+        }));
     states
         .conversation
         .service
@@ -334,6 +368,50 @@ pub async fn build_module_states(
         .await;
 
     Ok((states, channel_components))
+}
+
+/// Cross-session messaging state, plus the process's single drainer.
+///
+/// The drainer is spawned here rather than in `routes.rs` because this is where
+/// this crate already starts background work — see
+/// `spawn_assistant_mcp_binding_watcher`, called from `build_assistant_state`.
+/// Channel A's state. Read-only, so it takes the conversation repo (for the
+/// snapshot allow-list), the skill paths + repo (to resolve and read), and the
+/// runtime token service (to authenticate). Deliberately NOT the skill WRITE
+/// surface's state: this domain can never import, delete, or enable a skill.
+pub fn build_skill_runtime_state(services: &AppServices) -> SkillRuntimeRouterState {
+    SkillRuntimeRouterState {
+        service: Arc::new(SkillRuntimeService::new(
+            services.conversation_repo.clone(),
+            services.skill_paths.clone(),
+            services.skill_repo.clone(),
+        )),
+        runtime_token_service: services.runtime_token_service.clone(),
+    }
+}
+
+pub fn build_session_message_state(services: &AppServices) -> SessionMessageRouterState {
+    let state = SessionMessageRouterState {
+        service: services.session_message_service.clone(),
+        targets: Arc::new(MentionableTargets::new(
+            services.conversation_repo.clone(),
+            // `ProjectService` is `#[derive(Clone)]` and cheap to clone.
+            Arc::new(services.project_service.clone()),
+        )),
+        runtime_token_service: services.runtime_token_service.clone(),
+    };
+
+    // ONE drainer for the whole process — not one per target, not one per
+    // message. Both `DeliverySink` and `DrainGate` are implemented by the same
+    // service, hence the same Arc twice.
+    Arc::new(Drainer::new(
+        services.session_message_queue.clone(),
+        services.session_message_service.clone(),
+        services.session_message_service.clone(),
+    ))
+    .spawn(services.session_message_notify.clone());
+
+    state
 }
 
 /// Build the default `AssistantRouterState` from application services.
@@ -397,7 +475,7 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
 
 /// Build the default `SystemRouterState` from application services.
 pub fn build_system_state(services: &AppServices) -> SystemRouterState {
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
     let pool = services.database.pool().clone();
     let provider_repo = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let http_client = reqwest::Client::new();
@@ -446,7 +524,7 @@ pub fn build_conversation_state(
 
 /// Build the default `RemoteAgentRouterState` from application services.
 pub fn build_remote_agent_state(services: &AppServices) -> RemoteAgentRouterState {
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
     let pool = services.database.pool().clone();
     let repo = Arc::new(SqliteRemoteAgentRepository::new(pool));
     RemoteAgentRouterState {
@@ -496,6 +574,88 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
 pub fn build_project_state(services: &AppServices) -> ProjectRouterState {
     ProjectRouterState {
         project: Arc::new(services.project_service.clone()),
+    }
+}
+
+/// Build the sidebar read/ordering router state from application services.
+/// The sidebar store and ordering store share the app-wide pool; `work_dir` is
+/// the conversation temp-workspace root used for path classification (must match
+/// `ProjectService`'s temp root).
+pub fn build_sidebar_state(services: &AppServices) -> SidebarRouterState {
+    let sidebar_store: Arc<dyn aionui_db::ISidebarStore> =
+        Arc::new(aionui_db::SqliteSidebarStore::new(services.database.pool().clone()));
+    let service = SidebarService::new(
+        sidebar_store,
+        services.user_order_store.clone(),
+        services.work_dir.join("conversations"),
+    );
+    SidebarRouterState {
+        service: Arc::new(service),
+    }
+}
+
+/// Adapts the concrete conversation / team / project services to the sidebar's
+/// [`aionui_sidebar::RemoveProjectPorts`] trait so `remove_project` (BR-19) can
+/// reuse the existing per-unit delete paths (`ConversationService::delete`,
+/// `TeamSessionService::remove_team`, `ProjectService::delete_project`) without
+/// the sidebar crate depending on any of them.
+struct RemoveProjectAdapter {
+    conversation: ConversationService,
+    team: Arc<TeamSessionService>,
+    project: ProjectService,
+}
+
+#[async_trait::async_trait]
+impl aionui_sidebar::RemoveProjectPorts for RemoveProjectAdapter {
+    async fn delete_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), String> {
+        self.conversation
+            .delete(user_id, conversation_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), String> {
+        self.team
+            .remove_team(user_id, team_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn delete_project_record(&self, user_id: &str, project_id: &str) -> Result<(), String> {
+        self.project
+            .delete_project(user_id, project_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
+/// Adapts the process-teardown paths to the sidebar's
+/// [`aionui_sidebar::ArchiveTeardownPorts`] trait so the archive flip can
+/// release the agent runtime the same way delete does — kill the conversation's
+/// agent process, tear down the team runtime — without deleting any data and
+/// without the sidebar crate depending on the ai-agent / team crates.
+struct ArchiveTeardownAdapter {
+    task_manager: Arc<dyn IWorkerTaskManager>,
+    team: Arc<TeamSessionService>,
+}
+
+#[async_trait::async_trait]
+impl ArchiveTeardownPorts for ArchiveTeardownAdapter {
+    async fn stop_conversation(&self, _user_id: &str, conversation_id: &str) -> Result<(), String> {
+        // Ownership was already verified by the owner-scoped archive flip; this
+        // is a pure process kill (no DB write). `kill_and_wait` is a no-op for a
+        // conversation with no live runtime, so an already-idle agent is fine.
+        self.task_manager
+            .kill_and_wait(conversation_id, Some(AgentKillReason::Archived))
+            .await;
+        Ok(())
+    }
+
+    async fn stop_team(&self, user_id: &str, team_id: &str) -> Result<(), String> {
+        self.team
+            .stop_team_processes(user_id, team_id)
+            .await
+            .map_err(|err| err.to_string())
     }
 }
 
@@ -607,7 +767,7 @@ pub async fn build_channel_state(
 ) -> (ChannelRouterState, ChannelOrchestratorComponents) {
     let pool = services.database.pool().clone();
     let repo: Arc<dyn aionui_db::IChannelRepository> = Arc::new(aionui_db::SqliteChannelRepository::new(pool));
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
 
     let (message_tx, message_rx) = tokio::sync::mpsc::channel(256);
     let (confirm_tx, confirm_rx) = tokio::sync::mpsc::channel(256);
@@ -762,6 +922,8 @@ pub fn build_team_state(
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
     service.with_project_service(Arc::new(services.project_service.clone()));
+    // Path-2 cascade: removing a team drops its `user_order` row (sidebar §4.3).
+    service.with_user_order_store(services.user_order_store.clone());
     TeamRouterState {
         service,
         active_leases: services.active_lease_registry.clone(),

@@ -170,6 +170,7 @@ mod tests {
             args: vec![],
             env: vec![],
             native_skills_dirs: None,
+            skill_delivery: None,
             behavior_policy: aionui_api_types::BehaviorPolicy::default(),
             yolo_id: None,
             sort_order: 0,

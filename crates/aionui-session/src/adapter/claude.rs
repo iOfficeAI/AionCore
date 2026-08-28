@@ -61,6 +61,12 @@ pub struct ClaudeAdapter {
     /// stale leftover here is harmless (set membership only biases WHICH resolve
     /// event a cancel emits, and ids are unique per control request).
     ask_requests: std::collections::HashSet<String>,
+    /// tool_use_ids of TodoWrite calls this session translated into
+    /// `SessionEvent::Plan`. Their paired `tool_result` must be swallowed:
+    /// with no ToolCall to settle, the terminal frame it would produce makes
+    /// the renderer append a nameless junk card. Cleared at each turn
+    /// terminal, so it never grows across a session.
+    todo_tool_use_ids: std::collections::HashSet<String>,
 }
 
 /// Per-message streaming state for `--include-partial-messages`. Reset on each
@@ -428,7 +434,8 @@ impl ClaudeAdapter {
                     }
                 }
                 "tool_use" => {
-                    let name = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                    let raw_name = b.get("name").and_then(Value::as_str).unwrap_or("");
+                    let name = raw_name.to_string();
                     // #486 (parity with aionrs output_sink): DROP a malformed empty-name
                     // tool_use before it reaches persistence. claude occasionally emits a
                     // tool_use block with a missing/blank `name`; emitting it produces a
@@ -440,16 +447,53 @@ impl ClaudeAdapter {
                     if name.trim().is_empty() {
                         tracing::warn!(item_id = %item_id, "claude tool_use has an empty name; dropping malformed call");
                     } else {
+                        let input = b.get("input").cloned().unwrap_or(Value::Null);
+                        let tool_use_id = b.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+
+                        // claude's TodoWrite is a plan SNAPSHOT, not a tool step —
+                        // the same treatment the ACP bridge gives it, so both lanes
+                        // render one plan bar instead of a stray tool card. A
+                        // malformed payload falls through to the tool path: losing
+                        // the plan is acceptable, losing the card is not.
+                        if raw_name == "TodoWrite"
+                            && let Some(todos) = input.get("todos").and_then(Value::as_array)
+                        {
+                            let entries: Vec<crate::event::PlanEntry> = todos
+                                .iter()
+                                .filter_map(|t| {
+                                    let content = t.get("content").and_then(Value::as_str)?.to_string();
+                                    let status = crate::backend::map_plan_status(
+                                        t.get("status").and_then(Value::as_str).unwrap_or(""),
+                                    );
+                                    Some(crate::event::PlanEntry {
+                                        content,
+                                        status,
+                                        // claude's todos carry no priority field.
+                                        priority: None,
+                                    })
+                                })
+                                .collect();
+                            self.todo_tool_use_ids.insert(tool_use_id);
+                            out.push(SessionEvent::Plan {
+                                entries,
+                                explanation: None,
+                            });
+                            continue;
+                        }
+
                         out.push(SessionEvent::ToolCall {
-                            tool_use_id: b.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
-                            name,
+                            tool_use_id,
+                            // Presentation only: a bare tool name ("Bash" × 73% of all
+                            // calls) says nothing about what the step is doing. The raw
+                            // `input` below is untouched.
+                            name: tool_call_display_name(raw_name, &input),
                             // 002/F1 single-agent path: inline tool. subagent topology
                             // (Task/Workflow → Spawned/Workflow) is the new ClaudeConnection's
                             // job (007 §9.14); this legacy adapter stays Inline.
                             subagent: crate::event::SubagentKind::Inline,
                             // Gap #4 / H2: carry the tool ARGUMENTS (Anthropic `input` object).
                             // Absent → Value::Null. TIO-13: never logged at info.
-                            input: b.get("input").cloned().unwrap_or(Value::Null),
+                            input,
                             // 009 H5: attribute to the subagent's turn (frame-level), main = None.
                             parent_tool_use_id: parent_tool_use_id.clone(),
                         });
@@ -467,7 +511,7 @@ impl ClaudeAdapter {
 
     /// user frames carry synthesized `tool_result` blocks, referring back by
     /// tool_use_id.
-    fn parse_user(&self, v: &Value) -> Vec<SessionEvent> {
+    fn parse_user(&mut self, v: &Value) -> Vec<SessionEvent> {
         // 009 H5: same top-level attribution as parse_assistant — a subagent's
         // tool_result frame carries the parent's tool_use_id beside `message`.
         let parent_tool_use_id = v.get("parent_tool_use_id").and_then(Value::as_str).map(str::to_string);
@@ -480,8 +524,14 @@ impl ClaudeAdapter {
         let mut out = Vec::new();
         for b in &blocks {
             if b.get("type").and_then(Value::as_str) == Some("tool_result") {
+                let tool_use_id = b.get("tool_use_id").and_then(Value::as_str).unwrap_or("").to_string();
+                // The TodoWrite call this answers became a Plan, so there is no
+                // card for this terminal frame to settle (see `todo_tool_use_ids`).
+                if self.todo_tool_use_ids.remove(&tool_use_id) {
+                    continue;
+                }
                 out.push(SessionEvent::ToolResult {
-                    tool_use_id: b.get("tool_use_id").and_then(Value::as_str).unwrap_or("").to_string(),
+                    tool_use_id,
                     // 009 R7/H3: the wire block carries is_error on a failed/rejected
                     // tool (default false = success). Carrying it keeps a red tool red.
                     is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
@@ -526,6 +576,9 @@ impl ClaudeAdapter {
     /// terminal — codex already emits UsageDelta (map_usage); this closes the
     /// claude/codex asymmetry. The wrapping ClaudeConnection inherits both for free.
     fn parse_result(&mut self, v: &Value) -> Vec<SessionEvent> {
+        // Turn terminal: any TodoWrite whose tool_result never arrived is dead
+        // correlation state. Clearing here bounds the set to one turn.
+        self.todo_tool_use_ids.clear();
         let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
         let result_text = match v.get("result").and_then(Value::as_str) {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -1345,6 +1398,92 @@ async fn write_ndjson_line(stdin: &mut BoxedStdin, value: &Value) -> Result<(), 
     Ok(())
 }
 
+/// Turn a claude `tool_use` into a compact, user-facing step label.
+///
+/// A bare tool name is useless in the step list — "Bash" three times in a row
+/// says nothing about what ran. Mirrors what `command_execution_display_name`
+/// does for codex's `commandExecution`: presentation only, the raw `input` still
+/// rides along on `ToolCall.input`, so no detail is discarded.
+///
+/// Shapes are taken from real traffic (10969 persisted `tool_call` rows), not
+/// from assumptions about the tool set:
+/// - `Bash`/`Monitor` `{command, description}` — `description` is authored for
+///   humans, so it wins; the command is the fallback
+/// - `Read`/`Edit`/`Write` `{file_path, …}` — the file NAME, since a full path
+///   is mostly shared prefix and the meaningful tail is what truncation eats
+/// - `Grep` `{pattern}`, `WebSearch`/`ToolSearch` `{query}`, `Skill` `{skill}`,
+///   `WebFetch` `{url}`, `Agent`/`Task` `{description}`
+///
+/// Anything else — including every `mcp__*` tool, whose input shape we have not
+/// verified — keeps the name claude gave it. Never guess a shape.
+fn tool_call_display_name(name: &str, input: &Value) -> String {
+    const MAX_DETAIL_CHARS: usize = 96;
+
+    fn bounded(value: &str) -> String {
+        // Collapse all whitespace runs: a heredoc command must not turn one
+        // step into a wall of text.
+        let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut chars = value.chars();
+        let head: String = chars.by_ref().take(MAX_DETAIL_CHARS).collect();
+        if chars.next().is_some() {
+            format!("{head}…")
+        } else {
+            head
+        }
+    }
+
+    let raw = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let field = |key: &str| raw(key).map(bounded).filter(|s| !s.is_empty());
+    // The trailing path segment, taken from the RAW value and bounded only
+    // afterwards. Bounding first would cut a real project path (well over
+    // MAX_DETAIL_CHARS) mid-directory and leave that fragment as the "file
+    // name": `.../components/Markdown/CodeBlock.tsx` became "Markdown…".
+    // A path ending in a separator falls back to the whole value.
+    let file_name = || {
+        raw("file_path").map(|path| {
+            let tail = path.rsplit(['/', '\\']).find(|seg| !seg.is_empty()).unwrap_or(path);
+            bounded(tail)
+        })
+    };
+
+    let labeled = |verb: &str, detail: Option<String>| match detail {
+        Some(detail) => format!("{verb} {detail}"),
+        None => format!("{verb} command"),
+    };
+
+    match name {
+        // claude authors `description` for a human reader — prefer it verbatim.
+        "Bash" | "Monitor" => field("description").unwrap_or_else(|| labeled("Run", field("command"))),
+        "Agent" | "Task" => field("description").unwrap_or_else(|| name.to_string()),
+        "Read" => labeled("Read", file_name()),
+        "Edit" | "NotebookEdit" => labeled("Edit", file_name()),
+        "Write" => labeled("Write", file_name()),
+        "Grep" => labeled("Search", field("pattern")),
+        "Glob" => labeled("Glob", field("pattern")),
+        "WebSearch" | "ToolSearch" => labeled("Search", field("query")),
+        "WebFetch" => labeled("Fetch", field("url")),
+        "Skill" => labeled("Skill", field("skill")),
+        // A plan is a run of TaskCreate calls; without the subject they all read
+        // identically and the work is only visible after expanding each row.
+        "TaskCreate" => field("subject").unwrap_or_else(|| name.to_string()),
+        "TaskUpdate" => match (field("taskId"), field("status")) {
+            (Some(id), Some(status)) => format!("Task {id} → {status}"),
+            (Some(id), None) => format!("Task {id}"),
+            _ => name.to_string(),
+        },
+        "TaskStop" => labeled("Stop task", field("task_id")),
+        "SendMessage" => labeled("Message", field("to")),
+        // Unverified shape (every mcp__* tool lands here): keep claude's name.
+        _ => name.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1476,7 +1615,7 @@ mod tests {
     /// 009 R8: a STRING tool_result content → one Text part (e.g. Bash stdout).
     #[test]
     fn parse_user_tool_result_string_content_to_text() {
-        let a = ClaudeAdapter::new();
+        let mut a = ClaudeAdapter::new();
         let frame = r#"{"type":"user","message":{"role":"user","content":[
             {"type":"tool_result","tool_use_id":"tu1","content":"hello stdout"}]}}"#;
         let v: serde_json::Value = serde_json::from_str(frame).unwrap();
@@ -1519,6 +1658,111 @@ mod tests {
         );
     }
 
+    /// claude's TodoWrite is a plan SNAPSHOT, not a tool step. The ACP bridge
+    /// (claude-code-acp) already translates it into a `plan` session update and
+    /// suppresses the tool card; the direct-CLI lane must match, or the same
+    /// conversation shows a to-do bar over ACP and a bare "TodoWrite" tool card
+    /// here.
+    ///
+    /// Wire-pinned against a REAL 2.1.141 frame (captured 2026-08-21), hence the
+    /// `activeForm` and `caller` keys we ignore: never hand-write a shape we have
+    /// not seen on the wire.
+    ///
+    /// VERSION NOTE: claude removed TodoWrite from the headless tool set in
+    /// **2.1.142** (bisected 2026-08-21: 2.1.141 advertises it, 2.1.142 does
+    /// not — the `system:init` frame's `tools` array is the ground truth). On
+    /// 2.1.142+ this arm is dormant: the model has no such tool to call. It is
+    /// kept because the translation is correct and cheap, and the CLI surface
+    /// moves — not because it fires today.
+    #[test]
+    fn todo_write_becomes_a_plan_event_and_no_tool_call() {
+        let mut a = ClaudeAdapter::new();
+        // Verbatim 2.1.141 wire shape, including the `activeForm` / `caller`
+        // keys the translation ignores.
+        let frame = r#"{"type":"assistant","message":{"role":"assistant","content":[
+            {"type":"tool_use","id":"tu_todo_1","name":"TodoWrite","caller":{"type":"direct"},"input":{"todos":[
+                {"content":"read the readme","activeForm":"Reading the readme","status":"completed"},
+                {"content":"count the files","activeForm":"Counting the files","status":"in_progress"},
+                {"content":"summarize","activeForm":"Summarizing","status":"pending"}]}}]}}"#;
+        let v: serde_json::Value = serde_json::from_str(frame).unwrap();
+        let events = a.parse_assistant(&v);
+
+        assert!(
+            !events.iter().any(|e| matches!(e, SessionEvent::ToolCall { .. })),
+            "TodoWrite must not surface as a tool card, got {events:?}"
+        );
+        let [SessionEvent::Plan { entries, explanation }] = events.as_slice() else {
+            panic!("expected exactly one Plan, got {events:?}");
+        };
+        assert_eq!(explanation, &None);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].content, "read the readme");
+        assert_eq!(entries[0].status, crate::event::PlanStatus::Completed);
+        assert_eq!(entries[1].status, crate::event::PlanStatus::InProgress);
+        assert_eq!(entries[2].status, crate::event::PlanStatus::Pending);
+    }
+
+    /// The paired `tool_result` must be swallowed too. It translates to a
+    /// TERMINAL `AgentStreamEvent::ToolCall` downstream, and a terminal frame
+    /// with no card to settle makes the renderer append a nameless junk card.
+    #[test]
+    fn todo_write_tool_result_is_suppressed() {
+        let mut a = ClaudeAdapter::new();
+        let assistant = r#"{"type":"assistant","message":{"role":"assistant","content":[
+            {"type":"tool_use","id":"tu_todo_1","name":"TodoWrite","input":{"todos":[
+                {"content":"step","status":"pending"}]}}]}}"#;
+        a.parse_assistant(&serde_json::from_str(assistant).unwrap());
+
+        let user = r#"{"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"tu_todo_1","content":"ok"}]}}"#;
+        let events = a.parse_user(&serde_json::from_str(user).unwrap());
+
+        assert!(
+            !events.iter().any(|e| matches!(e, SessionEvent::ToolResult { .. })),
+            "the TodoWrite tool_result must not reach the stream, got {events:?}"
+        );
+    }
+
+    /// An unrelated tool's `tool_result` must still flow — the suppression is
+    /// keyed on the TodoWrite tool_use_id, not on the frame shape.
+    #[test]
+    fn other_tool_results_still_flow_after_a_todo_write() {
+        let mut a = ClaudeAdapter::new();
+        let assistant = r#"{"type":"assistant","message":{"role":"assistant","content":[
+            {"type":"tool_use","id":"tu_todo_1","name":"TodoWrite","input":{"todos":[
+                {"content":"step","status":"pending"}]}},
+            {"type":"tool_use","id":"tu_bash_1","name":"Bash","input":{"command":"ls"}}]}}"#;
+        a.parse_assistant(&serde_json::from_str(assistant).unwrap());
+
+        let user = r#"{"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"tu_bash_1","content":"a.txt"}]}}"#;
+        let events = a.parse_user(&serde_json::from_str(user).unwrap());
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::ToolResult { tool_use_id, .. } if tool_use_id == "tu_bash_1")),
+            "a normal tool_result must still emit, got {events:?}"
+        );
+    }
+
+    /// A malformed TodoWrite must not ALSO lose the tool card — degrade to the
+    /// ordinary tool path rather than swallowing the call entirely.
+    #[test]
+    fn todo_write_without_todos_array_falls_back_to_tool_call() {
+        let mut a = ClaudeAdapter::new();
+        let frame = r#"{"type":"assistant","message":{"role":"assistant","content":[
+            {"type":"tool_use","id":"tu_todo_2","name":"TodoWrite","input":{"unexpected":1}}]}}"#;
+        let v: serde_json::Value = serde_json::from_str(frame).unwrap();
+        let events = a.parse_assistant(&v);
+
+        assert!(
+            events.iter().any(|e| matches!(e, SessionEvent::ToolCall { .. })),
+            "a malformed TodoWrite must still produce its tool card, got {events:?}"
+        );
+        assert!(!events.iter().any(|e| matches!(e, SessionEvent::Plan { .. })));
+    }
+
     /// Regression guard for the other direction: a well-formed `tool_use` (real
     /// name) still emits its `ToolCall` — the #486 guard must not over-drop.
     #[test]
@@ -1538,7 +1782,10 @@ mod tests {
                 },
             ] => {
                 assert_eq!(tool_use_id, "t-ok");
-                assert_eq!(name, "Read");
+                // `name` is the user-facing step label now, not the bare tool
+                // name — `Read {file_path:"/x"}` reads as "Read x". The raw tool
+                // identity and arguments still live in `input`, pinned below.
+                assert_eq!(name, "Read x");
                 // The tool ARGUMENTS (Gap #4 / H2) are load-bearing — the conversation
                 // layer renders/persists them. A regression that dropped `input` would
                 // pass a name-only assertion, so pin the full payload here.
@@ -1631,7 +1878,7 @@ mod tests {
     #[test]
     fn parse_user_tool_result_array_with_image_to_text_and_image() {
         use base64::Engine as _;
-        let a = ClaudeAdapter::new();
+        let mut a = ClaudeAdapter::new();
         let b64 = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
         let frame = format!(
             r#"{{"type":"user","message":{{"role":"user","content":[
@@ -1670,7 +1917,7 @@ mod tests {
     /// (default-false) so the routing bit is pinned on both edges.
     #[test]
     fn parse_user_failed_tool_result_carries_is_error_true() {
-        let a = ClaudeAdapter::new();
+        let mut a = ClaudeAdapter::new();
         // A failed tool: is_error:true + the error text as content.
         let frame = r#"{"type":"user","message":{"role":"user","content":[
             {"type":"tool_result","tool_use_id":"tf1","is_error":true,
@@ -1946,8 +2193,197 @@ mod tests {
         assert!(
             consolidated
                 .iter()
-                .any(|e| matches!(e, SessionEvent::ToolCall { name, .. } if name == "Bash")),
+                .any(|e| matches!(e, SessionEvent::ToolCall { tool_use_id, .. } if tool_use_id == "t1")),
             "tool_use is never deduped, got {consolidated:?}"
+        );
+    }
+
+    /// Step labels must say what the tool is DOING, not just name the tool.
+    /// Shapes below are the real ones (10969 persisted tool_call rows on this
+    /// machine): Bash/Monitor carry `{command, description}`, Read/Edit/Write
+    /// carry `file_path`, Grep carries `pattern`, Agent/Task carry
+    /// `description`, WebSearch/ToolSearch carry `query`.
+    #[test]
+    fn tool_call_label_prefers_claudes_own_description() {
+        // Bash is 73% of all calls and already ships a human-readable
+        // description — use it verbatim.
+        assert_eq!(
+            tool_call_display_name(
+                "Bash",
+                &serde_json::json!({"command": "cargo test -p aionui-session", "description": "Re-run format tests"})
+            ),
+            "Re-run format tests"
+        );
+        // No description → fall back to the command itself.
+        assert_eq!(
+            tool_call_display_name("Bash", &serde_json::json!({"command": "ls -la"})),
+            "Run ls -la"
+        );
+        // Neither → a bare verb, never an empty label.
+        assert_eq!(tool_call_display_name("Bash", &serde_json::json!({})), "Run command");
+        // Agent/Task also carry a description.
+        assert_eq!(
+            tool_call_display_name(
+                "Agent",
+                &serde_json::json!({"description": "Audit the login flow", "prompt": "…"})
+            ),
+            "Audit the login flow"
+        );
+    }
+
+    /// A REAL project path is longer than the detail bound, and the bound must
+    /// not be applied before the file name is extracted — doing so truncates the
+    /// path mid-directory and leaves that directory fragment as the "file name":
+    /// `.../renderer/components/Markdown/CodeBlock.tsx` (116 chars) rendered as
+    /// "Read Ma…" because the cut landed inside "Markdown".
+    #[test]
+    fn long_paths_still_yield_the_file_name() {
+        for (path, expected) in [
+            (
+                "/Users/z/Documents/github/AionUi-worktrees/rtl/packages/desktop/src/renderer/components/Markdown/CodeBlock.tsx",
+                "Read CodeBlock.tsx",
+            ),
+            (
+                "/Users/z/Documents/github/AionUi-worktrees/rtl/packages/desktop/src/renderer/services/i18n/index.ts",
+                "Read index.ts",
+            ),
+        ] {
+            assert!(path.chars().count() > 96, "fixture must exceed the detail bound");
+            assert_eq!(
+                tool_call_display_name("Read", &serde_json::json!({"file_path": path})),
+                expected
+            );
+        }
+    }
+
+    /// A pathological file NAME (not path) still has to be bounded.
+    #[test]
+    fn an_absurdly_long_file_name_is_still_elided() {
+        let name = format!("{}.rs", "n".repeat(200));
+        let label = tool_call_display_name("Write", &serde_json::json!({"file_path": format!("/a/b/{name}")}));
+        assert!(label.starts_with("Write nnn"), "label: {label}");
+        assert!(label.ends_with('…'), "an over-long file name must be elided: {label}");
+        assert!(label.chars().count() <= 103, "label was not bounded: {label}");
+    }
+
+    #[test]
+    fn file_tool_labels_show_the_file_name_not_the_whole_path() {
+        // A full path is mostly shared prefix; the tail (the part that matters)
+        // is exactly what gets truncated away. Show the file name instead.
+        assert_eq!(
+            tool_call_display_name(
+                "Read",
+                &serde_json::json!({"file_path": "/Users/z/repo/tests/unit/renderer/i18nFormat.test.ts"})
+            ),
+            "Read i18nFormat.test.ts"
+        );
+        assert_eq!(
+            tool_call_display_name("Edit", &serde_json::json!({"file_path": "/a/b/service.rs"})),
+            "Edit service.rs"
+        );
+        assert_eq!(
+            tool_call_display_name("Write", &serde_json::json!({"file_path": "/a/b/new_mod.rs"})),
+            "Write new_mod.rs"
+        );
+        assert_eq!(
+            tool_call_display_name("Grep", &serde_json::json!({"pattern": "tool_call_display_name"})),
+            "Search tool_call_display_name"
+        );
+    }
+
+    /// The task/messaging tools were left on the bare name by #870, so a plan of
+    /// five `TaskCreate` steps read as five identical rows — the subject was only
+    /// visible after expanding each one. Shapes from real traffic:
+    /// `TaskCreate {activeForm, description, subject}` (26 rows),
+    /// `TaskUpdate {status, taskId}` (37), `TaskStop {task_id}` (14),
+    /// `SendMessage {to, message, …}` (12).
+    #[test]
+    fn task_and_messaging_tools_say_what_they_act_on() {
+        assert_eq!(
+            tool_call_display_name(
+                "TaskCreate",
+                &serde_json::json!({
+                    "subject": "P1: dir/lang sync + Arco rtl + LTR code islands",
+                    "description": "Add direction.ts helper …",
+                    "activeForm": "Implementing P1 direction plumbing"
+                })
+            ),
+            "P1: dir/lang sync + Arco rtl + LTR code islands"
+        );
+        assert_eq!(
+            tool_call_display_name("TaskUpdate", &serde_json::json!({"taskId": "3", "status": "completed"})),
+            "Task 3 → completed"
+        );
+        // A status-less update still names the task rather than falling back to
+        // the tool name.
+        assert_eq!(
+            tool_call_display_name("TaskUpdate", &serde_json::json!({"taskId": "3"})),
+            "Task 3"
+        );
+        assert_eq!(
+            tool_call_display_name("TaskStop", &serde_json::json!({"task_id": "b4p422pva"})),
+            "Stop task b4p422pva"
+        );
+        assert_eq!(
+            tool_call_display_name("SendMessage", &serde_json::json!({"to": "reviewer", "message": "ping"})),
+            "Message reviewer"
+        );
+    }
+
+    #[test]
+    fn unrecognized_and_mcp_tools_keep_their_own_name() {
+        // Never guess at a shape we have not verified — an unknown tool keeps
+        // the name claude gave it.
+        for name in [
+            "mcp__sentry__search_issues",
+            "mcp__aionui-team__team_send_message",
+            "AskUserQuestion",
+            "TodoWrite",
+        ] {
+            assert_eq!(
+                tool_call_display_name(name, &serde_json::json!({"whatever": 1})),
+                name,
+                "unknown tool must keep its name"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_call_labels_are_bounded_and_single_line() {
+        // A pasted heredoc must not turn one step into a wall of text.
+        let long = "x".repeat(400);
+        let label = tool_call_display_name("Bash", &serde_json::json!({"command": long}));
+        assert!(label.starts_with("Run xxx"), "label: {label}");
+        assert!(label.ends_with('…'), "long label must be elided: {label}");
+        assert!(label.chars().count() <= 101, "label was not bounded: {label}");
+
+        let multi = tool_call_display_name(
+            "Bash",
+            &serde_json::json!({"description": "line one\nline two\r\nline three"}),
+        );
+        assert_eq!(multi, "line one line two line three");
+    }
+
+    /// The label must reach the emitted event, not just exist as a helper.
+    #[test]
+    fn parsed_tool_use_carries_the_label_as_its_name() {
+        let mut a = ClaudeAdapter::default();
+        let frame = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t9","name":"Bash","input":{"command":"git status","description":"Show working tree status"}}]}}"#;
+        let events = a.parse_chunk(format!("{frame}\n").as_bytes());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::ToolCall { name, .. } if name == "Show working tree status")),
+            "the ToolCall must carry the readable label, got {events:?}"
+        );
+        // The raw input is still there — this changes presentation only.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SessionEvent::ToolCall { input, .. }
+                    if input.get("command").and_then(serde_json::Value::as_str) == Some("git status")
+            )),
+            "raw input must be preserved, got {events:?}"
         );
     }
 
@@ -2828,7 +3264,7 @@ mod tests {
                 "type": "user",
                 "message": { "role": "user", "content": content }
             });
-            let a = ClaudeAdapter::new();
+            let mut a = ClaudeAdapter::new();
             let events = a.parse_user(&frame); // (1) must not panic
 
             let results: Vec<&SessionEvent> =
@@ -2857,7 +3293,7 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "big1", "content": big}
             ]}
         });
-        let a = ClaudeAdapter::new();
+        let mut a = ClaudeAdapter::new();
         match a.parse_user(&frame).as_slice() {
             [SessionEvent::ToolResult { content, .. }] => match content.as_slice() {
                 [crate::event::ToolResultContent::Text(t)] => {

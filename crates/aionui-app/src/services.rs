@@ -8,18 +8,25 @@ use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
     RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
 };
-use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
+use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_encryption_secret, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    IProjectStore, ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
-    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
-    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProjectStore, SqliteProviderRepository,
-    SqliteSkillRepository, SqliteUserRepository,
+    IProjectStore, ISkillRepository, IUserOrderStore, IUserRepository, SqliteAcpSessionRepository,
+    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+    SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteMcpServerRepository, SqliteProjectStore,
+    SqliteProviderRepository, SqliteSettingsRepository, SqliteSkillRepository, SqliteUserOrderStore,
+    SqliteUserRepository,
 };
 use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
+use aionui_session_message::QueueClearingCancelHook;
+use aionui_session_message::queue::{DeliveryQueue, SystemClock};
+use aionui_session_message::rate_limit::RateLimiter;
+use aionui_session_message::service::{SessionMessageDeps, SessionMessageService};
+use aionui_sidebar::UserOrderDeleteHook;
+use tokio::sync::Notify;
 
 pub struct AppServices {
     pub database: Database,
@@ -34,9 +41,22 @@ pub struct AppServices {
     pub runtime_token_service: Arc<RuntimeTokenService>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
+    /// Cross-session messaging. The queue, the rate limiter and the notify
+    /// handle are shared by the send path, the drainer, and the cancel hook, so
+    /// they are built once here (`AppServices` is the sole construction centre).
+    pub session_message_service: Arc<SessionMessageService>,
+    /// Same queue the service and the cancel hook share. Exposed so the router
+    /// layer can build the drainer without reaching into the service.
+    pub session_message_queue: Arc<DeliveryQueue>,
+    /// Woken on enqueue so the idle drainer stops sleeping.
+    pub session_message_notify: Arc<Notify>,
     /// Project-bind service (project-bind side branch). Shared by conversation
     /// and team wiring to bind/backfill project/folder rows. Cheap to clone.
     pub project_service: ProjectService,
+    /// Sidebar ordering store (`user_order` table). Shared by the conversation
+    /// delete hook (path-1 cascade), the team service (path-2 cascade), and the
+    /// sidebar read state. Cheap to clone (Arc). See sidebar design §4.
+    pub user_order_store: Arc<dyn IUserOrderStore>,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -45,8 +65,10 @@ pub struct AppServices {
     pub agent_registry: Arc<AgentRegistry>,
     pub conversation_repo: Arc<dyn IConversationRepository>,
     pub acp_session_sync: Arc<AcpSessionSyncService>,
-    /// Raw JWT secret string, used to derive encryption keys.
-    pub jwt_secret_raw: String,
+    /// Raw storage-encryption secret string, used to derive the AES-256-GCM
+    /// key for at-rest credentials. Decoupled from the JWT signing secret held
+    /// by `jwt_service`, so signing can rotate without changing the key.
+    pub encryption_secret_raw: String,
     pub data_dir: PathBuf,
     pub dump_prompts: bool,
     pub work_dir: PathBuf,
@@ -65,6 +87,26 @@ pub struct AppServices {
     runtime_base_url: String,
     /// Shared with the Antigravity hook endpoint so it can authenticate callbacks.
     pub(crate) antigravity_hook_tokens: Arc<aionui_ai_agent::antigravity_hook::HookTokenRegistry>,
+}
+
+/// ELECTRON-3T0 decision: must startup be refused because a fresh signing
+/// secret would be generated while the system-user row actually exists?
+///
+/// Generating a new secret is only legitimate on a genuinely fresh install
+/// (`is_new`). If the system-user read returned nothing (`!system_user_present`)
+/// yet an independent id lookup finds the row (`existing_row_present`), the read
+/// misfired (e.g. a stale post-migration connection, ELECTRON-3T0) and deriving
+/// a fresh key would silently orphan every stored credential. A secret resolved
+/// from storage (`!is_new`), or a genuinely absent row, is always safe.
+///
+/// Pure so its full truth table is unit-testable: `from_config` hard-constructs
+/// the repo, so the guard branch cannot be exercised with a mock.
+fn must_refuse_startup_on_unreadable_system_user(
+    is_new: bool,
+    system_user_present: bool,
+    existing_row_present: bool,
+) -> bool {
+    is_new && !system_user_present && existing_row_present
 }
 
 impl AppServices {
@@ -91,6 +133,7 @@ impl AppServices {
             runtime_base_url: self.runtime_base_url.clone(),
             runtime_token_service: self.runtime_token_service.clone(),
             project_service: self.project_service.clone(),
+            user_order_store: self.user_order_store.clone(),
         });
         self
     }
@@ -126,17 +169,20 @@ impl AppServices {
         let app_version = config.app_version.clone();
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
 
-        // Resolve JWT secret: env var → system user db field → random generation
+        // Resolve the JWT *signing* secret: env var → system user db field →
+        // random generation. This signs/verifies JWTs only; the storage-
+        // encryption root is resolved separately below so change-password can
+        // rotate the signing secret without changing the encryption key.
+        // `resolve_jwt_secret` treats an empty value from either source as absent
+        // (an empty string is never a usable secret), so both are passed through
+        // raw — the empty-handling invariant lives in one place.
         let env_secret = std::env::var("JWT_SECRET").ok();
         let system_user = user_repo
             .get_system_user()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get system user: {e}"))?;
 
-        let db_secret = system_user
-            .as_ref()
-            .and_then(|u| u.jwt_secret.as_deref())
-            .filter(|s| !s.is_empty());
+        let db_secret = system_user.as_ref().and_then(|u| u.jwt_secret.as_deref());
 
         let (secret, is_new) = resolve_jwt_secret(env_secret.as_deref(), db_secret);
 
@@ -147,16 +193,22 @@ impl AppServices {
         // ELECTRON-3T0), deriving a fresh key would silently break decryption
         // of every stored credential. Verify absence with an independent
         // query and fail startup instead of corrupting.
-        if is_new
-            && system_user.is_none()
-            && user_repo
+        // Only the fresh-generation path with an empty system-user read can be
+        // dangerous; gate the extra confirmation query behind those cheap checks
+        // so normal startups (resolved-from-storage secret) skip it entirely.
+        let system_user_present = system_user.is_some();
+        let existing_row_present = if is_new && !system_user_present {
+            user_repo
                 .find_by_id("system_default_user")
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to verify system user absence: {e}"))?
                 .is_some()
-        {
+        } else {
+            false
+        };
+        if must_refuse_startup_on_unreadable_system_user(is_new, system_user_present, existing_row_present) {
             anyhow::bail!(
-                "system user row exists but could not be read; refusing to generate a new                  JWT secret (would break decryption of stored credentials)"
+                "system user row exists but could not be read; refusing to generate a new JWT secret (would break decryption of stored credentials)"
             );
         }
 
@@ -169,7 +221,34 @@ impl AppServices {
             tracing::info!("Generated and persisted new JWT secret");
         }
 
-        let encryption_key = derive_encryption_key(&secret);
+        // Resolve the storage-encryption root, independent of the signing
+        // secret above: AIONUI_ENCRYPTION_SECRET env → users.encryption_secret
+        // db → seeded from the effective JWT secret. Seeding from the JWT secret
+        // is the zero-re-encrypt upgrade path — a database created before this
+        // split was encrypted under the JWT secret, so the derived key is
+        // unchanged. In every path the derived key equals what the pre-split
+        // code would have derived (only once a distinct encryption secret is
+        // persisted does it diverge, which is the point), so this introduces no
+        // decryption regression. The ELECTRON-3T0 guard above already refuses to
+        // proceed on the one dangerous state (fresh-generated signing secret
+        // masking an existing-but-unreadable row).
+        let env_encryption_secret = std::env::var("AIONUI_ENCRYPTION_SECRET").ok();
+        let db_encryption_secret = system_user.as_ref().and_then(|u| u.encryption_secret.as_deref());
+        let (encryption_secret, encryption_is_new) =
+            resolve_encryption_secret(env_encryption_secret.as_deref(), db_encryption_secret, &secret);
+
+        // Persist a seeded/generated encryption secret so it survives restarts
+        // and stays stable when the signing secret later rotates. Only persist
+        // when the system user row is readable (mirrors the signing-secret path).
+        if encryption_is_new && let Some(user) = &system_user {
+            user_repo
+                .update_encryption_secret(&user.id, &encryption_secret)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to persist encryption secret: {e}"))?;
+            tracing::info!("Seeded and persisted storage-encryption secret");
+        }
+
+        let encryption_key = derive_encryption_key(&encryption_secret);
 
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
@@ -204,6 +283,11 @@ impl AppServices {
         let project_store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(database.pool().clone()));
         let project_service = ProjectService::new(project_store, work_dir.join("conversations"));
 
+        // Sidebar ordering store (`user_order` table). Built early so it can be
+        // shared by the conversation delete hook, the team service, and the
+        // sidebar read state.
+        let user_order_store: Arc<dyn IUserOrderStore> = Arc::new(SqliteUserOrderStore::new(database.pool().clone()));
+
         // Skill paths need app resource dir (for builtin rules) + data dir
         // (for user skills + materialized views). AcpSkillManager uses these
         // for first-message skill index/body loading.
@@ -224,6 +308,33 @@ impl AppServices {
             aionui_extension::sync_builtin_skill_catalog_into_repo(skill_paths.as_ref(), skill_repo.as_ref())
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
+        }
+
+        // Reap per-conversation skill view directories whose conversation is gone.
+        //
+        // A view outlives its conversation only when the delete hook did not run
+        // (crash, forced kill), so this is a startup sweep rather than a timer.
+        // Keyed by the (user, conversation) PAIR: two Core users can hold
+        // same-shaped conversation ids, and reaping by id alone would delete one
+        // user's view because the other's conversation was deleted.
+        match conversation_repo.list_all_conversation_ids().await {
+            Ok(live) => {
+                let live: std::collections::HashSet<(String, String)> = live.into_iter().collect();
+                match aionui_extension::skill_view::cleanup_orphan_views(&data_dir, &live).await {
+                    Ok(removed) if removed > 0 => {
+                        tracing::info!(removed, "startup: reaped orphan skill view directories");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(error = %error, "startup: orphan skill view cleanup failed");
+                    }
+                }
+            }
+            // Reaping nothing is the safe direction: a leaked view costs disk,
+            // a wrongly-deleted one costs a session its skills.
+            Err(error) => {
+                tracing::warn!(error = %error, "startup: could not list conversations; skipped skill view cleanup");
+            }
         }
 
         // Absolute path to this process's binary. Reused as the `command` for
@@ -292,7 +403,26 @@ impl AppServices {
             runtime_base_url: runtime_base_url.clone(),
             runtime_token_service: runtime_token_service.clone(),
             project_service: project_service.clone(),
+            user_order_store: user_order_store.clone(),
         });
+
+        let session_message_queue = Arc::new(DeliveryQueue::new(Arc::new(SystemClock)));
+        let session_message_notify = Arc::new(Notify::new());
+        let session_message_service = Arc::new(SessionMessageService::new(SessionMessageDeps {
+            conversation_service: conversation_service.clone(),
+            conversation_repo: conversation_repo.clone(),
+            settings_repo: Arc::new(SqliteSettingsRepository::new(database.pool().clone())),
+            task_manager: worker_task_manager.clone(),
+            broadcaster: event_bus.clone(),
+            queue: session_message_queue.clone(),
+            rate_limiter: Arc::new(RateLimiter::new(Arc::new(SystemClock))),
+            notify: session_message_notify.clone(),
+        }));
+        // Cancel ⇒ clear the deliveries queued for that conversation. Injected
+        // rather than called directly because the queue lives in an upper-layer
+        // crate (see `OnConversationTurnCancelled`).
+        conversation_service
+            .with_turn_cancelled_hook(Arc::new(QueueClearingCancelHook::new(session_message_queue.clone())));
 
         Ok(Self {
             database,
@@ -308,12 +438,16 @@ impl AppServices {
             runtime_token_service,
             conversation_runtime_state,
             conversation_service,
+            session_message_service,
+            session_message_queue,
+            session_message_notify,
             project_service,
+            user_order_store,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,
             acp_session_sync: acp_agent_service,
-            jwt_secret_raw: secret,
+            encryption_secret_raw: encryption_secret,
             data_dir,
             dump_prompts,
             work_dir,
@@ -344,6 +478,10 @@ struct ConversationServiceDeps<'a> {
     runtime_base_url: String,
     runtime_token_service: Arc<RuntimeTokenService>,
     project_service: ProjectService,
+    /// Sidebar ordering store. Wired as a second delete hook so deleting a
+    /// conversation cascades away its `user_order` rows (sidebar design §4.3,
+    /// path 1).
+    user_order_store: Arc<dyn IUserOrderStore>,
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
@@ -379,6 +517,8 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     if let Some(hook) = deps.task_manager_delete_hook {
         service.with_delete_hook(hook);
     }
+    // Path-1 cascade: a deleted conversation drops its `user_order` rows.
+    service.with_delete_hook(Arc::new(UserOrderDeleteHook::new(deps.user_order_store)));
     service.with_project_service(Arc::new(deps.project_service));
     service
 }
@@ -458,5 +598,25 @@ mod tests {
         );
 
         services.database.close().await;
+    }
+
+    // ELECTRON-3T0 guard decision table. `from_config` hard-constructs the repo,
+    // so the guard branch can't be reached with a mock; the decision is factored
+    // into a pure predicate and its full truth table is locked here. The single
+    // dangerous state — a freshly generated secret while the system-user read
+    // came back empty but the row is really present — must refuse startup; every
+    // other combination must proceed.
+    #[test]
+    fn refuse_startup_only_when_fresh_secret_masks_an_unread_existing_row() {
+        // is_new, system_user_present, existing_row_present
+        assert!(must_refuse_startup_on_unreadable_system_user(true, false, true));
+
+        assert!(!must_refuse_startup_on_unreadable_system_user(true, false, false));
+        assert!(!must_refuse_startup_on_unreadable_system_user(true, true, true));
+        assert!(!must_refuse_startup_on_unreadable_system_user(true, true, false));
+        assert!(!must_refuse_startup_on_unreadable_system_user(false, false, true));
+        assert!(!must_refuse_startup_on_unreadable_system_user(false, false, false));
+        assert!(!must_refuse_startup_on_unreadable_system_user(false, true, true));
+        assert!(!must_refuse_startup_on_unreadable_system_user(false, true, false));
     }
 }

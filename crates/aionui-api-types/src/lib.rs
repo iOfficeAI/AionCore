@@ -27,8 +27,12 @@ mod provider;
 mod remote_agent;
 mod response;
 mod runtime;
+mod session_tools;
 mod shell;
+mod sidebar;
 mod skill;
+mod skill_delivery;
+mod skill_runtime;
 mod system;
 mod team;
 mod team_mcp;
@@ -103,10 +107,11 @@ pub use conversation::{
     ConversationInputResponse, ConversationInputStatus, ConversationListResponse, ConversationMcpStatus,
     ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind,
     ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView,
-    ForkConversationRequest, InputChangedEvent, ListConversationInputsQuery, ListConversationsQuery, ListMessagesQuery,
-    MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse, PromptCapabilityView,
-    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SubmitConversationInputRequest, ToolEnforcementLevel,
-    UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ForkConversationRequest, InputChangedEvent, ListConversationInputsQuery, ListConversationsQuery,
+    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse,
+    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    SubmitConversationInputRequest, ToolEnforcementLevel, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, SessionRef,
 };
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,
@@ -162,10 +167,22 @@ pub use runtime::{
     EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload,
     RuntimeStatusPhase, RuntimeStatusScope, RuntimeStatusScopeKind,
 };
+pub use session_tools::{
+    SESSION_TOOLS_SCHEMA_VERSION, SessionCliEnvelope, SessionCliMeta, SessionDeliveryStatus, SessionMentionTarget,
+    SessionMentionableQuery, SessionMentionableResponse, SessionMessageRateLimitedPayload, SessionRateGate,
+    SessionSendMessageRequest, SessionSendMessageResponse, SessionToolDescriptor, SessionToolErrorCode,
+    SessionToolErrorPayload, SessionToolName, session_tool_descriptor, session_tool_descriptors,
+    tool_name_for_session_cli_path,
+};
 pub use shell::{
     CheckToolInstalledRequest, CheckToolInstalledResponse, DeepgramSpeechToTextConfig, OpenAISpeechToTextConfig,
     OpenExternalRequest, OpenFileRequest, OpenFolderWithRequest, ShowItemInFolderRequest, SpeechToTextConfig,
     SpeechToTextProvider, SpeechToTextResult, SttStreamClientMessage, SttStreamServerMessage, ToolType,
+};
+pub use sidebar::{
+    ArchiveDeleteResult, MoveOrderRequest, OrderItemRefDto, RemoveProjectItem, RemoveProjectItemKind,
+    RemoveProjectResult, SidebarGroup, SidebarItem, SidebarItemsResponse, SidebarResponse, SidebarScope,
+    SidebarTeamItem,
 };
 pub use skill::{
     AddExternalPathRequest, DeleteSkillRequest, ExportSkillRequest, ExternalSkillSourceResponse,
@@ -178,10 +195,16 @@ pub use skill::{
     SkillImportRecordResponse, SkillListItemResponse, SkillPathsResponse, SkillRegistryOriginResponse,
     SkillSourceResponse, UpdateOfficialSkillRequest, WriteAssistantRuleRequest,
 };
+pub use skill_delivery::{SkillDelivery, SkillDeliveryMode, SkillDeliveryParse, parse_skill_delivery};
+pub use skill_runtime::{
+    RuntimeSkillFileQuery, RuntimeSkillFileResponse, RuntimeSkillListItem, RuntimeSkillListResponse,
+    RuntimeSkillShowResponse, SKILL_RUNTIME_SCHEMA_VERSION, SkillRuntimeEnvelope, SkillRuntimeErrorCode,
+    SkillRuntimeErrorPayload, SkillRuntimeMeta,
+};
 pub use system::{
-    ClientPreferencesResponse, FeedbackDiagnosticsContextResponse, FeedbackDiagnosticsPrivacyResponse,
-    FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse, SystemSettingsResponse,
-    UpdateClientPreferencesRequest, UpdateSettingsRequest,
+    ClientPreferencesResponse, CurrentUserResponse, FeedbackDiagnosticsContextResponse,
+    FeedbackDiagnosticsPrivacyResponse, FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery,
+    FeedbackDiagnosticsResponse, SystemSettingsResponse, UpdateClientPreferencesRequest, UpdateSettingsRequest,
 };
 pub use team::{
     AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, PauseTeamSlotRequest,

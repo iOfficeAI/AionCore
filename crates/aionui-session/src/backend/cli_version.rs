@@ -1,6 +1,6 @@
 //! Version-drift detection for direct-CLI backends.
 //!
-//! None of claude / codex / agy ship with AionUi: each is whatever the user
+//! None of claude / codex / agy ship with WorkMate: each is whatever the user
 //! installed. Every wire contract a backend relies on — stream shapes, control
 //! frames, resume flags — was verified against one release, so a drifting
 //! install has to be visible rather than failing in some unexplained way
@@ -8,7 +8,7 @@
 //!
 //! claude and codex used to be exempt because the app bundled a version-pinned
 //! copy of each. That hid a worse problem: the bundled CLI and the user's own
-//! install could differ, so the same prompt behaved differently in AionUi and
+//! install could differ, so the same prompt behaved differently in WorkMate and
 //! in the user's terminal with nothing on screen explaining why. Bundling is
 //! gone; this module gives all three backends the same treatment.
 //!
@@ -31,13 +31,14 @@ use crate::event::{LocalizedText, NoticeLevel};
 /// is the evidence; a schema diff or a clean changelog is not, because neither
 /// can see a behavioural regression.
 ///
-/// codex is deliberately NOT on the latest release: 0.147.0 never completes a
-/// turn (its response stream disconnects with `httpStatusCode: null`, observed
-/// three times including a back-to-back control after three clean versions), so
-/// the verified release stops at 0.146.0 until upstream fixes it.
-pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.233";
-pub const VERIFIED_CODEX_VERSION: &str = "0.146.0";
-pub const VERIFIED_AGY_VERSION: &str = "1.1.12";
+/// codex skips 0.147.0, which never completes a turn (its response stream
+/// disconnects with `httpStatusCode: null`, observed three times including a
+/// back-to-back control after three clean versions). Every release from 0.148.0
+/// on does complete turns and passes the suite, so the gate walks forward over
+/// 0.147.0 and leaves it unverified rather than a floor anyone can install into.
+pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.235";
+pub const VERIFIED_CODEX_VERSION: &str = "0.150.1";
+pub const VERIFIED_AGY_VERSION: &str = "1.1.22";
 
 /// The verified release for a direct-CLI backend, keyed by the program name the
 /// backend spawns. `None` for anything not version-gated here.
@@ -139,18 +140,18 @@ pub fn drift_notice(cli: &str, reported: &str, verified: &str) -> Option<(Notice
         VersionVerdict::Older => Some((
             NoticeLevel::Info,
             format!(
-                "The installed {cli} is older than the version AionUi verified; \
+                "The installed {cli} is older than the version WorkMate verified; \
                  some features may be missing. Consider upgrading {cli}. \
-                 (installed {reported} / verified by AionUi: {verified})"
+                 (installed {reported} / verified by WorkMate: {verified})"
             ),
             localized(CODE_CLI_VERSION_OLDER),
         )),
         VersionVerdict::Newer => Some((
             NoticeLevel::Info,
             format!(
-                "The installed {cli} is newer than the version AionUi verified. \
+                "The installed {cli} is newer than the version WorkMate verified. \
                  It should still work; report anything that behaves oddly. \
-                 (installed {reported} / verified by AionUi: {verified})"
+                 (installed {reported} / verified by WorkMate: {verified})"
             ),
             localized(CODE_CLI_VERSION_NEWER),
         )),
@@ -449,8 +450,8 @@ mod tests {
     fn the_verified_release_says_nothing() {
         // Literal on purpose: this is the exact string a user on the verified
         // release reports, so the test breaks if a bump forgets to re-verify.
-        assert_eq!(classify("2.1.233", VERIFIED_CLAUDE_VERSION), VersionVerdict::Verified);
-        assert!(drift_notice("claude", "2.1.233", VERIFIED_CLAUDE_VERSION).is_none());
+        assert_eq!(classify("2.1.235", VERIFIED_CLAUDE_VERSION), VersionVerdict::Verified);
+        assert!(drift_notice("claude", "2.1.235", VERIFIED_CLAUDE_VERSION).is_none());
     }
 
     #[test]

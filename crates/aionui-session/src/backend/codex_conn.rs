@@ -30,6 +30,9 @@ use aionui_process::Spawner;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast, oneshot};
 
+#[cfg(any(test, feature = "test-support"))]
+use super::codex_title::NoTitleIo;
+use super::codex_title::{SpawnedTitleIo, TitleGen};
 use super::suspend::{ProcHandle, SuspendController, spawn_idle_timer};
 use super::types::{
     Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, PendingPermissionView,
@@ -131,6 +134,7 @@ impl BackendConnection for CodexConnection {
             env: config.spawn_env.clone(),
             cwd: config.cwd.clone(),
         };
+        let title_cmd = cmd.clone();
         let proc = self
             .spawner
             .spawn(cmd, &[], "aionui-session")
@@ -145,7 +149,17 @@ impl BackendConnection for CodexConnection {
             spawner: Some(self.spawner.clone()),
             config: config.clone(),
         };
-        let mut backend = CodexSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms).await;
+        // First-turn title latch: armed only for a Fresh open (a brand-new
+        // conversation). Its runs go to a THROWAWAY process built from the same
+        // CommandSpec — same codex install, env and cwd, hence the same
+        // credentials — but never onto this session's connection.
+        let title_gen = Arc::new(TitleGen::new(
+            matches!(&spec, SessionSpec::Fresh { .. }),
+            Arc::new(SpawnedTitleIo::new(self.spawner.clone(), title_cmd)),
+        ));
+        title_gen.set_model(config.model.clone());
+        let mut backend =
+            CodexSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms, title_gen).await;
         // Report a codex whose version differs from the release AionUi verified.
         // codex runs from the user's own install (nothing is bundled), the same
         // situation agy has always been in. Placed here rather than at the two
@@ -463,6 +477,48 @@ fn initialize_params() -> HandshakeParams {
         "clientInfo": { "name": "aionui-session", "version": "0.1.0" },
         "capabilities": { "experimentalApi": true, "requestAttestation": false }
     }))
+}
+
+/// `skills/extraRoots/set` params, or `None` when this session has no skill view
+/// to register (a non-protocol vendor, or an empty skill snapshot).
+///
+/// Wire shape verified against codex-cli 0.146.0's own generated schema
+/// (`codex app-server generate-json-schema`, `v2/SkillsExtraRootsSetParams.json`):
+/// the only property is `extraRoots`, an array of `AbsolutePathBuf`, and it is
+/// required. A live `codex app-server --stdio` probe confirmed the behaviour
+/// end-to-end: the request answers `{}`, codex then pushes a `skills/changed`
+/// notification, and `skills/list` reports the skill with `errors: []`.
+///
+/// Two properties that probe pinned, both load-bearing here:
+///  * A SYMLINKED skill directory is discovered — which is what the whole view
+///    directory design depends on.
+///  * `path` comes back as the REAL source path, not the link. So a CLI checking
+///    canonical paths would not match a view entry, which is why allow-listing
+///    targets the real source dirs instead.
+///
+/// ⚠️ R2' HARD CONSTRAINT — DO NOT REMOVE.
+/// `extraRoots` is PROCESS-scoped, not thread-scoped. Two independent
+/// confirmations: the params carry NO `threadId` (thread-level requests such as
+/// `ThreadForkParams` do), and the live probe reported the registered skill with
+/// `scope: "user"`. Isolation (one conversation's skills staying out of another)
+/// therefore holds ONLY because this file opens one process per logical session —
+/// see the `CodexConnection` doc comment, "P1 opens one process per logical
+/// session (multiplexing is a later refinement)".
+///
+/// If thread multiplexing is ever enabled, process-wide extra roots WILL leak one
+/// conversation's skills into another. Codex layer-1 delivery and thread reuse
+/// are MUTUALLY EXCLUSIVE. Before enabling reuse, either switch to per-skill
+/// `skills/config/write { name|path, enabled }` (present in the same schema) or
+/// drop codex to `injected`, and land a cross-conversation skill isolation
+/// regression test in the SAME change.
+fn skills_extra_roots_params(config: &SessionConfig) -> Option<HandshakeParams> {
+    let root = config
+        .init
+        .skill_view_skills_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(HandshakeParams(json!({ "extraRoots": [root] })))
 }
 
 /// `thread/start` params (Fresh / lost-Resume). approvalPolicy/sandbox are valid
@@ -932,6 +988,10 @@ struct CodexReaderState {
     /// terminal (TurnResult / Detached). The idle timer reads it so a streaming turn
     /// is never suspended mid-flight.
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// First-turn session-title latch. Fired by the reader on a successful turn
+    /// terminal; runs on its OWN process (see `codex_title`), so nothing here
+    /// touches `thread_binding` / `turn_in_flight` / the R8 `terminated` flag.
+    title_gen: Arc<TitleGen>,
 }
 
 /// Spawn a codex JSON-RPC reader over `stdout`/`io` using the shared state. Used
@@ -963,6 +1023,7 @@ fn start_codex_reader(
             state.discovered,
             state.stdin,
             state.turn_in_flight,
+            state.title_gen,
         )
         .await;
     })
@@ -1031,6 +1092,18 @@ impl CodexSessionBackend {
         Self::spawn(session_id.into(), io).await
     }
 
+    /// Test-support seam: build over an injected `AgentIo` WITH a caller-supplied
+    /// title latch, so the first-turn title wiring (reader terminal → fire) can be
+    /// driven without spawning a real codex.
+    #[cfg(test)]
+    pub(crate) async fn build_with_io_titled(
+        session_id: impl Into<String>,
+        io: Box<dyn AgentIo>,
+        title_gen: Arc<TitleGen>,
+    ) -> Self {
+        Self::spawn_with_wake(session_id.into(), io, CodexWakeRecipe::inert(), None, title_gen).await
+    }
+
     /// Test-support seam: build a SUSPENDABLE backend with a caller-supplied
     /// `Spawner` (to observe the wake re-spawn) + an `idle_ttl_ms`. Lets a test
     /// drive the suspend→wake path: the idle slot suspends, and the next dispatch
@@ -1046,7 +1119,14 @@ impl CodexSessionBackend {
             spawner: Some(spawner),
             config: SessionConfig::default(),
         };
-        Self::spawn_with_wake(session_id.into(), io, wake, Some(idle_ttl_ms)).await
+        Self::spawn_with_wake(
+            session_id.into(),
+            io,
+            wake,
+            Some(idle_ttl_ms),
+            Arc::new(TitleGen::new(false, Arc::new(NoTitleIo))),
+        )
+        .await
     }
 
     /// Test-support seam: pre-bind the backend threadId (the resume anchor the
@@ -1109,7 +1189,14 @@ impl CodexSessionBackend {
     /// wake recipe; only the `build_with_io` test seam uses this.
     #[cfg(any(test, feature = "test-support"))]
     async fn spawn(session_id: String, io: Box<dyn AgentIo>) -> Self {
-        Self::spawn_with_wake(session_id, io, CodexWakeRecipe::inert(), None).await
+        Self::spawn_with_wake(
+            session_id,
+            io,
+            CodexWakeRecipe::inert(),
+            None,
+            Arc::new(TitleGen::new(false, Arc::new(NoTitleIo))),
+        )
+        .await
     }
 
     /// Spawn + (optionally) enable F-4 idle self-suspend. `wake` carries what a
@@ -1120,6 +1207,7 @@ impl CodexSessionBackend {
         io: Box<dyn AgentIo>,
         wake: CodexWakeRecipe,
         idle_ttl_ms: Option<i64>,
+        title_gen: Arc<TitleGen>,
     ) -> Self {
         let io: Arc<dyn AgentIo> = Arc::from(io);
         let turn_gen = Arc::new(AtomicU64::new(0));
@@ -1163,6 +1251,7 @@ impl CodexSessionBackend {
             discovered: discovered.clone(),
             stdin: stdin.clone(),
             turn_in_flight: turn_in_flight.clone(),
+            title_gen: title_gen.clone(),
         };
         let reader = start_codex_reader(&reader_state, stdout, io.clone());
 
@@ -1299,6 +1388,25 @@ impl CodexSessionBackend {
         *self.resume_poison.lock().await = None;
         self.write_frame(initialize_params().into_frame(self.next_rpc_id(), "initialize"))
             .await?;
+
+        // Layer 1 (protocol): register this conversation's skill view. Sent after
+        // `initialize` (the probe order) and before thread start/resume so the
+        // first turn already sees the skills.
+        //
+        // Fire-and-forget by design: the response is an empty object, so there is
+        // nothing to claim, and a rejection must NOT fail the session — layer 2's
+        // dual channel still covers skills. A rejection therefore surfaces only as
+        // codex-side output, which is an accepted gap rather than a silent one.
+        if let Some(params) = skills_extra_roots_params(&self.wake.config) {
+            self.write_frame(params.into_frame(self.next_rpc_id(), "skills/extraRoots/set"))
+                .await?;
+            tracing::info!(
+                backend = "codex",
+                mode = "protocol",
+                "skill_delivery: registered the session skill view as a codex extra root"
+            );
+        }
+
         match mode {
             HandshakeMode::Resume(tid) => {
                 *self.thread_binding.lock().await = Some(tid.to_string());
@@ -1456,6 +1564,7 @@ async fn reader_task(
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    title_gen: Arc<TitleGen>,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1639,6 +1748,18 @@ async fn reader_task(
                                 // F-4: turn terminal → clear the turn-active flag so the
                                 // idle timer may suspend the now-idle process.
                                 turn_in_flight.store(false, Ordering::SeqCst);
+                                // First-turn title: every SUCCESSFUL turn fires
+                                // while the latch is armed (an error turn keeps it
+                                // armed for the next one). Detached onto its own
+                                // process — see `codex_title`.
+                                if let SessionEvent::TurnResult {
+                                    is_error: false,
+                                    result_text,
+                                    ..
+                                } = &ev
+                                {
+                                    title_gen.fire(&session_id, result_text, &event_tx, cur);
+                                }
                                 emit(&event_tx, &session_id, cur, ev);
                             } else if system_error_pending && !was_pending {
                                 // systemError was just deferred: arm the bounded grace
@@ -2937,6 +3058,60 @@ fn map_collab_status(s: &str) -> SubagentStatus {
     }
 }
 
+/// Turn codex's protocol-level `commandExecution` item into a compact,
+/// user-facing step label. The raw item is still carried as `ToolCall.input`,
+/// so this changes presentation only and does not discard command details.
+///
+/// `commandActions` is the semantic summary emitted by codex itself (for
+/// example `read`, `search`, or `listFiles`). Prefer it over reparsing the shell
+/// command; fall back to the command text for actions codex classifies as
+/// `unknown`.
+fn command_execution_display_name(item: &Value) -> String {
+    const MAX_DETAIL_CHARS: usize = 96;
+
+    fn bounded(value: &str) -> String {
+        let value = value.trim().replace(['\n', '\r'], " ");
+        let mut chars = value.chars();
+        let head: String = chars.by_ref().take(MAX_DETAIL_CHARS).collect();
+        if chars.next().is_some() {
+            format!("{head}…")
+        } else {
+            head
+        }
+    }
+
+    let actions = item.get("commandActions").and_then(Value::as_array);
+    let action = actions.and_then(|items| items.first());
+    let action_count = actions.map_or(0, Vec::len);
+
+    let (verb, detail) = match action.and_then(|a| a.get("type")).and_then(Value::as_str) {
+        Some("read") => (
+            "Read",
+            action
+                .and_then(|a| a.get("name").or_else(|| a.get("path")))
+                .and_then(Value::as_str),
+        ),
+        Some("search") => ("Search", action.and_then(|a| a.get("query")).and_then(Value::as_str)),
+        Some("listFiles") => ("List files", action.and_then(|a| a.get("path")).and_then(Value::as_str)),
+        Some("unknown") | Some(_) | None => (
+            "Run",
+            action
+                .and_then(|a| a.get("command"))
+                .and_then(Value::as_str)
+                .or_else(|| item.get("command").and_then(Value::as_str)),
+        ),
+    };
+
+    let mut label = match detail.map(bounded).filter(|s| !s.is_empty()) {
+        Some(detail) => format!("{verb} {detail}"),
+        None => format!("{verb} command"),
+    };
+    if action_count > 1 {
+        label.push_str(&format!(" · {action_count} actions"));
+    }
+    label
+}
+
 /// A1 CORE: match the item's `type` STRING with a fallthrough. The closed codex
 /// ThreadItem enum is NEVER constructed in our code, so an unknown future `type`
 /// becomes `AdapterSpecific` instead of a deserialization panic.
@@ -3079,7 +3254,11 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
             } else {
                 out.push(SessionEvent::ToolCall {
                     tool_use_id: id.clone(),
-                    name: item_type.to_string(),
+                    name: if item_type == "commandExecution" {
+                        command_execution_display_name(item)
+                    } else {
+                        item_type.to_string()
+                    },
                     subagent: crate::event::SubagentKind::Inline,
                     // Gap #4 / H2: carry the codex tool ARGUMENTS. On the started
                     // (non-completed) item the invocation fields (command/cwd/
@@ -3689,6 +3868,20 @@ impl SessionBackend for CodexSessionBackend {
                         command: crate::capability::block_kind_name(bad),
                     });
                 }
+                // While the first-turn title latch is armed, record the first
+                // prompt's text as the generation description (bounded inside;
+                // prompt content is never logged).
+                if self.reader_state.title_gen.is_armed() {
+                    let text = content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.reader_state.title_gen.record_first_prompt(&text);
+                }
                 // Bridge-parity slash routing (ELECTRON-3PX): the 6 advertised
                 // commands (builtin_slash_commands) translate to native ops the way
                 // the codex-acp bridge did in-process (v0.14.0 thread.rs:3252
@@ -3985,6 +4178,10 @@ impl SessionBackend for CodexSessionBackend {
                 // Track it so a subsequent SetMode can build collaborationMode (M1).
                 let tid = self.bound_thread().await?;
                 *self.current_model.lock().await = Some(model.clone());
+                // Keep the title latch on the model the user is actually talking
+                // to — a title run started after a switch must not use the stale
+                // open-time model.
+                self.reader_state.title_gen.set_model(Some(model.clone()));
                 let id = self.next_rpc_id();
                 // Register the rpc id so the reader claims the response: a JSON-RPC
                 // error (codex rejected the model) surfaces as a Notice instead of
@@ -5604,8 +5801,8 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("a ToolCall content event for c1, got {started:?}"));
         assert_eq!(
-            tool_call.0, "commandExecution",
-            "#1: ToolCall.name pinned (was unpinned)"
+            tool_call.0, "Run echo hi",
+            "#1: ToolCall.name is a readable command summary"
         );
         assert_eq!(
             tool_call.1.get("command").and_then(serde_json::Value::as_str),
@@ -5629,6 +5826,56 @@ mod tests {
                 .any(|e| matches!(e, SessionEvent::ToolResult { tool_use_id, .. } if tool_use_id == "c1")),
             "and the ToolResult content event, got {completed:?}"
         );
+    }
+
+    #[test]
+    fn command_execution_uses_codex_semantic_action_as_its_label() {
+        let read = serde_json::json!({
+            "type": "commandExecution",
+            "command": "/bin/zsh -lc 'sed -n 1,20p src/lib.rs'",
+            "commandActions": [{
+                "type": "read",
+                "command": "sed -n 1,20p src/lib.rs",
+                "name": "lib.rs",
+                "path": "/workspace/src/lib.rs"
+            }]
+        });
+        assert_eq!(command_execution_display_name(&read), "Read lib.rs");
+
+        let search = serde_json::json!({
+            "type": "commandExecution",
+            "commandActions": [
+                { "type": "search", "query": "SessionTitle", "path": "crates" },
+                { "type": "search", "query": "apply_agent_title", "path": "crates" }
+            ]
+        });
+        assert_eq!(
+            command_execution_display_name(&search),
+            "Search SessionTitle · 2 actions"
+        );
+
+        let list = serde_json::json!({
+            "type": "commandExecution",
+            "commandActions": [{ "type": "listFiles", "path": "crates/aionui-session" }]
+        });
+        assert_eq!(
+            command_execution_display_name(&list),
+            "List files crates/aionui-session"
+        );
+    }
+
+    #[test]
+    fn command_execution_falls_back_to_a_bounded_command_summary() {
+        let command = "x".repeat(120);
+        let item = serde_json::json!({
+            "type": "commandExecution",
+            "command": command,
+            "commandActions": [{ "type": "unknown", "command": command }]
+        });
+        let label = command_execution_display_name(&item);
+        assert!(label.starts_with("Run "));
+        assert!(label.ends_with('…'));
+        assert!(label.chars().count() <= 101, "label was not bounded: {label}");
     }
 
     #[tokio::test]
@@ -7462,6 +7709,57 @@ mod tests {
             "experimentalApi must NOT be top-level (codex ignores it there)"
         );
         assert_eq!(frame["params"]["clientInfo"]["name"], "aionui-session");
+    }
+
+    /// Exact wire shape, per codex-cli 0.146.0's own generated schema
+    /// (`v2/SkillsExtraRootsSetParams.json`): one required `extraRoots` array of
+    /// absolute paths, and NOTHING else. The absent `threadId` is the schema-level
+    /// evidence that this request is process-scoped (see R2' on the builder).
+    #[test]
+    fn extra_roots_frame_carries_only_the_skills_root() {
+        let params = skills_extra_roots_params(&SessionConfig {
+            init: crate::backend::SessionInit {
+                skill_view_skills_dir: Some("/data/session-skills/u/c/skills".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .expect("a session with a skill view must produce a frame");
+        let frame = params.into_frame(3, "skills/extraRoots/set");
+
+        assert_eq!(frame["method"], "skills/extraRoots/set");
+        assert_eq!(frame["params"]["extraRoots"][0], "/data/session-skills/u/c/skills");
+        assert_eq!(
+            frame["params"].as_object().map(|o| o.len()),
+            Some(1),
+            "the schema declares exactly one property; anything extra is a guess"
+        );
+        assert!(
+            frame["params"].get("threadId").is_none(),
+            "no threadId in the schema — the request is process-scoped (R2')"
+        );
+    }
+
+    /// The SKILLS root, not the plugin root. codex scans `{root}/{name}/SKILL.md`
+    /// directly, so handing it the plugin root would find nothing — and it answers
+    /// `{}` either way, so the mistake would be silent.
+    #[test]
+    fn no_skill_view_means_no_extra_roots_frame() {
+        assert!(
+            skills_extra_roots_params(&SessionConfig::default()).is_none(),
+            "a conversation with no skills must not touch the process-wide extra roots"
+        );
+        assert!(
+            skills_extra_roots_params(&SessionConfig {
+                init: crate::backend::SessionInit {
+                    skill_view_skills_dir: Some("   ".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .is_none(),
+            "a blank path must be treated as absent, not registered as a root"
+        );
     }
 
     /// thread/start params thread cwd from config; approvalPolicy/sandbox are valid

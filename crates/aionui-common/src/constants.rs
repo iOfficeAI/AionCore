@@ -3,6 +3,20 @@
 pub const AIONUI_TIMESTAMP_SEPARATOR: &str = "_aionui_";
 pub const AIONUI_FILES_MARKER: &str = "[[AION_FILES]]";
 
+// --- Cross-session messaging ---
+
+/// Sender-side block appended to a user message that referenced other
+/// conversations with `@@`. Carries name + id + workspace per target so the
+/// agent knows whether relative paths are meaningful to the recipient.
+pub const AIONUI_SESSIONS_MARKER: &str = "[[AION_SESSIONS]]";
+pub const AIONUI_SESSIONS_END_MARKER: &str = "[[/AION_SESSIONS]]";
+
+/// Recipient-side block prepended to a cross-session delivery. Tells the
+/// receiving agent who sent it, whether the sender's workspace matches, and
+/// the reply address.
+pub const AIONUI_SESSION_MESSAGE_MARKER: &str = "[[AION_SESSION_MESSAGE]]";
+pub const AIONUI_SESSION_MESSAGE_END_MARKER: &str = "[[/AION_SESSION_MESSAGE]]";
+
 // --- WebSocket ---
 
 pub const HEARTBEAT_INTERVAL_MS: u64 = 30_000;
@@ -12,11 +26,26 @@ pub const WS_CLOSE_POLICY_VIOLATION: u16 = 1008;
 
 // --- Authentication ---
 
-pub const SESSION_EXPIRY: &str = "24h";
+/// Human-readable session lifetime label. Currently unused; kept consistent
+/// with the real JWT/cookie lifetime (30 days).
+pub const SESSION_EXPIRY: &str = "30d";
 pub const COOKIE_NAME: &str = "aionui-session";
 pub const COOKIE_MAX_AGE_DAYS: u32 = 30;
 pub const CSRF_COOKIE_NAME: &str = "aionui-csrf-token";
 pub const CSRF_HEADER_NAME: &str = "x-csrf-token";
+
+/// Cookie carrying the refresh token.
+///
+/// Distinct from the access-token session cookie so the two credential roles
+/// never share a container.
+pub const REFRESH_COOKIE_NAME: &str = "aionui-refresh";
+/// Path the refresh cookie is scoped to. The browser attaches it only when
+/// calling the refresh endpoint, keeping the long-lived credential off every
+/// ordinary API/WebSocket request.
+pub const REFRESH_COOKIE_PATH: &str = "/api/auth/refresh";
+/// Refresh-token / refresh-cookie lifetime in days. This is the window in which
+/// a session can be renewed without re-authenticating.
+pub const REFRESH_COOKIE_MAX_AGE_DAYS: u32 = 30;
 
 // --- Server ---
 

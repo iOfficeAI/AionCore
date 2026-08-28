@@ -30,6 +30,8 @@ aionui-office.workspace = true
 aionui-shell.workspace = true
 aionui-ai-agent.workspace = true
 aionui-session.workspace = true
+aionui-session-message.workspace = true
+aionui-skill-runtime.workspace = true
 aionui-mcp.workspace = true
 aionui-conversation.workspace = true
 aionui-extension.workspace = true
@@ -38,6 +40,7 @@ aionui-team.workspace = true
 aionui-team-prompts.workspace = true
 aionui-cron.workspace = true
 aionui-project.workspace = true
+aionui-sidebar.workspace = true
 aionui-assistant.workspace = true
 aionui-runtime.workspace = true
 aionui-process.workspace = true
@@ -61,6 +64,7 @@ reqwest.workspace = true
 rmcp = { version = "1.5", features = ["server", "transport-io", "schemars"] }
 anyhow.workspace = true
 async-trait.workspace = true
+rpassword.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

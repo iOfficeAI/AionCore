@@ -73,10 +73,18 @@ impl AgentType {
 
     /// Native skill-discovery directories for non-ACP agent types.
     ///
-    /// ACP vendors own their skill dirs through the `agent_metadata`
-    /// table; this method covers the few non-ACP agent types that still
-    /// support native skill discovery. Returns `None` for agent types
-    /// that require prompt-injection instead of workspace symlinks.
+    /// ⚠️ RETIRED FROM SKILL DELIVERY. AionUi no longer creates these
+    /// directories: skills reach an agent through its own view directory
+    /// under the data dir (layer 1) or through prompt injection plus the
+    /// `aioncore skills` / `[LOAD_SKILL]` channels (layer 2). The delivery
+    /// decision is `agent_metadata.skill_delivery`, not this table.
+    ///
+    /// Kept as historical/reference data — a record of which directory each
+    /// non-ACP CLI scans — and asserted by the antigravity migration test to
+    /// keep the seeded row and this table in agreement. Do NOT reintroduce it
+    /// as a delivery signal: it conflated "declares a directory" with "can
+    /// discover skills", which is how a vendor could end up with neither
+    /// native discovery nor an injected index.
     ///
     /// `AgentType::Gemini` is intentionally absent: new Gemini
     /// conversations use `AgentType::Acp` with `backend = "gemini"`, so
@@ -279,6 +287,16 @@ pub enum AgentKillReason {
     /// The owning user's Core session was revoked, so foreground runtime state
     /// and agent processes for that user must be torn down.
     SessionRevoked,
+    /// The user explicitly requested a runtime restart. Any active turn is
+    /// intentionally cancelled and must converge without a user-facing error
+    /// before the old process is replaced.
+    RuntimeRestart,
+    /// The owning conversation (or its team) was archived. Like
+    /// `ConversationDeleted` the agent process is torn down so it stops
+    /// streaming for a unit the user moved out of the active workspace, but the
+    /// conversation row and history are preserved — unarchiving cold-starts a
+    /// fresh agent.
+    Archived,
 }
 
 /// File change operation type.

@@ -42,7 +42,11 @@ pub struct AuthProvisionService {
 
 pub struct ExternalSessionExchange {
     pub response: EnsureExternalSessionResponse,
+    /// Short-lived access token (set as the session cookie).
     pub token: String,
+    /// Long-lived refresh token (set as the refresh cookie) used to renew the
+    /// access token without re-authenticating.
+    pub refresh_token: String,
 }
 
 impl AuthProvisionService {
@@ -127,6 +131,9 @@ impl AuthProvisionService {
         let token = self
             .jwt_service
             .sign_with_session_generation(&user.id, &username, user.session_generation)?;
+        let refresh_token = self
+            .jwt_service
+            .sign_refresh(&user.id, &username, user.session_generation)?;
         self.user_repo.update_last_login(&user.id).await?;
 
         Ok(ExternalSessionExchange {
@@ -135,6 +142,7 @@ impl AuthProvisionService {
                 session_generation: user.session_generation,
             },
             token,
+            refresh_token,
         })
     }
 

@@ -48,7 +48,14 @@ pub struct User {
     pub email: Option<String>,
     pub password_hash: Option<String>,
     pub avatar_path: Option<String>,
+    /// JWT signing secret (rotatable; e.g. on change-password to invalidate
+    /// sessions). Signing only — never the storage-encryption root.
     pub jwt_secret: Option<String>,
+    /// Storage-encryption root, decoupled from `jwt_secret`. The AES-256-GCM
+    /// key for at-rest credentials is derived from this. NULL on databases
+    /// upgraded before migration 042; the server seeds it from the effective
+    /// JWT secret on first boot so existing ciphertext still decrypts.
+    pub encryption_secret: Option<String>,
     pub status: UserStatus,
     pub session_generation: i64,
     pub created_at: TimestampMs,

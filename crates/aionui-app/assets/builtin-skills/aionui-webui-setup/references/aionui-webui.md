@@ -277,7 +277,7 @@ sudo iptables -A INPUT -p tcp --dport 25808 -j ACCEPT
 #### Step 3: 配置防火墙
 
 ```bash
-# 允许端口 25808
+# Allow CSBU WorkMate through the macOS firewall (on-disk bundle is still AionUi.app).
 sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /Applications/AionUi.app/Contents/MacOS/AionUi
 sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp /Applications/AionUi.app/Contents/MacOS/AionUi
 ```

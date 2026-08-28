@@ -12,6 +12,13 @@ pub trait ISettingsRepository: Send + Sync {
     async fn get_settings(&self, user_id: &str) -> Result<Option<SystemSettings>, DbError>;
 
     /// Inserts or replaces the single settings row.
+    ///
+    /// Positional parameters, one per column, as this trait has always done.
+    /// Adding `cross_session_message_enabled` pushed the count past clippy's
+    /// default of 7; the repo's established response to that is the allow (see
+    /// e.g. `aionui-team/src/session.rs:146`) rather than reshaping a trait
+    /// every implementor and test already calls.
+    #[allow(clippy::too_many_arguments)]
     async fn upsert_settings(
         &self,
         user_id: &str,
@@ -20,5 +27,6 @@ pub trait ISettingsRepository: Send + Sync {
         cron_notification_enabled: bool,
         command_queue_enabled: bool,
         save_upload_to_workspace: bool,
+        cross_session_message_enabled: bool,
     ) -> Result<SystemSettings, DbError>;
 }

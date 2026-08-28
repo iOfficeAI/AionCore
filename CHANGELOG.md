@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.2.0](https://github.com/suoak/AionCore/compare/v0.1.86...v0.2.0) (2026-08-28)
+
+### Features
+
+* **sidebar:** archive foundation, aggregated read model, and agent teardown on archive
+* **session-message:** deliver messages across a user's conversations
+* **conversation:** persist plan snapshots for rehydration
+* **auth:** account/secret CLI, dual-token refresh, and 30-day JWT TTL
+* **project:** fs/remount, fs/createFile, and explorer copy/move
+* **skills:** deliver skills through a WorkMate-owned view instead of the workspace
+* **cli:** bump verified claude 2.1.235, codex 0.150.1, agy 1.1.22, and ACP registry pins
+
+### Bug Fixes
+
+* **claude:** in-band model selection, tool-step labels
+* **codex:** auto-name sessions and label command steps
+* **antigravity:** route Team over the CLI
+* **cli:** register unindexed top-level subcommands in the capability index
+
+
 ## [0.1.86](https://github.com/suoak/AionCore/compare/v0.1.85...v0.1.86) (2026-08-26)
 
 ### Bug Fixes

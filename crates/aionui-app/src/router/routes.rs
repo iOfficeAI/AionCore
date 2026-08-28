@@ -20,8 +20,8 @@ use aionui_api_types::ErrorResponse;
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
-    AuthIdentityMode, AuthRouterState, AuthState, IRuntimeTokenVerifier, SystemDefaultFilesystemAdopter,
-    auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
+    AuthIdentityMode, AuthRouterState, AuthState, IRuntimeTokenVerifier, RefreshCoalescer,
+    SystemDefaultFilesystemAdopter, auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
 };
 use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
@@ -36,6 +36,7 @@ use aionui_office::{office_proxy_routes, office_routes};
 use aionui_project::project_routes;
 use aionui_realtime::{NoopMessageRouter, WsHandlerState, ws_upgrade_handler};
 use aionui_shell::shell_routes;
+use aionui_sidebar::sidebar_routes;
 use aionui_system::{ClientPrefService, connection_test_routes, system_routes};
 use aionui_team::{TeamSessionService, team_routes};
 
@@ -43,6 +44,9 @@ use crate::services::AppServices;
 
 use super::fs_monitor::spawn_fs_monitor;
 use super::health::health_check;
+use aionui_session_message::{session_message_routes, session_message_user_routes};
+use aionui_skill_runtime::skill_runtime_routes;
+
 use super::runtime_team_tools::{RuntimeTeamToolsState, runtime_team_tools_routes};
 use super::scm_monitor::{CompositeMessageRouter, spawn_scm_monitor};
 use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
@@ -188,6 +192,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
 
     let auth_state = AuthRouterState {
         jwt_service: services.jwt_service.clone(),
+        refresh_coalescer: RefreshCoalescer::new(),
         user_repo: services.user_repo.clone(),
         fs_adopter: Some(Arc::new(SkillFilesystemAdopter {
             skill_paths: services.skill_paths.clone(),
@@ -283,6 +288,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let project_authenticated =
         project_routes(states.project).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // Sidebar read + ordering routes protected by auth middleware
+    let sidebar_authenticated =
+        sidebar_routes(states.sidebar).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // MCP routes protected by auth middleware
     let mcp_authenticated =
         mcp_routes(states.mcp).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -340,6 +349,15 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         team_service: states.team.service.clone(),
         runtime_token_service: services.runtime_token_service.clone(),
     });
+    // Runtime routes authenticate on their own token header — deliberately NOT
+    // behind auth_middleware, same as runtime_team_tools.
+    let session_message_runtime = session_message_routes(states.session_message.clone());
+    // Channel A. Same runtime-token self-authentication: the caller is an agent
+    // process holding a conversation-scoped token, not a browser session.
+    let skill_runtime = skill_runtime_routes(states.skill_runtime);
+    // The `@@` picker's outlet goes through ordinary user auth.
+    let session_message_authenticated = session_message_user_routes(states.session_message)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: route groups built");
 
     // Antigravity permission hook callback. Deliberately NOT behind
@@ -364,16 +382,19 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(connection_test_authenticated)
         .merge(file_authenticated)
         .merge(project_authenticated)
+        .merge(sidebar_authenticated)
         .merge(mcp_authenticated)
         .merge(extension_authenticated)
         .merge(hub_authenticated)
         .merge(skill_authenticated)
+        .merge(skill_runtime)
         .merge(channel_authenticated)
         .merge(team_authenticated)
         .merge(cron_authenticated)
         .merge(office_authenticated)
         .merge(shell_authenticated)
-        .merge(assistant_authenticated);
+        .merge(assistant_authenticated)
+        .merge(session_message_authenticated);
 
     // Conditionally merge WeChat login SSE route (feature-gated)
     #[cfg(feature = "weixin")]
@@ -389,6 +410,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     }
     .merge(ws_routes)
     .merge(runtime_team_tools)
+    .merge(session_message_runtime)
     .merge(office_proxy)
     .merge(public_assets)
     .layer(middleware::from_fn(security_headers_middleware));

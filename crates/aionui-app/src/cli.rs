@@ -115,8 +115,15 @@ pub(crate) enum Command {
     Diagnose(DiagnoseArgs),
     /// Agent-facing Team collaboration CLI fallback.
     Team(TeamArgs),
+    /// Cross-session messaging: list deliverable conversations and deliver a
+    /// message to one of them.
+    Session(SessionArgs),
+    /// Agent-facing read-only runtime CLI for THIS conversation's skills.
+    /// Channel A of skill delivery: a normal tool call instead of the
+    /// `[LOAD_SKILL]` text-protocol round trip.
+    Skills(SkillsArgs),
     /// PreToolUse permission gate for the Antigravity CLI (spawned by agy).
-    /// Reads the tool request on stdin, asks the running AionUi backend, and
+    /// Reads the tool request on stdin, asks the running WorkMate backend, and
     /// writes agy's decision to stdout.
     AntigravityHook,
     /// Stdio ↔ TCP bridge for the team MCP server (spawned by the ACP agent CLI).
@@ -131,6 +138,20 @@ pub(crate) enum Command {
     Doctor,
     /// Prepare current-platform managed runtime resources under a bundle output root.
     PrepareManagedResources(PrepareManagedResourcesArgs),
+    /// Manage local user accounts. Short-lived: opens the data-dir database
+    /// directly and exits without starting the server. Bootstrap path for
+    /// self-hosted deployments where the HTTP set-password endpoints are
+    /// unreachable without `--local` (which disables auth entirely).
+    User(UserArgs),
+    /// Inspect and provision the storage-encryption secret — the root key that
+    /// encrypts at-rest credentials (provider API keys, remote-agent tokens,
+    /// channel config). Short-lived like `user`: opens the data-dir database
+    /// directly and exits. Lets a self-hosted node persist its encryption
+    /// secret so it survives a restart, instead of relying on an
+    /// `AIONUI_ENCRYPTION_SECRET` env var that is used but never stored. This
+    /// is independent of the JWT *signing* secret, which change-password may
+    /// rotate freely without affecting decryption.
+    Secret(SecretArgs),
 }
 
 impl Command {
@@ -140,11 +161,15 @@ impl Command {
             Self::Config(_) => "config",
             Self::Diagnose(_) => "diagnose",
             Self::Team(_) => "team",
+            Self::Session(_) => "session",
+            Self::Skills(_) => "skills",
             Self::AntigravityHook => "antigravity-hook",
             Self::McpBridge => "mcp-bridge",
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::Doctor => "doctor",
             Self::PrepareManagedResources(_) => "prepare-managed-resources",
+            Self::User(_) => "user",
+            Self::Secret(_) => "secret",
         }
     }
 
@@ -200,6 +225,59 @@ pub(crate) enum TeamTaskCommand {
     Create,
     Update,
     List,
+    #[command(external_subcommand)]
+    Unknown(Vec<OsString>),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SessionArgs {
+    #[command(subcommand)]
+    pub command: SessionCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum SessionCommand {
+    Capabilities,
+    List,
+    SendMessage,
+    #[command(external_subcommand)]
+    Unknown(Vec<OsString>),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SkillsArgs {
+    #[command(subcommand)]
+    pub command: SkillsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum SkillsCommand {
+    /// Print the agent-readable skills CLI capability contract.
+    Capabilities,
+    /// List the skills enabled in THIS conversation.
+    List,
+    // The stdin contract is spelled out in the help text below because omitting it
+    // has a measured cost: live agents that tried `skills show <name>` and then
+    // reached for `--help` found nothing about stdin, and spent three to five
+    // failed tool calls guessing. Help text stays purely instructional -- this
+    // rationale is for maintainers, so it does not belong on the page an agent
+    // reads.
+    /// Print a skill's full body plus its absolute directory.
+    ///
+    /// Takes no positional arguments. The skill name is read from stdin as a JSON
+    /// object:
+    ///
+    /// {n}  printf '%s' '{"name":"mermaid"}' | aioncore skills show
+    #[command(verbatim_doc_comment)]
+    Show,
+    /// Read one of a skill's supplementary files.
+    ///
+    /// Takes no positional arguments. The path is read from stdin as a JSON
+    /// object, and must be `<skill-name>/<relative-path>`:
+    ///
+    /// {n}  printf '%s' '{"path":"mermaid/references/syntax.md"}' | aioncore skills cat
+    #[command(verbatim_doc_comment)]
+    Cat,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
 }
@@ -612,6 +690,127 @@ pub(crate) struct PrepareManagedResourcesArgs {
     pub bundle_out: PathBuf,
 }
 
+#[derive(Args, Debug, Clone)]
+pub(crate) struct UserArgs {
+    #[command(subcommand)]
+    pub command: UserCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum UserCommand {
+    /// Set (or create) a local user's login password. With no `--username`,
+    /// targets the built-in `system_default_user` (login name `admin`) — the
+    /// bootstrap path for a fresh deployment. Does not revoke existing
+    /// sessions; restart the server after a hot password change.
+    SetPassword(SetPasswordArgs),
+    /// Create a NEW local user with a login password. `--username` is required
+    /// and must not already exist — a conflict (including the built-in `admin`
+    /// seed) fails with `CLI_USER_ALREADY_EXISTS` and never overwrites the
+    /// existing account. Use `set-password` to change an existing user's password.
+    Create(CreateUserArgs),
+    /// List all users with non-sensitive fields (id, type, username, status,
+    /// timestamps). Never prints password hashes, JWT secrets, or
+    /// encryption secrets.
+    List,
+    /// Disable a local user account: blocks future logins and revokes any live
+    /// sessions (bumps the account's session generation). Reversible with
+    /// `user enable`. `--username` is required — there is no default target, so
+    /// the built-in admin cannot be disabled by accident. Only local password
+    /// accounts can be disabled; external identity-provider users are managed
+    /// upstream.
+    Disable(UserStatusArgs),
+    /// Re-enable a previously disabled local user account, restoring login.
+    /// `--username` is required. Does not create sessions or reset the password.
+    Enable(UserStatusArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct UserStatusArgs {
+    /// Target username (required). Must name an existing local password
+    /// account; unknown names fail with `CLI_USER_NOT_FOUND`.
+    #[arg(long)]
+    pub username: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SetPasswordArgs {
+    /// Target username. Omit to set the password of the built-in
+    /// `system_default_user` (login name `admin`).
+    #[arg(long)]
+    pub username: Option<String>,
+
+    /// Read the new password from stdin (one line) instead of prompting
+    /// interactively. Use for scripted/containerized bootstrap:
+    /// `echo "$PW" | aioncore user set-password --password-stdin`.
+    #[arg(long)]
+    pub password_stdin: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct CreateUserArgs {
+    /// Username for the new account (required). Must not already exist as a
+    /// local user — the built-in `admin` seed counts — or the command fails
+    /// with `CLI_USER_ALREADY_EXISTS`.
+    #[arg(long)]
+    pub username: String,
+
+    /// Read the new password from stdin (one line) instead of prompting
+    /// interactively. Use for scripted/containerized bootstrap:
+    /// `echo "$PW" | aioncore user create --username alice --password-stdin`.
+    #[arg(long)]
+    pub password_stdin: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SecretArgs {
+    #[command(subcommand)]
+    pub command: SecretCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum SecretCommand {
+    /// Report where the storage-encryption secret comes from (environment vs
+    /// database), whether it is persisted, and warn about an env/database
+    /// mismatch. Prints only presence and non-reversible fingerprints — never
+    /// the secret itself.
+    Status,
+    /// Generate a random secret and persist it to the database. Refuses to
+    /// clobber an already-effective secret unless `--force`, since a new
+    /// secret changes the derived encryption key and orphans stored
+    /// credentials. Use on a fresh install.
+    Generate(GenerateArgs),
+    /// Persist an operator-supplied secret to the database. The value is read
+    /// from stdin or an interactive no-echo prompt, never from argv. Refuses
+    /// to replace a different effective secret unless `--force`. Persisting
+    /// the value that is already effective (e.g. an env-only secret) is the
+    /// way to make it survive a restart.
+    Set(SetSecretArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct GenerateArgs {
+    /// Overwrite an existing effective secret. This changes the storage
+    /// encryption key and makes every already-stored credential undecryptable
+    /// — only use on a fresh install or when intentionally rotating.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SetSecretArgs {
+    /// Read the secret from stdin (one line) instead of prompting
+    /// interactively. Use for scripted bootstrap:
+    /// `echo "$AIONUI_ENCRYPTION_SECRET" | aioncore secret set --secret-stdin`.
+    #[arg(long)]
+    pub secret_stdin: bool,
+
+    /// Overwrite a different existing effective secret. This changes the
+    /// storage encryption key and makes every already-stored credential
+    /// undecryptable — omit unless you intend to rotate.
+    #[arg(long)]
+    pub force: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -619,7 +818,10 @@ mod tests {
     use clap::Parser;
     use clap::error::ErrorKind;
 
-    use super::{Cli, Command, ConfigArgs, ConfigCommand, ManagedResourcesModeArg, PrepareManagedResourcesArgs};
+    use super::{
+        Cli, Command, ConfigArgs, ConfigCommand, ManagedResourcesModeArg, PrepareManagedResourcesArgs, SecretArgs,
+        SecretCommand, SessionCommand, TeamCommand, UserArgs, UserCommand, UserStatusArgs,
+    };
 
     #[test]
     fn long_version_flag_uses_workspace_package_version() {
@@ -743,6 +945,18 @@ mod tests {
                 Command::PrepareManagedResources(prepare_args),
                 "prepare-managed-resources",
             ),
+            (
+                Command::User(UserArgs {
+                    command: UserCommand::List,
+                }),
+                "user",
+            ),
+            (
+                Command::Secret(SecretArgs {
+                    command: SecretCommand::Status,
+                }),
+                "secret",
+            ),
         ];
 
         for (command, expected) in cases {
@@ -830,6 +1044,85 @@ mod tests {
         }
     }
 
+    /// Resolves a `team ...` argv to its parsed subcommand, or `None` when clap
+    /// swallowed it into `TeamCommand::Unknown`.
+    ///
+    /// `Unknown` is an `external_subcommand`, so a missing subcommand still
+    /// parses successfully — asserting `is_ok()` alone proves nothing about
+    /// whether the command is actually wired.
+    fn parse_team_command(argv: &[&str]) -> Option<TeamCommand> {
+        let cli = Cli::try_parse_from(argv).ok()?;
+        let Some(Command::Team(args)) = cli.command else {
+            return None;
+        };
+        match args.command {
+            TeamCommand::Unknown(_) => None,
+            command => Some(command),
+        }
+    }
+
+    fn parse_session_command(argv: &[&str]) -> Option<SessionCommand> {
+        let cli = Cli::try_parse_from(argv).ok()?;
+        let Some(Command::Session(args)) = cli.command else {
+            return None;
+        };
+        match args.command {
+            SessionCommand::Unknown(_) => None,
+            command => Some(command),
+        }
+    }
+
+    /// Every tool in the session registry advertises a `cli_command`, and that
+    /// path is printed by `session capabilities` and copied into the
+    /// auto-inject skill. A registry entry with no wired subcommand sends
+    /// agents at a command that can only fail.
+    #[test]
+    fn every_registry_tool_has_a_wired_session_cli_subcommand() {
+        for tool in aionui_api_types::session_tool_descriptors() {
+            let mut argv = vec!["aioncore", "session"];
+            argv.extend(tool.cli_command.iter().map(String::as_str));
+            assert!(
+                parse_session_command(&argv).is_some(),
+                "`{}` is advertised by tool {} but is not wired into SessionCommand",
+                argv[1..].join(" "),
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn session_cli_accepts_capabilities() {
+        assert!(parse_session_command(&["aioncore", "session", "capabilities"]).is_some());
+    }
+
+    #[test]
+    fn unwired_session_subcommand_is_reported_as_unknown() {
+        assert!(
+            parse_session_command(&["aioncore", "session", "definitely-not-a-command"]).is_none(),
+            "the guard above only works if an unwired path resolves to Unknown"
+        );
+    }
+
+    /// Every tool in the shared Team registry advertises a `cli_command`, and
+    /// that path is printed by `team capabilities`, `team help`, and the CLI
+    /// transport prompt. A tool present in the registry but missing from
+    /// `TeamCommand` sends agents at a command that can only fail, so the
+    /// registry is the source of truth for this test rather than a hand-kept
+    /// list that drifts when a tool is added.
+    #[test]
+    fn every_registry_tool_has_a_wired_team_cli_subcommand() {
+        for tool in aionui_api_types::team_tool_descriptors() {
+            let mut argv = vec!["aioncore", "team"];
+            argv.extend(tool.cli_command.iter().map(String::as_str));
+            assert!(
+                parse_team_command(&argv).is_some(),
+                "`{}` is advertised by tool {} but is not wired into TeamCommand",
+                argv[1..].join(" "),
+                tool.name
+            );
+        }
+    }
+
     #[test]
     fn team_cli_accepts_agent_facing_command_paths() {
         let commands: &[&[&str]] = &[
@@ -861,5 +1154,211 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn user_set_password_parses_without_username() {
+        let cli = Cli::parse_from(["aioncore", "user", "set-password"]);
+        match cli.command {
+            Some(Command::User(UserArgs {
+                command: UserCommand::SetPassword(args),
+            })) => {
+                assert_eq!(args.username, None);
+                assert!(!args.password_stdin);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_set_password_parses_username_and_stdin() {
+        let cli = Cli::parse_from([
+            "aioncore",
+            "user",
+            "set-password",
+            "--username",
+            "alice",
+            "--password-stdin",
+        ]);
+        match cli.command {
+            Some(Command::User(UserArgs {
+                command: UserCommand::SetPassword(args),
+            })) => {
+                assert_eq!(args.username.as_deref(), Some("alice"));
+                assert!(args.password_stdin);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_list_parses() {
+        let cli = Cli::parse_from(["aioncore", "user", "list"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::User(UserArgs {
+                command: UserCommand::List,
+            }))
+        ));
+    }
+
+    #[test]
+    fn user_disable_parses_username() {
+        let cli = Cli::parse_from(["aioncore", "user", "disable", "--username", "alice"]);
+        match cli.command {
+            Some(Command::User(UserArgs {
+                command: UserCommand::Disable(UserStatusArgs { username }),
+            })) => assert_eq!(username, "alice"),
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_enable_parses_username() {
+        let cli = Cli::parse_from(["aioncore", "user", "enable", "--username", "bob"]);
+        match cli.command {
+            Some(Command::User(UserArgs {
+                command: UserCommand::Enable(UserStatusArgs { username }),
+            })) => assert_eq!(username, "bob"),
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_disable_requires_username() {
+        let err = match Cli::try_parse_from(["aioncore", "user", "disable"]) {
+            Ok(_) => panic!("user disable should require --username"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn user_create_parses_username_and_stdin() {
+        let cli = Cli::parse_from(["aioncore", "user", "create", "--username", "alice", "--password-stdin"]);
+        match cli.command {
+            Some(Command::User(UserArgs {
+                command: UserCommand::Create(args),
+            })) => {
+                assert_eq!(args.username, "alice");
+                assert!(args.password_stdin);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    // The required, non-Option `--username` is exactly what separates strict
+    // `create` from the upsert `set-password` (whose username is `Option`).
+    // Lock it: a later change to `Option<String>` that silently loosened
+    // strict-create semantics would turn this red.
+    #[test]
+    fn user_create_requires_username() {
+        let err = match Cli::try_parse_from(["aioncore", "user", "create"]) {
+            Ok(_) => panic!("user create should require --username"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn secret_status_parses() {
+        let cli = Cli::parse_from(["aioncore", "secret", "status"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Secret(SecretArgs {
+                command: SecretCommand::Status,
+            }))
+        ));
+    }
+
+    #[test]
+    fn secret_generate_parses_force() {
+        let cli = Cli::parse_from(["aioncore", "secret", "generate", "--force"]);
+        match cli.command {
+            Some(Command::Secret(SecretArgs {
+                command: SecretCommand::Generate(args),
+            })) => assert!(args.force),
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_generate_defaults_without_force() {
+        let cli = Cli::parse_from(["aioncore", "secret", "generate"]);
+        match cli.command {
+            Some(Command::Secret(SecretArgs {
+                command: SecretCommand::Generate(args),
+            })) => assert!(!args.force),
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_set_parses_stdin_and_force() {
+        let cli = Cli::parse_from(["aioncore", "secret", "set", "--secret-stdin", "--force"]);
+        match cli.command {
+            Some(Command::Secret(SecretArgs {
+                command: SecretCommand::Set(args),
+            })) => {
+                assert!(args.secret_stdin);
+                assert!(args.force);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    /// Every `aioncore skills …` command line the injected skills index teaches an
+    /// agent must actually parse.
+    ///
+    /// This pins two crates together. The index text lives in `aionui-ai-agent`
+    /// and the argument grammar lives here, so nothing structural stopped them
+    /// from disagreeing -- and they did: the index taught `skills show <name>`
+    /// while `Show` accepts no positional arguments at all. Unit tests on either
+    /// side stayed green (the text side only asserted the string mentioned
+    /// `$AIONUI_HELPER_BIN`), and the mismatch only surfaced against live agents,
+    /// which spent three to five failed tool calls each recovering from it.
+    #[test]
+    fn skills_cli_commands_in_the_index_are_parseable() {
+        let index = aionui_ai_agent::build_skills_index_text(&[aionui_ai_agent::SkillIndex {
+            name: "mermaid".to_owned(),
+            description: "Render Mermaid diagrams.".to_owned(),
+        }]);
+
+        // Pull out each taught invocation: the segment that starts at the helper
+        // binary placeholder and runs to the end of its backticked command.
+        let mut checked = 0usize;
+        for segment in index.split('`') {
+            let Some((_, after_bin)) = segment.split_once("\"$AIONUI_HELPER_BIN\"") else {
+                continue;
+            };
+            let argv: Vec<&str> = after_bin.split_whitespace().collect();
+            if argv.first() != Some(&"skills") {
+                continue;
+            }
+
+            let parsed = Cli::try_parse_from(std::iter::once("aioncore").chain(argv.iter().copied()));
+            assert!(
+                parsed.is_ok(),
+                "the skills index teaches `aioncore {}`, which the CLI rejects: {}",
+                argv.join(" "),
+                parsed.err().map(|e| e.to_string()).unwrap_or_default()
+            );
+            checked += 1;
+        }
+
+        assert!(
+            checked >= 3,
+            "expected the index to teach `skills show`, `skills cat` and `skills capabilities`; \
+             only {checked} parseable invocation(s) were found -- if the wording changed, update \
+             this extraction rather than dropping the guard"
+        );
+
+        // The failure mode this test exists for, stated directly: a positional
+        // argument after `show` or `cat` is not a wording preference, it is a
+        // command the binary refuses.
+        assert!(
+            Cli::try_parse_from(["aioncore", "skills", "show", "mermaid"]).is_err(),
+            "`skills show <name>` must stay a parse error, so the index can never teach it again"
+        );
     }
 }

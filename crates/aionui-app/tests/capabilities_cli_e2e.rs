@@ -55,4 +55,27 @@ async fn top_level_capabilities_prints_domain_index_without_runtime_env() {
     assert_eq!(diagnose["mode"], "read-only");
     assert_eq!(diagnose["contract_command"], "diagnose capabilities");
     assert_eq!(diagnose["invocation"], "aioncore diagnose capabilities");
+
+    let session = domains
+        .iter()
+        .find(|domain| domain["name"] == "session")
+        .expect("session domain should be advertised");
+    assert_eq!(session["mode"], "cross-session-messaging");
+    assert_eq!(session["contract_command"], "session capabilities");
+    assert_eq!(session["invocation"], "aioncore session capabilities");
+    // `session capabilities` is reachable with the feature switched off and
+    // without a runtime token, so the index must not claim otherwise.
+    assert_eq!(
+        session["runtime_free_commands"],
+        serde_json::json!(["session capabilities"])
+    );
+
+    let non_agent = stdout["data"]["non_agent_subcommands"]
+        .as_array()
+        .expect("non_agent_subcommands should be an array");
+    assert!(
+        non_agent.iter().any(|entry| entry["name"] == "antigravity-hook"),
+        "antigravity-hook is spawned by agy, not by agents — it must be declared \
+         as a non-agent subcommand rather than left out of the index: {non_agent:?}"
+    );
 }
