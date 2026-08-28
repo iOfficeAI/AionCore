@@ -43,9 +43,9 @@ impl From<ConversationError> for ApiError {
                 ApiError::coded(StatusCode::CONFLICT, "CROSS_ACCOUNT_REFERENCE", reason, None)
             }
             ConversationError::Busy { reason } => ApiError::Conflict(reason),
-            ConversationError::RuntimeRestarting { conversation_id } => ApiError::Conflict(
-                format!("conversation {conversation_id} runtime is restarting"),
-            ),
+            ConversationError::RuntimeRestarting { conversation_id } => {
+                ApiError::Conflict(format!("conversation {conversation_id} runtime is restarting"))
+            }
             ConversationError::Forbidden { reason } => ApiError::Forbidden(reason),
             ConversationError::NotFoundReason { reason } => ApiError::NotFound(reason),
             ConversationError::Unauthorized { reason } => ApiError::Unauthorized(reason),

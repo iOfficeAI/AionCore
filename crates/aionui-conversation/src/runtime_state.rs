@@ -359,7 +359,6 @@ impl ConversationRuntimeStateService {
         }
     }
 
-
     pub fn begin_restart(&self, conversation_id: &str) -> Result<(), ConversationError> {
         let mut state = self
             .state
