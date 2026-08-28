@@ -116,8 +116,8 @@ dependencies = [
 
 [[package]]
 name = "aion-agent"
-version = "0.2.21"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.21#45405a94b8d402de8e4e2613fc85794400491a9c"
+version = "0.2.22"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.22#42de86c60f031f441480df1be144f8f56e09011f"
 dependencies = [
  "aion-compact",
  "aion-config",
@@ -148,8 +148,8 @@ dependencies = [
 
 [[package]]
 name = "aion-compact"
-version = "0.2.21"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.21#45405a94b8d402de8e4e2613fc85794400491a9c"
+version = "0.2.22"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.22#42de86c60f031f441480df1be144f8f56e09011f"
 dependencies = [
  "regex",
  "serde",
@@ -160,8 +160,8 @@ dependencies = [
 
 [[package]]
 name = "aion-config"
-version = "0.2.21"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.21#45405a94b8d402de8e4e2613fc85794400491a9c"
+version = "0.2.22"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.22#42de86c60f031f441480df1be144f8f56e09011f"
 dependencies = [
  "aion-compact",
  "aion-process",
@@ -185,8 +185,8 @@ dependencies = [
 
 [[package]]
 name = "aion-mcp"
-version = "0.2.21"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.21#45405a94b8d402de8e4e2613fc85794400491a9c"
+version = "0.2.22"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.22#42de86c60f031f441480df1be144f8f56e09011f"
 dependencies = [
  "aion-config",
  "aion-protocol",
@@ -206,8 +206,8 @@ dependencies = [
 
 [[package]]
 name = "aion-memory"
-version = "0.2.21"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.21#45405a94b8d402de8e4e2613fc85794400491a9c"
+version = "0.2.22"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.22#42de86c60f031f441480df1be144f8f56e09011f"
 dependencies = [
  "aion-config",
  "chrono",
@@ -220,8 +220,8 @@ dependencies = [
 
 [[package]]
 name = "aion-process"
-version = "0.2.21"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.21#45405a94b8d402de8e4e2613fc85794400491a9c"
+version = "0.2.22"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.22#42de86c60f031f441480df1be144f8f56e09011f"
 dependencies = [
  "libc",
  "tokio",
@@ -232,8 +232,8 @@ dependencies = [
 
 [[package]]
 name = "aion-protocol"
-version = "0.2.21"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.21#45405a94b8d402de8e4e2613fc85794400491a9c"
+version = "0.2.22"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.22#42de86c60f031f441480df1be144f8f56e09011f"
 dependencies = [
  "aion-types",
  "serde",
@@ -245,8 +245,8 @@ dependencies = [
 
 [[package]]
 name = "aion-providers"
-version = "0.2.21"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.21#45405a94b8d402de8e4e2613fc85794400491a9c"
+version = "0.2.22"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.22#42de86c60f031f441480df1be144f8f56e09011f"
 dependencies = [
  "aion-config",
  "aion-types",
@@ -275,8 +275,8 @@ dependencies = [
 
 [[package]]
 name = "aion-skills"
-version = "0.2.21"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.21#45405a94b8d402de8e4e2613fc85794400491a9c"
+version = "0.2.22"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.22#42de86c60f031f441480df1be144f8f56e09011f"
 dependencies = [
  "aion-config",
  "aion-mcp",
@@ -302,8 +302,8 @@ dependencies = [
 
 [[package]]
 name = "aion-tools"
-version = "0.2.21"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.21#45405a94b8d402de8e4e2613fc85794400491a9c"
+version = "0.2.22"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.22#42de86c60f031f441480df1be144f8f56e09011f"
 dependencies = [
  "aion-config",
  "aion-process",
@@ -327,8 +327,8 @@ dependencies = [
 
 [[package]]
 name = "aion-types"
-version = "0.2.21"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.21#45405a94b8d402de8e4e2613fc85794400491a9c"
+version = "0.2.22"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.22#42de86c60f031f441480df1be144f8f56e09011f"
 dependencies = [
  "async-trait",
  "base64",
@@ -1158,7 +1158,7 @@ dependencies = [
  "objc2-foundation",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
  "x11rb",
 ]
 
@@ -2617,7 +2617,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2764,7 +2764,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3753,7 +3753,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3900,7 +3900,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8cfc352a66ba903c23239ef51e809508b6fc2b0f90e3476ac7a9ff47e863ae95"
 dependencies = [
  "scopeguard",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4189,7 +4189,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4797,7 +4797,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5225,7 +5225,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6019,7 +6019,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6871,7 +6871,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -7235,7 +7235,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "workspace-hack"
 version = "0.1.0"
-source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.21#45405a94b8d402de8e4e2613fc85794400491a9c"
+source = "git+https://github.com/suoak/aionrs.git?tag=v0.2.22#42de86c60f031f441480df1be144f8f56e09011f"
 dependencies = [
  "bitflags 2.13.1",
  "cc",
