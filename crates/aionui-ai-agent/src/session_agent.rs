@@ -1231,15 +1231,28 @@ impl IAgentTask for SessionAgentTask {
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.runtime.touch();
         // Partition attachments by the backend's declared prompt blocks:
-        // capable media becomes native Image/Audio blocks; everything else
-        // keeps the pre-multimodal form (path in the [[AION_FILES]] text +
-        // resource link). A read failure degrades that attachment back to a
-        // resource link — the path also remains in the original text because
+        // capable media becomes native Image/Audio blocks PAIRED with a
+        // ResourceLink to the same file; everything else keeps the
+        // pre-multimodal form (path in the [[AION_FILES]] text + resource
+        // link). The pair is how the disk path reaches an agent: a native
+        // image/audio block has no uri field, and partition already stripped
+        // that path out of the text. Adapters render a link as
+        // `[Attached file: <uri>]` (see `adapter/claude.rs` /
+        // `backend/codex_conn.rs`), which is how every non-media attachment
+        // already travels and how images travelled before the multimodal
+        // split. Without the pair, an agent that can both see and read files
+        // gets pixels it cannot open. The pair is gated on the backend
+        // advertising `resource`: an un-advertised block is rejected at
+        // dispatch and would kill the whole Send (`BlockSet::allows`).
+        //
+        // A read failure degrades that attachment back to a resource link
+        // alone — the path also remains in the original text because
         // partition already ran, which the adapters tolerate (they resolve
         // links independently of the text).
         let mut partition =
             crate::media::partition_media(&data.content, &data.files, &data.attachments, self.prompt_media_caps())
                 .await;
+        let link_media_paths = self.backend.capabilities().prompt_blocks.resource;
         let mut content: Vec<ContentBlock> = Vec::new();
         if !partition.content.is_empty() {
             content.push(ContentBlock::Text(partition.content));
@@ -1252,18 +1265,30 @@ impl IAgentTask for SessionAgentTask {
                 mime_type: None,
             });
         }
+        let mut media_links = 0usize;
         for attachment in &partition.media {
             match crate::media::read_media_bytes(attachment).await {
-                Some(bytes) => content.push(match attachment.kind {
-                    crate::media::MediaKind::Image => ContentBlock::Image {
-                        data: bytes,
-                        media_type: attachment.mime.clone(),
-                    },
-                    crate::media::MediaKind::Audio => ContentBlock::Audio {
-                        data: bytes,
-                        media_type: attachment.mime.clone(),
-                    },
-                }),
+                Some(bytes) => {
+                    content.push(match attachment.kind {
+                        crate::media::MediaKind::Image => ContentBlock::Image {
+                            data: bytes,
+                            media_type: attachment.mime.clone(),
+                        },
+                        crate::media::MediaKind::Audio => ContentBlock::Audio {
+                            data: bytes,
+                            media_type: attachment.mime.clone(),
+                        },
+                    });
+                    // Pair the bytes with the path (see the fn doc): the block
+                    // itself has no uri field and the text no longer lists it.
+                    if link_media_paths {
+                        content.push(ContentBlock::ResourceLink {
+                            uri: attachment.path.clone(),
+                            mime_type: Some(attachment.mime.clone()),
+                        });
+                        media_links += 1;
+                    }
+                }
                 None => {
                     if let Some(delivery) = partition.deliveries.get_mut(attachment.attachment_index) {
                         delivery.delivery = aionui_api_types::PromptAttachmentDelivery::PathFallback;
@@ -1288,6 +1313,7 @@ impl IAgentTask for SessionAgentTask {
                 msg_id = %data.msg_id,
                 images,
                 audios,
+                media_links,
                 "session prompt carries native media content blocks"
             );
         }
@@ -7111,8 +7137,8 @@ mod pump_tests {
     }
 
     // Image-capable backend: an image attachment leaves the [[AION_FILES]]
-    // text and rides as a native Image block; non-media files keep the
-    // path-text + resource-link form.
+    // text and rides as a native Image block PAIRED with a link to the same
+    // file; non-media files keep the path-text + resource-link form.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_message_partitions_image_into_native_block() {
         let dir = std::env::temp_dir().join("aionui-session-media-tests");
@@ -7166,7 +7192,11 @@ mod pump_tests {
         let Some(Command::Send { content, .. }) = commands.iter().find(|c| matches!(c, Command::Send { .. })) else {
             panic!("expected a Send command");
         };
-        assert_eq!(content.len(), 3, "text + pdf link + image block: {content:?}");
+        assert_eq!(
+            content.len(),
+            4,
+            "text + pdf link + image block + the image's own link: {content:?}"
+        );
         let ContentBlock::Text(text) = &content[0] else {
             panic!("expected text first: {content:?}");
         };
@@ -7180,6 +7210,144 @@ mod pump_tests {
         };
         assert_eq!(data, &image_bytes);
         assert_eq!(media_type, "image/png");
+        let ContentBlock::ResourceLink { uri, mime_type } = &content[3] else {
+            panic!("expected the image's paired resource link fourth: {content:?}");
+        };
+        assert_eq!(uri, &img);
+        assert_eq!(mime_type.as_deref(), Some("image/png"));
+    }
+
+    // Regression guard: a natively-delivered image must ALSO carry its disk
+    // path. Without the paired link the agent sees pixels but has no path for
+    // its Read tool — it can look at the image but not open the file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_message_pairs_image_block_with_resource_link() {
+        let dir = std::env::temp_dir().join("aionui-session-media-link-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("qr.png");
+        let mut image_bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut image_bytes, image::ImageFormat::Png)
+            .unwrap();
+        let image_bytes = image_bytes.into_inner();
+        std::fs::write(&img, &image_bytes).unwrap();
+        let img = img.to_string_lossy().into_owned();
+
+        let backend = Arc::new(RecordingBackend {
+            commands: std::sync::Mutex::new(Vec::new()),
+            blocks: aionui_session::BlockSet {
+                text: true,
+                image: true,
+                audio: false,
+                resource: true,
+                at_mention: false,
+            },
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-link".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend.clone() as Arc<dyn SessionBackend>,
+            None,
+        );
+        let marker = aionui_common::constants::AIONUI_FILES_MARKER;
+        crate::agent_task::IAgentTask::send_message(
+            task.as_ref(),
+            SendMessageData {
+                content: format!("replace the qr code\n\n{marker}\n{img}"),
+                msg_id: "m-link".into(),
+                turn_id: None,
+                files: vec![img.clone()],
+                attachments: Vec::new(),
+                inject_skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let commands = backend.commands.lock().unwrap();
+        let Some(Command::Send { content, .. }) = commands.iter().find(|c| matches!(c, Command::Send { .. })) else {
+            panic!("expected a Send command");
+        };
+        assert!(
+            content.iter().any(|b| matches!(b, ContentBlock::Image { .. })),
+            "image block missing: {content:?}"
+        );
+        let linked: Vec<&str> = content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ResourceLink { uri, .. } => Some(uri.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            linked,
+            vec![img.as_str()],
+            "the image's path must ride along as a resource link: {content:?}"
+        );
+    }
+
+    // Capability gate: a backend that takes images but NOT resource links must not
+    // receive the paired link — `BlockSet::allows` rejects an un-advertised block
+    // and that rejection kills the WHOLE Send.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_message_omits_media_link_when_resource_block_unsupported() {
+        let dir = std::env::temp_dir().join("aionui-session-media-link-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("no-link.png");
+        let mut image_bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut image_bytes, image::ImageFormat::Png)
+            .unwrap();
+        let image_bytes = image_bytes.into_inner();
+        std::fs::write(&img, &image_bytes).unwrap();
+        let img = img.to_string_lossy().into_owned();
+
+        let backend = Arc::new(RecordingBackend {
+            commands: std::sync::Mutex::new(Vec::new()),
+            blocks: aionui_session::BlockSet {
+                text: true,
+                image: true,
+                audio: false,
+                resource: false,
+                at_mention: false,
+            },
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-nolink".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend.clone() as Arc<dyn SessionBackend>,
+            None,
+        );
+        crate::agent_task::IAgentTask::send_message(
+            task.as_ref(),
+            SendMessageData {
+                content: "look".into(),
+                msg_id: "m-nolink".into(),
+                turn_id: None,
+                files: vec![img.clone()],
+                attachments: Vec::new(),
+                inject_skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let commands = backend.commands.lock().unwrap();
+        let Some(Command::Send { content, .. }) = commands.iter().find(|c| matches!(c, Command::Send { .. })) else {
+            panic!("expected a Send command");
+        };
+        assert!(
+            content.iter().any(|b| matches!(b, ContentBlock::Image { .. })),
+            "image block missing: {content:?}"
+        );
+        assert!(
+            !content.iter().any(|b| matches!(b, ContentBlock::ResourceLink { .. })),
+            "must not emit a resource link to a backend that does not advertise it: {content:?}"
+        );
     }
 
     /// A codex detached exec (`source: unifiedExecStartup`) is still RUNNING when
