@@ -66,6 +66,7 @@ pub enum TeamToolTransport {
 #[serde(rename_all = "snake_case")]
 pub enum TeamToolName {
     TeamMembers,
+    TeamReadMessages,
     TeamSendMessage,
     TeamTaskCreate,
     TeamTaskUpdate,
@@ -81,6 +82,7 @@ impl TeamToolName {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::TeamMembers => "team_members",
+            Self::TeamReadMessages => "team_read_messages",
             Self::TeamSendMessage => "team_send_message",
             Self::TeamTaskCreate => "team_task_create",
             Self::TeamTaskUpdate => "team_task_update",
@@ -96,6 +98,7 @@ impl TeamToolName {
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "team_members" => Self::TeamMembers,
+            "team_read_messages" => Self::TeamReadMessages,
             "team_send_message" => Self::TeamSendMessage,
             "team_task_create" => Self::TeamTaskCreate,
             "team_task_update" => Self::TeamTaskUpdate,
@@ -320,6 +323,19 @@ fn tool_specs() -> Vec<TeamToolSpec> {
             input_summary: "{}",
         },
         TeamToolSpec {
+            name: TeamToolName::TeamReadMessages,
+            permission: TeamToolPermission::AnyTeamAgent,
+            description: "Peek at your own unread team mailbox messages without marking them read. Returns at most the most recent 50 messages in FIFO order; long content is truncated.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {}
+            }),
+            cli_command: &["read-messages"],
+            when: "Check queued messages",
+            input_summary: "{}",
+        },
+        TeamToolSpec {
             name: TeamToolName::TeamSendMessage,
             permission: TeamToolPermission::AnyTeamAgent,
             description: "Send a message to a teammate or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files.",
@@ -516,7 +532,7 @@ mod tests {
     #[test]
     fn descriptor_count_and_names_are_unique() {
         let descriptors = team_tool_descriptors();
-        assert_eq!(descriptors.len(), 10);
+        assert_eq!(descriptors.len(), 11);
         let names = descriptors
             .iter()
             .map(|descriptor| descriptor.name.as_str())
@@ -540,6 +556,7 @@ mod tests {
     fn cli_command_mapping_matches_spec() {
         let cases = [
             ("team_members", vec!["members"]),
+            ("team_read_messages", vec!["read-messages"]),
             ("team_send_message", vec!["send-message"]),
             ("team_task_create", vec!["task", "create"]),
             ("team_task_update", vec!["task", "update"]),
@@ -566,6 +583,7 @@ mod tests {
         assert!(!names.contains(&"team_spawn_agent".to_owned()));
         assert!(!names.contains(&"team_rename_agent".to_owned()));
         assert!(!names.contains(&"team_shutdown_agent".to_owned()));
+        assert!(names.contains(&"team_read_messages".to_owned()));
         assert!(names.contains(&"team_send_message".to_owned()));
     }
 

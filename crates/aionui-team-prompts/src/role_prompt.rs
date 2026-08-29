@@ -29,6 +29,8 @@ that, call `team_members` before delegating work, adding or removing teammates,
 or referring to teammates. Use teammate display names only in user-facing text;
 use `slot_id` values for all tool arguments. Use `team_task_list` when you need
 current task state.
+Before assigning or replying to teammates, and before key decisions in a long task,
+call `team_read_messages` to check for queued messages so you do not act on stale information.
 
 ## Workflow
 1. Receive user request
@@ -242,6 +244,8 @@ Display names are only for user-facing text. For tool arguments such as
 `team_send_message.to`, `team_rename_agent.slot_id`, and
 `team_shutdown_agent.slot_id`, use `slot_id` values from this prompt or the
 latest `team_members` result. Never pass display names as agent targets.
+Before replying to teammates, and before key decisions in a long task, call
+`team_read_messages` to check for queued messages so you do not act on stale information.
 
 ## How to Work
 1. Read your unread messages to understand your assignment
@@ -355,6 +359,7 @@ mod tests {
         assert!(prompt.to_lowercase().contains("first team turn"));
         assert!(prompt.contains("team_members"));
         assert!(prompt.contains("team_list_assistants"));
+        assert!(prompt.contains("call `team_read_messages` to check for queued messages"));
         assert!(!prompt.contains("${"));
     }
 
@@ -382,6 +387,7 @@ mod tests {
         assert!(prompt.contains("Leader: Lead (slot_id: lead-1)"));
         assert!(prompt.contains("Display names are only for user-facing text"));
         assert!(prompt.contains("Never pass display names as agent targets"));
+        assert!(prompt.contains("`team_read_messages` to check for queued messages"));
         assert!(prompt.contains("STOP GENERATING"));
         assert!(!prompt.contains("Teammates: Worker"));
     }

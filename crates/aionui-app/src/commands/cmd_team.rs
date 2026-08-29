@@ -45,6 +45,7 @@ async fn run_team_inner(args: TeamArgs) -> Result<(), ExitCode> {
             print_response(response).await
         }
         TeamCommand::Members => call_tool(vec!["members"]).await,
+        TeamCommand::ReadMessages => call_tool(vec!["read-messages"]).await,
         TeamCommand::SendMessage => call_tool(vec!["send-message"]).await,
         TeamCommand::Task(task) => match task.command {
             TeamTaskCommand::Create => call_tool(vec!["task", "create"]).await,
