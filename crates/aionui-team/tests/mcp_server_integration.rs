@@ -1252,6 +1252,96 @@ async fn tsa4_non_lead_cannot_shutdown() {
 }
 
 // ---------------------------------------------------------------------------
+// Tests: team_interrupt_agent argument contract on the real wire
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn interrupt_agent_is_hidden_from_and_refused_to_a_teammate() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
+
+    let names = list_tools(&mut stream, 2).await;
+    assert!(
+        !names.contains(&"team_interrupt_agent".to_owned()),
+        "a lead-only tool must not be advertised to a teammate"
+    );
+
+    let resp = call_tool(
+        &mut stream,
+        3,
+        "team_interrupt_agent",
+        json!({"slot_id": "lead-1", "message": "stop"}),
+    )
+    .await;
+    assert!(is_error_response(&resp));
+    let text = extract_text(&resp);
+    assert!(
+        text.contains("Only Lead"),
+        "a teammate calling it directly must be refused, got {text:?}"
+    );
+
+    env.server.stop();
+}
+
+/// Validation runs before the service lookup, so these are observable in this
+/// standalone env (no live `TeamSessionService`, same as
+/// `sp1_lead_spawn_requires_live_session_service`).
+#[tokio::test]
+async fn interrupt_agent_rejects_wildcard_empty_message_and_unknown_arguments() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+
+    let cases: &[(u64, Value, &str)] = &[
+        (
+            2,
+            json!({"slot_id": "*", "message": "stop"}),
+            "wildcard is not supported",
+        ),
+        (3, json!({"slot_id": "worker-1", "message": "   "}), "must not be empty"),
+        (
+            4,
+            json!({"slot_id": "worker-1", "message": "stop", "queued_policy": "discard"}),
+            "Invalid params:",
+        ),
+        (5, json!({"slot_id": "worker-1"}), "Invalid params:"),
+    ];
+
+    for (id, args, expected) in cases {
+        let resp = call_tool(&mut stream, *id, "team_interrupt_agent", args.clone()).await;
+        assert!(is_error_response(&resp), "{args} should be rejected");
+        let text = extract_text(&resp);
+        assert!(
+            text.contains(expected),
+            "{args} should mention {expected:?}, got {text:?}"
+        );
+    }
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn interrupt_agent_rejects_an_unknown_target_before_touching_the_service() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+
+    let resp = call_tool(
+        &mut stream,
+        2,
+        "team_interrupt_agent",
+        json!({"slot_id": "ghost-9", "message": "stop"}),
+    )
+    .await;
+    assert!(is_error_response(&resp));
+    let text = extract_text(&resp);
+    assert!(
+        text.contains("Invalid agent target"),
+        "an unresolvable slot_id must be named, got {text:?}"
+    );
+
+    env.server.stop();
+}
+
+// ---------------------------------------------------------------------------
 // Tests: Unknown method / non-initialize first request
 // ---------------------------------------------------------------------------
 

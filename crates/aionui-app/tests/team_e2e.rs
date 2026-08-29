@@ -519,6 +519,13 @@ async fn team_api_rejects_cross_user_access() {
         ),
         json_with_token(
             "POST",
+            &format!("/api/teams/{team_id}/agents/{slot_id}/interrupt"),
+            json!({ "message": "Nope" }),
+            &other_token,
+            &other_csrf,
+        ),
+        json_with_token(
+            "POST",
             &format!("/api/teams/{team_id}/agents/{slot_id}/context/reset"),
             json!({}),
             &other_token,
@@ -573,6 +580,101 @@ async fn pause_team_slot_endpoint_requires_owned_team_and_active_run() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_json(resp).await;
     assert!(body["success"].as_bool().is_some_and(|success| !success));
+}
+
+/// I5: the interrupt endpoint had no coverage at all. Bad paths only — the happy
+/// path needs a live agent turn and is covered by the `src/session.rs` lib tests.
+#[tokio::test]
+async fn interrupt_agent_endpoint_rejects_bad_requests() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let lead_slot_id = data["assistants"][0]["slot_id"].as_str().unwrap();
+    let worker_slot_id = data["assistants"][1]["slot_id"].as_str().unwrap();
+
+    // Unauthenticated: the bearer token is not accepted.
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/{worker_slot_id}/interrupt"),
+        json!({ "message": "stop" }),
+        "not-a-real-token",
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Missing required `message`.
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/{worker_slot_id}/interrupt"),
+        json!({ "reason": "no message field" }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["code"], "BAD_REQUEST",
+        "a missing required field is a body-shape rejection"
+    );
+
+    // Empty message.
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/{worker_slot_id}/interrupt"),
+        json!({ "message": "   " }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("must not be empty"),
+        "expected the empty-message validation error, got {error:?}"
+    );
+
+    // The lead cannot be interrupted.
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/{lead_slot_id}/interrupt"),
+        json!({ "message": "stop" }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("cannot interrupt the team lead"),
+        "expected the lead-target rejection, got {error:?}"
+    );
+
+    // Unknown slot.
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/ghost-9/interrupt"),
+        json!({ "message": "stop" }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Unknown team.
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/not-a-team/agents/{worker_slot_id}/interrupt"),
+        json!({ "message": "stop" }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

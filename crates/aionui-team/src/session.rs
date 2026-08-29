@@ -1563,6 +1563,269 @@ impl TeamSession {
         self.scheduler.rename_agent(slot_id, new_name).await
     }
 
+    fn start_pending_mcp_refresh(&self, slot_id: &str) -> bool {
+        let Some(fingerprint) = self.work_coordinator.claim_pending_mcp_refresh(slot_id) else {
+            return false;
+        };
+        let Some(service) = self.service.upgrade() else {
+            self.work_coordinator.release_mcp_refresh(slot_id, &fingerprint);
+            return false;
+        };
+        let Some(session) = service.capture_published_session(self) else {
+            self.work_coordinator.release_mcp_refresh(slot_id, &fingerprint);
+            return false;
+        };
+        let user_id = self.user_id.clone();
+        let team_id = self.team.id.clone();
+        let slot_id = slot_id.to_owned();
+        tokio::spawn(async move {
+            match service
+                .restart_agent_runtime_for_mcp_refresh(&user_id, &team_id, &slot_id)
+                .await
+            {
+                Ok(()) => session
+                    .work_coordinator
+                    .settle_mcp_refresh_claim(&slot_id, &fingerprint),
+                Err(error) => {
+                    session.work_coordinator.release_mcp_refresh(&slot_id, &fingerprint);
+                    warn!(team_id, slot_id, error = %error, "deferred assistant MCP refresh failed");
+                }
+            }
+        });
+        true
+    }
+
+    pub async fn interrupt_agent_from_user(
+        &self,
+        to_slot_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+        reason: Option<String>,
+        queued_policy: TeamQueuedPolicy,
+    ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        self.interrupt_agent_message(None, to_slot_id, content, files, reason, queued_policy)
+            .await
+    }
+
+    pub(crate) async fn interrupt_agent_from_agent(
+        &self,
+        from_slot_id: &str,
+        to_slot_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+        reason: Option<String>,
+    ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        let caller = self.scheduler.get_agent(from_slot_id).await?;
+        if caller.role != TeammateRole::Lead {
+            return Err(TeamError::LeaderOnly("team_interrupt_agent".into()));
+        }
+        self.interrupt_agent_message(
+            Some(from_slot_id),
+            to_slot_id,
+            content,
+            files,
+            reason,
+            TeamQueuedPolicy::Retain,
+        )
+        .await
+    }
+
+    async fn interrupt_agent_message(
+        &self,
+        from_slot_id: Option<&str>,
+        to_slot_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+        reason: Option<String>,
+        queued_policy: TeamQueuedPolicy,
+    ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        if content.trim().is_empty() {
+            return Err(TeamError::InvalidRequest("interrupt message must not be empty".into()));
+        }
+        if to_slot_id == "*" {
+            return Err(TeamError::InvalidRequest(
+                "team_interrupt_agent does not support wildcard targets".into(),
+            ));
+        }
+        let target_agent = self.scheduler.get_agent(to_slot_id).await?;
+        if target_agent.role == TeammateRole::Lead {
+            return Err(TeamError::InvalidRequest("cannot interrupt the team lead".into()));
+        }
+        self.ensure_member_runtime_lazy(to_slot_id, from_slot_id.is_some())
+            .await?;
+        self.publish_runtime_constraint(to_slot_id).await?;
+        let active_before = self
+            .work_coordinator
+            .slot_snapshot(to_slot_id)
+            .and_then(|snapshot| snapshot.active_batch.map(|batch| (batch, snapshot.active_turn_id)));
+        let lease = self.work_coordinator.acquire_enqueue(EnqueueRequest {
+            slot_id: to_slot_id.to_owned(),
+            role: target_role_for(target_agent.role),
+            source: WorkSource::LeadIntervention,
+            binding: from_slot_id.map_or(CausalBinding::UserVisible, |caller_slot_id| {
+                CausalBinding::InheritRunningBatch {
+                    caller_slot_id: caller_slot_id.to_owned(),
+                }
+            }),
+        })?;
+        let sender = from_slot_id.unwrap_or("user");
+        let mailbox_message = match self
+            .mailbox
+            .write_with_files(
+                &self.team.id,
+                to_slot_id,
+                sender,
+                MailboxMessageType::Message,
+                content,
+                None,
+                files.as_deref(),
+            )
+            .await
+        {
+            Ok(message) => message,
+            Err(error) => {
+                self.work_coordinator.abort_enqueue(&lease, "mailbox_write_failed");
+                return Err(error);
+            }
+        };
+
+        let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
+        let projection_request = if let Some(from_slot_id) = from_slot_id {
+            let from_agent = self.scheduler.get_agent(from_slot_id).await?;
+            TeamProjectionRequest {
+                user_id: self.user_id.clone(),
+                team_id: self.team.id.clone(),
+                slot_id: to_slot_id.to_owned(),
+                conversation_id: target_agent.conversation_id.clone(),
+                source: TeamProjectionSource::Teammate {
+                    from_slot_id: from_slot_id.to_owned(),
+                    from_name: from_agent.name,
+                    sender_backend: Some(from_agent.backend),
+                    sender_conversation_id: Some(from_agent.conversation_id),
+                },
+                content: content.to_owned(),
+                files: files.clone().unwrap_or_default(),
+                visibility: crate::visibility::TeamVisibilityPolicy::teammate_message(),
+                dedupe_key: Some(teammate_dedupe_key(
+                    &self.team.id,
+                    &mailbox_message.id,
+                    &target_agent.conversation_id,
+                )),
+            }
+        } else {
+            TeamProjectionRequest::user_visible(
+                &self.user_id,
+                &self.team.id,
+                to_slot_id,
+                &target_agent.conversation_id,
+                content,
+                files.clone().unwrap_or_default(),
+            )
+        };
+        if let Err(error) = projection.project(projection_request).await {
+            warn!(
+                team_id = %self.team.id,
+                slot_id = to_slot_id,
+                error = %error,
+                "failed to project lead intervention (non-fatal)"
+            );
+        }
+
+        let commit = self
+            .commit_persisted_enqueue(&lease, mailbox_message.id.clone())
+            .await?;
+
+        let (outcome, interrupted_turn_id) = if let Some((batch, turn_id)) = active_before {
+            let still_active = self.work_coordinator.is_active_batch(&batch, turn_id.as_deref());
+            let cancellation_result = if still_active {
+                if let Some(turn_id) = &turn_id {
+                    self.cancellation_port
+                        .cancel_agent_turn(&self.user_id, &target_agent.conversation_id, turn_id)
+                        .await
+                } else {
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            };
+            if let Err(error) = cancellation_result
+                && self.work_coordinator.is_active_batch(&batch, turn_id.as_deref())
+            {
+                return Err(TeamError::InvalidRequest(error.to_string()));
+            }
+            let interrupted = still_active.then(|| {
+                self.work_coordinator
+                    .interrupt_batch(&batch, reason.clone(), mailbox_message.id.clone())
+            });
+            if interrupted
+                .as_ref()
+                .is_some_and(|value| value.commit_result == CommitResult::Committed)
+            {
+                let interrupted = interrupted.expect("committed interrupt result exists");
+                if !interrupted.terminal_message_ids.is_empty() {
+                    self.mailbox
+                        .mark_read_batch(&self.team.id, &interrupted.terminal_message_ids)
+                        .await?;
+                }
+                if let Some(turn_id) = &turn_id {
+                    let metadata = self.work_coordinator.take_interrupt_metadata(&batch.batch_id);
+                    for team_run_id in &batch.team_run_ids {
+                        self.team_event_emitter().broadcast_child_turn(
+                            TEAM_CHILD_TURN_CANCELLED_EVENT,
+                            TeamChildTurnPayload {
+                                team_id: self.team.id.clone(),
+                                team_run_id: team_run_id.clone(),
+                                slot_id: to_slot_id.to_owned(),
+                                role: target_role_for(target_agent.role),
+                                conversation_id: target_agent.conversation_id.clone(),
+                                turn_id: turn_id.clone(),
+                                status: TeamRunStatus::Cancelled,
+                                reason: metadata.as_ref().and_then(|value| value.reason.clone()),
+                                replacement_message_id: metadata
+                                    .as_ref()
+                                    .map(|value| value.replacement_message_id.clone()),
+                            },
+                        );
+                    }
+                }
+                (TeamInterruptOutcome::Interrupted, turn_id)
+            } else {
+                (TeamInterruptOutcome::CompletedRace, turn_id)
+            }
+        } else {
+            (TeamInterruptOutcome::QueuedNoActiveTurn, None)
+        };
+
+        // Discarding is irreversible (the rows are marked read), so it runs only
+        // after the interruption itself has settled. Doing it before the cancel
+        // meant a cancellation failure returned `Err` with the queued work
+        // already destroyed, leaving the caller nothing to retry.
+        if queued_policy == TeamQueuedPolicy::Discard {
+            let discarded = self
+                .work_coordinator
+                .discard_queued_except(to_slot_id, &mailbox_message.id);
+            if !discarded.is_empty() {
+                self.mailbox.mark_read_batch(&self.team.id, &discarded).await?;
+            }
+        }
+
+        self.event_loops.notify(to_slot_id);
+        let target = self.work_coordinator.slot_snapshot(to_slot_id).unwrap_or(commit.slot);
+        info!(
+            team_id = %self.team.id,
+            slot_id = to_slot_id,
+            replacement_message_id = %mailbox_message.id,
+            ?outcome,
+            "team agent interruption committed"
+        );
+        Ok(TeamInterruptAgentResponse {
+            outcome,
+            interrupted_turn_id,
+            message_id: mailbox_message.id,
+            target: TeamRunManager::slot_payload(&target),
+        })
+    }
+
     pub async fn update_agent_model(&self, slot_id: &str, model: &str) -> Result<(), TeamError> {
         self.scheduler.update_agent_model(slot_id, model).await
     }
@@ -2227,6 +2490,33 @@ mod tests {
                 turn_id: "turn-background".into(),
                 status: crate::ports::AgentTurnStatus::Completed,
                 runtime: None,
+            })
+        }
+    }
+
+    /// Reports that the batch was claimed *without* invoking `on_started`, so the
+    /// slot has an active batch but no turn_id, then fails the start once released.
+    /// Reproduces the one path where interrupt metadata had no owner.
+    struct StartFailsWithoutStartedCallback {
+        claimed_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release_rx: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ports::AgentTurnExecutionPort for StartFailsWithoutStartedCallback {
+        async fn run_agent_turn(
+            &self,
+            _request: crate::ports::AgentTurnRequest,
+        ) -> Result<crate::ports::AgentTurnOutcome, crate::ports::AgentTurnExecutionError> {
+            if let Some(tx) = self.claimed_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let release_rx = self.release_rx.lock().unwrap().take();
+            if let Some(rx) = release_rx {
+                let _ = rx.await;
+            }
+            Err(crate::ports::AgentTurnExecutionError::Failed {
+                reason: "forced start failure".into(),
             })
         }
     }
@@ -3480,6 +3770,332 @@ mod tests {
                 .any(|message| message.id == queued.message_id)
         );
         release_tx.send(()).unwrap();
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn interrupt_agent_marks_claimed_input_read_and_retains_older_queue() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let session = Arc::new(
+            TeamSession::start(
+                make_team(),
+                repo,
+                broadcaster,
+                backend_path(),
+                empty_task_manager(),
+                Arc::new(BlockingRunningTurnPort::new(started_tx, release_rx)),
+                noop_cancellation_port(),
+                noop_projection_store(),
+                "user-test".into(),
+                Weak::<TeamSessionService>::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        register_test_event_loop(&session, "worker-1");
+
+        let first = session
+            .send_message_to_agent("worker-1", "old claimed input", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .expect("worker turn should start")
+            .expect("start signal should be sent");
+        session
+            .send_message_to_agent("worker-1", "older queued input", None)
+            .await
+            .unwrap();
+
+        let response = session
+            .interrupt_agent_from_user(
+                "worker-1",
+                "replacement instruction",
+                None,
+                Some("requirements changed".into()),
+                TeamQueuedPolicy::Retain,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.outcome, TeamInterruptOutcome::Interrupted);
+        assert_eq!(response.interrupted_turn_id.as_deref(), Some("turn-background"));
+        let unread = session.mailbox.peek_unread("t1", "worker-1").await.unwrap();
+        assert!(!unread.iter().any(|message| message.id == first.message_id));
+        assert!(unread.iter().any(|message| message.content == "older queued input"));
+        assert!(
+            unread
+                .iter()
+                .any(|message| message.content == "replacement instruction")
+        );
+
+        release_tx.send(()).unwrap();
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancellation_failure_keeps_active_batch_and_durable_replacement() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let session = Arc::new(
+            TeamSession::start(
+                make_team(),
+                repo,
+                broadcaster,
+                backend_path(),
+                empty_task_manager(),
+                Arc::new(BlockingRunningTurnPort::new(started_tx, release_rx)),
+                Arc::new(FailingCancellationPort),
+                noop_projection_store(),
+                "user-test".into(),
+                Weak::<TeamSessionService>::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        register_test_event_loop(&session, "worker-1");
+        session
+            .send_message_to_agent("worker-1", "active input", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .expect("worker turn should start")
+            .expect("start signal should be sent");
+
+        let error = session
+            .interrupt_agent_from_user("worker-1", "durable replacement", None, None, TeamQueuedPolicy::Retain)
+            .await
+            .expect_err("cancellation failure must surface");
+        assert!(error.to_string().contains("forced cancellation failure"));
+        assert_eq!(
+            session
+                .work_coordinator
+                .slot_snapshot("worker-1")
+                .unwrap()
+                .active_turn_id
+                .as_deref(),
+            Some("turn-background")
+        );
+        assert!(
+            session
+                .mailbox
+                .peek_unread("t1", "worker-1")
+                .await
+                .unwrap()
+                .iter()
+                .any(|message| message.content == "durable replacement")
+        );
+
+        release_tx.send(()).unwrap();
+        session.stop();
+    }
+
+    /// I2: `TeamQueuedPolicy::Discard` had no coverage above the coordinator, even
+    /// though it irreversibly marks the superseded rows read.
+    #[tokio::test]
+    async fn interrupt_with_discard_policy_drops_queued_work_but_keeps_the_replacement() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let session = Arc::new(
+            TeamSession::start(
+                make_team(),
+                repo,
+                broadcaster,
+                backend_path(),
+                empty_task_manager(),
+                Arc::new(BlockingRunningTurnPort::new(started_tx, release_rx)),
+                noop_cancellation_port(),
+                noop_projection_store(),
+                "user-test".into(),
+                Weak::<TeamSessionService>::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        register_test_event_loop(&session, "worker-1");
+
+        session
+            .send_message_to_agent("worker-1", "claimed input", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .expect("worker turn should start")
+            .expect("start signal should be sent");
+        session
+            .send_message_to_agent("worker-1", "superseded input", None)
+            .await
+            .unwrap();
+
+        let response = session
+            .interrupt_agent_from_user(
+                "worker-1",
+                "replacement instruction",
+                None,
+                None,
+                TeamQueuedPolicy::Discard,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.outcome, TeamInterruptOutcome::Interrupted);
+
+        let unread = session.mailbox.peek_unread("t1", "worker-1").await.unwrap();
+        let contents = unread.iter().map(|m| m.content.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            contents,
+            vec!["replacement instruction"],
+            "discard leaves only the replacement unread"
+        );
+        assert!(
+            !contents.contains(&"superseded input"),
+            "the superseded row must be marked read"
+        );
+
+        release_tx.send(()).unwrap();
+        session.stop();
+    }
+
+    /// I3: discarding used to run before the cancellation attempt, so a failing
+    /// cancel returned `Err` with the queued work already destroyed and nothing
+    /// left to retry. The discard must not happen on that path.
+    #[tokio::test]
+    async fn interrupt_cancellation_failure_does_not_discard_queued_work() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let session = Arc::new(
+            TeamSession::start(
+                make_team(),
+                repo,
+                broadcaster,
+                backend_path(),
+                empty_task_manager(),
+                Arc::new(BlockingRunningTurnPort::new(started_tx, release_rx)),
+                Arc::new(FailingCancellationPort),
+                noop_projection_store(),
+                "user-test".into(),
+                Weak::<TeamSessionService>::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        register_test_event_loop(&session, "worker-1");
+
+        session
+            .send_message_to_agent("worker-1", "active input", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .expect("worker turn should start")
+            .expect("start signal should be sent");
+        session
+            .send_message_to_agent("worker-1", "queued input", None)
+            .await
+            .unwrap();
+
+        let error = session
+            .interrupt_agent_from_user("worker-1", "replacement", None, None, TeamQueuedPolicy::Discard)
+            .await
+            .expect_err("cancellation failure must surface");
+        assert!(error.to_string().contains("forced cancellation failure"));
+
+        let unread = session.mailbox.peek_unread("t1", "worker-1").await.unwrap();
+        let contents = unread.iter().map(|m| m.content.as_str()).collect::<Vec<_>>();
+        assert!(
+            contents.contains(&"queued input"),
+            "a failed interruption must not destroy queued work, got {contents:?}"
+        );
+        assert!(
+            contents.contains(&"replacement"),
+            "the replacement stays durable so the caller can retry, got {contents:?}"
+        );
+
+        release_tx.send(()).unwrap();
+        session.stop();
+    }
+
+    /// I4: interrupting a batch that was claimed but never reached `mark_started`
+    /// left its metadata in the coordinator forever — the interrupting caller skips
+    /// the take (no turn_id) and the late-start callback never runs because the
+    /// start itself fails.
+    #[tokio::test]
+    async fn interrupt_metadata_is_drained_when_the_interrupted_turn_never_starts() {
+        let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let session = Arc::new(
+            TeamSession::start(
+                make_team(),
+                repo,
+                broadcaster,
+                backend_path(),
+                empty_task_manager(),
+                Arc::new(StartFailsWithoutStartedCallback {
+                    claimed_tx: Mutex::new(Some(claimed_tx)),
+                    release_rx: Mutex::new(Some(release_rx)),
+                }),
+                noop_cancellation_port(),
+                noop_projection_store(),
+                "user-test".into(),
+                Weak::<TeamSessionService>::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        register_test_event_loop(&session, "worker-1");
+
+        session
+            .send_message_to_agent("worker-1", "claimed input", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), claimed_rx)
+            .await
+            .expect("worker batch should be claimed")
+            .expect("claim signal should be sent");
+        assert_eq!(
+            session
+                .work_coordinator
+                .slot_snapshot("worker-1")
+                .unwrap()
+                .active_turn_id,
+            None,
+            "the batch must be claimed without a turn_id for this path"
+        );
+
+        session
+            .interrupt_agent_from_user("worker-1", "replacement", None, None, TeamQueuedPolicy::Retain)
+            .await
+            .unwrap();
+        assert_eq!(
+            session.work_coordinator.interrupted_batch_count(),
+            1,
+            "the interrupt records metadata that nobody has claimed yet"
+        );
+
+        // Release the blocked start so it fails; the event loop must drain the metadata.
+        release_tx.send(()).unwrap();
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while session.work_coordinator.interrupted_batch_count() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "interrupt metadata leaked: {} entries still pending",
+            session.work_coordinator.interrupted_batch_count()
+        );
+
         session.stop();
     }
 

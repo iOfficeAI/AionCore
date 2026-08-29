@@ -298,6 +298,26 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
             return ExecuteResult::WaitForSignal;
         }
         Err(error) => {
+            if ctx.session.work_coordinator().is_batch_cancelled(&batch) {
+                // The turn never reached `mark_started`, so neither the interrupting
+                // caller (it had no turn_id) nor the late-start callback claimed this
+                // batch's interrupt metadata. Drain it here or it stays in the
+                // coordinator for the rest of the session. There is no turn_id to
+                // hang a child-turn event on, so the reason is logged instead.
+                if let Some(metadata) = ctx.session.work_coordinator().take_interrupt_metadata(&batch.batch_id) {
+                    info!(
+                        team_id = %ctx.team_id,
+                        slot_id = %ctx.slot_id,
+                        batch_id = %batch.batch_id,
+                        replacement_message_id = %metadata.replacement_message_id,
+                        has_reason = metadata.reason.is_some(),
+                        "interrupted team batch never started; interrupt metadata drained without a child-turn event"
+                    );
+                }
+                let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
+                finalize_scheduler_turn(ctx).await;
+                return ExecuteResult::ContinueDraining;
+            }
             warn!(
                 team_id = %ctx.team_id,
                 slot_id = %ctx.slot_id,

@@ -205,6 +205,7 @@ pub(crate) enum TeamCommand {
     Members,
     ReadMessages,
     SendMessage,
+    InterruptAgent,
     Task(TeamTaskArgs),
     ListAssistants,
     DescribeAssistant,
@@ -1127,28 +1128,28 @@ mod tests {
 
     #[test]
     fn team_cli_accepts_agent_facing_command_paths() {
+        // Registry-independent commands; the tool-backed paths are covered by
+        // `every_registry_tool_has_a_wired_team_cli_subcommand`.
         let commands: &[&[&str]] = &[
             &["aioncore", "team", "capabilities"],
             &["aioncore", "team", "help"],
             &["aioncore", "team", "context"],
-            &["aioncore", "team", "members"],
-            &["aioncore", "team", "read-messages"],
-            &["aioncore", "team", "send-message"],
-            &["aioncore", "team", "task", "create"],
-            &["aioncore", "team", "task", "update"],
-            &["aioncore", "team", "task", "list"],
-            &["aioncore", "team", "list-assistants"],
-            &["aioncore", "team", "describe-assistant"],
-            &["aioncore", "team", "spawn-agent"],
-            &["aioncore", "team", "rename-agent"],
-            &["aioncore", "team", "clear-agent-context"],
-            &["aioncore", "team", "shutdown-agent"],
         ];
 
         for command in commands {
-            let result = Cli::try_parse_from(*command);
-            assert!(result.is_ok(), "command should parse: {command:?}");
+            assert!(
+                parse_team_command(command).is_some(),
+                "command should parse to a wired subcommand: {command:?}"
+            );
         }
+    }
+
+    #[test]
+    fn unwired_team_subcommand_is_reported_as_unknown() {
+        assert!(
+            parse_team_command(&["aioncore", "team", "definitely-not-a-command"]).is_none(),
+            "the guard above only works if an unwired path resolves to Unknown"
+        );
     }
 
     #[test]
