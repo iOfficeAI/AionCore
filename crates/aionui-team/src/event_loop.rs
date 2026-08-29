@@ -19,7 +19,7 @@ use crate::scheduler::TeammateManager;
 use crate::session::{PrepareBatchResult, TeamSession, WakeInput};
 use crate::team_run::target_role_for;
 use crate::types::TeammateStatus;
-use crate::work_coordinator::{CommitResult, StartCommitResult, WorkBatch};
+use crate::work_coordinator::{BatchFailureResult, CommitResult, StartCommitResult, WorkBatch};
 use crate::work_source::WorkSource;
 
 pub struct EventLoopRegistry {
@@ -305,21 +305,22 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                 error = %error,
                 "agent turn start failed"
             );
-            mark_batch_messages_read(ctx, &batch).await;
-            ctx.session.work_coordinator().fail_batch(&batch, "turn_start_failed");
+            let failure = ctx.session.work_coordinator().fail_batch(&batch, "turn_start_failed");
+            finalize_failed_delivery(ctx, &batch, &failure).await;
             let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
             return ExecuteResult::ContinueDraining;
         }
     };
 
-    mark_batch_messages_read(ctx, &batch).await;
     let terminal_status = if outcome.status.is_success() {
+        mark_message_ids_read(ctx, &batch, &batch.mailbox_message_ids).await;
         (ctx.session.work_coordinator().complete_batch(&batch) == CommitResult::Committed)
             .then_some(TeamRunStatus::Completed)
     } else {
-        let committed = ctx.session.work_coordinator().fail_batch(&batch, "turn_failed");
+        let failure = ctx.session.work_coordinator().fail_batch(&batch, "turn_failed");
+        finalize_failed_delivery(ctx, &batch, &failure).await;
         let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
-        (committed == CommitResult::Committed).then_some(TeamRunStatus::Failed)
+        (failure.commit_result == CommitResult::Committed).then_some(TeamRunStatus::Failed)
     };
     if let Some(status) = terminal_status {
         let emitter = ctx.session.team_event_emitter();
@@ -366,15 +367,25 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
     ExecuteResult::ContinueDraining
 }
 
-async fn mark_batch_messages_read(ctx: &AgentLoopContext, batch: &WorkBatch) {
-    if batch.mailbox_message_ids.is_empty() {
+async fn finalize_failed_delivery(ctx: &AgentLoopContext, batch: &WorkBatch, failure: &BatchFailureResult) {
+    if failure.exhausted_message_ids.is_empty() {
         return;
     }
-    if let Err(error) = ctx
-        .mailbox
-        .mark_read_batch(&ctx.team_id, &batch.mailbox_message_ids)
-        .await
-    {
+    warn!(
+        team_id = %ctx.team_id,
+        slot_id = %ctx.slot_id,
+        batch_id = %batch.batch_id,
+        exhausted_message_count = failure.exhausted_message_ids.len(),
+        "team batch delivery retry limit reached; messages abandoned and slot paused"
+    );
+    mark_message_ids_read(ctx, batch, &failure.exhausted_message_ids).await;
+}
+
+async fn mark_message_ids_read(ctx: &AgentLoopContext, batch: &WorkBatch, message_ids: &[String]) {
+    if message_ids.is_empty() {
+        return;
+    }
+    if let Err(error) = ctx.mailbox.mark_read_batch(&ctx.team_id, message_ids).await {
         warn!(
             team_id = %ctx.team_id,
             slot_id = %ctx.slot_id,
