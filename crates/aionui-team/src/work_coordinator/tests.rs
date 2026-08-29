@@ -68,6 +68,33 @@ fn coordinator_with_recorder() -> (SlotWorkCoordinator, Arc<RecordingRunCausalit
     (coordinator, recorder)
 }
 
+#[test]
+fn runtime_restart_gate_rejects_queued_work_and_preserves_it() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "queued-1");
+
+    assert_eq!(
+        coordinator.begin_runtime_restart("lead-1"),
+        Err(RuntimeRestartRejection::Busy)
+    );
+    let snapshot = coordinator.slot_snapshot("lead-1").unwrap();
+    assert_eq!(snapshot.queued_foreground_count, 1);
+    assert_eq!(snapshot.state, SlotPhase::Queued);
+}
+
+#[test]
+fn aborted_runtime_restart_restores_the_previous_constraint() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+
+    let gate = coordinator.begin_runtime_restart("lead-1").unwrap();
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().state, SlotPhase::Starting);
+
+    coordinator.abort_runtime_restart("lead-1", &gate);
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().state, SlotPhase::Idle);
+}
+
 // Regression: run-less work (Background binding → no team_run_id, e.g. a leader
 // self-wake draining its mailbox for a membership-change notice) produces NO run
 // summaries, so the ONLY way the frontend learns the slot moved Running→Idle is a

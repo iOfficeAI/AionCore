@@ -43,6 +43,20 @@ pub enum TeamError {
         public_reason: String,
     },
 
+    #[error("Team member is busy: {slot_id}")]
+    MemberBusy {
+        team_id: String,
+        slot_id: String,
+        conversation_id: String,
+    },
+
+    #[error("Team member runtime is starting: {slot_id}")]
+    MemberRuntimeStarting {
+        team_id: String,
+        slot_id: String,
+        conversation_id: String,
+    },
+
     #[error("Workspace path is unavailable: {0}")]
     WorkspacePathUnavailable(String),
 

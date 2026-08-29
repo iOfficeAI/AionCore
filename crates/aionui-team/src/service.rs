@@ -52,6 +52,7 @@ use crate::runtime_tools::{
 use crate::session::{AgentMessageQueueResult, TeamSession, attach_member_runtime, spawn_attach_agent_process_bg};
 use crate::team_run::TeamRunManager;
 use crate::types::{Team, TeamAgent, TeamTask, TeammateRole};
+use crate::work_coordinator::RuntimeRestartRejection;
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
 
@@ -2199,6 +2200,111 @@ impl TeamSessionService {
             false,
         );
         Ok(())
+    }
+
+    /// Force-rebuild a ready team member runtime while preserving its
+    /// conversation and resume anchor.
+    pub async fn restart_agent_runtime(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+        let team = self.load_owned_team(user_id, team_id).await?;
+        let requested_agent = team
+            .agents
+            .iter()
+            .find(|agent| agent.slot_id == slot_id)
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        let session = {
+            let entry = self.sessions.get(team_id).ok_or_else(|| TeamError::RuntimeNotReady {
+                conversation_id: requested_agent.conversation_id.clone(),
+            })?;
+            Arc::clone(&entry.session)
+        };
+        let agent = session.scheduler().get_agent(slot_id).await?;
+        let service = self
+            .self_ref
+            .upgrade()
+            .ok_or_else(|| TeamError::InvalidRequest("team service is shutting down".to_owned()))?;
+        let busy_error = || TeamError::MemberBusy {
+            team_id: team_id.to_owned(),
+            slot_id: slot_id.to_owned(),
+            conversation_id: agent.conversation_id.clone(),
+        };
+        match session.member_runtimes().snapshot(slot_id) {
+            MemberRuntimeSnapshot::Ready => {}
+            MemberRuntimeSnapshot::Attaching { .. } => {
+                return Err(TeamError::MemberRuntimeStarting {
+                    team_id: team_id.to_owned(),
+                    slot_id: slot_id.to_owned(),
+                    conversation_id: agent.conversation_id.clone(),
+                });
+            }
+            MemberRuntimeSnapshot::Removing { .. } => {
+                return Err(TeamError::InvalidRequest(format!(
+                    "team member runtime is being removed: {slot_id}"
+                )));
+            }
+            MemberRuntimeSnapshot::Absent
+            | MemberRuntimeSnapshot::Failed { .. }
+            | MemberRuntimeSnapshot::SessionStopped => {
+                return Err(TeamError::RuntimeNotReady {
+                    conversation_id: agent.conversation_id.clone(),
+                });
+            }
+        }
+        let restart_gate = session
+            .work_coordinator()
+            .begin_runtime_restart(slot_id)
+            .map_err(|rejection| match rejection {
+                RuntimeRestartRejection::Busy => busy_error(),
+                RuntimeRestartRejection::Removing => {
+                    TeamError::InvalidRequest(format!("team member runtime is being removed: {slot_id}"))
+                }
+                RuntimeRestartRejection::SessionStopped => TeamError::SessionNotFound(team_id.to_owned()),
+            })?;
+        let lease = match session.member_runtimes().reserve_restart(slot_id) {
+            ReserveAttach::Start(lease) => lease,
+            ReserveAttach::Join(_) | ReserveAttach::AlreadyReady => {
+                session.work_coordinator().abort_runtime_restart(slot_id, &restart_gate);
+                return Err(busy_error());
+            }
+            ReserveAttach::Removing(_) => {
+                session.work_coordinator().abort_runtime_restart(slot_id, &restart_gate);
+                return Err(TeamError::InvalidRequest(format!(
+                    "team member runtime is being removed: {slot_id}"
+                )));
+            }
+            ReserveAttach::SessionStopped => {
+                session.work_coordinator().abort_runtime_restart(slot_id, &restart_gate);
+                return Err(TeamError::SessionNotFound(team_id.to_owned()));
+            }
+        };
+
+        self.broadcast_agent_runtime_status(user_id, team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
+        info!(
+            team_id,
+            slot_id,
+            conversation_id = agent.conversation_id,
+            "team member runtime restart requested"
+        );
+        match attach_member_runtime(
+            service,
+            Arc::clone(&session),
+            user_id.to_owned(),
+            agent.clone(),
+            self.task_manager.clone(),
+            lease,
+            false,
+        )
+        .await
+        {
+            AttachOutcome::Ready => Ok(()),
+            AttachOutcome::Failed(failure) => Err(TeamError::MemberRuntimeFailed {
+                team_id: team_id.to_owned(),
+                slot_id: slot_id.to_owned(),
+                conversation_id: agent.conversation_id,
+                public_reason: failure.public_reason,
+            }),
+            AttachOutcome::Removed => Err(TeamError::AgentNotFound(slot_id.to_owned())),
+            AttachOutcome::SessionStopped => Err(TeamError::SessionNotFound(team_id.to_owned())),
+        }
     }
 
     pub async fn cancel_run(
