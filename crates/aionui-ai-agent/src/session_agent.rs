@@ -1298,9 +1298,7 @@ impl SessionAgentTask {
             .await
             .map(|_| ())
             .map_err(|error| match &error {
-                BackendError::Transport(code)
-                    if code == "too_late" || code.contains("no active turn to steer") =>
-                {
+                BackendError::Transport(code) if code == "too_late" || code.contains("no active turn to steer") => {
                     AgentError::bad_request("too_late")
                 }
                 _ => AgentError::bad_gateway(error.to_string()),

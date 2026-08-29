@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.2](https://github.com/suoak/AionCore/compare/v0.2.1...v0.2.2) (2026-08-29)
+
+### Features
+
+* **conversation:** mid-turn interjection — deliver messages into a running claude/codex turn
+* **session:** distinguish Task subagents from background tasks (`AgentContainer`)
+* **skills:** slim auto-inject skill descriptions to the 200-char injection budget
+
+### Bug Fixes
+
+* **ai-agent:** wait for terminal output before asserting after process exit
+
+### Chores
+
+* **cli:** verify claude against 2.1.236
+* **acp:** bump codebuddy 2.141.0 and dimcode 0.3.22 registry pins
+
 ## [0.2.1](https://github.com/suoak/AionCore/compare/v0.2.0...v0.2.1) (2026-08-29)
 
 ### Bug Fixes

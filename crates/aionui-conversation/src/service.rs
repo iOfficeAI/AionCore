@@ -3904,6 +3904,7 @@ impl ConversationService {
             msg_id: user_msg_id.clone(),
             turn_id: Some(active_turn_id.clone()),
             files: resolved.files.clone(),
+            attachments: resolved.attachments.clone(),
             inject_skills,
         };
         match agent.deliver_midturn(data).await {

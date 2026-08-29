@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aionui_process::Spawner;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, broadcast, oneshot};
+use tokio::sync::{Mutex, broadcast};
 
 #[cfg(any(test, feature = "test-support"))]
 use super::codex_title::NoTitleIo;
@@ -967,13 +967,6 @@ struct Discovered {
     /// For codex this holds the fixed permission-tier mode enum mapped from
     /// `permissionProfile/list` (feature 012), NOT collaborationMode.
     modes: Vec<crate::capability::ModeInfo>,
-}
-
-fn codex_steer_is_too_late(error: &Value) -> bool {
-    let encoded = error.to_string();
-    encoded.contains("activeTurnNotSteerable")
-        || encoded.contains("active turn not steerable")
-        || encoded.contains("turn is no longer active")
 }
 
 /// What `CodexSessionBackend::wake_handle` needs to re-spawn the codex app-server

@@ -10,11 +10,11 @@ use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationCapabilities,
-    ConversationInputListResponse, ConversationInputMode, ConversationInputReceipt, ConversationListResponse,
-    ConversationResponse, CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest,
-    ListConversationInputsQuery, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    SubmitConversationInputRequest, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ConversationInputListResponse, ConversationInputReceipt, ConversationListResponse, ConversationResponse,
+    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest, ListConversationInputsQuery,
+    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SubmitConversationInputRequest,
+    UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
