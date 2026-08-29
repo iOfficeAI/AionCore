@@ -108,9 +108,10 @@ pub use conversation::{
     ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind,
     ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView,
     ForkConversationRequest, InputChangedEvent, ListConversationInputsQuery, ListConversationsQuery, ListMessagesQuery,
-    MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload,
-    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionRef,
-    SubmitConversationInputRequest, ToolEnforcementLevel, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse,
+    MessageStatusChangedPayload, PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    SessionRef, SubmitConversationInputRequest, ToolEnforcementLevel, UpdateConversationArtifactRequest,
+    UpdateConversationRequest,
 };
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,
@@ -211,10 +212,10 @@ pub use team::{
     TeamActivityItemResponse, TeamActivityKind, TeamActivityPageResponse, TeamAgentInput, TeamAgentRemovedPayload,
     TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentRuntimeStatus, TeamAgentRuntimeStatusPayload,
     TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload, TeamListResponse, TeamMailboxChange,
-    TeamMailboxChangedPayload, TeamMailboxMessageResponse, TeamMcpRuntimeConfig, TeamMessageEnqueueStatus,
-    TeamResponse, TeamRunAckResponse, TeamRunPayload, TeamRunSource, TeamRunStateResponse, TeamRunStatus,
-    TeamRunTargetRole, TeamRuntimeSeed, TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase,
-    TeamSessionStatus, TeamSessionStatusPayload, TeamSlotBlockedReason, TeamSlotWorkChangedPayload,
+    TeamMailboxChangedPayload, TeamMailboxMessageResponse, TeamMcpRuntimeConfig, TeamMcpSelection,
+    TeamMessageEnqueueStatus, TeamResponse, TeamRunAckResponse, TeamRunPayload, TeamRunSource, TeamRunStateResponse,
+    TeamRunStatus, TeamRunTargetRole, TeamRuntimeSeed, TeamSendMessageQueuedResponse, TeamSessionBinding,
+    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamSlotBlockedReason, TeamSlotWorkChangedPayload,
     TeamSlotWorkPayload, TeamSlotWorkState, TeamTaskChange, TeamTaskChangedPayload, TeamTaskResponse,
     TeammateMessagePayload,
 };
