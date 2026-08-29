@@ -9,11 +9,11 @@ use std::sync::{Arc, RwLock, Weak};
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
-    AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamActivityCursor, TeamActivityPageResponse,
-    TeamAgentResponse, TeamAgentRuntimeStatus, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse,
-    TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
-    TeamTaskResponse, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
-    TeamToolTransport, WebSocketMessage,
+    AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, SetConfigOptionRequest, SetConfigOptionResponse,
+    TeamActivityCursor, TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
+    TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding,
+    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
+    TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -1576,6 +1576,48 @@ impl TeamSessionService {
         self.conversation_port.get_config_options(conversation_id).await
     }
 
+    pub async fn set_conversation_config_option(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+        option_id: &str,
+        request: SetConfigOptionRequest,
+    ) -> Result<SetConfigOptionResponse, TeamError> {
+        let team = self.load_owned_team(user_id, team_id).await?;
+        let member = team
+            .agents
+            .iter()
+            .find(|agent| agent.conversation_id == conversation_id)
+            .cloned()
+            .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
+        let options = self.conversation_port.get_config_options(conversation_id).await?;
+        let is_model_option = options.config_options.iter().any(|option| {
+            option.id == option_id && (option.category.as_deref() == Some("model") || option.id == "model")
+        });
+        let requested_model = is_model_option.then(|| request.value.trim().to_owned());
+        let response = self
+            .conversation_port
+            .set_config_option(conversation_id, option_id, request)
+            .await?;
+
+        if let Some(model) = requested_model.filter(|value| !value.is_empty())
+            && let Err(error) = self
+                .persist_member_model_selection(user_id, team_id, &member.slot_id, &model)
+                .await
+        {
+            warn!(
+                team_id,
+                slot_id = member.slot_id,
+                conversation_id,
+                model,
+                error = %error,
+                "team member model switch applied but could not be persisted"
+            );
+        }
+        Ok(response)
+    }
+
     fn broadcast_session_status<F>(
         &self,
         user_id: &str,
@@ -2305,6 +2347,63 @@ impl TeamSessionService {
             AttachOutcome::Removed => Err(TeamError::AgentNotFound(slot_id.to_owned())),
             AttachOutcome::SessionStopped => Err(TeamError::SessionNotFound(team_id.to_owned())),
         }
+    }
+
+    pub async fn update_agent_model(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        model: &str,
+    ) -> Result<(), TeamError> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(TeamError::InvalidRequest("model must not be empty".to_owned()));
+        }
+        self.persist_member_model_selection(user_id, team_id, slot_id, model)
+            .await
+    }
+
+    async fn persist_member_model_selection(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        model: &str,
+    ) -> Result<(), TeamError> {
+        let lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        let mut team = self.load_owned_team(user_id, team_id).await?;
+        let agent = team
+            .agents
+            .iter_mut()
+            .find(|agent| agent.slot_id == slot_id)
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        let conversation_id = agent.conversation_id.clone();
+
+        self.conversation_port
+            .persist_confirmed_model(&conversation_id, model)
+            .await?;
+        agent.model = model.to_owned();
+        self.repo
+            .update_team(
+                user_id,
+                team_id,
+                &UpdateTeamParams {
+                    agents: Some(serde_json::to_string(&team.agents)?),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
+            session.update_agent_model(slot_id, model).await?;
+        }
+        Ok(())
     }
 
     pub async fn cancel_run(
@@ -3487,6 +3586,64 @@ mod tests {
 
         assert_eq!(options.config_options[0].id, "model");
         assert_eq!(svc.session_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn update_agent_model_persists_roster_and_conversation_seed() {
+        let (svc, _repo, _task_manager, conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Model Persistence"))
+            .await
+            .unwrap();
+        let lead = &created.assistants[0];
+
+        svc.update_agent_model("user-test", &created.id, &lead.slot_id, "new-model")
+            .await
+            .unwrap();
+
+        let refreshed = svc.get_team("user-test", &created.id).await.unwrap();
+        assert_eq!(refreshed.assistants[0].model, "new-model");
+        let extra = conv_repo.get_extra(&lead.conversation_id).unwrap();
+        assert_eq!(
+            extra.get("current_model_id").and_then(serde_json::Value::as_str),
+            Some("new-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_agent_model_rejects_empty_value_without_changing_roster() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Empty Model"))
+            .await
+            .unwrap();
+        let lead = &created.assistants[0];
+
+        let error = svc
+            .update_agent_model("user-test", &created.id, &lead.slot_id, "  ")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, TeamError::InvalidRequest(message) if message == "model must not be empty"));
+        let refreshed = svc.get_team("user-test", &created.id).await.unwrap();
+        assert_eq!(refreshed.assistants[0].model, lead.model);
+    }
+
+    #[tokio::test]
+    async fn update_agent_model_rejects_cross_user_access() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Private Model"))
+            .await
+            .unwrap();
+        let lead = &created.assistants[0];
+
+        let error = svc
+            .update_agent_model("other-user", &created.id, &lead.slot_id, "other-model")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, TeamError::TeamNotFound(_)));
     }
 
     #[tokio::test]

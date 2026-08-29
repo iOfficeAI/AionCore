@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest, GetConfigOptionsResponse};
+use aionui_api_types::{
+    AssistantConversationRequest, CreateConversationRequest, GetConfigOptionsResponse, SetConfigOptionRequest,
+    SetConfigOptionResponse,
+};
 use aionui_conversation::{
     ConversationAgentTurnRequest, ConversationAgentTurnStarted, ConversationAgentTurnStatus, ConversationError,
     ConversationService,
@@ -505,6 +508,11 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map_err(map_conversation_update_error)
     }
 
+    async fn persist_confirmed_model(&self, conversation_id: &str, model: &str) -> Result<(), TeamError> {
+        self.patch_runtime_config(conversation_id, serde_json::json!({ "current_model_id": model }))
+            .await
+    }
+
     async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), TeamError> {
         let user_id = self.require_owner_user_id(conversation_id).await?;
         self.conversation_service
@@ -517,6 +525,19 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
         let user_id = self.require_owner_user_id(conversation_id).await?;
         self.conversation_service
             .get_config_options(&user_id, conversation_id)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn set_config_option(
+        &self,
+        conversation_id: &str,
+        option_id: &str,
+        request: SetConfigOptionRequest,
+    ) -> Result<SetConfigOptionResponse, TeamError> {
+        let user_id = self.require_owner_user_id(conversation_id).await?;
+        self.conversation_service
+            .set_config_option(&user_id, conversation_id, option_id, request)
             .await
             .map_err(map_conversation_update_error)
     }

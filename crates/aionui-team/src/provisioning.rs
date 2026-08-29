@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{AddAgentRequest, GetConfigOptionsResponse, TeamAgentInput, TeamToolTransport};
+use aionui_api_types::{
+    AddAgentRequest, GetConfigOptionsResponse, SetConfigOptionRequest, SetConfigOptionResponse, TeamAgentInput,
+    TeamToolTransport,
+};
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
 use aionui_db::models::{AgentMetadataRow, TeamRow};
 use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
@@ -91,9 +94,25 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError>;
 
+    async fn persist_confirmed_model(&self, conversation_id: &str, model: &str) -> Result<(), TeamError> {
+        self.patch_runtime_config(conversation_id, serde_json::json!({ "current_model_id": model }))
+            .await
+    }
+
     async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), TeamError>;
 
     async fn get_config_options(&self, conversation_id: &str) -> Result<GetConfigOptionsResponse, TeamError>;
+
+    async fn set_config_option(
+        &self,
+        _conversation_id: &str,
+        _option_id: &str,
+        _request: SetConfigOptionRequest,
+    ) -> Result<SetConfigOptionResponse, TeamError> {
+        Err(TeamError::InvalidRequest(
+            "team conversation config updates are unavailable".to_owned(),
+        ))
+    }
 
     async fn warmup_agent_process(
         &self,

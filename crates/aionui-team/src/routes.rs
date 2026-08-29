@@ -12,8 +12,9 @@ use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
     GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
-    SendTeamMessageRequest, SetModeRequest, TeamActivityPageResponse, TeamAgentResponse, TeamListResponse,
-    TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
+    SendTeamMessageRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest, SetModelRequest,
+    TeamActivityPageResponse, TeamAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse,
+    TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -130,6 +131,10 @@ pub fn team_routes(state: TeamRouterState) -> Router {
             "/api/teams/{id}/agents/{slot_id}/name",
             axum::routing::patch(rename_agent),
         )
+        .route(
+            "/api/teams/{id}/agents/{slot_id}/model",
+            axum::routing::patch(update_agent_model),
+        )
         .route("/api/teams/{id}/messages", post(send_message))
         .route("/api/teams/{id}/agents/{slot_id}/messages", post(send_message_to_agent))
         .route("/api/teams/{id}/agents/{slot_id}/attach", post(attach_agent))
@@ -140,6 +145,10 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route(
             "/api/teams/{id}/conversations/{conversation_id}/config-options",
             get(get_conversation_config_options),
+        )
+        .route(
+            "/api/teams/{id}/conversations/{conversation_id}/config-options/{option_id}",
+            axum::routing::put(set_conversation_config_option),
         )
         .route("/api/teams/{id}/runs/{team_run_id}/cancel", post(cancel_run))
         .route(
@@ -390,6 +399,20 @@ async fn attach_agent(
     Ok(Json(ApiResponse::success()))
 }
 
+async fn update_agent_model(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<AgentPathParams>,
+    body: Result<Json<SetModelRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .service
+        .update_agent_model(&user.id, &params.id, &params.slot_id, &req.model_id)
+        .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
 async fn restart_agent_runtime(
     State(state): State<TeamRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -519,6 +542,21 @@ async fn get_conversation_config_options(
         state
             .service
             .get_conversation_config_options(&user.id, &id, &conversation_id)
+            .await?,
+    )))
+}
+
+async fn set_conversation_config_option(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, conversation_id, option_id)): Path<(String, String, String)>,
+    body: Result<Json<SetConfigOptionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<SetConfigOptionResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .set_conversation_config_option(&user.id, &id, &conversation_id, &option_id, req)
             .await?,
     )))
 }
