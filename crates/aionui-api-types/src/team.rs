@@ -33,6 +33,14 @@ pub struct TeamMcpSelection {
     pub mcp_statuses: Vec<ConversationMcpStatus>,
 }
 
+/// Stable representation used to deduplicate assistant MCP binding refreshes.
+pub fn assistant_mcp_binding_fingerprint(ids: &[String]) -> String {
+    let mut ids = ids.to_vec();
+    ids.sort();
+    ids.dedup();
+    serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_owned())
+}
+
 /// Input for a single agent when creating a team or adding an agent.
 ///
 /// Each agent gets its own conversation. Create requests must include exactly
@@ -291,6 +299,33 @@ pub struct SendAgentMessageRequest {
     pub files: Option<Vec<ChatFileRef>>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamQueuedPolicy {
+    #[default]
+    Retain,
+    Discard,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InterruptTeamAgentRequest {
+    pub message: String,
+    #[serde(default)]
+    pub files: Option<Vec<ChatFileRef>>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub queued_policy: TeamQueuedPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamInterruptOutcome {
+    Interrupted,
+    QueuedNoActiveTurn,
+    CompletedRace,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TeamRunTargetRole {
@@ -423,6 +458,15 @@ pub struct TeamChildTurnPayload {
     pub conversation_id: String,
     pub turn_id: String,
     pub status: TeamRunStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamInterruptAgentResponse {
+    pub outcome: TeamInterruptOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupted_turn_id: Option<String>,
+    pub message_id: String,
+    pub target: TeamSlotWorkPayload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
