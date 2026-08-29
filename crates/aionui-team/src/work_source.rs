@@ -25,9 +25,9 @@ impl WorkSource {
     pub(crate) fn priority(self) -> WorkPriority {
         match self {
             Self::UserMessage | Self::UserCommand | Self::UserIntervention => WorkPriority::Foreground,
+            Self::McpSendMessage => WorkPriority::Directed,
             Self::McpShutdownRequest | Self::ShutdownRejected => WorkPriority::Control,
-            Self::McpSendMessage
-            | Self::SpawnWelcome
+            Self::SpawnWelcome
             | Self::TeamMembershipChanged
             | Self::SpawnAttachFailure
             | Self::IdleNotification
@@ -91,5 +91,10 @@ mod tests {
         assert!(WorkSource::UserCommand.resumes_paused_slot());
         assert!(WorkSource::UserCommand.requires_mailbox_message());
         assert_eq!(WorkSource::UserCommand.to_string(), "user_command");
+    }
+
+    #[test]
+    fn mcp_send_message_uses_the_directed_lane() {
+        assert_eq!(WorkSource::McpSendMessage.priority(), WorkPriority::Directed);
     }
 }

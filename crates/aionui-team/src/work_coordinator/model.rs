@@ -6,6 +6,7 @@ use crate::work_source::WorkSource;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkPriority {
     Foreground,
+    Directed,
     Control,
     Background,
 }

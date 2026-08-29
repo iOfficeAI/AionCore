@@ -13,13 +13,26 @@ pub struct MockState {
 
 pub struct MockTeamRepo {
     pub state: Mutex<MockState>,
+    peek_snapshot_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    peek_release_rx: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 impl MockTeamRepo {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(MockState::default()),
+            peek_snapshot_tx: Mutex::new(None),
+            peek_release_rx: Mutex::new(None),
         }
+    }
+
+    pub fn arm_peek_barrier(
+        &self,
+        snapshot_tx: tokio::sync::oneshot::Sender<()>,
+        release_rx: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.peek_snapshot_tx.lock().unwrap() = Some(snapshot_tx);
+        *self.peek_release_rx.lock().unwrap() = Some(release_rx);
     }
 }
 
@@ -97,13 +110,22 @@ impl ITeamRepository for MockTeamRepo {
         team_id: &str,
         to_agent_id: &str,
     ) -> Result<Vec<MailboxMessageRow>, DbError> {
-        let state = self.state.lock().unwrap();
-        let result = state
-            .messages
-            .iter()
-            .filter(|m| m.team_id == team_id && m.to_agent_id == to_agent_id && !m.read)
-            .cloned()
-            .collect();
+        let result = {
+            let state = self.state.lock().unwrap();
+            state
+                .messages
+                .iter()
+                .filter(|m| m.team_id == team_id && m.to_agent_id == to_agent_id && !m.read)
+                .cloned()
+                .collect()
+        };
+        if let Some(snapshot_tx) = self.peek_snapshot_tx.lock().unwrap().take() {
+            let _ = snapshot_tx.send(());
+        }
+        let release_rx = self.peek_release_rx.lock().unwrap().take();
+        if let Some(release_rx) = release_rx {
+            let _ = release_rx.await;
+        }
         Ok(result)
     }
 
