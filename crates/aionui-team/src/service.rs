@@ -52,7 +52,7 @@ use crate::runtime_tools::{
 use crate::session::{AgentMessageQueueResult, TeamSession, attach_member_runtime, spawn_attach_agent_process_bg};
 use crate::team_run::TeamRunManager;
 use crate::types::{Team, TeamAgent, TeamTask, TeammateRole};
-use crate::work_coordinator::RuntimeRestartRejection;
+use crate::work_coordinator::{ObserveMessagesResult, RuntimeRestartRejection};
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
 
@@ -2193,6 +2193,18 @@ impl TeamSessionService {
     ) -> Result<Vec<crate::types::MailboxMessage>, TeamError> {
         self.published_session(team_id)?.peek_agent_messages(slot_id).await
     }
+
+    pub(crate) async fn observe_agent_messages(
+        &self,
+        team_id: &str,
+        slot_id: &str,
+        message_ids: &[String],
+    ) -> Result<ObserveMessagesResult, TeamError> {
+        self.published_session(team_id)?
+            .observe_agent_messages(slot_id, message_ids)
+            .await
+    }
+
     /// Resolve a send's attachments to absolute paths and re-inline them into
     /// the content (`[[AION_FILES]]` form) at the team send boundary. Atomic;
     /// empty/absent `files` is a no-op needing no project service.
