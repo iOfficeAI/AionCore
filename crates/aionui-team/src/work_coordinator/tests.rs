@@ -344,6 +344,85 @@ fn runtime_starting_blocks_and_runtime_ready_releases_work() {
 }
 
 #[test]
+fn runtime_restart_gate_atomically_rejects_active_work() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+    let ReconcileDecision::Claim(_) = coordinator.next("lead-1") else {
+        panic!("message must be claimable");
+    };
+
+    assert_eq!(
+        coordinator.begin_runtime_restart("lead-1"),
+        Err(RuntimeRestartRejection::Busy)
+    );
+    assert!(matches!(
+        coordinator.slot_snapshot("lead-1").unwrap().runtime_constraint,
+        RuntimeConstraint::Ready
+    ));
+}
+
+#[test]
+fn runtime_restart_gate_rejects_queued_work() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+
+    assert_eq!(
+        coordinator.begin_runtime_restart("lead-1"),
+        Err(RuntimeRestartRejection::Busy)
+    );
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("rejected restart must leave queued work claimable");
+    };
+    assert_eq!(batch.mailbox_message_ids, vec!["m1"]);
+}
+
+#[test]
+fn runtime_restart_gate_and_batch_claim_have_one_atomic_winner() {
+    for _ in 0..64 {
+        let coordinator = Arc::new(coordinator());
+        coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+        enqueue(&coordinator, WorkSource::UserMessage, "m1");
+        let barrier = Arc::new(Barrier::new(3));
+
+        let gate_coordinator = Arc::clone(&coordinator);
+        let gate_barrier = Arc::clone(&barrier);
+        let gate_task = std::thread::spawn(move || {
+            gate_barrier.wait();
+            gate_coordinator.begin_runtime_restart("lead-1")
+        });
+        let claim_coordinator = Arc::clone(&coordinator);
+        let claim_barrier = Arc::clone(&barrier);
+        let claim_task = std::thread::spawn(move || {
+            claim_barrier.wait();
+            claim_coordinator.next("lead-1")
+        });
+        barrier.wait();
+
+        let gate = gate_task.join().unwrap();
+        let claim = claim_task.join().unwrap();
+        assert!(matches!(gate, Err(RuntimeRestartRejection::Busy)));
+        assert!(matches!(claim, ReconcileDecision::Claim(_)));
+    }
+}
+
+#[test]
+fn runtime_restart_gate_rejects_removing_and_stopped_slots() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Removing { operation_id: 7 });
+    assert_eq!(
+        coordinator.begin_runtime_restart("lead-1"),
+        Err(RuntimeRestartRejection::Removing)
+    );
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::SessionStopped);
+    assert_eq!(
+        coordinator.begin_runtime_restart("lead-1"),
+        Err(RuntimeRestartRejection::SessionStopped)
+    );
+}
+
+#[test]
 fn remove_cancels_queued_and_running_work_and_rejects_new_enqueue() {
     let coordinator = coordinator();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);

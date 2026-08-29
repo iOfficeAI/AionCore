@@ -325,6 +325,7 @@ async fn tools_list_returns_all_11_tools() {
     assert!(names.contains(&"team_task_list".to_owned()));
     assert!(names.contains(&"team_members".to_owned()));
     assert!(names.contains(&"team_rename_agent".to_owned()));
+    assert!(names.contains(&"team_clear_agent_context".to_owned()));
     assert!(names.contains(&"team_shutdown_agent".to_owned()));
     assert!(names.contains(&"team_list_assistants".to_owned()));
     assert!(names.contains(&"team_describe_assistant".to_owned()));
@@ -342,8 +343,19 @@ async fn mcp_tools_list_filters_lead_only_tools() {
 
     assert!(!names.contains(&"team_spawn_agent".to_owned()));
     assert!(!names.contains(&"team_rename_agent".to_owned()));
+    assert!(!names.contains(&"team_clear_agent_context".to_owned()));
     assert!(!names.contains(&"team_shutdown_agent".to_owned()));
     assert!(names.contains(&"team_send_message".to_owned()));
+
+    let response = call_tool(
+        &mut stream,
+        11,
+        "team_clear_agent_context",
+        json!({ "slot_id": "worker-1" }),
+    )
+    .await;
+    assert!(is_error_response(&response));
+    assert!(extract_text(&response).contains("Only Lead"));
     assert!(names.contains(&"team_task_create".to_owned()));
     assert!(names.contains(&"team_task_update".to_owned()));
     assert!(names.contains(&"team_task_list".to_owned()));

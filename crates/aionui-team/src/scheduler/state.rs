@@ -87,6 +87,17 @@ impl TeammateManager {
         }
     }
 
+    /// Ensure the next real wake re-injects Team Governance and the member's
+    /// role prompt after its backend context was reset to a Fresh session.
+    pub async fn require_role_prompt(&self, slot_id: &str) -> Result<(), TeamError> {
+        let mut slots = self.slots.lock().await;
+        let slot = slots
+            .get_mut(slot_id)
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        slot.needs_role_prompt = true;
+        Ok(())
+    }
+
     pub(crate) async fn maybe_wake_leader_when_all_idle(&self) -> Result<Option<String>, TeamError> {
         let slots = self.slots.lock().await;
 

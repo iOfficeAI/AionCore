@@ -114,6 +114,11 @@ pub struct RenameAgentInput {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ClearAgentContextInput {
+    pub slot_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ShutdownAgentInput {
     pub slot_id: String,
     pub reason: Option<String>,

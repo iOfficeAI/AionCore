@@ -75,6 +75,7 @@ pub enum TeamToolName {
     TeamDescribeAssistant,
     TeamSpawnAgent,
     TeamRenameAgent,
+    TeamClearAgentContext,
     TeamShutdownAgent,
 }
 
@@ -91,6 +92,7 @@ impl TeamToolName {
             Self::TeamDescribeAssistant => "team_describe_assistant",
             Self::TeamSpawnAgent => "team_spawn_agent",
             Self::TeamRenameAgent => "team_rename_agent",
+            Self::TeamClearAgentContext => "team_clear_agent_context",
             Self::TeamShutdownAgent => "team_shutdown_agent",
         }
     }
@@ -107,6 +109,7 @@ impl TeamToolName {
             "team_describe_assistant" => Self::TeamDescribeAssistant,
             "team_spawn_agent" => Self::TeamSpawnAgent,
             "team_rename_agent" => Self::TeamRenameAgent,
+            "team_clear_agent_context" => Self::TeamClearAgentContext,
             "team_shutdown_agent" => Self::TeamShutdownAgent,
             _ => return None,
         })
@@ -510,6 +513,22 @@ fn tool_specs() -> Vec<TeamToolSpec> {
             input_summary: "slot_id, new_name",
         },
         TeamToolSpec {
+            name: TeamToolName::TeamClearAgentContext,
+            permission: TeamToolPermission::LeadOnly,
+            description: "Clear a team member's backend conversation context while preserving team membership, settings, and visible chat history. Lead only.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "slot_id": { "type": "string", "description": "Agent slot_id whose context should be cleared" }
+                },
+                "required": ["slot_id"]
+            }),
+            cli_command: &["clear-agent-context"],
+            when: "Clear teammate context",
+            input_summary: "slot_id",
+        },
+        TeamToolSpec {
             name: TeamToolName::TeamShutdownAgent,
             permission: TeamToolPermission::LeadOnly,
             description: "Initiate shutdown of a teammate. Lead only. Sends a shutdown_request to the target agent.",
@@ -570,6 +589,7 @@ mod tests {
             ("team_describe_assistant", vec!["describe-assistant"]),
             ("team_spawn_agent", vec!["spawn-agent"]),
             ("team_rename_agent", vec!["rename-agent"]),
+            ("team_clear_agent_context", vec!["clear-agent-context"]),
             ("team_shutdown_agent", vec!["shutdown-agent"]),
         ];
         for (tool, path) in cases {
@@ -587,6 +607,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!names.contains(&"team_spawn_agent".to_owned()));
         assert!(!names.contains(&"team_rename_agent".to_owned()));
+        assert!(!names.contains(&"team_clear_agent_context".to_owned()));
         assert!(!names.contains(&"team_shutdown_agent".to_owned()));
         assert!(names.contains(&"team_read_messages".to_owned()));
         assert!(names.contains(&"team_send_message".to_owned()));
