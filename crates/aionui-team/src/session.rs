@@ -1563,38 +1563,6 @@ impl TeamSession {
         self.scheduler.rename_agent(slot_id, new_name).await
     }
 
-    fn start_pending_mcp_refresh(&self, slot_id: &str) -> bool {
-        let Some(fingerprint) = self.work_coordinator.claim_pending_mcp_refresh(slot_id) else {
-            return false;
-        };
-        let Some(service) = self.service.upgrade() else {
-            self.work_coordinator.release_mcp_refresh(slot_id, &fingerprint);
-            return false;
-        };
-        let Some(session) = service.capture_published_session(self) else {
-            self.work_coordinator.release_mcp_refresh(slot_id, &fingerprint);
-            return false;
-        };
-        let user_id = self.user_id.clone();
-        let team_id = self.team.id.clone();
-        let slot_id = slot_id.to_owned();
-        tokio::spawn(async move {
-            match service
-                .restart_agent_runtime_for_mcp_refresh(&user_id, &team_id, &slot_id)
-                .await
-            {
-                Ok(()) => session
-                    .work_coordinator
-                    .settle_mcp_refresh_claim(&slot_id, &fingerprint),
-                Err(error) => {
-                    session.work_coordinator.release_mcp_refresh(&slot_id, &fingerprint);
-                    warn!(team_id, slot_id, error = %error, "deferred assistant MCP refresh failed");
-                }
-            }
-        });
-        true
-    }
-
     pub async fn interrupt_agent_from_user(
         &self,
         to_slot_id: &str,

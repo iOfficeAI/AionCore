@@ -9,12 +9,11 @@ use std::sync::{Arc, RwLock, Weak};
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
-    AddAgentRequest, AssistantMcpBindingChanged, CreateTeamRequest, GetConfigOptionsResponse,
-    InterruptTeamAgentRequest, SetConfigOptionRequest, SetConfigOptionResponse, TeamActivityCursor,
-    TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus, TeamContextResetAvailability,
-    TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamInterruptAgentResponse,
-    TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding,
-    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
+    AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, InterruptTeamAgentRequest, SetConfigOptionRequest,
+    SetConfigOptionResponse, TeamActivityCursor, TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
+    TeamContextResetAvailability, TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus,
+    TeamInterruptAgentResponse, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
+    TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
     TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
@@ -2172,6 +2171,23 @@ impl TeamSessionService {
         session.send_message_to_agent(slot_id, &content, files).await
     }
 
+    pub async fn interrupt_agent(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        request: InterruptTeamAgentRequest,
+    ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
+        let (message, files) = self
+            .resolve_message_attachments(user_id, &request.message, request.files)
+            .await?;
+        self.published_session(team_id)?
+            .interrupt_agent_from_user(slot_id, &message, files, request.reason, request.queued_policy)
+            .await
+    }
+
     fn published_session(&self, team_id: &str) -> Result<Arc<TeamSession>, TeamError> {
         self.sessions
             .get(team_id)
@@ -2829,6 +2845,29 @@ impl TeamSessionService {
         session
             .send_agent_message_from_agent(from_slot_id, to_slot_id, content, files)
             .await
+    }
+
+    pub async fn interrupt_agent_from_agent(
+        &self,
+        team_id: &str,
+        from_slot_id: &str,
+        to_slot_id: &str,
+        message: &str,
+        files: Option<Vec<String>>,
+        reason: Option<String>,
+    ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        self.published_session(team_id)?
+            .interrupt_agent_from_agent(from_slot_id, to_slot_id, message, files, reason)
+            .await
+    }
+
+    pub(crate) async fn restart_agent_runtime_for_mcp_refresh(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+    ) -> Result<(), TeamError> {
+        self.restart_agent_runtime(user_id, team_id, slot_id).await
     }
 
     pub async fn shutdown_agent_in_session(

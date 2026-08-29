@@ -144,6 +144,17 @@ struct SendMessageParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct InterruptAgentParams {
+    slot_id: String,
+    message: String,
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SpawnAgentParams {
     /// Agent display name.
     name: String,
@@ -286,6 +297,23 @@ impl TeamStdioServer {
                 "to": params.to,
                 "message": params.message,
                 "files": params.files,
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_interrupt_agent",
+        description = "Immediately stop a teammate's active turn and durably deliver a replacement instruction as its next highest-priority message."
+    )]
+    async fn interrupt_agent(&self, Parameters(params): Parameters<InterruptAgentParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_interrupt_agent",
+            &serde_json::json!({
+                "slot_id": params.slot_id,
+                "message": params.message,
+                "files": params.files,
+                "reason": params.reason,
             }),
         )
         .await

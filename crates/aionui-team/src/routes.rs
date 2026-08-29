@@ -197,6 +197,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         )
         .route("/api/teams/{id}/messages", post(send_message))
         .route("/api/teams/{id}/agents/{slot_id}/messages", post(send_message_to_agent))
+        .route("/api/teams/{id}/agents/{slot_id}/interrupt", post(interrupt_agent))
         .route("/api/teams/{id}/agents/{slot_id}/attach", post(attach_agent))
         .route(
             "/api/teams/{id}/agents/{slot_id}/runtime/restart",
@@ -513,6 +514,20 @@ async fn send_message(
         .send_message(&user.id, &id, &req.content, req.files)
         .await?;
     Ok(Json(ApiResponse::ok(ack)))
+}
+
+async fn interrupt_agent(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<AgentPathParams>,
+    body: Result<Json<InterruptTeamAgentRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TeamInterruptAgentResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let response = state
+        .service
+        .interrupt_agent(&user.id, &params.id, &params.slot_id, req)
+        .await?;
+    Ok(Json(ApiResponse::ok(response)))
 }
 
 async fn send_message_to_agent(

@@ -260,6 +260,19 @@ pub(crate) struct BatchCompletionResult {
     pub(crate) ack_message_ids: Vec<String>,
     pub(crate) team_run_ids: Vec<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchInterruptMetadata {
+    pub(crate) reason: Option<String>,
+    pub(crate) replacement_message_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InterruptBatchResult {
+    pub(crate) commit_result: CommitResult,
+    pub(crate) terminal_message_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PauseWorkResult {
     pub(crate) cancel_target: Option<BatchCancelTarget>,

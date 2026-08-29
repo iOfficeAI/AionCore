@@ -68,6 +68,7 @@ pub enum TeamToolName {
     TeamMembers,
     TeamReadMessages,
     TeamSendMessage,
+    TeamInterruptAgent,
     TeamTaskCreate,
     TeamTaskUpdate,
     TeamTaskList,
@@ -85,6 +86,7 @@ impl TeamToolName {
             Self::TeamMembers => "team_members",
             Self::TeamReadMessages => "team_read_messages",
             Self::TeamSendMessage => "team_send_message",
+            Self::TeamInterruptAgent => "team_interrupt_agent",
             Self::TeamTaskCreate => "team_task_create",
             Self::TeamTaskUpdate => "team_task_update",
             Self::TeamTaskList => "team_task_list",
@@ -102,6 +104,7 @@ impl TeamToolName {
             "team_members" => Self::TeamMembers,
             "team_read_messages" => Self::TeamReadMessages,
             "team_send_message" => Self::TeamSendMessage,
+            "team_interrupt_agent" => Self::TeamInterruptAgent,
             "team_task_create" => Self::TeamTaskCreate,
             "team_task_update" => Self::TeamTaskUpdate,
             "team_task_list" => Self::TeamTaskList,
@@ -366,6 +369,25 @@ fn tool_specs() -> Vec<TeamToolSpec> {
             input_summary: "to, message",
         },
         TeamToolSpec {
+            name: TeamToolName::TeamInterruptAgent,
+            permission: TeamToolPermission::LeadOnly,
+            description: "Immediately stop a teammate's active turn and durably deliver a replacement instruction as its next highest-priority message.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "slot_id": { "type": "string", "description": "Exact teammate slot_id; wildcard is not supported" },
+                    "message": { "type": "string", "description": "Replacement instruction delivered after interruption" },
+                    "files": { "type": "array", "items": { "type": "string" }, "description": "Absolute attachment paths" },
+                    "reason": { "type": "string", "description": "Optional interruption reason" }
+                },
+                "required": ["slot_id", "message"]
+            }),
+            cli_command: &["interrupt-agent"],
+            when: "Interrupt teammate turn",
+            input_summary: "slot_id, message, optional files/reason",
+        },
+        TeamToolSpec {
             name: TeamToolName::TeamTaskCreate,
             permission: TeamToolPermission::AnyTeamAgent,
             description: "Create a new task on the team task board.",
@@ -556,7 +578,7 @@ mod tests {
     #[test]
     fn descriptor_count_and_names_are_unique() {
         let descriptors = team_tool_descriptors();
-        assert_eq!(descriptors.len(), 11);
+        assert_eq!(descriptors.len(), 13);
         let names = descriptors
             .iter()
             .map(|descriptor| descriptor.name.as_str())

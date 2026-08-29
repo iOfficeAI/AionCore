@@ -48,6 +48,17 @@ pub struct SendMessageInput {
     pub files: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterruptAgentInput {
+    pub slot_id: String,
+    pub message: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 /// Arguments for the `team_read_messages` MCP tool call. `since_message_id` is a
 /// FIFO cursor: the page starts at the unread message right after it.
 #[derive(Debug, Default, Deserialize)]
@@ -144,7 +155,7 @@ mod tests {
 
     #[test]
     fn all_descriptors_count() {
-        assert_eq!(all_tool_descriptors().len(), 11);
+        assert_eq!(all_tool_descriptors().len(), 13);
     }
 
     #[test]
@@ -153,7 +164,7 @@ mod tests {
         let mut names: Vec<&str> = descs.iter().map(|d| d.name.as_str()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 13);
     }
 
     #[test]
