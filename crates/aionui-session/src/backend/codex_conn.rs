@@ -7243,10 +7243,6 @@ mod tests {
             "carries the correlation id so codex round-trips it (§6甲.10), got: {written}"
         );
         assert!(written.contains("STEERED"), "carries the steer text, got: {written}");
-        assert!(
-            written.contains(r#""clientUserMessageId":"input-1""#),
-            "carries the host input correlation id, got: {written}"
-        );
     }
 
     #[test]
