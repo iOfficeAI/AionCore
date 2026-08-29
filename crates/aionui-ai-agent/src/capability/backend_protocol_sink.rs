@@ -158,6 +158,7 @@ impl ProtocolEmitter for BackendProtocolSink {
                     input: None,
                     output: None,
                     description: Some(Self::execution_description(execution_id, "execute")),
+                    parent_call_id: None,
                 }));
             }
 
@@ -189,6 +190,7 @@ impl ProtocolEmitter for BackendProtocolSink {
                         error_code,
                         truncation,
                     )),
+                    parent_call_id: None,
                 }));
             }
 
@@ -219,6 +221,7 @@ impl ProtocolEmitter for BackendProtocolSink {
                         })
                         .to_string(),
                     ),
+                    parent_call_id: None,
                 }));
             }
 

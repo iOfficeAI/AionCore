@@ -108,9 +108,9 @@ pub use conversation::{
     ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind,
     ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView,
     ForkConversationRequest, InputChangedEvent, ListConversationInputsQuery, ListConversationsQuery, ListMessagesQuery,
-    MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse, PromptCapabilityView,
-    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionRef, SubmitConversationInputRequest,
-    ToolEnforcementLevel, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload,
+    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionRef,
+    SubmitConversationInputRequest, ToolEnforcementLevel, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,

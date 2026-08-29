@@ -36,7 +36,7 @@ use crate::event::{LocalizedText, NoticeLevel};
 /// back-to-back control after three clean versions). Every release from 0.148.0
 /// on does complete turns and passes the suite, so the gate walks forward over
 /// 0.147.0 and leaves it unverified rather than a floor anyone can install into.
-pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.235";
+pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.236";
 pub const VERIFIED_CODEX_VERSION: &str = "0.150.1";
 pub const VERIFIED_AGY_VERSION: &str = "1.1.22";
 
@@ -450,8 +450,8 @@ mod tests {
     fn the_verified_release_says_nothing() {
         // Literal on purpose: this is the exact string a user on the verified
         // release reports, so the test breaks if a bump forgets to re-verify.
-        assert_eq!(classify("2.1.235", VERIFIED_CLAUDE_VERSION), VersionVerdict::Verified);
-        assert!(drift_notice("claude", "2.1.235", VERIFIED_CLAUDE_VERSION).is_none());
+        assert_eq!(classify("2.1.236", VERIFIED_CLAUDE_VERSION), VersionVerdict::Verified);
+        assert!(drift_notice("claude", "2.1.236", VERIFIED_CLAUDE_VERSION).is_none());
     }
 
     #[test]

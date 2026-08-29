@@ -248,6 +248,7 @@ mod tests {
             input: None,
             output: Some(output.into()),
             description: None,
+            parent_call_id: None,
         })
     }
 

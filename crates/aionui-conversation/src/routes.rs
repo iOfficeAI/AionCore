@@ -10,11 +10,11 @@ use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationCapabilities,
-    ConversationInputListResponse, ConversationInputMode, ConversationInputReceipt, ConversationListResponse,
-    ConversationResponse, CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest,
-    ListConversationInputsQuery, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    SubmitConversationInputRequest, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ConversationInputListResponse, ConversationInputReceipt, ConversationListResponse, ConversationResponse,
+    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest, ListConversationInputsQuery,
+    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SubmitConversationInputRequest,
+    UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -324,34 +324,19 @@ async fn send_msg(
     body: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let receipt = state
+    let response = state
         .service
-        .submit_input(
-            &user.id,
-            &id,
-            SubmitConversationInputRequest {
-                mode: ConversationInputMode::Followup,
-                content: req.content,
-                files: req.files,
-                inject_skills: req.inject_skills,
-                hidden: req.hidden,
-                client_key: format!("legacy_{}", aionui_common::generate_short_id()),
-            },
-        )
+        .send_message(&user.id, &id, req, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
-    let response = SendMessageResponse {
-        msg_id: receipt
-            .input
-            .msg_id
-            .clone()
-            .unwrap_or_else(|| receipt.input.input_id.clone()),
-        turn_id: receipt.input.turn_id.clone().unwrap_or_default(),
-        runtime: receipt.runtime,
-        input_id: Some(receipt.input.input_id),
-        input_status: Some(receipt.input.status),
+    // B5: a mid-turn delivery already handed the message to the RUNNING turn —
+    // that is a completed delivery (200), not a scheduled one (202).
+    let status = if response.delivered_midturn {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
     };
-    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))
+    Ok((status, Json(ApiResponse::ok(response))))
 }
 
 async fn submit_input(

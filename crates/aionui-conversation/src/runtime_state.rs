@@ -154,6 +154,17 @@ impl ConversationRuntimeStateService {
         })
     }
 
+    /// Claim a turn the AGENT started on its own (a CLI-initiated turn, or the
+    /// follow-up turn claude opens for a mid-turn message it could not fold into
+    /// the running one — verified in the design spec §6甲.2).
+    ///
+    /// Returns `None` when a turn is already claimed: for an agent-driven turn
+    /// that is the NORMAL case (the message folded into the running turn), not an
+    /// error, so it must not surface as 409.
+    pub fn claim_for_agent_turn(self: &Arc<Self>, conversation_id: &str, turn_id: &str) -> Option<TurnClaim> {
+        self.try_claim_turn(conversation_id, turn_id).ok()
+    }
+
     pub fn is_claimed(&self, conversation_id: &str) -> bool {
         self.state
             .lock()
@@ -537,6 +548,7 @@ impl ConversationRuntimeStateService {
         task_status: Option<ConversationStatus>,
         has_task: bool,
         pending_confirmations: usize,
+        supports_midturn_delivery: bool,
     ) -> ConversationRuntimeSummary {
         let (active_turn_id, cancelling) = self
             .state
@@ -572,6 +584,7 @@ impl ConversationRuntimeStateService {
             is_processing,
             pending_confirmations,
             turn_id: active_turn_id,
+            supports_midturn_delivery,
         }
     }
 
@@ -686,7 +699,7 @@ mod tests {
 
         assert_eq!(state.active_turn_id_for("conv-1").as_deref(), Some("turn-a"));
 
-        let summary = state.summary_from_parts("conv-1", None, false, 0);
+        let summary = state.summary_from_parts("conv-1", None, false, 0, false);
         assert_eq!(summary.turn_id.as_deref(), Some("turn-a"));
         assert_eq!(summary.state, ConversationRuntimeStateKind::Starting);
     }
@@ -704,6 +717,26 @@ mod tests {
 
         assert!(!claim.release_for_turn("turn-a"));
         assert!(!state.is_claimed("conv-1"));
+    }
+
+    #[test]
+    fn a_midturn_send_does_not_mint_a_phantom_turn_id() {
+        let svc = Arc::new(ConversationRuntimeStateService::default());
+        let _claim = svc.try_claim_turn("conv-1", "t-1").expect("first claim");
+        // A second send while t-1 runs must NOT create a second claim, and the
+        // summary must keep reporting the REAL active turn.
+        assert!(svc.claim_for_agent_turn("conv-1", "t-2").is_none());
+        assert_eq!(svc.active_turn_id_for("conv-1").as_deref(), Some("t-1"));
+    }
+
+    #[test]
+    fn an_agent_started_turn_claims_after_the_previous_one_released() {
+        let svc = Arc::new(ConversationRuntimeStateService::default());
+        let claim = svc.try_claim_turn("conv-1", "t-1").expect("first claim");
+        drop(claim);
+        let adopted = svc.claim_for_agent_turn("conv-1", "t-2").expect("adopted");
+        assert_eq!(svc.active_turn_id_for("conv-1").as_deref(), Some("t-2"));
+        drop(adopted);
     }
 
     #[test]
@@ -902,11 +935,25 @@ mod tests {
             .try_claim_turn("conv-1", "turn-1")
             .expect("claim should be created");
 
-        let summary = state.summary_from_parts("conv-1", None, false, 0);
+        let summary = state.summary_from_parts("conv-1", None, false, 0, false);
 
         assert_eq!(summary.state, ConversationRuntimeStateKind::Starting);
         assert!(summary.is_processing);
         assert!(!summary.can_send_message);
+    }
+
+    /// Task-1 brief: `summary_from_parts` must pass the caller-supplied
+    /// `supports_midturn_delivery` straight through, unmodified by any other
+    /// runtime-state derivation.
+    #[test]
+    fn summary_from_parts_carries_supports_midturn_delivery_through() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+
+        let summary_true = state.summary_from_parts("conv-1", None, false, 0, true);
+        assert!(summary_true.supports_midturn_delivery);
+
+        let summary_false = state.summary_from_parts("conv-1", None, false, 0, false);
+        assert!(!summary_false.supports_midturn_delivery);
     }
 
     #[test]
@@ -916,7 +963,7 @@ mod tests {
             .try_claim_turn("conv-1", "turn-1")
             .expect("claim should be created");
 
-        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 1);
+        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 1, false);
 
         assert_eq!(summary.state, ConversationRuntimeStateKind::WaitingConfirmation);
         assert!(summary.is_processing);
@@ -931,7 +978,7 @@ mod tests {
             .expect("claim should be created");
         state.mark_cancelling("conv-1");
 
-        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 0);
+        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 0, false);
 
         assert_eq!(summary.state, ConversationRuntimeStateKind::Cancelling);
         assert_eq!(summary.turn_id.as_deref(), Some("turn-a"));
@@ -943,7 +990,7 @@ mod tests {
     fn summary_uses_running_task_without_claim() {
         let state = Arc::new(ConversationRuntimeStateService::default());
 
-        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 0);
+        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Running), true, 0, false);
 
         assert_eq!(summary.state, ConversationRuntimeStateKind::Running);
         assert!(summary.is_processing);
@@ -954,7 +1001,7 @@ mod tests {
     fn summary_idle_when_no_claim_running_task_or_confirmation() {
         let state = Arc::new(ConversationRuntimeStateService::default());
 
-        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Finished), true, 0);
+        let summary = state.summary_from_parts("conv-1", Some(ConversationStatus::Finished), true, 0, false);
 
         assert_eq!(summary.state, ConversationRuntimeStateKind::Idle);
         assert!(!summary.is_processing);
