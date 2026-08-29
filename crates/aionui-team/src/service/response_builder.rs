@@ -4,7 +4,7 @@ impl TeamSessionService {
     pub(super) async fn build_team_response(&self, user_id: &str, team: &Team) -> Result<TeamResponse, TeamError> {
         let mut agents = Vec::with_capacity(team.agents.len());
         for agent in &team.agents {
-            agents.push(self.build_agent_response(user_id, agent).await?);
+            agents.push(self.build_agent_response(user_id, &team.id, agent).await?);
         }
 
         Ok(TeamResponse {
@@ -21,12 +21,81 @@ impl TeamSessionService {
     pub(super) async fn build_agent_response(
         &self,
         user_id: &str,
+        team_id: &str,
         agent: &TeamAgent,
     ) -> Result<aionui_api_types::TeamAgentResponse, TeamError> {
         let icon = self.resolve_agent_icon(user_id, agent).await?;
         let mut response = agent.to_response_with_icon(icon);
         response.pending_confirmations = self.pending_confirmation_count(&agent.conversation_id);
+        response.context_reset = self.context_reset_capability(user_id, team_id, agent).await?;
         Ok(response)
+    }
+
+    pub(super) async fn context_reset_capability(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        agent: &TeamAgent,
+    ) -> Result<aionui_api_types::TeamContextResetCapability, TeamError> {
+        let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+        self.context_reset_capability_for_session(user_id, agent, session.as_deref())
+            .await
+    }
+
+    pub(super) async fn context_reset_capability_for_session(
+        &self,
+        user_id: &str,
+        agent: &TeamAgent,
+        session: Option<&TeamSession>,
+    ) -> Result<aionui_api_types::TeamContextResetCapability, TeamError> {
+        use aionui_api_types::{TeamContextResetAvailability as Availability, TeamContextResetCapability};
+
+        if agent.role == TeammateRole::Lead {
+            return Ok(TeamContextResetCapability {
+                supported: false,
+                availability: Availability::LeaderNotTargetable,
+            });
+        }
+
+        if !self
+            .conversation_port
+            .supports_context_reset(user_id, &agent.conversation_id)
+            .await?
+        {
+            return Ok(TeamContextResetCapability {
+                supported: false,
+                availability: Availability::Unsupported,
+            });
+        }
+
+        let Some(session) = session else {
+            return Ok(TeamContextResetCapability {
+                supported: true,
+                availability: Availability::SessionStopped,
+            });
+        };
+
+        let availability = match session.member_runtimes().snapshot(&agent.slot_id) {
+            MemberRuntimeSnapshot::Absent => Availability::Dormant,
+            MemberRuntimeSnapshot::Attaching { .. } => Availability::Initializing,
+            MemberRuntimeSnapshot::Failed { .. } => Availability::Failed,
+            MemberRuntimeSnapshot::Removing { .. } => Availability::Removing,
+            MemberRuntimeSnapshot::SessionStopped => Availability::SessionStopped,
+            MemberRuntimeSnapshot::Ready => {
+                let work = session.work_coordinator().slot_snapshot(&agent.slot_id);
+                if work.is_some_and(|slot| {
+                    slot.active_batch.is_some() || slot.queued_foreground_count > 0 || slot.queued_background_count > 0
+                }) {
+                    Availability::Busy
+                } else {
+                    Availability::Ready
+                }
+            }
+        };
+        Ok(TeamContextResetCapability {
+            supported: true,
+            availability,
+        })
     }
 
     fn pending_confirmation_count(&self, conversation_id: &str) -> usize {

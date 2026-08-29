@@ -364,6 +364,18 @@ impl TeamStdioServer {
     }
 
     #[tool(
+        name = "team_clear_agent_context",
+        description = "Start a fresh backend context for a teammate while preserving team membership, settings, visible chat history, tasks, files, and unread mailbox messages. Lead only."
+    )]
+    async fn clear_agent_context(&self, Parameters(params): Parameters<ClearAgentContextParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_clear_agent_context",
+            &serde_json::json!({ "slot_id": params.slot_id }),
+        )
+        .await
+    }
+
+    #[tool(
         name = "team_shutdown_agent",
         description = "Initiate shutdown of a teammate. Lead only. Sends a shutdown_request to the target agent."
     )]

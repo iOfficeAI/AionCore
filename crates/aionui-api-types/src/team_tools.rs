@@ -515,7 +515,7 @@ fn tool_specs() -> Vec<TeamToolSpec> {
         TeamToolSpec {
             name: TeamToolName::TeamClearAgentContext,
             permission: TeamToolPermission::LeadOnly,
-            description: "Clear a team member's backend conversation context while preserving team membership, settings, and visible chat history. Lead only.",
+            description: "Start a fresh backend context for a teammate while preserving team membership, settings, visible chat history, tasks, files, and unread mailbox messages. Lead only.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -525,7 +525,7 @@ fn tool_specs() -> Vec<TeamToolSpec> {
                 "required": ["slot_id"]
             }),
             cli_command: &["clear-agent-context"],
-            when: "Clear teammate context",
+            when: "Start fresh teammate context",
             input_summary: "slot_id",
         },
         TeamToolSpec {

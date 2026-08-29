@@ -441,6 +441,14 @@ pub(crate) mod workspace_harness {
         }
 
         pub(crate) fn mark_runtime_not_ready(&self, id: &str) {
+            self.set_extra_flag(id, "runtime_not_ready");
+        }
+
+        pub(crate) fn mark_runtime_attach_failed(&self, id: &str) {
+            self.set_extra_flag(id, "runtime_attach_failed");
+        }
+
+        fn set_extra_flag(&self, id: &str, key: &str) {
             let mut conversations = self.conversations.lock().unwrap();
             let conversation = conversations
                 .iter_mut()
@@ -448,7 +456,7 @@ pub(crate) mod workspace_harness {
                 .expect("conversation exists");
             let mut extra: serde_json::Value =
                 serde_json::from_str(&conversation.extra).unwrap_or_else(|_| serde_json::json!({}));
-            extra["runtime_not_ready"] = serde_json::Value::Bool(true);
+            extra[key] = serde_json::Value::Bool(true);
             conversation.extra = serde_json::to_string(&extra).unwrap();
         }
     }
@@ -604,12 +612,14 @@ pub(crate) mod workspace_harness {
 
     pub(crate) struct FullMockTeamRepo {
         teams: Mutex<Vec<TeamRow>>,
+        messages: Mutex<Vec<aionui_db::models::MailboxMessageRow>>,
     }
 
     impl FullMockTeamRepo {
         fn new() -> Self {
             Self {
                 teams: Mutex::new(Vec::new()),
+                messages: Mutex::new(Vec::new()),
             }
         }
     }
@@ -686,27 +696,43 @@ pub(crate) mod workspace_harness {
         async fn write_message(
             &self,
             _user_id: &str,
-            _row: &aionui_db::models::MailboxMessageRow,
+            row: &aionui_db::models::MailboxMessageRow,
         ) -> Result<(), DbError> {
+            self.messages.lock().unwrap().push(row.clone());
             Ok(())
         }
 
         async fn read_unread_and_mark(
             &self,
             _user_id: &str,
-            _team_id: &str,
-            _to_agent_id: &str,
+            team_id: &str,
+            to_agent_id: &str,
         ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-            Ok(vec![])
+            let mut messages = self.messages.lock().unwrap();
+            let mut unread = Vec::new();
+            for message in messages.iter_mut() {
+                if message.team_id == team_id && message.to_agent_id == to_agent_id && !message.read {
+                    unread.push(message.clone());
+                    message.read = true;
+                }
+            }
+            Ok(unread)
         }
 
         async fn peek_unread(
             &self,
             _user_id: &str,
-            _team_id: &str,
-            _to_agent_id: &str,
+            team_id: &str,
+            to_agent_id: &str,
         ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-            Ok(vec![])
+            Ok(self
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|message| message.team_id == team_id && message.to_agent_id == to_agent_id && !message.read)
+                .cloned()
+                .collect())
         }
 
         async fn peek_unread_by_ids(
@@ -790,12 +816,23 @@ pub(crate) mod workspace_harness {
 
         async fn list_messages_by_ids(
             &self,
-            _ids: &[String],
+            ids: &[String],
         ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-            Ok(vec![])
+            Ok(self
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|message| ids.contains(&message.id))
+                .cloned()
+                .collect())
         }
 
-        async fn delete_mailbox_by_team(&self, _user_id: &str, _team_id: &str) -> Result<(), DbError> {
+        async fn delete_mailbox_by_team(&self, _user_id: &str, team_id: &str) -> Result<(), DbError> {
+            self.messages
+                .lock()
+                .unwrap()
+                .retain(|message| message.team_id != team_id);
             Ok(())
         }
 
@@ -1101,9 +1138,17 @@ pub(crate) mod workspace_harness {
         async fn warmup_agent_process(
             &self,
             _user_id: &str,
-            _conversation_id: &str,
+            conversation_id: &str,
             _task_manager: &Arc<dyn IWorkerTaskManager>,
         ) -> Result<(), TeamError> {
+            if self
+                .repo
+                .get_extra(conversation_id)
+                .and_then(|extra| extra.get("runtime_attach_failed").and_then(serde_json::Value::as_bool))
+                .unwrap_or(false)
+            {
+                return Err(TeamError::InvalidRequest("forced runtime attach failure".to_owned()));
+            }
             Ok(())
         }
 

@@ -5,8 +5,9 @@ use std::time::Instant;
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
-    TeamAgentRuntimeStatus, TeamChildTurnPayload, TeamMessageEnqueueStatus, TeamRunAckResponse, TeamRunPayload,
-    TeamRunSource, TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
+    TeamAgentRuntimeStatus, TeamChildTurnPayload, TeamContextResetNotice, TeamContextResetRuntimeStatus,
+    TeamInterruptAgentResponse, TeamInterruptOutcome, TeamMessageEnqueueStatus, TeamQueuedPolicy, TeamRunAckResponse,
+    TeamRunPayload, TeamRunSource, TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
 };
 use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::ITeamRepository;
@@ -23,8 +24,7 @@ use crate::member_runtime::{
     ReserveAttach,
 };
 use crate::message_projection::{
-    ProjectedTeamMessage, TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest,
-    TeamProjectionSource, teammate_dedupe_key,
+    TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest, TeamProjectionSource, teammate_dedupe_key,
 };
 use crate::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, NoopNativeSlashCommandPort,
@@ -800,65 +800,31 @@ impl TeamSession {
         })
     }
 
-    /// Project a locally handled team command and its result without placing
-    /// either message in the backend mailbox. This keeps `/clear` visible in
-    /// the initiating conversation while guaranteeing it is never forwarded
-    /// to the agent process.
-    pub(crate) async fn project_local_command_result(
+    /// Project a semantic system notice into the target teammate conversation.
+    /// The renderer localizes the structured payload; it never enters the agent mailbox.
+    pub(crate) async fn project_context_reset_notice(
         &self,
-        initiating_slot_id: &str,
-        command: &str,
-        result: &str,
-    ) -> Result<TeamRunAckResponse, TeamError> {
-        let agent = self.scheduler.get_agent(initiating_slot_id).await?;
+        slot_id: &str,
+        runtime_status: TeamContextResetRuntimeStatus,
+    ) -> Result<(), TeamError> {
+        let agent = self.scheduler.get_agent(slot_id).await?;
+        let content = serde_json::to_string(&TeamContextResetNotice {
+            kind: "context_reset".to_owned(),
+            member_name: agent.name.clone(),
+            runtime_status,
+        })?;
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
-        let command_projection = projection
-            .project(TeamProjectionRequest::user_visible(
-                &self.user_id,
-                &self.team.id,
-                initiating_slot_id,
-                &agent.conversation_id,
-                command,
-                Vec::new(),
-            ))
-            .await?;
-        let message_id = match command_projection {
-            ProjectedTeamMessage::Inserted { msg_id } | ProjectedTeamMessage::AlreadyProjected { msg_id } => msg_id,
-            ProjectedTeamMessage::Skipped => generate_id(),
-        };
         projection
             .project(TeamProjectionRequest::team_system_visible(
                 &self.user_id,
                 &self.team.id,
-                initiating_slot_id,
+                slot_id,
                 &agent.conversation_id,
-                result,
+                content,
                 generate_id(),
             ))
             .await?;
-
-        let target_role = match agent.role {
-            TeammateRole::Lead => TeamRunTargetRole::Lead,
-            TeammateRole::Teammate => TeamRunTargetRole::Teammate,
-        };
-        Ok(TeamRunAckResponse {
-            enqueue_status: TeamMessageEnqueueStatus::Accepted,
-            message_id,
-            run: TeamRunPayload {
-                team_id: self.team.id.clone(),
-                team_run_id: generate_id(),
-                source: TeamRunSource::UserMessage,
-                has_user_intervention: true,
-                target_slot_id: initiating_slot_id.to_owned(),
-                target_role,
-                status: TeamRunStatus::Completed,
-                queued_intent_count: 0,
-                starting_batch_count: 0,
-                running_batch_count: 0,
-                active_enqueue_lease_count: 0,
-                slot_work: Vec::new(),
-            },
-        })
+        Ok(())
     }
 
     async fn publish_runtime_constraint(&self, slot_id: &str) -> Result<(), TeamError> {

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use aionui_api_types::{TeamAgentResponse, TeamResponse};
+use aionui_api_types::{TeamAgentResponse, TeamContextResetAvailability, TeamContextResetCapability, TeamResponse};
 use aionui_common::TimestampMs;
 use serde::{Deserialize, Serialize};
 
@@ -134,6 +134,17 @@ impl TeamAgent {
             assistant_id: self.assistant_id.clone(),
             status: self.status.map(|s| s.to_string()),
             pending_confirmations: 0,
+            context_reset: if self.role == TeammateRole::Lead {
+                TeamContextResetCapability {
+                    supported: false,
+                    availability: TeamContextResetAvailability::LeaderNotTargetable,
+                }
+            } else {
+                TeamContextResetCapability {
+                    supported: false,
+                    availability: TeamContextResetAvailability::Unsupported,
+                }
+            },
         }
     }
 }
