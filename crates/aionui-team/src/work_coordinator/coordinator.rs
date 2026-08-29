@@ -575,11 +575,33 @@ impl SlotWorkCoordinator {
         ReconcileDecision::Claim(batch)
     }
 
+    /// The batch that currently owns `slot_id`'s turn, if any. Captured at peek
+    /// time so a later `observe_messages` can prove it is still talking about
+    /// the same turn.
+    pub(crate) fn active_batch_id(&self, slot_id: &str) -> Option<String> {
+        self.lock_state()
+            .slots
+            .get(slot_id)
+            .and_then(|slot| slot.active.as_ref())
+            .map(|active| active.batch.batch_id.clone())
+    }
+
     /// Bind mailbox rows observed through `team_read_messages` to the active
     /// turn. The binding is coordinator-local until the turn succeeds, so a
     /// failed, cancelled, or interrupted turn leaves every observed row unread
     /// and available to the existing retry/recovery path.
-    pub(crate) fn observe_messages(&self, slot_id: &str, message_ids: &[String]) -> ObserveMessagesResult {
+    ///
+    /// `expected_batch_id` is the batch that owned the turn when the rows were
+    /// read. A mismatch means the turn was replaced (cancelled, interrupted, or
+    /// completed) while the tool call was in flight, so the rows must not be
+    /// attributed to whatever batch happens to own the slot now — dropping the
+    /// binding leaves them unread for the normal delivery path.
+    pub(crate) fn observe_messages(
+        &self,
+        slot_id: &str,
+        expected_batch_id: &str,
+        message_ids: &[String],
+    ) -> ObserveMessagesResult {
         let mut state = self.lock_state();
         let Some(active) = state.slots.get_mut(slot_id).and_then(|slot| slot.active.as_mut()) else {
             return ObserveMessagesResult {
@@ -587,6 +609,22 @@ impl SlotWorkCoordinator {
                 observed_count: 0,
             };
         };
+        if active.batch.batch_id != expected_batch_id {
+            let current_batch_id = active.batch.batch_id.clone();
+            drop(state);
+            warn!(
+                team_id = %self.team_id,
+                session_generation = %self.session_generation,
+                slot_id,
+                expected_batch_id,
+                current_batch_id,
+                "team mailbox observation dropped; active turn was replaced"
+            );
+            return ObserveMessagesResult {
+                batch_id: None,
+                observed_count: 0,
+            };
+        }
         let original_ids = active.batch.mailbox_message_ids.iter().cloned().collect::<HashSet<_>>();
         let mut known_ids = active
             .batch
@@ -802,6 +840,10 @@ impl SlotWorkCoordinator {
         let slot = state.slots.get_mut(&batch.slot_id).expect("current batch slot exists");
         slot.active = None;
         let mut exhausted_message_ids = Vec::new();
+        // Only messages this batch actually tried to deliver count toward the retry
+        // limit. Rows merely observed through `team_read_messages` were never a
+        // delivery attempt, so they keep their counter and stay unread — they accrue
+        // failures later if a batch genuinely claims and fails to deliver them.
         for message_id in &batch.mailbox_message_ids {
             let failure_count = slot.delivery_failure_counts.entry(message_id.clone()).or_default();
             *failure_count = failure_count.saturating_add(1);

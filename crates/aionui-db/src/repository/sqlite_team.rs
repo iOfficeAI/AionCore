@@ -275,7 +275,8 @@ impl ITeamRepository for SqliteTeamRepository {
                  FROM mailbox \
                  WHERE team_id = ? AND to_agent_id = ? AND read = 0 \
                    AND id IN ({placeholders}) \
-                   AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?)"
+                   AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?) \
+                 ORDER BY created_at ASC, id ASC"
             );
             let mut query = sqlx::query_as::<_, MailboxMessageRow>(&sql)
                 .bind(team_id)
@@ -286,6 +287,13 @@ impl ITeamRepository for SqliteTeamRepository {
             query = query.bind(user_id);
             rows.extend(query.fetch_all(&self.pool).await?);
         }
+        // Each chunk is ordered by SQL, but chunk boundaries would still interleave
+        // out of order, so restore the global FIFO order the trait promises.
+        rows.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
         Ok(rows)
     }
 

@@ -39,7 +39,8 @@ use crate::team_run::{TeamRunManager, target_role_for};
 use crate::types::{MailboxMessage, MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 use crate::work_coordinator::{
     CausalBinding, CommitResult, EnqueueCommit, EnqueueDisposition, EnqueueLease, EnqueueRequest,
-    ObserveMessagesResult, ReconcileDecision, RuntimeConstraint, SlotWorkCoordinator, WorkBatch,
+    MAX_MESSAGE_DELIVERY_FAILURES, ObserveMessagesResult, ReconcileDecision, RuntimeConstraint, SlotWorkCoordinator,
+    WorkBatch,
 };
 use crate::work_source::WorkSource;
 
@@ -64,6 +65,16 @@ pub struct WakeInput {
 pub struct AgentMessageQueueResult {
     pub team_run_id: Option<String>,
     pub target: TeamSlotWorkPayload,
+}
+
+/// Result of a `team_read_messages` peek: the unread rows plus the batch that
+/// owned the slot's turn at read time. `batch_id` is `None` when no turn was
+/// active (for example a CLI-driven read outside a turn), in which case nothing
+/// can be acknowledged and every row simply stays unread.
+#[derive(Debug, Clone)]
+pub(crate) struct AgentInboxPeek {
+    pub(crate) messages: Vec<MailboxMessage>,
+    pub(crate) batch_id: Option<String>,
 }
 
 pub(crate) enum PrepareBatchResult {
@@ -1702,24 +1713,66 @@ impl TeamSession {
         &self.mailbox
     }
 
-    pub(crate) async fn peek_agent_messages(&self, slot_id: &str) -> Result<Vec<MailboxMessage>, TeamError> {
+    pub(crate) async fn peek_agent_messages(&self, slot_id: &str) -> Result<AgentInboxPeek, TeamError> {
         self.scheduler.get_agent(slot_id).await?;
-        Ok(self
+        // Capture the owning batch before reading so the caller can prove a later
+        // `observe_agent_messages` still refers to the turn these rows were read in.
+        let batch_id = self.work_coordinator.active_batch_id(slot_id);
+        let messages = self
             .mailbox
             .peek_unread(&self.team.id, slot_id)
             .await?
             .into_iter()
             .filter(|message| message.from_agent_id != slot_id)
-            .collect())
+            .collect();
+        Ok(AgentInboxPeek { messages, batch_id })
     }
 
     pub(crate) async fn observe_agent_messages(
         &self,
         slot_id: &str,
+        expected_batch_id: &str,
         message_ids: &[String],
     ) -> Result<ObserveMessagesResult, TeamError> {
         self.scheduler.get_agent(slot_id).await?;
-        Ok(self.work_coordinator.observe_messages(slot_id, message_ids))
+        Ok(self
+            .work_coordinator
+            .observe_messages(slot_id, expected_batch_id, message_ids))
+    }
+
+    /// Tell the lead that a teammate burned through its delivery retries and is
+    /// now paused. Without this the slot stalls silently and the lead waits on a
+    /// teammate that will never answer. Mirrors `notify_leader_spawn_attach_failed`.
+    pub(crate) async fn notify_leader_delivery_exhausted(
+        &self,
+        slot_id: &str,
+        abandoned_count: usize,
+    ) -> Result<(), TeamError> {
+        let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await else {
+            return Ok(());
+        };
+        if lead_slot_id == slot_id {
+            // The lead itself stalled; there is no higher authority to notify.
+            return Ok(());
+        }
+        let content = format!(
+            "Teammate {slot_id} could not process {abandoned_count} queued message(s) after \
+             {MAX_MESSAGE_DELIVERY_FAILURES} delivery attempts. Those messages were dropped and the \
+             teammate is now paused: it will not pick up new work until you interrupt it with \
+             team_interrupt_agent or the user intervenes. Check on it before assigning more work."
+        );
+        self.mailbox
+            .write(
+                &self.team.id,
+                &lead_slot_id,
+                slot_id,
+                MailboxMessageType::Message,
+                &content,
+                Some("Delivery retry limit reached"),
+            )
+            .await?;
+        self.wake_leader_after_recovery_message(slot_id, WorkSource::DeliveryFailureNotification)
+            .await
     }
 
     pub fn task_board(&self) -> &Arc<TaskBoard> {
@@ -2938,11 +2991,15 @@ mod tests {
 
         let peeked = session.peek_agent_messages("lead-1").await.unwrap();
         assert_eq!(
-            peeked.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(),
+            peeked
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
             vec![first.id.as_str(), second.id.as_str()],
             "the inbox peek is FIFO and excludes messages sent by the caller to itself"
         );
-        assert!(peeked.iter().all(|message| !message.read));
+        assert!(peeked.messages.iter().all(|message| !message.read));
         let still_unread = session.mailbox.peek_unread("t1", "lead-1").await.unwrap();
         assert_eq!(still_unread.len(), 3, "peeking must not mark any mailbox row read");
         assert!(still_unread.iter().any(|message| message.id == self_message.id));
@@ -2960,6 +3017,202 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["first", "second"]
         );
+        session.stop();
+    }
+
+    /// Claims a batch for `slot_id` so the slot has an active turn, and returns it.
+    async fn claim_active_batch(session: &Arc<TeamSession>, slot_id: &str) -> WorkBatch {
+        register_test_event_loop(session, slot_id);
+        let PrepareBatchResult::Execute { batch, .. } = session.prepare_next_batch(slot_id).await.unwrap() else {
+            panic!("a queued mailbox message must be claimable");
+        };
+        *batch
+    }
+
+    async fn unread_ids(session: &Arc<TeamSession>, slot_id: &str) -> Vec<String> {
+        session
+            .mailbox
+            .peek_unread("t1", slot_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|message| message.id)
+            .collect()
+    }
+
+    /// P4: the whole `team_read_messages` acknowledgement contract across layers —
+    /// peek reads without consuming, observe binds to the live turn, and only a
+    /// successful turn marks the observed rows read in the repository.
+    #[tokio::test]
+    async fn observed_messages_are_marked_read_when_the_turn_succeeds() {
+        let (session, _repo) = start_session_with(empty_task_manager()).await;
+        let session = Arc::new(session);
+        let claimed = session
+            .mailbox
+            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "claimed", None)
+            .await
+            .unwrap();
+
+        let batch = claim_active_batch(&session, "lead-1").await;
+        assert_eq!(batch.mailbox_message_ids, vec![claimed.id.clone()]);
+
+        // A teammate message lands mid-turn: exactly the case peeking exists for.
+        let queued = session
+            .mailbox
+            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "queued", None)
+            .await
+            .unwrap();
+
+        let peek = session.peek_agent_messages("lead-1").await.unwrap();
+        assert_eq!(
+            peek.messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![claimed.id.as_str(), queued.id.as_str()],
+            "the peek is FIFO across the claimed and the mid-turn message"
+        );
+        assert_eq!(
+            peek.batch_id.as_deref(),
+            Some(batch.batch_id.as_str()),
+            "the peek reports the turn its rows belong to"
+        );
+        assert_eq!(
+            unread_ids(&session, "lead-1").await,
+            vec![claimed.id.clone(), queued.id.clone()],
+            "peeking alone consumes nothing"
+        );
+
+        let observed = session
+            .observe_agent_messages("lead-1", &batch.batch_id, &[claimed.id.clone(), queued.id.clone()])
+            .await
+            .unwrap();
+        assert_eq!(observed.batch_id.as_deref(), Some(batch.batch_id.as_str()));
+        assert_eq!(observed.observed_count, 1, "the claimed row was already owned");
+        assert_eq!(
+            unread_ids(&session, "lead-1").await,
+            vec![claimed.id.clone(), queued.id.clone()],
+            "observing is coordinator-local; nothing is read until the turn ends"
+        );
+
+        // Terminal step the event loop performs on a successful turn.
+        let completion = session.work_coordinator().complete_batch_with_ack(&batch);
+        assert_eq!(completion.commit_result, CommitResult::Committed);
+        assert_eq!(
+            completion.ack_message_ids,
+            vec![claimed.id.clone(), queued.id.clone()],
+            "the observed row is acknowledged alongside the claimed one"
+        );
+        session
+            .mailbox
+            .mark_read_batch("t1", &completion.ack_message_ids)
+            .await
+            .unwrap();
+
+        assert!(
+            unread_ids(&session, "lead-1").await.is_empty(),
+            "both rows are read in the repository after a successful turn"
+        );
+        assert!(
+            matches!(
+                session.work_coordinator().next("lead-1"),
+                crate::work_coordinator::ReconcileDecision::Quiescent
+            ),
+            "the observed message must not wake the lead a second time"
+        );
+        session.stop();
+    }
+
+    /// P4: the failure half of the same contract — a turn that does not succeed
+    /// leaves every observed row unread so the normal delivery path retries it.
+    #[tokio::test]
+    async fn observed_messages_stay_unread_when_the_turn_fails() {
+        let (session, _repo) = start_session_with(empty_task_manager()).await;
+        let session = Arc::new(session);
+        let claimed = session
+            .mailbox
+            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "claimed", None)
+            .await
+            .unwrap();
+        let batch = claim_active_batch(&session, "lead-1").await;
+        let queued = session
+            .mailbox
+            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "queued", None)
+            .await
+            .unwrap();
+
+        session.peek_agent_messages("lead-1").await.unwrap();
+        session
+            .observe_agent_messages("lead-1", &batch.batch_id, std::slice::from_ref(&queued.id))
+            .await
+            .unwrap();
+
+        let failure = session.work_coordinator().fail_batch(&batch, "turn_failed");
+        assert_eq!(failure.commit_result, CommitResult::Committed);
+        assert!(
+            failure.exhausted_message_ids.is_empty(),
+            "a single failure is below the retry limit"
+        );
+        assert_eq!(
+            unread_ids(&session, "lead-1").await,
+            vec![claimed.id.clone(), queued.id.clone()],
+            "a failed turn acknowledges nothing"
+        );
+
+        let PrepareBatchResult::Execute { batch: retry, .. } = session.prepare_next_batch("lead-1").await.unwrap()
+        else {
+            panic!("both rows must remain claimable after the failed turn");
+        };
+        assert_eq!(retry.mailbox_message_ids, vec![claimed.id, queued.id]);
+        session.stop();
+    }
+
+    /// P3 across layers: an observation carrying a replaced turn's batch id must
+    /// not be re-attributed to whichever batch owns the slot now.
+    #[tokio::test]
+    async fn observations_from_a_replaced_turn_do_not_acknowledge_the_next_turn() {
+        let (session, _repo) = start_session_with(empty_task_manager()).await;
+        let session = Arc::new(session);
+        let claimed = session
+            .mailbox
+            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "claimed", None)
+            .await
+            .unwrap();
+        let first = claim_active_batch(&session, "lead-1").await;
+        let queued = session
+            .mailbox
+            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "queued", None)
+            .await
+            .unwrap();
+
+        let peek = session.peek_agent_messages("lead-1").await.unwrap();
+        assert_eq!(peek.batch_id.as_deref(), Some(first.batch_id.as_str()));
+
+        // The turn the agent was reading in is cancelled; the next batch takes over.
+        assert_eq!(
+            session.work_coordinator().cancel_batch(&first, "turn_cancelled"),
+            CommitResult::Committed
+        );
+        let PrepareBatchResult::Execute { batch: second, .. } = session.prepare_next_batch("lead-1").await.unwrap()
+        else {
+            panic!("the next batch must claim the surviving rows");
+        };
+        assert_ne!(first.batch_id, second.batch_id);
+
+        let observed = session
+            .observe_agent_messages("lead-1", &first.batch_id, std::slice::from_ref(&queued.id))
+            .await
+            .unwrap();
+        assert_eq!(observed.batch_id, None, "the stale observation is rejected");
+        assert_eq!(observed.observed_count, 0);
+
+        let completion = session.work_coordinator().complete_batch_with_ack(&second);
+        assert!(
+            !completion.ack_message_ids.contains(&queued.id) || second.mailbox_message_ids.contains(&queued.id),
+            "the replacement turn only acknowledges rows it actually claimed"
+        );
+        assert_eq!(
+            completion.ack_message_ids, second.mailbox_message_ids,
+            "no stale observation leaked into the acknowledgement set"
+        );
+        drop(claimed);
         session.stop();
     }
 

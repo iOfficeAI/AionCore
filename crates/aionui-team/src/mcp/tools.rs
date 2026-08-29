@@ -48,6 +48,15 @@ pub struct SendMessageInput {
     pub files: Vec<String>,
 }
 
+/// Arguments for the `team_read_messages` MCP tool call. `since_message_id` is a
+/// FIFO cursor: the page starts at the unread message right after it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadMessagesInput {
+    #[serde(default)]
+    pub since_message_id: Option<String>,
+}
+
 /// Arguments for the `team_spawn_agent` MCP tool call.
 ///
 /// Team spawning is assistant-first. The MCP tool accepts an assistant identity;
