@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
@@ -38,6 +38,13 @@ use tokio::sync::{Notify, broadcast};
 
 pub const USER: &str = "user_1";
 pub const OTHER_USER: &str = "user_2";
+
+static NEXT_TEST_ROOT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn unique_test_root(label: &str) -> std::path::PathBuf {
+    let id = NEXT_TEST_ROOT_ID.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("aionui-session-message-{label}-{}-{id}", std::process::id()))
+}
 
 // ── Recording broadcaster ───────────────────────────────────────────
 
@@ -280,7 +287,7 @@ pub async fn setup_with_clock(clock: Arc<TestClock>) -> Ctx {
     let task_manager: Arc<dyn IWorkerTaskManager> = stub_task_manager.clone();
 
     let conversation_service = ConversationService::new(
-        std::env::temp_dir().join("aionui-session-message-test-workspaces"),
+        unique_test_root("workspaces"),
         broadcaster.clone(),
         Arc::new(NoSkills),
         task_manager.clone(),
@@ -305,7 +312,7 @@ pub async fn setup_with_clock(clock: Arc<TestClock>) -> Ctx {
 
     let project_service = Arc::new(ProjectService::new(
         Arc::new(SqliteProjectStore::new(pool.clone())),
-        std::env::temp_dir().join("aionui-session-message-test-projects"),
+        unique_test_root("projects"),
     ));
 
     Ctx {

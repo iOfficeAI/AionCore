@@ -26,12 +26,14 @@ pub(super) struct ActiveBatch {
 pub(super) struct SlotState {
     pub(super) role: TeamRunTargetRole,
     pub(super) foreground: VecDeque<String>,
+    pub(super) directed: VecDeque<String>,
     pub(super) control: VecDeque<String>,
     pub(super) background: VecDeque<String>,
     pub(super) active: Option<ActiveBatch>,
     pub(super) paused: bool,
     pub(super) runtime_constraint: RuntimeConstraint,
     known_unread_message_ids: HashSet<String>,
+    delivery_failure_counts: HashMap<String, u8>,
     removed: bool,
 }
 
@@ -40,12 +42,14 @@ impl SlotState {
         Self {
             role,
             foreground: VecDeque::new(),
+            directed: VecDeque::new(),
             control: VecDeque::new(),
             background: VecDeque::new(),
             active: None,
             paused: false,
             runtime_constraint: RuntimeConstraint::Starting { operation_id: 0 },
             known_unread_message_ids: HashSet::new(),
+            delivery_failure_counts: HashMap::new(),
             removed: false,
         }
     }
@@ -53,6 +57,7 @@ impl SlotState {
     fn queue(&self, priority: WorkPriority) -> &VecDeque<String> {
         match priority {
             WorkPriority::Foreground => &self.foreground,
+            WorkPriority::Directed => &self.directed,
             WorkPriority::Control => &self.control,
             WorkPriority::Background => &self.background,
         }
@@ -61,6 +66,7 @@ impl SlotState {
     fn queue_mut(&mut self, priority: WorkPriority) -> &mut VecDeque<String> {
         match priority {
             WorkPriority::Foreground => &mut self.foreground,
+            WorkPriority::Directed => &mut self.directed,
             WorkPriority::Control => &mut self.control,
             WorkPriority::Background => &mut self.background,
         }
@@ -69,12 +75,18 @@ impl SlotState {
     pub(super) fn queued_ids(&self) -> impl Iterator<Item = &String> {
         self.foreground
             .iter()
+            .chain(self.directed.iter())
             .chain(self.control.iter())
             .chain(self.background.iter())
     }
 
     fn remove_queued(&mut self, intent_id: &str) {
-        for queue in [&mut self.foreground, &mut self.control, &mut self.background] {
+        for queue in [
+            &mut self.foreground,
+            &mut self.directed,
+            &mut self.control,
+            &mut self.background,
+        ] {
             queue.retain(|candidate| candidate != intent_id);
         }
     }
@@ -85,6 +97,7 @@ pub(super) struct CoordinatorState {
     pub(super) slots: BTreeMap<String, SlotState>,
     pub(super) intents: HashMap<String, WorkIntent>,
     pub(super) enqueue_leases: HashMap<String, EnqueueLeaseRecord>,
+    interrupted_batches: HashMap<String, BatchInterruptMetadata>,
     next_operation_id: u64,
 }
 
@@ -304,11 +317,23 @@ impl SlotWorkCoordinator {
         CommitResult::Committed
     }
 
+    #[cfg(test)]
     pub(crate) fn reconcile_mailbox(
         &self,
         slot_id: &str,
         unread_message_ids: &[String],
         role: TeamRunTargetRole,
+    ) -> ReconcileProjection {
+        let stale_candidates = self.mailbox_reconcile_candidates(slot_id);
+        self.reconcile_mailbox_snapshot(slot_id, unread_message_ids, role, &stale_candidates)
+    }
+
+    pub(crate) fn reconcile_mailbox_snapshot(
+        &self,
+        slot_id: &str,
+        unread_message_ids: &[String],
+        role: TeamRunTargetRole,
+        stale_candidates: &HashSet<String>,
     ) -> ReconcileProjection {
         let mut state = self.lock_state();
         let unread = unread_message_ids.iter().cloned().collect::<HashSet<_>>();
@@ -318,6 +343,8 @@ impl SlotWorkCoordinator {
             .or_insert_with(|| SlotState::new(role.clone()));
         slot.role = role.clone();
         slot.known_unread_message_ids = unread.clone();
+        slot.delivery_failure_counts
+            .retain(|message_id, _| unread.contains(message_id));
 
         let candidates = slot.queued_ids().cloned().collect::<Vec<_>>();
         let mut retained_intent_ids = Vec::new();
@@ -330,7 +357,7 @@ impl SlotWorkCoordinator {
                 retained_intent_ids.push(intent_id);
                 continue;
             };
-            if unread.contains(message_id) {
+            if unread.contains(message_id) || !stale_candidates.contains(&intent_id) {
                 retained_intent_ids.push(intent_id);
             } else {
                 intent.state = WorkIntentState::Completed;
@@ -393,6 +420,23 @@ impl SlotWorkCoordinator {
         }
     }
 
+    pub(crate) fn mailbox_reconcile_candidates(&self, slot_id: &str) -> HashSet<String> {
+        let state = self.lock_state();
+        state
+            .slots
+            .get(slot_id)
+            .into_iter()
+            .flat_map(SlotState::queued_ids)
+            .filter(|intent_id| {
+                state
+                    .intents
+                    .get(*intent_id)
+                    .is_some_and(|intent| intent.mailbox_message_id.is_some())
+            })
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn next(&self, slot_id: &str) -> ReconcileDecision {
         let mut state = self.lock_state();
         let Some(slot) = state.slots.get(slot_id) else {
@@ -410,6 +454,7 @@ impl SlotWorkCoordinator {
 
         let selected_priority = [
             WorkPriority::Foreground,
+            WorkPriority::Directed,
             WorkPriority::Control,
             WorkPriority::Background,
         ]
@@ -442,27 +487,27 @@ impl SlotWorkCoordinator {
         }
 
         // ELECTRON-3RN: isolate recognized slash commands into single-message
-        // batches (FIFO, no preemption). The queue head decides:
-        // - head is a `UserCommand` → this batch is exactly that one command, so
-        //   the native op is not fed the rest of the turn (the flaw that ruled
-        //   out option B);
-        // - head is an ordinary message → merge the leading run of ordinary
-        //   messages but STOP at the first `UserCommand` so a command is never
-        //   folded into a plain batch (existing multi-message merge, bounded).
-        let head_is_command = state
+        // batches (FIFO, no preemption). Lead interventions are isolated for the
+        // same reason: after an interrupt they must run as the replacement turn,
+        // without absorbing retained queued work.
+        let head_source = state
             .intents
             .get(&fifo_message_intent_ids[0])
-            .is_some_and(|intent| intent.source == WorkSource::UserCommand);
-        let (message_intent_ids, is_command) = if head_is_command {
-            (vec![fifo_message_intent_ids[0].clone()], true)
+            .map(|intent| intent.source);
+        let head_is_isolated =
+            head_source.is_some_and(|source| matches!(source, WorkSource::UserCommand | WorkSource::LeadIntervention));
+        let (message_intent_ids, is_command) = if head_is_isolated {
+            (
+                vec![fifo_message_intent_ids[0].clone()],
+                head_source == Some(WorkSource::UserCommand),
+            )
         } else {
             let mut selected = Vec::new();
             for intent_id in &fifo_message_intent_ids {
-                let is_command_intent = state
-                    .intents
-                    .get(intent_id)
-                    .is_some_and(|intent| intent.source == WorkSource::UserCommand);
-                if is_command_intent {
+                let is_isolated_intent = state.intents.get(intent_id).is_some_and(|intent| {
+                    matches!(intent.source, WorkSource::UserCommand | WorkSource::LeadIntervention)
+                });
+                if is_isolated_intent {
                     break;
                 }
                 selected.push(intent_id.clone());
@@ -496,6 +541,7 @@ impl SlotWorkCoordinator {
             slot_id: slot_id.to_owned(),
             intent_ids: message_intent_ids.clone(),
             mailbox_message_ids,
+            observed_message_ids: Vec::new(),
             highest_priority: priority,
             team_run_ids: team_run_ids.clone(),
             operation_id,
@@ -528,6 +574,87 @@ impl SlotWorkCoordinator {
             "team work batch claimed"
         );
         ReconcileDecision::Claim(batch)
+    }
+
+    /// The batch that currently owns `slot_id`'s turn, if any. Captured at peek
+    /// time so a later `observe_messages` can prove it is still talking about
+    /// the same turn.
+    pub(crate) fn active_batch_id(&self, slot_id: &str) -> Option<String> {
+        self.lock_state()
+            .slots
+            .get(slot_id)
+            .and_then(|slot| slot.active.as_ref())
+            .map(|active| active.batch.batch_id.clone())
+    }
+
+    /// Bind mailbox rows observed through `team_read_messages` to the active
+    /// turn. The binding is coordinator-local until the turn succeeds, so a
+    /// failed, cancelled, or interrupted turn leaves every observed row unread
+    /// and available to the existing retry/recovery path.
+    ///
+    /// `expected_batch_id` is the batch that owned the turn when the rows were
+    /// read. A mismatch means the turn was replaced (cancelled, interrupted, or
+    /// completed) while the tool call was in flight, so the rows must not be
+    /// attributed to whatever batch happens to own the slot now — dropping the
+    /// binding leaves them unread for the normal delivery path.
+    pub(crate) fn observe_messages(
+        &self,
+        slot_id: &str,
+        expected_batch_id: &str,
+        message_ids: &[String],
+    ) -> ObserveMessagesResult {
+        let mut state = self.lock_state();
+        let Some(active) = state.slots.get_mut(slot_id).and_then(|slot| slot.active.as_mut()) else {
+            return ObserveMessagesResult {
+                batch_id: None,
+                observed_count: 0,
+            };
+        };
+        if active.batch.batch_id != expected_batch_id {
+            let current_batch_id = active.batch.batch_id.clone();
+            drop(state);
+            warn!(
+                team_id = %self.team_id,
+                session_generation = %self.session_generation,
+                slot_id,
+                expected_batch_id,
+                current_batch_id,
+                "team mailbox observation dropped; active turn was replaced"
+            );
+            return ObserveMessagesResult {
+                batch_id: None,
+                observed_count: 0,
+            };
+        }
+        let original_ids = active.batch.mailbox_message_ids.iter().cloned().collect::<HashSet<_>>();
+        let mut known_ids = active
+            .batch
+            .observed_message_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut observed_count = 0;
+        for message_id in message_ids {
+            if original_ids.contains(message_id) || !known_ids.insert(message_id.clone()) {
+                continue;
+            }
+            active.batch.observed_message_ids.push(message_id.clone());
+            observed_count += 1;
+        }
+        let batch_id = active.batch.batch_id.clone();
+        drop(state);
+        debug!(
+            team_id = %self.team_id,
+            session_generation = %self.session_generation,
+            slot_id,
+            batch_id,
+            observed_count,
+            "team mailbox messages bound to active turn"
+        );
+        ObserveMessagesResult {
+            batch_id: Some(batch_id),
+            observed_count,
+        }
     }
 
     pub(crate) fn mark_started(&self, batch: &WorkBatch, turn_id: &str) -> StartCommitResult {
@@ -611,16 +738,280 @@ impl SlotWorkCoordinator {
         CommitResult::Committed
     }
 
+    #[cfg(test)]
     pub(crate) fn complete_batch(&self, batch: &WorkBatch) -> CommitResult {
-        self.terminalize_batch(batch, WorkIntentState::Completed, "completed")
+        self.complete_batch_with_ack(batch).commit_result
     }
 
-    pub(crate) fn fail_batch(&self, batch: &WorkBatch, classification: &'static str) -> CommitResult {
-        self.terminalize_batch(batch, WorkIntentState::Failed { classification }, classification)
+    pub(crate) fn complete_batch_with_ack(&self, batch: &WorkBatch) -> BatchCompletionResult {
+        let mut state = self.lock_state();
+        if !self.is_current_batch(&state, batch) {
+            self.log_stale_batch(batch, "complete_batch_with_ack");
+            return BatchCompletionResult {
+                commit_result: CommitResult::StaleOwner,
+                ack_message_ids: Vec::new(),
+                team_run_ids: Vec::new(),
+            };
+        }
+
+        let active_batch = state
+            .slots
+            .get(&batch.slot_id)
+            .and_then(|slot| slot.active.as_ref())
+            .expect("current batch slot has active ownership")
+            .batch
+            .clone();
+        let mut ack_message_ids = active_batch.mailbox_message_ids.clone();
+        for message_id in &active_batch.observed_message_ids {
+            if !ack_message_ids.contains(message_id) {
+                ack_message_ids.push(message_id.clone());
+            }
+        }
+        let observed_ids = active_batch
+            .observed_message_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut completed_intent_ids = active_batch.intent_ids.iter().cloned().collect::<HashSet<_>>();
+        let mut team_run_ids = active_batch.team_run_ids.clone();
+
+        for intent in state.intents.values_mut() {
+            let belongs_to_observed_message = intent.slot_id == batch.slot_id
+                && intent
+                    .mailbox_message_id
+                    .as_ref()
+                    .is_some_and(|message_id| observed_ids.contains(message_id));
+            if completed_intent_ids.contains(&intent.intent_id)
+                || (belongs_to_observed_message && !intent.state.is_terminal())
+            {
+                completed_intent_ids.insert(intent.intent_id.clone());
+                if let Some(team_run_id) = &intent.team_run_id
+                    && !team_run_ids.contains(team_run_id)
+                {
+                    team_run_ids.push(team_run_id.clone());
+                }
+                intent.state = WorkIntentState::Completed;
+            }
+        }
+
+        let slot = state.slots.get_mut(&batch.slot_id).expect("current batch slot exists");
+        for intent_id in &completed_intent_ids {
+            slot.remove_queued(intent_id);
+        }
+        slot.active = None;
+        for message_id in &ack_message_ids {
+            slot.delivery_failure_counts.remove(message_id);
+        }
+        let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
+        let summaries = Self::run_summaries_locked(&state, team_run_ids.iter().cloned());
+        drop(state);
+        self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(slot_snapshot);
+        info!(
+            team_id = %self.team_id,
+            session_generation = %self.session_generation,
+            slot_id = %batch.slot_id,
+            batch_id = %batch.batch_id,
+            operation_id = batch.operation_id,
+            ack_count = ack_message_ids.len(),
+            observed_count = active_batch.observed_message_ids.len(),
+            "team work batch terminal"
+        );
+        BatchCompletionResult {
+            commit_result: CommitResult::Committed,
+            ack_message_ids,
+            team_run_ids,
+        }
+    }
+
+    pub(crate) fn fail_batch(&self, batch: &WorkBatch, classification: &'static str) -> BatchFailureResult {
+        let mut state = self.lock_state();
+        if !self.is_current_batch(&state, batch) {
+            self.log_stale_batch(batch, "fail_batch");
+            return BatchFailureResult {
+                commit_result: CommitResult::StaleOwner,
+                exhausted_message_ids: Vec::new(),
+            };
+        }
+        for intent_id in &batch.intent_ids {
+            if let Some(intent) = state.intents.get_mut(intent_id) {
+                intent.state = WorkIntentState::Failed { classification };
+            }
+        }
+        let slot = state.slots.get_mut(&batch.slot_id).expect("current batch slot exists");
+        slot.active = None;
+        let mut exhausted_message_ids = Vec::new();
+        // Only messages this batch actually tried to deliver count toward the retry
+        // limit. Rows merely observed through `team_read_messages` were never a
+        // delivery attempt, so they keep their counter and stay unread — they accrue
+        // failures later if a batch genuinely claims and fails to deliver them.
+        for message_id in &batch.mailbox_message_ids {
+            let failure_count = slot.delivery_failure_counts.entry(message_id.clone()).or_default();
+            *failure_count = failure_count.saturating_add(1);
+            if *failure_count >= MAX_MESSAGE_DELIVERY_FAILURES {
+                exhausted_message_ids.push(message_id.clone());
+            }
+        }
+        if !exhausted_message_ids.is_empty() {
+            slot.paused = true;
+        }
+        let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
+        let summaries = Self::run_summaries_locked(&state, batch.team_run_ids.iter().cloned());
+        drop(state);
+        self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(slot_snapshot);
+        info!(
+            team_id = %self.team_id,
+            session_generation = %self.session_generation,
+            slot_id = %batch.slot_id,
+            batch_id = %batch.batch_id,
+            operation_id = batch.operation_id,
+            classification,
+            exhausted_message_count = exhausted_message_ids.len(),
+            "team work batch terminal"
+        );
+        BatchFailureResult {
+            commit_result: CommitResult::Committed,
+            exhausted_message_ids,
+        }
     }
 
     pub(crate) fn cancel_batch(&self, batch: &WorkBatch, classification: &'static str) -> CommitResult {
         self.terminalize_batch(batch, WorkIntentState::Cancelled { classification }, classification)
+    }
+
+    pub(crate) fn interrupt_batch(
+        &self,
+        batch: &WorkBatch,
+        reason: Option<String>,
+        replacement_message_id: String,
+    ) -> InterruptBatchResult {
+        let mut state = self.lock_state();
+        if !self.is_current_batch(&state, batch) {
+            self.log_stale_batch(batch, "interrupt_batch");
+            return InterruptBatchResult {
+                commit_result: CommitResult::StaleOwner,
+                terminal_message_ids: Vec::new(),
+            };
+        }
+        for intent_id in &batch.intent_ids {
+            if let Some(intent) = state.intents.get_mut(intent_id) {
+                intent.state = WorkIntentState::Cancelled {
+                    classification: "lead_interrupted",
+                };
+            }
+        }
+        let replacement_intent_id = state.intents.iter().find_map(|(intent_id, intent)| {
+            (intent.slot_id == batch.slot_id
+                && intent.source == WorkSource::LeadIntervention
+                && intent.mailbox_message_id.as_deref() == Some(&replacement_message_id)
+                && matches!(intent.state, WorkIntentState::Queued))
+            .then(|| intent_id.clone())
+        });
+        let slot = state.slots.get_mut(&batch.slot_id).expect("current batch slot exists");
+        slot.active = None;
+        for message_id in &batch.mailbox_message_ids {
+            slot.delivery_failure_counts.remove(message_id);
+        }
+        if let Some(replacement_intent_id) = replacement_intent_id {
+            slot.foreground.retain(|intent_id| intent_id != &replacement_intent_id);
+            slot.foreground.push_front(replacement_intent_id);
+        }
+        state.interrupted_batches.insert(
+            batch.batch_id.clone(),
+            BatchInterruptMetadata {
+                reason,
+                replacement_message_id,
+            },
+        );
+        let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
+        let summaries = Self::run_summaries_locked(&state, batch.team_run_ids.iter().cloned());
+        drop(state);
+        self.publish_run_summaries(summaries);
+        self.publish_slot_work_snapshot(slot_snapshot);
+        InterruptBatchResult {
+            commit_result: CommitResult::Committed,
+            terminal_message_ids: batch.mailbox_message_ids.clone(),
+        }
+    }
+
+    pub(crate) fn take_interrupt_metadata(&self, batch_id: &str) -> Option<BatchInterruptMetadata> {
+        self.lock_state().interrupted_batches.remove(batch_id)
+    }
+
+    /// Pending interrupt metadata. Every entry must eventually be taken by the
+    /// interrupting caller or by the event loop, so a non-zero residue after a
+    /// batch is finished is a leak.
+    #[cfg(test)]
+    pub(crate) fn interrupted_batch_count(&self) -> usize {
+        self.lock_state().interrupted_batches.len()
+    }
+
+    pub(crate) fn is_batch_cancelled(&self, batch: &WorkBatch) -> bool {
+        let state = self.lock_state();
+        batch.intent_ids.iter().all(|intent_id| {
+            state
+                .intents
+                .get(intent_id)
+                .is_some_and(|intent| matches!(intent.state, WorkIntentState::Cancelled { .. }))
+        })
+    }
+
+    pub(crate) fn is_active_batch(&self, batch: &WorkBatch, turn_id: Option<&str>) -> bool {
+        let state = self.lock_state();
+        self.is_current_batch(&state, batch)
+            && state
+                .slots
+                .get(&batch.slot_id)
+                .and_then(|slot| slot.active.as_ref())
+                .is_some_and(|active| active.turn_id.as_deref() == turn_id)
+    }
+
+    /// Terminalize the slot's queued work so only `retained_message_id` survives,
+    /// backing `TeamQueuedPolicy::Discard`. Returns the mailbox rows the caller
+    /// must mark read.
+    ///
+    /// Control-lane work is exempt. Discard means "supersede the queued
+    /// instructions", but the Control lane carries lifecycle protocol
+    /// (`team_shutdown_agent` handshakes) rather than instructions, and dropping
+    /// a queued shutdown request would strand that handshake forever with no
+    /// retry path.
+    pub(crate) fn discard_queued_except(&self, slot_id: &str, retained_message_id: &str) -> Vec<String> {
+        let mut state = self.lock_state();
+        let queued_ids = state
+            .slots
+            .get(slot_id)
+            .map(|slot| slot.queued_ids().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut terminal_message_ids = Vec::new();
+        let mut discard_ids = Vec::new();
+        for intent_id in queued_ids {
+            let Some(intent) = state.intents.get_mut(&intent_id) else {
+                continue;
+            };
+            if intent.mailbox_message_id.as_deref() == Some(retained_message_id) {
+                continue;
+            }
+            if intent.source.priority() == WorkPriority::Control {
+                continue;
+            }
+            if let Some(message_id) = &intent.mailbox_message_id {
+                terminal_message_ids.push(message_id.clone());
+            }
+            intent.state = WorkIntentState::Cancelled {
+                classification: "lead_interrupt_discarded",
+            };
+            discard_ids.push(intent_id);
+        }
+        if let Some(slot) = state.slots.get_mut(slot_id) {
+            for intent_id in discard_ids {
+                slot.remove_queued(&intent_id);
+            }
+        }
+        let slot_snapshot = Self::slot_snapshot_locked(&state, slot_id);
+        drop(state);
+        self.publish_slot_work_snapshot(slot_snapshot);
+        terminal_message_ids
     }
 
     pub(crate) fn cancel_run(&self, team_run_id: &str) -> CancelRunWorkResult {
@@ -756,6 +1147,8 @@ impl SlotWorkCoordinator {
             turn_id: active.turn_id.clone(),
         });
         let snapshot = Self::slot_snapshot_locked(&state, slot_id).expect("paused slot exists");
+        drop(state);
+        self.publish_slot_work_snapshot(Some(snapshot.clone()));
         PauseWorkResult {
             cancel_target,
             slot: snapshot,
@@ -813,6 +1206,7 @@ impl SlotWorkCoordinator {
             }
             let slot = state.slots.get_mut(slot_id).expect("constrained slot exists");
             slot.foreground.clear();
+            slot.directed.clear();
             slot.control.clear();
             slot.background.clear();
             slot.active = None;
@@ -833,6 +1227,57 @@ impl SlotWorkCoordinator {
             terminal_message_ids,
             affected_run_summaries,
         }
+    }
+
+    /// Atomically blocks new work while a member runtime is restarted.
+    pub(crate) fn begin_runtime_restart(&self, slot_id: &str) -> Result<RuntimeRestartGate, RuntimeRestartRejection> {
+        let mut state = self.lock_state();
+        let slot = state
+            .slots
+            .entry(slot_id.to_owned())
+            .or_insert_with(|| SlotState::new(TeamRunTargetRole::Teammate));
+        if slot.active.is_some() || slot.queued_ids().next().is_some() {
+            return Err(RuntimeRestartRejection::Busy);
+        }
+        match slot.runtime_constraint {
+            RuntimeConstraint::Removing { .. } => return Err(RuntimeRestartRejection::Removing),
+            RuntimeConstraint::SessionStopped => return Err(RuntimeRestartRejection::SessionStopped),
+            RuntimeConstraint::Ready | RuntimeConstraint::Starting { .. } | RuntimeConstraint::Failed { .. } => {}
+        }
+        let previous_constraint = slot.runtime_constraint.clone();
+        state.next_operation_id = state.next_operation_id.saturating_add(1);
+        let operation_id = state.next_operation_id;
+        state
+            .slots
+            .get_mut(slot_id)
+            .expect("restart-gated slot exists")
+            .runtime_constraint = RuntimeConstraint::Starting { operation_id };
+        let snapshot = Self::slot_snapshot_locked(&state, slot_id);
+        drop(state);
+        self.publish_slot_work_snapshot(snapshot);
+        Ok(RuntimeRestartGate {
+            operation_id,
+            previous_constraint,
+        })
+    }
+
+    /// Roll back an unused restart gate without overwriting a newer runtime transition.
+    pub(crate) fn abort_runtime_restart(&self, slot_id: &str, gate: &RuntimeRestartGate) {
+        let mut state = self.lock_state();
+        let Some(slot) = state.slots.get_mut(slot_id) else {
+            return;
+        };
+        if slot.runtime_constraint
+            != (RuntimeConstraint::Starting {
+                operation_id: gate.operation_id,
+            })
+        {
+            return;
+        }
+        slot.runtime_constraint = gate.previous_constraint.clone();
+        let snapshot = Self::slot_snapshot_locked(&state, slot_id);
+        drop(state);
+        self.publish_slot_work_snapshot(snapshot);
     }
 
     pub(crate) fn remove_slot(&self, slot_id: &str) -> RemoveWorkResult {
@@ -883,6 +1328,7 @@ impl SlotWorkCoordinator {
         }
         if let Some(slot) = state.slots.get_mut(slot_id) {
             slot.foreground.clear();
+            slot.directed.clear();
             slot.control.clear();
             slot.background.clear();
             slot.active = None;
@@ -911,6 +1357,7 @@ impl SlotWorkCoordinator {
         }
         for slot in state.slots.values_mut() {
             slot.foreground.clear();
+            slot.directed.clear();
             slot.control.clear();
             slot.background.clear();
             slot.active = None;
@@ -983,11 +1430,11 @@ impl SlotWorkCoordinator {
                 intent.state = terminal_state.clone();
             }
         }
-        state
-            .slots
-            .get_mut(&batch.slot_id)
-            .expect("current batch slot exists")
-            .active = None;
+        let slot = state.slots.get_mut(&batch.slot_id).expect("current batch slot exists");
+        slot.active = None;
+        for message_id in &batch.mailbox_message_ids {
+            slot.delivery_failure_counts.remove(message_id);
+        }
         let slot_snapshot = Self::slot_snapshot_locked(&state, &batch.slot_id);
         let summaries = Self::run_summaries_locked(&state, batch.team_run_ids.iter().cloned());
         drop(state);

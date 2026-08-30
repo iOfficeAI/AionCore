@@ -1214,6 +1214,59 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
     }
 }
 
+#[tokio::test]
+async fn clear_acp_context_anchor_drops_only_the_resume_anchor() {
+    let runtime_state = PersistedSessionState {
+        current_mode_id: Some("full_auto".to_owned()),
+        current_model_id: Some("model-preserved".to_owned()),
+        ..Default::default()
+    };
+    let acp_session_repo = Arc::new(StubAcpSessionRepo {
+        create_calls: Mutex::new(Vec::new()),
+        runtime_state_saves: Mutex::new(Vec::new()),
+        session_id: Mutex::new(Some("session-to-clear".to_owned())),
+        runtime_state: Mutex::new(Some(runtime_state.clone())),
+    });
+    let (service, _broadcaster, _repo, _task_manager) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_session_repo.clone(),
+    );
+    let conversation = service.create("user_1", make_create_req()).await.unwrap();
+
+    assert!(
+        service
+            .supports_acp_context_reset("user_1", &conversation.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        service
+            .clear_acp_context_anchor("user_1", &conversation.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(*acp_session_repo.session_id.lock().unwrap(), None);
+    assert_eq!(*acp_session_repo.runtime_state.lock().unwrap(), Some(runtime_state));
+}
+
+#[tokio::test]
+async fn aionrs_conversation_does_not_support_acp_context_reset() {
+    let (service, _broadcaster, _repo, _task_manager) = make_service();
+    let request = serde_json::from_value(json!({
+        "type": "aionrs",
+        "extra": { "workspace": ensure_test_workspace_path() }
+    }))
+    .unwrap();
+    let conversation = service.create("user_1", request).await.unwrap();
+
+    assert!(
+        !service
+            .supports_acp_context_reset("user_1", &conversation.id)
+            .await
+            .unwrap()
+    );
+}
+
 fn make_service() -> (
     ConversationService,
     Arc<MockBroadcaster>,
@@ -2956,8 +3009,8 @@ async fn list_artifacts_includes_legacy_cron_trigger_messages() {
             position: Some("center".into()),
             status: Some("finish".into()),
             hidden: false,
-            created_at: 1234,
             backend_turn_id: None,
+            created_at: 1234,
         },
     )
     .await
@@ -4565,6 +4618,120 @@ async fn ensure_runtime_uses_existing_agent_snapshot_without_recovery() {
     assert!(result.runtime.has_task);
     assert_eq!(result.config_options[0].id, "model");
     assert_eq!(result.config_options[0].current_value.as_deref(), Some("gpt-5.5"));
+}
+
+#[tokio::test]
+async fn restart_runtime_without_existing_task_is_rejected() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let error = svc
+        .restart_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConversationError::Busy { reason }
+            if reason == format!("conversation {} runtime is not ready to restart", conv.id)
+    ));
+    assert_eq!(task_mgr.kill_count(), 0);
+}
+
+#[tokio::test]
+async fn restart_runtime_evicts_existing_task_before_rebuild() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+
+    let result = svc
+        .restart_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        task_mgr.kill_records(),
+        vec![(conv.id.clone(), Some(AgentKillReason::RuntimeRestart))]
+    );
+    assert!(result.runtime.has_task);
+}
+
+#[tokio::test]
+async fn restart_runtime_rejects_team_owned_conversation() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let mut req = make_create_req();
+    req.extra = serde_json::json!({
+        "teamId": "team-1",
+        "slot_id": "slot-1",
+        "role": "member"
+    });
+    let conv = svc.create("user_1", req).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+
+    let error = svc
+        .restart_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConversationError::TeamRuntimeRequired { conversation_id, team_id }
+            if conversation_id == conv.id && team_id == "team-1"
+    ));
+    assert_eq!(task_mgr.kill_count(), 0);
+}
+
+#[tokio::test]
+async fn restart_runtime_preserves_persisted_messages() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+    repo.insert_message(
+        "user_1",
+        &MessageRow {
+            id: "message-before-restart".into(),
+            conversation_id: conv.id.clone(),
+            msg_id: Some("message-before-restart".into()),
+            r#type: "user".into(),
+            content: json!({ "text": "keep me" }).to_string(),
+            position: Some("right".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            backend_turn_id: None,
+            created_at: 1234,
+        },
+    )
+    .await
+    .unwrap();
+
+    svc.restart_runtime("user_1", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap();
+
+    let messages = repo_messages_asc(&repo, &conv.id, 10).await;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, "message-before-restart");
+}
+
+#[tokio::test]
+async fn restart_runtime_rejects_cross_user_access_without_eviction() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+
+    let error = svc
+        .restart_runtime("user_2", &conv.id, &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ConversationError::NotFound { .. }));
+    assert_eq!(task_mgr.kill_count(), 0);
+    assert!(task_mgr.get_task(&conv.id).is_some());
 }
 
 #[tokio::test]
@@ -6877,6 +7044,39 @@ async fn warmup_injects_conversation_runtime_context() {
     let options = task_mgr.captured_options();
     assert_eq!(options.len(), 1);
     assert_conversation_runtime_context(&options[0], "user_1", &conv.id);
+}
+
+#[tokio::test]
+async fn warmup_keeps_existing_acp_session_anchor_in_build_options() {
+    let acp_session_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-existing"));
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_session_repo,
+    );
+    let mut request = make_create_req();
+    request.extra = serde_json::json!({
+        "teamId": "team-1",
+        "slot_id": "slot-1",
+        "role": "teammate",
+    });
+    let conv = svc.create("user_1", request).await.unwrap();
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+        MockAgent::new(&conv.id),
+    ))]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.warmup("user_1", &conv.id, &task_mgr_dyn).await.unwrap();
+
+    let options = task_mgr.captured_options();
+    assert_eq!(options.len(), 1);
+    match &options[0].context.kind {
+        AgentSessionKind::Acp(context) => {
+            assert_eq!(context.session_id.as_deref(), Some("sess-existing"));
+        }
+        AgentSessionKind::Aionrs(_) | AgentSessionKind::Antigravity(_) => {
+            panic!("test conversation should build ACP options")
+        }
+    }
 }
 
 #[tokio::test]

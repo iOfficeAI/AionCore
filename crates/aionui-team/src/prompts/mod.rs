@@ -283,6 +283,9 @@ mod tests {
         assert!(prompt.contains("team_members"));
         assert!(prompt.contains("team_task_list"));
         assert!(prompt.contains("team_rename_agent"));
+        assert!(prompt.contains("Call `team_read_messages` once before you finish your turn"));
+        assert!(prompt.contains("`since_message_id`"));
+        assert!(prompt.contains("`content_truncated: true`"));
     }
 
     #[test]
@@ -355,6 +358,8 @@ mod tests {
         assert!(prompt.contains("You MUST use the `team_*` MCP tools for ALL team coordination."));
         assert!(prompt.contains("team_send_message"));
         assert!(prompt.contains("team_task_update"));
+        assert!(prompt.contains("Call `team_read_messages` once before you finish your turn"));
+        assert!(prompt.contains("`next_since_message_id`"));
         assert!(prompt.contains("shutdown_request"));
         assert!(prompt.contains("shutdown_approved"));
         assert!(prompt.contains("STOP GENERATING"));

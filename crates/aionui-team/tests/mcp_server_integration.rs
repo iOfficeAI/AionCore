@@ -248,7 +248,7 @@ async fn mc1_correct_token_connects() {
     send_request(&mut stream, &req).await;
     let resp = read_response(&mut stream).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 10);
+    assert_eq!(tools.len(), 13);
     let names: Vec<&str> = tools.iter().filter_map(|tool| tool["name"].as_str()).collect();
     assert!(!names.contains(&"team_list_models"));
 
@@ -310,13 +310,14 @@ async fn mc3_no_token_rejected() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tools_list_returns_all_10_tools() {
+async fn tools_list_returns_all_13_tools() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
     let names = list_tools(&mut stream, 10).await;
-    assert_eq!(names.len(), 10);
+    assert_eq!(names.len(), 13);
 
+    assert!(names.contains(&"team_read_messages".to_owned()));
     assert!(names.contains(&"team_send_message".to_owned()));
     assert!(names.contains(&"team_spawn_agent".to_owned()));
     assert!(names.contains(&"team_task_create".to_owned()));
@@ -324,6 +325,7 @@ async fn tools_list_returns_all_10_tools() {
     assert!(names.contains(&"team_task_list".to_owned()));
     assert!(names.contains(&"team_members".to_owned()));
     assert!(names.contains(&"team_rename_agent".to_owned()));
+    assert!(names.contains(&"team_clear_agent_context".to_owned()));
     assert!(names.contains(&"team_shutdown_agent".to_owned()));
     assert!(names.contains(&"team_list_assistants".to_owned()));
     assert!(names.contains(&"team_describe_assistant".to_owned()));
@@ -341,8 +343,19 @@ async fn mcp_tools_list_filters_lead_only_tools() {
 
     assert!(!names.contains(&"team_spawn_agent".to_owned()));
     assert!(!names.contains(&"team_rename_agent".to_owned()));
+    assert!(!names.contains(&"team_clear_agent_context".to_owned()));
     assert!(!names.contains(&"team_shutdown_agent".to_owned()));
     assert!(names.contains(&"team_send_message".to_owned()));
+
+    let response = call_tool(
+        &mut stream,
+        11,
+        "team_clear_agent_context",
+        json!({ "slot_id": "worker-1" }),
+    )
+    .await;
+    assert!(is_error_response(&response));
+    assert!(extract_text(&response).contains("Only Lead"));
     assert!(names.contains(&"team_task_create".to_owned()));
     assert!(names.contains(&"team_task_update".to_owned()));
     assert!(names.contains(&"team_task_list".to_owned()));
@@ -500,6 +513,85 @@ async fn team_send_message_regular_message_rejects_without_live_team_run_service
     assert!(text.contains("Team service not available"));
     assert!(!text.contains("shutdown_approved_received"));
     assert!(!text.contains("shutdown_rejected_received"));
+
+    env.server.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Tests: team_read_messages argument contract on the real wire
+// ---------------------------------------------------------------------------
+
+/// The tool's schema must reach the wire, so an agent can discover the cursor.
+#[tokio::test]
+async fn read_messages_advertises_only_an_optional_cursor_over_the_wire() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
+
+    let req = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
+    send_request(&mut stream, &req).await;
+    let resp = read_response(&mut stream).await;
+    let tool = resp["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "team_read_messages")
+        .expect("team_read_messages must be visible to a teammate")
+        .clone();
+
+    // NOTE: `tools/list` serializes `TeamToolDescriptor` verbatim, so the wire key is
+    // `input_schema`. The `inputSchema` projection is only used for the prompt dump.
+    let schema = &tool["input_schema"];
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert!(
+        schema.get("required").is_none(),
+        "a bare team_read_messages call must stay valid"
+    );
+    assert!(
+        schema["properties"]["since_message_id"]["type"] == "string",
+        "the paging cursor must be discoverable, got {schema}"
+    );
+
+    env.server.stop();
+}
+
+/// Argument validation happens before the service lookup, so it is observable
+/// even in this standalone env (no live `TeamSessionService`, same as
+/// `sp1_lead_spawn_requires_live_session_service`). The deeper peek → observe →
+/// acknowledge path is covered by the `src/session.rs` lib tests that wire a
+/// real session and coordinator.
+#[tokio::test]
+async fn read_messages_rejects_unknown_arguments_before_touching_the_service() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
+
+    let resp = call_tool(&mut stream, 2, "team_read_messages", json!({"limit": 10})).await;
+    assert!(is_error_response(&resp));
+    let text = extract_text(&resp);
+    assert!(
+        text.starts_with("Invalid params:"),
+        "an unknown argument must fail schema validation, got {text:?}"
+    );
+    assert!(
+        !text.contains("Team service not available"),
+        "validation must run before the service lookup, got {text:?}"
+    );
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn read_messages_accepts_a_bare_call_and_a_cursor() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
+
+    for (id, args) in [(2, json!({})), (3, json!({"since_message_id": "message-01"}))] {
+        let resp = call_tool(&mut stream, id, "team_read_messages", args.clone()).await;
+        let text = extract_text(&resp);
+        assert!(
+            text.contains("Team service not available"),
+            "{args} must pass validation and reach the service lookup, got {text:?}"
+        );
+    }
 
     env.server.stop();
 }
@@ -1155,6 +1247,96 @@ async fn tsa4_non_lead_cannot_shutdown() {
     assert!(is_error_response(&resp));
     let text = extract_text(&resp);
     assert!(text.contains("Only Lead"));
+
+    env.server.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Tests: team_interrupt_agent argument contract on the real wire
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn interrupt_agent_is_hidden_from_and_refused_to_a_teammate() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
+
+    let names = list_tools(&mut stream, 2).await;
+    assert!(
+        !names.contains(&"team_interrupt_agent".to_owned()),
+        "a lead-only tool must not be advertised to a teammate"
+    );
+
+    let resp = call_tool(
+        &mut stream,
+        3,
+        "team_interrupt_agent",
+        json!({"slot_id": "lead-1", "message": "stop"}),
+    )
+    .await;
+    assert!(is_error_response(&resp));
+    let text = extract_text(&resp);
+    assert!(
+        text.contains("Only Lead"),
+        "a teammate calling it directly must be refused, got {text:?}"
+    );
+
+    env.server.stop();
+}
+
+/// Validation runs before the service lookup, so these are observable in this
+/// standalone env (no live `TeamSessionService`, same as
+/// `sp1_lead_spawn_requires_live_session_service`).
+#[tokio::test]
+async fn interrupt_agent_rejects_wildcard_empty_message_and_unknown_arguments() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+
+    let cases: &[(u64, Value, &str)] = &[
+        (
+            2,
+            json!({"slot_id": "*", "message": "stop"}),
+            "wildcard is not supported",
+        ),
+        (3, json!({"slot_id": "worker-1", "message": "   "}), "must not be empty"),
+        (
+            4,
+            json!({"slot_id": "worker-1", "message": "stop", "queued_policy": "discard"}),
+            "Invalid params:",
+        ),
+        (5, json!({"slot_id": "worker-1"}), "Invalid params:"),
+    ];
+
+    for (id, args, expected) in cases {
+        let resp = call_tool(&mut stream, *id, "team_interrupt_agent", args.clone()).await;
+        assert!(is_error_response(&resp), "{args} should be rejected");
+        let text = extract_text(&resp);
+        assert!(
+            text.contains(expected),
+            "{args} should mention {expected:?}, got {text:?}"
+        );
+    }
+
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn interrupt_agent_rejects_an_unknown_target_before_touching_the_service() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+
+    let resp = call_tool(
+        &mut stream,
+        2,
+        "team_interrupt_agent",
+        json!({"slot_id": "ghost-9", "message": "stop"}),
+    )
+    .await;
+    assert!(is_error_response(&resp));
+    let text = extract_text(&resp);
+    assert!(
+        text.contains("Invalid agent target"),
+        "an unresolvable slot_id must be named, got {text:?}"
+    );
 
     env.server.stop();
 }

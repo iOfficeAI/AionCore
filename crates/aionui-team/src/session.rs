@@ -5,8 +5,9 @@ use std::time::Instant;
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
-    TeamAgentRuntimeStatus, TeamChildTurnPayload, TeamMessageEnqueueStatus, TeamRunAckResponse, TeamRunStatus,
-    TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
+    TeamAgentRuntimeStatus, TeamChildTurnPayload, TeamContextResetNotice, TeamContextResetRuntimeStatus,
+    TeamInterruptAgentResponse, TeamInterruptOutcome, TeamMessageEnqueueStatus, TeamQueuedPolicy, TeamRunAckResponse,
+    TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
 };
 use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::ITeamRepository;
@@ -36,10 +37,11 @@ use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
 use crate::task_board::TaskBoard;
 use crate::team_run::{TeamRunManager, target_role_for};
-use crate::types::{MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
+use crate::types::{MailboxMessage, MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 use crate::work_coordinator::{
-    CausalBinding, CommitResult, EnqueueCommit, EnqueueDisposition, EnqueueLease, EnqueueRequest, ReconcileDecision,
-    RuntimeConstraint, SlotWorkCoordinator, WorkBatch,
+    CausalBinding, CommitResult, EnqueueCommit, EnqueueDisposition, EnqueueLease, EnqueueRequest,
+    MAX_MESSAGE_DELIVERY_FAILURES, ObserveMessagesResult, ReconcileDecision, RuntimeConstraint, SlotWorkCoordinator,
+    WorkBatch,
 };
 use crate::work_source::WorkSource;
 
@@ -64,6 +66,16 @@ pub struct WakeInput {
 pub struct AgentMessageQueueResult {
     pub team_run_id: Option<String>,
     pub target: TeamSlotWorkPayload,
+}
+
+/// Result of a `team_read_messages` peek: the unread rows plus the batch that
+/// owned the slot's turn at read time. `batch_id` is `None` when no turn was
+/// active (for example a CLI-driven read outside a turn), in which case nothing
+/// can be acknowledged and every row simply stays unread.
+#[derive(Debug, Clone)]
+pub(crate) struct AgentInboxPeek {
+    pub(crate) messages: Vec<MailboxMessage>,
+    pub(crate) batch_id: Option<String>,
 }
 
 pub(crate) enum PrepareBatchResult {
@@ -349,6 +361,10 @@ impl TeamSession {
                 .await?;
         }
 
+        // Only intents already queued before this snapshot are eligible for stale
+        // cleanup. A concurrently committed intent may not appear in the snapshot,
+        // but must remain claimable for the authoritative post-claim reread below.
+        let stale_candidates = self.work_coordinator.mailbox_reconcile_candidates(slot_id);
         let unread = self
             .mailbox
             .peek_unread(&self.team.id, slot_id)
@@ -357,20 +373,50 @@ impl TeamSession {
             .filter(|message| message.from_agent_id != slot_id)
             .collect::<Vec<_>>();
         let unread_ids = unread.iter().map(|message| message.id.clone()).collect::<Vec<_>>();
-        self.work_coordinator
-            .reconcile_mailbox(slot_id, &unread_ids, target_role_for(agent.role));
+        self.work_coordinator.reconcile_mailbox_snapshot(
+            slot_id,
+            &unread_ids,
+            target_role_for(agent.role),
+            &stale_candidates,
+        );
 
         match self.work_coordinator.next(slot_id) {
             ReconcileDecision::Claim(batch) => {
-                let claimed_ids = batch
+                let claimed_rows = match self
+                    .mailbox
+                    .peek_unread_by_ids(&self.team.id, slot_id, &batch.mailbox_message_ids)
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        self.work_coordinator.retry_start(&batch, "batch_mailbox_reread_failed");
+                        return Err(error);
+                    }
+                };
+                let mut claimed_by_id = claimed_rows
+                    .into_iter()
+                    .map(|message| (message.id.clone(), message))
+                    .collect::<std::collections::HashMap<_, _>>();
+                let claimed_unread = batch
                     .mailbox_message_ids
                     .iter()
-                    .map(String::as_str)
-                    .collect::<std::collections::HashSet<_>>();
-                let claimed_unread = unread
-                    .into_iter()
-                    .filter(|message| claimed_ids.contains(message.id.as_str()))
+                    .filter_map(|message_id| claimed_by_id.remove(message_id))
                     .collect::<Vec<_>>();
+                if claimed_unread.len() != batch.mailbox_message_ids.len() {
+                    warn!(
+                        team_id = %self.team.id,
+                        slot_id,
+                        batch_id = %batch.batch_id,
+                        claimed_count = batch.mailbox_message_ids.len(),
+                        found_count = claimed_unread.len(),
+                        "team work batch mailbox reread incomplete"
+                    );
+                    self.work_coordinator
+                        .retry_start(&batch, "batch_mailbox_reread_incomplete");
+                    return Err(TeamError::InvalidRequest(
+                        "claimed team mailbox messages are no longer unread".into(),
+                    ));
+                }
                 let tasks = match self.scheduler.list_tasks().await {
                     Ok(tasks) => tasks,
                     Err(error) => {
@@ -752,6 +798,33 @@ impl TeamSession {
             message_id: mailbox_message.id,
             run,
         })
+    }
+
+    /// Project a semantic system notice into the target teammate conversation.
+    /// The renderer localizes the structured payload; it never enters the agent mailbox.
+    pub(crate) async fn project_context_reset_notice(
+        &self,
+        slot_id: &str,
+        runtime_status: TeamContextResetRuntimeStatus,
+    ) -> Result<(), TeamError> {
+        let agent = self.scheduler.get_agent(slot_id).await?;
+        let content = serde_json::to_string(&TeamContextResetNotice {
+            kind: "context_reset".to_owned(),
+            member_name: agent.name.clone(),
+            runtime_status,
+        })?;
+        let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
+        projection
+            .project(TeamProjectionRequest::team_system_visible(
+                &self.user_id,
+                &self.team.id,
+                slot_id,
+                &agent.conversation_id,
+                content,
+                generate_id(),
+            ))
+            .await?;
+        Ok(())
     }
 
     async fn publish_runtime_constraint(&self, slot_id: &str) -> Result<(), TeamError> {
@@ -1155,6 +1228,8 @@ impl TeamSession {
                     conversation_id: agent.conversation_id,
                     turn_id,
                     status: TeamRunStatus::Cancelled,
+                    reason: None,
+                    replacement_message_id: None,
                 },
             );
         }
@@ -1195,6 +1270,8 @@ impl TeamSession {
                     conversation_id: agent.conversation_id,
                     turn_id,
                     status: TeamRunStatus::Cancelled,
+                    reason: None,
+                    replacement_message_id: None,
                 },
             );
         }
@@ -1234,6 +1311,8 @@ impl TeamSession {
                         conversation_id: agent.conversation_id,
                         turn_id,
                         status: TeamRunStatus::Cancelled,
+                        reason: None,
+                        replacement_message_id: None,
                     },
                 );
             }
@@ -1490,6 +1569,241 @@ impl TeamSession {
         self.scheduler.rename_agent(slot_id, new_name).await
     }
 
+    pub async fn interrupt_agent_from_user(
+        &self,
+        to_slot_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+        reason: Option<String>,
+        queued_policy: TeamQueuedPolicy,
+    ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        self.interrupt_agent_message(None, to_slot_id, content, files, reason, queued_policy)
+            .await
+    }
+
+    pub(crate) async fn interrupt_agent_from_agent(
+        &self,
+        from_slot_id: &str,
+        to_slot_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+        reason: Option<String>,
+    ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        let caller = self.scheduler.get_agent(from_slot_id).await?;
+        if caller.role != TeammateRole::Lead {
+            return Err(TeamError::LeaderOnly("team_interrupt_agent".into()));
+        }
+        self.interrupt_agent_message(
+            Some(from_slot_id),
+            to_slot_id,
+            content,
+            files,
+            reason,
+            TeamQueuedPolicy::Retain,
+        )
+        .await
+    }
+
+    async fn interrupt_agent_message(
+        &self,
+        from_slot_id: Option<&str>,
+        to_slot_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+        reason: Option<String>,
+        queued_policy: TeamQueuedPolicy,
+    ) -> Result<TeamInterruptAgentResponse, TeamError> {
+        if content.trim().is_empty() {
+            return Err(TeamError::InvalidRequest("interrupt message must not be empty".into()));
+        }
+        if to_slot_id == "*" {
+            return Err(TeamError::InvalidRequest(
+                "team_interrupt_agent does not support wildcard targets".into(),
+            ));
+        }
+        let target_agent = self.scheduler.get_agent(to_slot_id).await?;
+        if target_agent.role == TeammateRole::Lead {
+            return Err(TeamError::InvalidRequest("cannot interrupt the team lead".into()));
+        }
+        self.ensure_member_runtime_lazy(to_slot_id, from_slot_id.is_some())
+            .await?;
+        self.publish_runtime_constraint(to_slot_id).await?;
+        let active_before = self
+            .work_coordinator
+            .slot_snapshot(to_slot_id)
+            .and_then(|snapshot| snapshot.active_batch.map(|batch| (batch, snapshot.active_turn_id)));
+        let lease = self.work_coordinator.acquire_enqueue(EnqueueRequest {
+            slot_id: to_slot_id.to_owned(),
+            role: target_role_for(target_agent.role),
+            source: WorkSource::LeadIntervention,
+            binding: from_slot_id.map_or(CausalBinding::UserVisible, |caller_slot_id| {
+                CausalBinding::InheritRunningBatch {
+                    caller_slot_id: caller_slot_id.to_owned(),
+                }
+            }),
+        })?;
+        let sender = from_slot_id.unwrap_or("user");
+        let mailbox_message = match self
+            .mailbox
+            .write_with_files(
+                &self.team.id,
+                to_slot_id,
+                sender,
+                MailboxMessageType::Message,
+                content,
+                None,
+                files.as_deref(),
+            )
+            .await
+        {
+            Ok(message) => message,
+            Err(error) => {
+                self.work_coordinator.abort_enqueue(&lease, "mailbox_write_failed");
+                return Err(error);
+            }
+        };
+
+        let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
+        let projection_request = if let Some(from_slot_id) = from_slot_id {
+            let from_agent = self.scheduler.get_agent(from_slot_id).await?;
+            TeamProjectionRequest {
+                user_id: self.user_id.clone(),
+                team_id: self.team.id.clone(),
+                slot_id: to_slot_id.to_owned(),
+                conversation_id: target_agent.conversation_id.clone(),
+                source: TeamProjectionSource::Teammate {
+                    from_slot_id: from_slot_id.to_owned(),
+                    from_name: from_agent.name,
+                    sender_backend: Some(from_agent.backend),
+                    sender_conversation_id: Some(from_agent.conversation_id),
+                },
+                content: content.to_owned(),
+                files: files.clone().unwrap_or_default(),
+                visibility: crate::visibility::TeamVisibilityPolicy::teammate_message(),
+                dedupe_key: Some(teammate_dedupe_key(
+                    &self.team.id,
+                    &mailbox_message.id,
+                    &target_agent.conversation_id,
+                )),
+            }
+        } else {
+            TeamProjectionRequest::user_visible(
+                &self.user_id,
+                &self.team.id,
+                to_slot_id,
+                &target_agent.conversation_id,
+                content,
+                files.clone().unwrap_or_default(),
+            )
+        };
+        if let Err(error) = projection.project(projection_request).await {
+            warn!(
+                team_id = %self.team.id,
+                slot_id = to_slot_id,
+                error = %error,
+                "failed to project lead intervention (non-fatal)"
+            );
+        }
+
+        let commit = self
+            .commit_persisted_enqueue(&lease, mailbox_message.id.clone())
+            .await?;
+
+        let (outcome, interrupted_turn_id) = if let Some((batch, turn_id)) = active_before {
+            let still_active = self.work_coordinator.is_active_batch(&batch, turn_id.as_deref());
+            let cancellation_result = if still_active {
+                if let Some(turn_id) = &turn_id {
+                    self.cancellation_port
+                        .cancel_agent_turn(&self.user_id, &target_agent.conversation_id, turn_id)
+                        .await
+                } else {
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            };
+            if let Err(error) = cancellation_result
+                && self.work_coordinator.is_active_batch(&batch, turn_id.as_deref())
+            {
+                return Err(TeamError::InvalidRequest(error.to_string()));
+            }
+            let interrupted = still_active.then(|| {
+                self.work_coordinator
+                    .interrupt_batch(&batch, reason.clone(), mailbox_message.id.clone())
+            });
+            if interrupted
+                .as_ref()
+                .is_some_and(|value| value.commit_result == CommitResult::Committed)
+            {
+                let interrupted = interrupted.expect("committed interrupt result exists");
+                if !interrupted.terminal_message_ids.is_empty() {
+                    self.mailbox
+                        .mark_read_batch(&self.team.id, &interrupted.terminal_message_ids)
+                        .await?;
+                }
+                if let Some(turn_id) = &turn_id {
+                    let metadata = self.work_coordinator.take_interrupt_metadata(&batch.batch_id);
+                    for team_run_id in &batch.team_run_ids {
+                        self.team_event_emitter().broadcast_child_turn(
+                            TEAM_CHILD_TURN_CANCELLED_EVENT,
+                            TeamChildTurnPayload {
+                                team_id: self.team.id.clone(),
+                                team_run_id: team_run_id.clone(),
+                                slot_id: to_slot_id.to_owned(),
+                                role: target_role_for(target_agent.role),
+                                conversation_id: target_agent.conversation_id.clone(),
+                                turn_id: turn_id.clone(),
+                                status: TeamRunStatus::Cancelled,
+                                reason: metadata.as_ref().and_then(|value| value.reason.clone()),
+                                replacement_message_id: metadata
+                                    .as_ref()
+                                    .map(|value| value.replacement_message_id.clone()),
+                            },
+                        );
+                    }
+                }
+                (TeamInterruptOutcome::Interrupted, turn_id)
+            } else {
+                (TeamInterruptOutcome::CompletedRace, turn_id)
+            }
+        } else {
+            (TeamInterruptOutcome::QueuedNoActiveTurn, None)
+        };
+
+        // Discarding is irreversible (the rows are marked read), so it runs only
+        // after the interruption itself has settled. Doing it before the cancel
+        // meant a cancellation failure returned `Err` with the queued work
+        // already destroyed, leaving the caller nothing to retry.
+        if queued_policy == TeamQueuedPolicy::Discard {
+            let discarded = self
+                .work_coordinator
+                .discard_queued_except(to_slot_id, &mailbox_message.id);
+            if !discarded.is_empty() {
+                self.mailbox.mark_read_batch(&self.team.id, &discarded).await?;
+            }
+        }
+
+        self.event_loops.notify(to_slot_id);
+        let target = self.work_coordinator.slot_snapshot(to_slot_id).unwrap_or(commit.slot);
+        info!(
+            team_id = %self.team.id,
+            slot_id = to_slot_id,
+            replacement_message_id = %mailbox_message.id,
+            ?outcome,
+            "team agent interruption committed"
+        );
+        Ok(TeamInterruptAgentResponse {
+            outcome,
+            interrupted_turn_id,
+            message_id: mailbox_message.id,
+            target: TeamRunManager::slot_payload(&target),
+        })
+    }
+
+    pub async fn update_agent_model(&self, slot_id: &str, model: &str) -> Result<(), TeamError> {
+        self.scheduler.update_agent_model(slot_id, model).await
+    }
+
     /// Spawn a new teammate at the Lead's request (backing of `team_spawn_agent`).
     ///
     /// Validation chain mirrors the assistant-first team contract:
@@ -1645,10 +1959,11 @@ impl TeamSession {
         mcp_stdio_cfg: crate::mcp::TeamMcpStdioConfig,
         user_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
+        kill_existing: bool,
     ) -> Result<(), TeamError> {
         service
             .provisioner()
-            .attach_agent_process(user_id, agent, mcp_stdio_cfg, task_manager)
+            .attach_agent_process(user_id, agent, mcp_stdio_cfg, task_manager, kill_existing)
             .await
     }
 
@@ -1662,6 +1977,68 @@ impl TeamSession {
 
     pub fn mailbox(&self) -> &Arc<Mailbox> {
         &self.mailbox
+    }
+
+    pub(crate) async fn peek_agent_messages(&self, slot_id: &str) -> Result<AgentInboxPeek, TeamError> {
+        self.scheduler.get_agent(slot_id).await?;
+        // Capture the owning batch before reading so the caller can prove a later
+        // `observe_agent_messages` still refers to the turn these rows were read in.
+        let batch_id = self.work_coordinator.active_batch_id(slot_id);
+        let messages = self
+            .mailbox
+            .peek_unread(&self.team.id, slot_id)
+            .await?
+            .into_iter()
+            .filter(|message| message.from_agent_id != slot_id)
+            .collect();
+        Ok(AgentInboxPeek { messages, batch_id })
+    }
+
+    pub(crate) async fn observe_agent_messages(
+        &self,
+        slot_id: &str,
+        expected_batch_id: &str,
+        message_ids: &[String],
+    ) -> Result<ObserveMessagesResult, TeamError> {
+        self.scheduler.get_agent(slot_id).await?;
+        Ok(self
+            .work_coordinator
+            .observe_messages(slot_id, expected_batch_id, message_ids))
+    }
+
+    /// Tell the lead that a teammate burned through its delivery retries and is
+    /// now paused. Without this the slot stalls silently and the lead waits on a
+    /// teammate that will never answer. Mirrors `notify_leader_spawn_attach_failed`.
+    pub(crate) async fn notify_leader_delivery_exhausted(
+        &self,
+        slot_id: &str,
+        abandoned_count: usize,
+    ) -> Result<(), TeamError> {
+        let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await else {
+            return Ok(());
+        };
+        if lead_slot_id == slot_id {
+            // The lead itself stalled; there is no higher authority to notify.
+            return Ok(());
+        }
+        let content = format!(
+            "Teammate {slot_id} could not process {abandoned_count} queued message(s) after \
+             {MAX_MESSAGE_DELIVERY_FAILURES} delivery attempts. Those messages were dropped and the \
+             teammate is now paused: it will not pick up new work until you interrupt it with \
+             team_interrupt_agent or the user intervenes. Check on it before assigning more work."
+        );
+        self.mailbox
+            .write(
+                &self.team.id,
+                &lead_slot_id,
+                slot_id,
+                MailboxMessageType::Message,
+                &content,
+                Some("Delivery retry limit reached"),
+            )
+            .await?;
+        self.wake_leader_after_recovery_message(slot_id, WorkSource::DeliveryFailureNotification)
+            .await
     }
 
     pub fn task_board(&self) -> &Arc<TaskBoard> {
@@ -1731,6 +2108,55 @@ pub(crate) async fn attach_member_runtime(
     lease: AttachLease,
     notify_leader_on_failure: bool,
 ) -> AttachOutcome {
+    attach_member_runtime_inner(
+        service,
+        session,
+        user_id,
+        agent,
+        task_manager,
+        lease,
+        notify_leader_on_failure,
+        true,
+    )
+    .await
+}
+
+/// Attach a member whose previous runtime has already been stopped by the
+/// caller. Used by context reset so clearing the resume anchor happens after
+/// the old process exits and before any replacement process can start.
+pub(crate) async fn attach_member_runtime_after_kill(
+    service: Arc<TeamSessionService>,
+    session: Arc<TeamSession>,
+    user_id: String,
+    agent: TeamAgent,
+    task_manager: Arc<dyn IWorkerTaskManager>,
+    lease: AttachLease,
+    notify_leader_on_failure: bool,
+) -> AttachOutcome {
+    attach_member_runtime_inner(
+        service,
+        session,
+        user_id,
+        agent,
+        task_manager,
+        lease,
+        notify_leader_on_failure,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn attach_member_runtime_inner(
+    service: Arc<TeamSessionService>,
+    session: Arc<TeamSession>,
+    user_id: String,
+    agent: TeamAgent,
+    task_manager: Arc<dyn IWorkerTaskManager>,
+    lease: AttachLease,
+    notify_leader_on_failure: bool,
+    kill_existing: bool,
+) -> AttachOutcome {
     let started_at = Instant::now();
     let operation_id = lease.operation_id();
     let generation = session.generation().to_owned();
@@ -1762,6 +2188,7 @@ pub(crate) async fn attach_member_runtime(
         session.mcp_stdio_config(&agent.slot_id),
         &user_id,
         &task_manager,
+        kill_existing,
     )
     .await;
     if let Err(error) = attach_result {
@@ -2041,6 +2468,33 @@ mod tests {
         }
     }
 
+    /// Reports that the batch was claimed *without* invoking `on_started`, so the
+    /// slot has an active batch but no turn_id, then fails the start once released.
+    /// Reproduces the one path where interrupt metadata had no owner.
+    struct StartFailsWithoutStartedCallback {
+        claimed_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release_rx: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ports::AgentTurnExecutionPort for StartFailsWithoutStartedCallback {
+        async fn run_agent_turn(
+            &self,
+            _request: crate::ports::AgentTurnRequest,
+        ) -> Result<crate::ports::AgentTurnOutcome, crate::ports::AgentTurnExecutionError> {
+            if let Some(tx) = self.claimed_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let release_rx = self.release_rx.lock().unwrap().take();
+            if let Some(rx) = release_rx {
+                let _ = rx.await;
+            }
+            Err(crate::ports::AgentTurnExecutionError::Failed {
+                reason: "forced start failure".into(),
+            })
+        }
+    }
+
     #[async_trait::async_trait]
     impl crate::ports::AgentTurnExecutionPort for NoopTurnPort {
         async fn run_agent_turn(
@@ -2086,6 +2540,22 @@ mod tests {
 
     fn noop_cancellation_port() -> Arc<dyn crate::ports::AgentTurnCancellationPort> {
         Arc::new(NoopCancellationPort)
+    }
+
+    struct FailingCancellationPort;
+
+    #[async_trait::async_trait]
+    impl crate::ports::AgentTurnCancellationPort for FailingCancellationPort {
+        async fn cancel_agent_turn(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _turn_id: &str,
+        ) -> Result<(), crate::ports::AgentTurnExecutionError> {
+            Err(crate::ports::AgentTurnExecutionError::Failed {
+                reason: "forced cancellation failure".into(),
+            })
+        }
     }
 
     #[derive(Default)]
@@ -2851,6 +3321,354 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peek_agent_messages_is_read_only_and_preserves_normal_claim() {
+        let (session, _repo) = start_session_with(empty_task_manager()).await;
+        let session = Arc::new(session);
+        let first = session
+            .mailbox
+            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "first", None)
+            .await
+            .unwrap();
+        let self_message = session
+            .mailbox
+            .write("t1", "lead-1", "lead-1", MailboxMessageType::Message, "self", None)
+            .await
+            .unwrap();
+        let second = session
+            .mailbox
+            .write_with_files(
+                "t1",
+                "lead-1",
+                "worker-1",
+                MailboxMessageType::Message,
+                "second",
+                None,
+                Some(&["C:\\work\\note.txt".into()]),
+            )
+            .await
+            .unwrap();
+
+        let peeked = session.peek_agent_messages("lead-1").await.unwrap();
+        assert_eq!(
+            peeked
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first.id.as_str(), second.id.as_str()],
+            "the inbox peek is FIFO and excludes messages sent by the caller to itself"
+        );
+        assert!(peeked.messages.iter().all(|message| !message.read));
+        let still_unread = session.mailbox.peek_unread("t1", "lead-1").await.unwrap();
+        assert_eq!(still_unread.len(), 3, "peeking must not mark any mailbox row read");
+        assert!(still_unread.iter().any(|message| message.id == self_message.id));
+
+        register_test_event_loop(&session, "lead-1");
+        let PrepareBatchResult::Execute { batch, input } = session.prepare_next_batch("lead-1").await.unwrap() else {
+            panic!("peeked messages must remain available to the normal claim path");
+        };
+        assert_eq!(batch.mailbox_message_ids, vec![first.id, second.id]);
+        assert_eq!(
+            input
+                .unread
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        session.stop();
+    }
+
+    /// Claims a batch for `slot_id` so the slot has an active turn, and returns it.
+    async fn claim_active_batch(session: &Arc<TeamSession>, slot_id: &str) -> WorkBatch {
+        register_test_event_loop(session, slot_id);
+        let PrepareBatchResult::Execute { batch, .. } = session.prepare_next_batch(slot_id).await.unwrap() else {
+            panic!("a queued mailbox message must be claimable");
+        };
+        *batch
+    }
+
+    async fn unread_ids(session: &Arc<TeamSession>, slot_id: &str) -> Vec<String> {
+        session
+            .mailbox
+            .peek_unread("t1", slot_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|message| message.id)
+            .collect()
+    }
+
+    /// P4: the whole `team_read_messages` acknowledgement contract across layers —
+    /// peek reads without consuming, observe binds to the live turn, and only a
+    /// successful turn marks the observed rows read in the repository.
+    #[tokio::test]
+    async fn observed_messages_are_marked_read_when_the_turn_succeeds() {
+        let (session, _repo) = start_session_with(empty_task_manager()).await;
+        let session = Arc::new(session);
+        let claimed = session
+            .mailbox
+            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "claimed", None)
+            .await
+            .unwrap();
+
+        let batch = claim_active_batch(&session, "lead-1").await;
+        assert_eq!(batch.mailbox_message_ids, vec![claimed.id.clone()]);
+
+        // A teammate message lands mid-turn: exactly the case peeking exists for.
+        let queued = session
+            .mailbox
+            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "queued", None)
+            .await
+            .unwrap();
+
+        let peek = session.peek_agent_messages("lead-1").await.unwrap();
+        assert_eq!(
+            peek.messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![claimed.id.as_str(), queued.id.as_str()],
+            "the peek is FIFO across the claimed and the mid-turn message"
+        );
+        assert_eq!(
+            peek.batch_id.as_deref(),
+            Some(batch.batch_id.as_str()),
+            "the peek reports the turn its rows belong to"
+        );
+        assert_eq!(
+            unread_ids(&session, "lead-1").await,
+            vec![claimed.id.clone(), queued.id.clone()],
+            "peeking alone consumes nothing"
+        );
+
+        let observed = session
+            .observe_agent_messages("lead-1", &batch.batch_id, &[claimed.id.clone(), queued.id.clone()])
+            .await
+            .unwrap();
+        assert_eq!(observed.batch_id.as_deref(), Some(batch.batch_id.as_str()));
+        assert_eq!(observed.observed_count, 1, "the claimed row was already owned");
+        assert_eq!(
+            unread_ids(&session, "lead-1").await,
+            vec![claimed.id.clone(), queued.id.clone()],
+            "observing is coordinator-local; nothing is read until the turn ends"
+        );
+
+        // Terminal step the event loop performs on a successful turn.
+        let completion = session.work_coordinator().complete_batch_with_ack(&batch);
+        assert_eq!(completion.commit_result, CommitResult::Committed);
+        assert_eq!(
+            completion.ack_message_ids,
+            vec![claimed.id.clone(), queued.id.clone()],
+            "the observed row is acknowledged alongside the claimed one"
+        );
+        session
+            .mailbox
+            .mark_read_batch("t1", &completion.ack_message_ids)
+            .await
+            .unwrap();
+
+        assert!(
+            unread_ids(&session, "lead-1").await.is_empty(),
+            "both rows are read in the repository after a successful turn"
+        );
+        assert!(
+            matches!(
+                session.work_coordinator().next("lead-1"),
+                crate::work_coordinator::ReconcileDecision::Quiescent
+            ),
+            "the observed message must not wake the lead a second time"
+        );
+        session.stop();
+    }
+
+    /// P4: the failure half of the same contract — a turn that does not succeed
+    /// leaves every observed row unread so the normal delivery path retries it.
+    #[tokio::test]
+    async fn observed_messages_stay_unread_when_the_turn_fails() {
+        let (session, _repo) = start_session_with(empty_task_manager()).await;
+        let session = Arc::new(session);
+        let claimed = session
+            .mailbox
+            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "claimed", None)
+            .await
+            .unwrap();
+        let batch = claim_active_batch(&session, "lead-1").await;
+        let queued = session
+            .mailbox
+            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "queued", None)
+            .await
+            .unwrap();
+
+        session.peek_agent_messages("lead-1").await.unwrap();
+        session
+            .observe_agent_messages("lead-1", &batch.batch_id, std::slice::from_ref(&queued.id))
+            .await
+            .unwrap();
+
+        let failure = session.work_coordinator().fail_batch(&batch, "turn_failed");
+        assert_eq!(failure.commit_result, CommitResult::Committed);
+        assert!(
+            failure.exhausted_message_ids.is_empty(),
+            "a single failure is below the retry limit"
+        );
+        assert_eq!(
+            unread_ids(&session, "lead-1").await,
+            vec![claimed.id.clone(), queued.id.clone()],
+            "a failed turn acknowledges nothing"
+        );
+
+        let PrepareBatchResult::Execute { batch: retry, .. } = session.prepare_next_batch("lead-1").await.unwrap()
+        else {
+            panic!("both rows must remain claimable after the failed turn");
+        };
+        assert_eq!(retry.mailbox_message_ids, vec![claimed.id, queued.id]);
+        session.stop();
+    }
+
+    /// P3 across layers: an observation carrying a replaced turn's batch id must
+    /// not be re-attributed to whichever batch owns the slot now.
+    #[tokio::test]
+    async fn observations_from_a_replaced_turn_do_not_acknowledge_the_next_turn() {
+        let (session, _repo) = start_session_with(empty_task_manager()).await;
+        let session = Arc::new(session);
+        let claimed = session
+            .mailbox
+            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "claimed", None)
+            .await
+            .unwrap();
+        let first = claim_active_batch(&session, "lead-1").await;
+        let queued = session
+            .mailbox
+            .write("t1", "lead-1", "worker-1", MailboxMessageType::Message, "queued", None)
+            .await
+            .unwrap();
+
+        let peek = session.peek_agent_messages("lead-1").await.unwrap();
+        assert_eq!(peek.batch_id.as_deref(), Some(first.batch_id.as_str()));
+
+        // The turn the agent was reading in is cancelled; the next batch takes over.
+        assert_eq!(
+            session.work_coordinator().cancel_batch(&first, "turn_cancelled"),
+            CommitResult::Committed
+        );
+        let PrepareBatchResult::Execute { batch: second, .. } = session.prepare_next_batch("lead-1").await.unwrap()
+        else {
+            panic!("the next batch must claim the surviving rows");
+        };
+        assert_ne!(first.batch_id, second.batch_id);
+
+        let observed = session
+            .observe_agent_messages("lead-1", &first.batch_id, std::slice::from_ref(&queued.id))
+            .await
+            .unwrap();
+        assert_eq!(observed.batch_id, None, "the stale observation is rejected");
+        assert_eq!(observed.observed_count, 0);
+
+        let completion = session.work_coordinator().complete_batch_with_ack(&second);
+        assert!(
+            !completion.ack_message_ids.contains(&queued.id) || second.mailbox_message_ids.contains(&queued.id),
+            "the replacement turn only acknowledges rows it actually claimed"
+        );
+        assert_eq!(
+            completion.ack_message_ids, second.mailbox_message_ids,
+            "no stale observation leaked into the acknowledgement set"
+        );
+        drop(claimed);
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn prepare_next_batch_rereads_messages_committed_after_initial_peek() {
+        let (session, repo) = start_session_with(empty_task_manager()).await;
+        let session = Arc::new(session);
+        let first = session.send_message("first", None).await.unwrap();
+        register_test_event_loop(&session, "lead-1");
+
+        let (snapshot_tx, snapshot_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        repo.arm_peek_barrier(snapshot_tx, release_rx);
+
+        let preparing_session = session.clone();
+        let prepare = tokio::spawn(async move { preparing_session.prepare_next_batch("lead-1").await });
+        snapshot_rx.await.expect("initial unread snapshot must be captured");
+
+        let late_lease = session
+            .work_coordinator
+            .acquire_enqueue(EnqueueRequest {
+                slot_id: "lead-1".into(),
+                role: TeamRunTargetRole::Lead,
+                source: WorkSource::UserIntervention,
+                binding: CausalBinding::UserVisible,
+            })
+            .unwrap();
+        let late = session
+            .mailbox
+            .write("t1", "lead-1", "user", MailboxMessageType::Message, "late", None)
+            .await
+            .unwrap();
+        session
+            .commit_persisted_enqueue(&late_lease, late.id.clone())
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+
+        let PrepareBatchResult::Execute { batch, input } = prepare.await.unwrap().unwrap() else {
+            panic!("both committed messages must be prepared together");
+        };
+        assert_eq!(
+            batch.mailbox_message_ids,
+            vec![first.message_id, late.id],
+            "the claim includes the message committed after the initial peek"
+        );
+        assert_eq!(
+            input
+                .unread
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "late"],
+            "the post-claim reread must include every claimed message in the prompt input"
+        );
+        assert!(input.first_message.contains("first"));
+        assert!(input.first_message.contains("late"));
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn prepare_next_batch_requeues_when_a_claimed_mailbox_row_is_missing() {
+        let (session, repo) = start_session_with(empty_task_manager()).await;
+        let session = Arc::new(session);
+        let first = session.send_message("first", None).await.unwrap();
+        register_test_event_loop(&session, "lead-1");
+
+        let (snapshot_tx, snapshot_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        repo.arm_peek_barrier(snapshot_tx, release_rx);
+
+        let preparing_session = session.clone();
+        let prepare = tokio::spawn(async move { preparing_session.prepare_next_batch("lead-1").await });
+        snapshot_rx.await.expect("initial unread snapshot must be captured");
+        repo.state
+            .lock()
+            .unwrap()
+            .messages
+            .iter_mut()
+            .find(|message| message.id == first.message_id)
+            .expect("persisted mailbox row")
+            .read = true;
+        release_tx.send(()).unwrap();
+
+        let error = match prepare.await.unwrap() {
+            Err(error) => error,
+            Ok(_) => panic!("an incomplete claimed batch must not be executed"),
+        };
+        assert!(matches!(error, TeamError::InvalidRequest(_)));
+        let slot = session.work_coordinator.slot_snapshot("lead-1").unwrap();
+        assert_eq!(slot.state, SlotPhase::Queued);
+        assert!(slot.active_batch.is_none());
+        assert_eq!(slot.queued_foreground_count, 1);
+        session.stop();
+    }
+
+    #[tokio::test]
     async fn shutdown_turn_is_reported_running_inside_a_system_run() {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -2942,6 +3760,332 @@ mod tests {
                 .any(|message| message.id == queued.message_id)
         );
         release_tx.send(()).unwrap();
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn interrupt_agent_marks_claimed_input_read_and_retains_older_queue() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let session = Arc::new(
+            TeamSession::start(
+                make_team(),
+                repo,
+                broadcaster,
+                backend_path(),
+                empty_task_manager(),
+                Arc::new(BlockingRunningTurnPort::new(started_tx, release_rx)),
+                noop_cancellation_port(),
+                noop_projection_store(),
+                "user-test".into(),
+                Weak::<TeamSessionService>::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        register_test_event_loop(&session, "worker-1");
+
+        let first = session
+            .send_message_to_agent("worker-1", "old claimed input", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .expect("worker turn should start")
+            .expect("start signal should be sent");
+        session
+            .send_message_to_agent("worker-1", "older queued input", None)
+            .await
+            .unwrap();
+
+        let response = session
+            .interrupt_agent_from_user(
+                "worker-1",
+                "replacement instruction",
+                None,
+                Some("requirements changed".into()),
+                TeamQueuedPolicy::Retain,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.outcome, TeamInterruptOutcome::Interrupted);
+        assert_eq!(response.interrupted_turn_id.as_deref(), Some("turn-background"));
+        let unread = session.mailbox.peek_unread("t1", "worker-1").await.unwrap();
+        assert!(!unread.iter().any(|message| message.id == first.message_id));
+        assert!(unread.iter().any(|message| message.content == "older queued input"));
+        assert!(
+            unread
+                .iter()
+                .any(|message| message.content == "replacement instruction")
+        );
+
+        release_tx.send(()).unwrap();
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancellation_failure_keeps_active_batch_and_durable_replacement() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let session = Arc::new(
+            TeamSession::start(
+                make_team(),
+                repo,
+                broadcaster,
+                backend_path(),
+                empty_task_manager(),
+                Arc::new(BlockingRunningTurnPort::new(started_tx, release_rx)),
+                Arc::new(FailingCancellationPort),
+                noop_projection_store(),
+                "user-test".into(),
+                Weak::<TeamSessionService>::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        register_test_event_loop(&session, "worker-1");
+        session
+            .send_message_to_agent("worker-1", "active input", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .expect("worker turn should start")
+            .expect("start signal should be sent");
+
+        let error = session
+            .interrupt_agent_from_user("worker-1", "durable replacement", None, None, TeamQueuedPolicy::Retain)
+            .await
+            .expect_err("cancellation failure must surface");
+        assert!(error.to_string().contains("forced cancellation failure"));
+        assert_eq!(
+            session
+                .work_coordinator
+                .slot_snapshot("worker-1")
+                .unwrap()
+                .active_turn_id
+                .as_deref(),
+            Some("turn-background")
+        );
+        assert!(
+            session
+                .mailbox
+                .peek_unread("t1", "worker-1")
+                .await
+                .unwrap()
+                .iter()
+                .any(|message| message.content == "durable replacement")
+        );
+
+        release_tx.send(()).unwrap();
+        session.stop();
+    }
+
+    /// I2: `TeamQueuedPolicy::Discard` had no coverage above the coordinator, even
+    /// though it irreversibly marks the superseded rows read.
+    #[tokio::test]
+    async fn interrupt_with_discard_policy_drops_queued_work_but_keeps_the_replacement() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let session = Arc::new(
+            TeamSession::start(
+                make_team(),
+                repo,
+                broadcaster,
+                backend_path(),
+                empty_task_manager(),
+                Arc::new(BlockingRunningTurnPort::new(started_tx, release_rx)),
+                noop_cancellation_port(),
+                noop_projection_store(),
+                "user-test".into(),
+                Weak::<TeamSessionService>::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        register_test_event_loop(&session, "worker-1");
+
+        session
+            .send_message_to_agent("worker-1", "claimed input", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .expect("worker turn should start")
+            .expect("start signal should be sent");
+        session
+            .send_message_to_agent("worker-1", "superseded input", None)
+            .await
+            .unwrap();
+
+        let response = session
+            .interrupt_agent_from_user(
+                "worker-1",
+                "replacement instruction",
+                None,
+                None,
+                TeamQueuedPolicy::Discard,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.outcome, TeamInterruptOutcome::Interrupted);
+
+        let unread = session.mailbox.peek_unread("t1", "worker-1").await.unwrap();
+        let contents = unread.iter().map(|m| m.content.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            contents,
+            vec!["replacement instruction"],
+            "discard leaves only the replacement unread"
+        );
+        assert!(
+            !contents.contains(&"superseded input"),
+            "the superseded row must be marked read"
+        );
+
+        release_tx.send(()).unwrap();
+        session.stop();
+    }
+
+    /// I3: discarding used to run before the cancellation attempt, so a failing
+    /// cancel returned `Err` with the queued work already destroyed and nothing
+    /// left to retry. The discard must not happen on that path.
+    #[tokio::test]
+    async fn interrupt_cancellation_failure_does_not_discard_queued_work() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let session = Arc::new(
+            TeamSession::start(
+                make_team(),
+                repo,
+                broadcaster,
+                backend_path(),
+                empty_task_manager(),
+                Arc::new(BlockingRunningTurnPort::new(started_tx, release_rx)),
+                Arc::new(FailingCancellationPort),
+                noop_projection_store(),
+                "user-test".into(),
+                Weak::<TeamSessionService>::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        register_test_event_loop(&session, "worker-1");
+
+        session
+            .send_message_to_agent("worker-1", "active input", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .expect("worker turn should start")
+            .expect("start signal should be sent");
+        session
+            .send_message_to_agent("worker-1", "queued input", None)
+            .await
+            .unwrap();
+
+        let error = session
+            .interrupt_agent_from_user("worker-1", "replacement", None, None, TeamQueuedPolicy::Discard)
+            .await
+            .expect_err("cancellation failure must surface");
+        assert!(error.to_string().contains("forced cancellation failure"));
+
+        let unread = session.mailbox.peek_unread("t1", "worker-1").await.unwrap();
+        let contents = unread.iter().map(|m| m.content.as_str()).collect::<Vec<_>>();
+        assert!(
+            contents.contains(&"queued input"),
+            "a failed interruption must not destroy queued work, got {contents:?}"
+        );
+        assert!(
+            contents.contains(&"replacement"),
+            "the replacement stays durable so the caller can retry, got {contents:?}"
+        );
+
+        release_tx.send(()).unwrap();
+        session.stop();
+    }
+
+    /// I4: interrupting a batch that was claimed but never reached `mark_started`
+    /// left its metadata in the coordinator forever — the interrupting caller skips
+    /// the take (no turn_id) and the late-start callback never runs because the
+    /// start itself fails.
+    #[tokio::test]
+    async fn interrupt_metadata_is_drained_when_the_interrupted_turn_never_starts() {
+        let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let session = Arc::new(
+            TeamSession::start(
+                make_team(),
+                repo,
+                broadcaster,
+                backend_path(),
+                empty_task_manager(),
+                Arc::new(StartFailsWithoutStartedCallback {
+                    claimed_tx: Mutex::new(Some(claimed_tx)),
+                    release_rx: Mutex::new(Some(release_rx)),
+                }),
+                noop_cancellation_port(),
+                noop_projection_store(),
+                "user-test".into(),
+                Weak::<TeamSessionService>::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        register_test_event_loop(&session, "worker-1");
+
+        session
+            .send_message_to_agent("worker-1", "claimed input", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), claimed_rx)
+            .await
+            .expect("worker batch should be claimed")
+            .expect("claim signal should be sent");
+        assert_eq!(
+            session
+                .work_coordinator
+                .slot_snapshot("worker-1")
+                .unwrap()
+                .active_turn_id,
+            None,
+            "the batch must be claimed without a turn_id for this path"
+        );
+
+        session
+            .interrupt_agent_from_user("worker-1", "replacement", None, None, TeamQueuedPolicy::Retain)
+            .await
+            .unwrap();
+        assert_eq!(
+            session.work_coordinator.interrupted_batch_count(),
+            1,
+            "the interrupt records metadata that nobody has claimed yet"
+        );
+
+        // Release the blocked start so it fails; the event loop must drain the metadata.
+        release_tx.send(()).unwrap();
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while session.work_coordinator.interrupted_batch_count() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "interrupt metadata leaked: {} entries still pending",
+            session.work_coordinator.interrupted_batch_count()
+        );
+
         session.stop();
     }
 

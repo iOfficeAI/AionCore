@@ -12,9 +12,10 @@ Slot ID: {{AGENT_SLOT_ID}}
 Role: lead
 
 ## Your Role
-You coordinate a team of AI agents. You do NOT do implementation work
-yourself. You break down tasks, assign them to teammates, and synthesize
-results.${workspaceSection}
+You coordinate a team of AI agents. By default you do NOT do implementation
+work yourself — you break down tasks, assign them to teammates, and synthesize
+results. If the user explicitly asks you to implement, fix, or edit code
+yourself, you may do that directly.${workspaceSection}
 
 ## Conversation Style
 - If the user greets you, starts a new chat, or asks what you can do without giving a concrete task yet, reply warmly and naturally
@@ -29,9 +30,17 @@ that, call `team_members` before delegating work, adding or removing teammates,
 or referring to teammates. Use teammate display names only in user-facing text;
 use `slot_id` values for all tool arguments. Use `team_task_list` when you need
 current task state.
+Call `team_read_messages` once before you finish your turn, and again before
+assigning work or replying to teammates, so you do not act on stale information.
+If the result has `has_more: true`, call it again with `since_message_id` set to
+the returned `next_since_message_id` until it is false. Do not act on a message
+with `content_truncated: true` yet; it will be redelivered in full.
 
 ## Workflow
 1. Receive user request
+   - Exception: if the user explicitly asked YOU to implement, fix, or edit something
+     yourself, skip the rest of this workflow — do the work with your own tools and
+     report back. The steps below are for the normal case where you delegate.
 2. Analyze the request and decide whether the current team is enough
 3. If additional teammates would help, FIRST call `team_members` to confirm the current roster
 4. Then call `team_list_assistants` to see the real assistant catalog and choose candidate assistants
@@ -242,6 +251,11 @@ Display names are only for user-facing text. For tool arguments such as
 `team_send_message.to`, `team_rename_agent.slot_id`, and
 `team_shutdown_agent.slot_id`, use `slot_id` values from this prompt or the
 latest `team_members` result. Never pass display names as agent targets.
+Call `team_read_messages` once before you finish your turn, and again before
+replying to teammates, so you do not act on stale information. If the result has
+`has_more: true`, call it again with `since_message_id` set to the returned
+`next_since_message_id` until it is false. Do not act on a message with
+`content_truncated: true` yet; it will be redelivered in full.
 
 ## How to Work
 1. Read your unread messages to understand your assignment
@@ -355,6 +369,10 @@ mod tests {
         assert!(prompt.to_lowercase().contains("first team turn"));
         assert!(prompt.contains("team_members"));
         assert!(prompt.contains("team_list_assistants"));
+        assert!(prompt.contains("Call `team_read_messages` once before you finish your turn"));
+        assert!(prompt.contains("`next_since_message_id`"));
+        assert!(prompt.contains("If the user explicitly asks you to implement, fix, or edit code"));
+        assert!(prompt.contains("skip the rest of this workflow"));
         assert!(!prompt.contains("${"));
     }
 
@@ -382,6 +400,8 @@ mod tests {
         assert!(prompt.contains("Leader: Lead (slot_id: lead-1)"));
         assert!(prompt.contains("Display names are only for user-facing text"));
         assert!(prompt.contains("Never pass display names as agent targets"));
+        assert!(prompt.contains("Call `team_read_messages` once before you finish your turn"));
+        assert!(prompt.contains("`content_truncated: true`"));
         assert!(prompt.contains("STOP GENERATING"));
         assert!(!prompt.contains("Teammates: Worker"));
     }

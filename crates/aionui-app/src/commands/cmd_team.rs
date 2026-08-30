@@ -45,7 +45,9 @@ async fn run_team_inner(args: TeamArgs) -> Result<(), ExitCode> {
             print_response(response).await
         }
         TeamCommand::Members => call_tool(vec!["members"]).await,
+        TeamCommand::ReadMessages => call_tool(vec!["read-messages"]).await,
         TeamCommand::SendMessage => call_tool(vec!["send-message"]).await,
+        TeamCommand::InterruptAgent => call_tool(vec!["interrupt-agent"]).await,
         TeamCommand::Task(task) => match task.command {
             TeamTaskCommand::Create => call_tool(vec!["task", "create"]).await,
             TeamTaskCommand::Update => call_tool(vec!["task", "update"]).await,
@@ -56,6 +58,7 @@ async fn run_team_inner(args: TeamArgs) -> Result<(), ExitCode> {
         TeamCommand::DescribeAssistant => call_tool(vec!["describe-assistant"]).await,
         TeamCommand::SpawnAgent => call_tool(vec!["spawn-agent"]).await,
         TeamCommand::RenameAgent => call_tool(vec!["rename-agent"]).await,
+        TeamCommand::ClearAgentContext => call_tool(vec!["clear-agent-context"]).await,
         TeamCommand::ShutdownAgent => call_tool(vec!["shutdown-agent"]).await,
         TeamCommand::Unknown(path) => Err(unknown_command("team", path, "unknown team command")),
     }

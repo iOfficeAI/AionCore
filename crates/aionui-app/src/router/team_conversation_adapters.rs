@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest, GetConfigOptionsResponse};
+use aionui_api_types::{
+    AssistantConversationRequest, CreateConversationRequest, GetConfigOptionsResponse, McpRuntimeSnapshot,
+    SetConfigOptionRequest, SetConfigOptionResponse, TeamMcpSelection,
+};
+use aionui_common::AgentType;
 use aionui_conversation::{
     ConversationAgentTurnRequest, ConversationAgentTurnStarted, ConversationAgentTurnStatus, ConversationError,
     ConversationService,
@@ -494,6 +498,37 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map_err(map_conversation_update_error)
     }
 
+    async fn resolve_global_mcp_selection(&self, user_id: &str) -> Result<TeamMcpSelection, TeamError> {
+        self.conversation_service
+            .resolve_global_mcp_selection(user_id)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn resolve_conversation_mcp_snapshot(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<McpRuntimeSnapshot, TeamError> {
+        let Some(row) = self.conversation_repo.get(user_id, conversation_id).await? else {
+            return Err(TeamError::InvalidRequest(format!(
+                "conversation {conversation_id} not found"
+            )));
+        };
+        let agent_type: AgentType =
+            serde_json::from_value(serde_json::Value::String(row.r#type.clone())).map_err(|e| {
+                TeamError::InvalidRequest(format!(
+                    "conversation {conversation_id} has unparseable type {}: {e}",
+                    row.r#type
+                ))
+            })?;
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        self.conversation_service
+            .resolve_global_mcp_snapshot(user_id, &agent_type, &extra)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError> {
         self.conversation_service
             .update_extra(
@@ -503,6 +538,11 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             )
             .await
             .map_err(map_conversation_update_error)
+    }
+
+    async fn persist_confirmed_model(&self, conversation_id: &str, model: &str) -> Result<(), TeamError> {
+        self.patch_runtime_config(conversation_id, serde_json::json!({ "current_model_id": model }))
+            .await
     }
 
     async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), TeamError> {
@@ -517,6 +557,33 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
         let user_id = self.require_owner_user_id(conversation_id).await?;
         self.conversation_service
             .get_config_options(&user_id, conversation_id)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn set_config_option(
+        &self,
+        conversation_id: &str,
+        option_id: &str,
+        request: SetConfigOptionRequest,
+    ) -> Result<SetConfigOptionResponse, TeamError> {
+        let user_id = self.require_owner_user_id(conversation_id).await?;
+        self.conversation_service
+            .set_config_option(&user_id, conversation_id, option_id, request)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn supports_context_reset(&self, user_id: &str, conversation_id: &str) -> Result<bool, TeamError> {
+        self.conversation_service
+            .supports_acp_context_reset(user_id, conversation_id)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
+    async fn clear_context_anchor(&self, user_id: &str, conversation_id: &str) -> Result<bool, TeamError> {
+        self.conversation_service
+            .clear_acp_context_anchor(user_id, conversation_id)
             .await
             .map_err(map_conversation_update_error)
     }

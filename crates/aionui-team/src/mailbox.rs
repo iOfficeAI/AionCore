@@ -126,6 +126,27 @@ impl Mailbox {
         Ok(messages)
     }
 
+    /// Re-reads a claimed set of unread mailbox rows without marking them read.
+    pub async fn peek_unread_by_ids(
+        &self,
+        team_id: &str,
+        agent_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<MailboxMessage>, TeamError> {
+        let rows = self
+            .repo
+            .peek_unread_by_ids(&self.user_id, team_id, agent_id, ids)
+            .await?;
+        debug!(
+            team_id,
+            agent_id,
+            requested_count = ids.len(),
+            found_count = rows.len(),
+            "mailbox peek_unread_by_ids"
+        );
+        Ok(rows.iter().filter_map(MailboxMessage::from_row).collect())
+    }
+
     /// Marks the given message IDs as read. Called after successful prompt delivery.
     pub async fn mark_read_batch(&self, team_id: &str, ids: &[String]) -> Result<(), TeamError> {
         self.repo.mark_read_batch(&self.user_id, team_id, ids).await?;

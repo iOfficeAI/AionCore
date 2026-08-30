@@ -19,7 +19,7 @@ use crate::scheduler::TeammateManager;
 use crate::session::{PrepareBatchResult, TeamSession, WakeInput};
 use crate::team_run::target_role_for;
 use crate::types::TeammateStatus;
-use crate::work_coordinator::{CommitResult, StartCommitResult, WorkBatch};
+use crate::work_coordinator::{BatchFailureResult, CommitResult, StartCommitResult, WorkBatch};
 use crate::work_source::WorkSource;
 
 pub struct EventLoopRegistry {
@@ -237,6 +237,8 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                                 conversation_id: started.conversation_id,
                                 turn_id: started.turn_id,
                                 status: TeamRunStatus::Running,
+                                reason: None,
+                                replacement_message_id: None,
                             },
                         );
                     }
@@ -266,6 +268,8 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                                 conversation_id: started.conversation_id,
                                 turn_id: started.turn_id,
                                 status: TeamRunStatus::Cancelled,
+                                reason: None,
+                                replacement_message_id: None,
                             },
                         );
                     }
@@ -298,6 +302,26 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
             return ExecuteResult::WaitForSignal;
         }
         Err(error) => {
+            if ctx.session.work_coordinator().is_batch_cancelled(&batch) {
+                // The turn never reached `mark_started`, so neither the interrupting
+                // caller (it had no turn_id) nor the late-start callback claimed this
+                // batch's interrupt metadata. Drain it here or it stays in the
+                // coordinator for the rest of the session. There is no turn_id to
+                // hang a child-turn event on, so the reason is logged instead.
+                if let Some(metadata) = ctx.session.work_coordinator().take_interrupt_metadata(&batch.batch_id) {
+                    info!(
+                        team_id = %ctx.team_id,
+                        slot_id = %ctx.slot_id,
+                        batch_id = %batch.batch_id,
+                        replacement_message_id = %metadata.replacement_message_id,
+                        has_reason = metadata.reason.is_some(),
+                        "interrupted team batch never started; interrupt metadata drained without a child-turn event"
+                    );
+                }
+                let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
+                finalize_scheduler_turn(ctx).await;
+                return ExecuteResult::ContinueDraining;
+            }
             warn!(
                 team_id = %ctx.team_id,
                 slot_id = %ctx.slot_id,
@@ -305,25 +329,37 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                 error = %error,
                 "agent turn start failed"
             );
-            mark_batch_messages_read(ctx, &batch).await;
-            ctx.session.work_coordinator().fail_batch(&batch, "turn_start_failed");
+            let failure = ctx.session.work_coordinator().fail_batch(&batch, "turn_start_failed");
+            finalize_failed_delivery(ctx, &batch, &failure).await;
             let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
             return ExecuteResult::ContinueDraining;
         }
     };
 
-    mark_batch_messages_read(ctx, &batch).await;
-    let terminal_status = if outcome.status.is_success() {
-        (ctx.session.work_coordinator().complete_batch(&batch) == CommitResult::Committed)
-            .then_some(TeamRunStatus::Completed)
+    let (terminal_status, terminal_team_run_ids) = if ctx.session.work_coordinator().is_batch_cancelled(&batch) {
+        let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
+        (None, batch.team_run_ids.clone())
+    } else if outcome.status.is_success() {
+        let completion = ctx.session.work_coordinator().complete_batch_with_ack(&batch);
+        if completion.commit_result == CommitResult::Committed {
+            mark_message_ids_read(ctx, &batch, &completion.ack_message_ids).await;
+        }
+        (
+            (completion.commit_result == CommitResult::Committed).then_some(TeamRunStatus::Completed),
+            completion.team_run_ids,
+        )
     } else {
-        let committed = ctx.session.work_coordinator().fail_batch(&batch, "turn_failed");
+        let failure = ctx.session.work_coordinator().fail_batch(&batch, "turn_failed");
+        finalize_failed_delivery(ctx, &batch, &failure).await;
         let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
-        (committed == CommitResult::Committed).then_some(TeamRunStatus::Failed)
+        (
+            (failure.commit_result == CommitResult::Committed).then_some(TeamRunStatus::Failed),
+            batch.team_run_ids.clone(),
+        )
     };
     if let Some(status) = terminal_status {
         let emitter = ctx.session.team_event_emitter();
-        for team_run_id in &batch.team_run_ids {
+        for team_run_id in &terminal_team_run_ids {
             emitter.broadcast_child_turn(
                 TEAM_CHILD_TURN_COMPLETED_EVENT,
                 TeamChildTurnPayload {
@@ -334,11 +370,18 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                     conversation_id: outcome.conversation_id.clone(),
                     turn_id: outcome.turn_id.clone(),
                     status: status.clone(),
+                    reason: None,
+                    replacement_message_id: None,
                 },
             );
         }
     }
 
+    finalize_scheduler_turn(ctx).await;
+    ExecuteResult::ContinueDraining
+}
+
+async fn finalize_scheduler_turn(ctx: &AgentLoopContext) {
     match ctx.scheduler.finalize_turn(&ctx.slot_id).await {
         Ok(Some(wake_target)) if wake_target != ctx.slot_id => {
             if let Err(error) = ctx
@@ -363,16 +406,25 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
             "scheduler turn finalization failed"
         ),
     }
-    ExecuteResult::ContinueDraining
 }
 
-async fn mark_batch_messages_read(ctx: &AgentLoopContext, batch: &WorkBatch) {
-    if batch.mailbox_message_ids.is_empty() {
+async fn finalize_failed_delivery(ctx: &AgentLoopContext, batch: &WorkBatch, failure: &BatchFailureResult) {
+    if failure.exhausted_message_ids.is_empty() {
         return;
     }
+    warn!(
+        team_id = %ctx.team_id,
+        slot_id = %ctx.slot_id,
+        batch_id = %batch.batch_id,
+        exhausted_message_count = failure.exhausted_message_ids.len(),
+        "team batch delivery retry limit reached; messages abandoned and slot paused"
+    );
+    mark_message_ids_read(ctx, batch, &failure.exhausted_message_ids).await;
+    // The slot is now paused and only a user or lead intervention can resume it,
+    // so the lead has to hear about it or it will wait on a teammate forever.
     if let Err(error) = ctx
-        .mailbox
-        .mark_read_batch(&ctx.team_id, &batch.mailbox_message_ids)
+        .session
+        .notify_leader_delivery_exhausted(&ctx.slot_id, failure.exhausted_message_ids.len())
         .await
     {
         warn!(
@@ -380,8 +432,30 @@ async fn mark_batch_messages_read(ctx: &AgentLoopContext, batch: &WorkBatch) {
             slot_id = %ctx.slot_id,
             batch_id = %batch.batch_id,
             error = %error,
-            "team batch mailbox terminal mark-read failed"
+            "team delivery exhaustion notice to lead failed"
         );
+    }
+}
+
+async fn mark_message_ids_read(ctx: &AgentLoopContext, batch: &WorkBatch, message_ids: &[String]) {
+    if message_ids.is_empty() {
+        return;
+    }
+    match ctx.mailbox.mark_read_batch(&ctx.team_id, message_ids).await {
+        Ok(()) => debug!(
+            team_id = %ctx.team_id,
+            slot_id = %ctx.slot_id,
+            batch_id = %batch.batch_id,
+            ack_count = message_ids.len(),
+            "team batch mailbox messages marked read"
+        ),
+        Err(error) => warn!(
+            team_id = %ctx.team_id,
+            slot_id = %ctx.slot_id,
+            batch_id = %batch.batch_id,
+            error = %error,
+            "team batch mailbox terminal mark-read failed"
+        ),
     }
 }
 

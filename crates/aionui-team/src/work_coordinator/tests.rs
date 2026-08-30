@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 
 use aionui_api_types::TeamRunTargetRole;
 
@@ -68,6 +68,34 @@ fn coordinator_with_recorder() -> (SlotWorkCoordinator, Arc<RecordingRunCausalit
     (coordinator, recorder)
 }
 
+#[test]
+fn runtime_restart_gate_rejects_queued_work_and_preserves_it() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "queued-1");
+
+    assert_eq!(
+        coordinator.begin_runtime_restart("lead-1"),
+        Err(RuntimeRestartRejection::Busy)
+    );
+    let snapshot = coordinator.slot_snapshot("lead-1").unwrap();
+    assert_eq!(snapshot.queued_foreground_count, 1);
+    assert_eq!(snapshot.state, SlotPhase::Queued);
+}
+
+#[test]
+fn aborted_runtime_restart_restores_the_previous_constraint() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+
+    let gate = coordinator.begin_runtime_restart("lead-1").unwrap();
+    assert_eq!(gate.previous_constraint, RuntimeConstraint::Ready);
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().state, SlotPhase::Blocked);
+
+    coordinator.abort_runtime_restart("lead-1", &gate);
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().state, SlotPhase::Idle);
+}
+
 // Regression: run-less work (Background binding → no team_run_id, e.g. a leader
 // self-wake draining its mailbox for a membership-change notice) produces NO run
 // summaries, so the ONLY way the frontend learns the slot moved Running→Idle is a
@@ -106,13 +134,14 @@ fn run_less_batch_lifecycle_publishes_per_slot_work_snapshots() {
 }
 
 #[test]
-fn foreground_precedes_background_and_fifo_is_stable() {
+fn priority_lanes_claim_foreground_then_directed_then_control_then_background() {
     let coordinator = coordinator();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
-    enqueue(&coordinator, WorkSource::McpSendMessage, "background-1");
+    enqueue(&coordinator, WorkSource::TeamMembershipChanged, "background-1");
+    enqueue(&coordinator, WorkSource::McpShutdownRequest, "control-1");
+    enqueue(&coordinator, WorkSource::McpSendMessage, "directed-1");
     enqueue(&coordinator, WorkSource::UserMessage, "foreground-1");
     enqueue(&coordinator, WorkSource::UserIntervention, "foreground-2");
-    enqueue(&coordinator, WorkSource::TeamMembershipChanged, "background-2");
 
     let ReconcileDecision::Claim(foreground) = coordinator.next("lead-1") else {
         panic!("foreground batch must be claimable");
@@ -124,14 +153,48 @@ fn foreground_precedes_background_and_fifo_is_stable() {
     );
     assert_eq!(coordinator.complete_batch(&foreground), CommitResult::Committed);
 
+    let ReconcileDecision::Claim(directed) = coordinator.next("lead-1") else {
+        panic!("directed batch must follow foreground");
+    };
+    assert_eq!(directed.highest_priority, WorkPriority::Directed);
+    assert_eq!(directed.mailbox_message_ids, vec!["directed-1"]);
+    assert_eq!(coordinator.complete_batch(&directed), CommitResult::Committed);
+
+    let ReconcileDecision::Claim(control) = coordinator.next("lead-1") else {
+        panic!("control batch must follow directed");
+    };
+    assert_eq!(control.highest_priority, WorkPriority::Control);
+    assert_eq!(control.mailbox_message_ids, vec!["control-1"]);
+    assert_eq!(coordinator.complete_batch(&control), CommitResult::Committed);
+
     let ReconcileDecision::Claim(background) = coordinator.next("lead-1") else {
-        panic!("background batch must follow foreground");
+        panic!("background batch must follow control");
     };
     assert_eq!(background.highest_priority, WorkPriority::Background);
-    assert_eq!(
-        background.mailbox_message_ids,
-        vec!["background-1".to_owned(), "background-2".to_owned()]
-    );
+    assert_eq!(background.mailbox_message_ids, vec!["background-1"]);
+}
+
+#[test]
+fn directed_message_follows_a_coalesced_foreground_backlog() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::McpSendMessage, "directed-1");
+    for index in 1..=5 {
+        enqueue(&coordinator, WorkSource::UserMessage, &format!("foreground-{index}"));
+    }
+
+    let ReconcileDecision::Claim(foreground) = coordinator.next("lead-1") else {
+        panic!("foreground backlog must be claimable");
+    };
+    assert_eq!(foreground.highest_priority, WorkPriority::Foreground);
+    assert_eq!(foreground.mailbox_message_ids.len(), 5);
+    assert_eq!(coordinator.complete_batch(&foreground), CommitResult::Committed);
+
+    let ReconcileDecision::Claim(directed) = coordinator.next("lead-1") else {
+        panic!("directed message must follow the foreground batch");
+    };
+    assert_eq!(directed.highest_priority, WorkPriority::Directed);
+    assert_eq!(directed.mailbox_message_ids, vec!["directed-1"]);
 }
 
 #[test]
@@ -282,6 +345,85 @@ fn runtime_starting_blocks_and_runtime_ready_releases_work() {
 }
 
 #[test]
+fn runtime_restart_gate_atomically_rejects_active_work() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+    let ReconcileDecision::Claim(_) = coordinator.next("lead-1") else {
+        panic!("message must be claimable");
+    };
+
+    assert_eq!(
+        coordinator.begin_runtime_restart("lead-1"),
+        Err(RuntimeRestartRejection::Busy)
+    );
+    assert!(matches!(
+        coordinator.slot_snapshot("lead-1").unwrap().runtime_constraint,
+        RuntimeConstraint::Ready
+    ));
+}
+
+#[test]
+fn runtime_restart_gate_rejects_queued_work() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+
+    assert_eq!(
+        coordinator.begin_runtime_restart("lead-1"),
+        Err(RuntimeRestartRejection::Busy)
+    );
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("rejected restart must leave queued work claimable");
+    };
+    assert_eq!(batch.mailbox_message_ids, vec!["m1"]);
+}
+
+#[test]
+fn runtime_restart_gate_and_batch_claim_have_one_atomic_winner() {
+    for _ in 0..64 {
+        let coordinator = Arc::new(coordinator());
+        coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+        enqueue(&coordinator, WorkSource::UserMessage, "m1");
+        let barrier = Arc::new(Barrier::new(3));
+
+        let gate_coordinator = Arc::clone(&coordinator);
+        let gate_barrier = Arc::clone(&barrier);
+        let gate_task = std::thread::spawn(move || {
+            gate_barrier.wait();
+            gate_coordinator.begin_runtime_restart("lead-1")
+        });
+        let claim_coordinator = Arc::clone(&coordinator);
+        let claim_barrier = Arc::clone(&barrier);
+        let claim_task = std::thread::spawn(move || {
+            claim_barrier.wait();
+            claim_coordinator.next("lead-1")
+        });
+        barrier.wait();
+
+        let gate = gate_task.join().unwrap();
+        let claim = claim_task.join().unwrap();
+        assert!(matches!(gate, Err(RuntimeRestartRejection::Busy)));
+        assert!(matches!(claim, ReconcileDecision::Claim(_)));
+    }
+}
+
+#[test]
+fn runtime_restart_gate_rejects_removing_and_stopped_slots() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Removing { operation_id: 7 });
+    assert_eq!(
+        coordinator.begin_runtime_restart("lead-1"),
+        Err(RuntimeRestartRejection::Removing)
+    );
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::SessionStopped);
+    assert_eq!(
+        coordinator.begin_runtime_restart("lead-1"),
+        Err(RuntimeRestartRejection::SessionStopped)
+    );
+}
+
+#[test]
 fn remove_cancels_queued_and_running_work_and_rejects_new_enqueue() {
     let coordinator = coordinator();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
@@ -349,6 +491,94 @@ fn unread_without_projection_creates_one_recovery_intent() {
 }
 
 #[test]
+fn failed_batch_is_reprojected_from_the_unread_mailbox() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+    let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
+        panic!("message must be claimable");
+    };
+
+    let failure = coordinator.fail_batch(&first, "turn_start_failed");
+    assert_eq!(failure.commit_result, CommitResult::Committed);
+    assert!(failure.exhausted_message_ids.is_empty());
+
+    coordinator.reconcile_mailbox("lead-1", &["m1".into()], TeamRunTargetRole::Lead);
+    let ReconcileDecision::Claim(retry) = coordinator.next("lead-1") else {
+        panic!("unread failed delivery must be reprojected");
+    };
+    assert_eq!(retry.mailbox_message_ids, vec!["m1"]);
+    assert_ne!(retry.intent_ids, first.intent_ids);
+    assert_eq!(
+        coordinator
+            .intents_for_slot("lead-1")
+            .into_iter()
+            .find(|intent| retry.intent_ids.contains(&intent.intent_id))
+            .expect("recovery intent must exist")
+            .source,
+        WorkSource::RecoveryDrain
+    );
+}
+
+#[test]
+fn delivery_failures_pause_after_three_attempts() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+
+    for attempt in 1..=MAX_MESSAGE_DELIVERY_FAILURES {
+        let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+            panic!("attempt {attempt} must be claimable");
+        };
+        let failure = coordinator.fail_batch(&batch, "turn_failed");
+        assert_eq!(failure.commit_result, CommitResult::Committed);
+        if attempt < MAX_MESSAGE_DELIVERY_FAILURES {
+            assert!(failure.exhausted_message_ids.is_empty());
+            coordinator.reconcile_mailbox("lead-1", &["m1".into()], TeamRunTargetRole::Lead);
+        } else {
+            assert_eq!(failure.exhausted_message_ids, vec!["m1"]);
+        }
+    }
+
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().state, SlotPhase::Paused);
+    coordinator.reconcile_mailbox("lead-1", &[], TeamRunTargetRole::Lead);
+    assert_eq!(coordinator.next("lead-1"), ReconcileDecision::Quiescent);
+}
+
+#[test]
+fn successful_retry_clears_the_consecutive_failure_count() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "m1");
+    let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
+        panic!("first attempt must be claimable");
+    };
+    assert!(
+        coordinator
+            .fail_batch(&first, "turn_failed")
+            .exhausted_message_ids
+            .is_empty()
+    );
+    coordinator.reconcile_mailbox("lead-1", &["m1".into()], TeamRunTargetRole::Lead);
+    let ReconcileDecision::Claim(success) = coordinator.next("lead-1") else {
+        panic!("successful retry must be claimable");
+    };
+    assert_eq!(coordinator.complete_batch(&success), CommitResult::Committed);
+
+    coordinator.reconcile_mailbox("lead-1", &["m1".into()], TeamRunTargetRole::Lead);
+    let ReconcileDecision::Claim(after_success) = coordinator.next("lead-1") else {
+        panic!("simulated mark-read failure must be recoverable");
+    };
+    assert!(
+        coordinator
+            .fail_batch(&after_success, "turn_failed")
+            .exhausted_message_ids
+            .is_empty(),
+        "a success between failures must reset the consecutive count"
+    );
+}
+
+#[test]
 fn active_batch_prevents_unread_projection_from_being_rebuilt() {
     let coordinator = coordinator();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
@@ -363,8 +593,183 @@ fn active_batch_prevents_unread_projection_from_being_rebuilt() {
 }
 
 #[test]
-fn pause_cancels_running_batch_and_retains_queued_work() {
+fn observed_messages_complete_with_the_active_batch_and_do_not_requeue() {
     let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "initial");
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("initial message must be claimable");
+    };
+    assert_eq!(coordinator.mark_started(&batch, "turn-1"), StartCommitResult::Accepted);
+    enqueue(&coordinator, WorkSource::UserMessage, "late");
+
+    let observed = coordinator.observe_messages("lead-1", &batch.batch_id, &["initial".into(), "late".into()]);
+    assert_eq!(observed.batch_id.as_deref(), Some(batch.batch_id.as_str()));
+    assert_eq!(
+        observed.observed_count, 1,
+        "the original batch message is already owned"
+    );
+    assert_eq!(
+        coordinator
+            .slot_snapshot("lead-1")
+            .unwrap()
+            .active_batch
+            .unwrap()
+            .observed_message_ids,
+        vec!["late"]
+    );
+
+    let completion = coordinator.complete_batch_with_ack(&batch);
+    assert_eq!(completion.commit_result, CommitResult::Committed);
+    assert_eq!(completion.ack_message_ids, vec!["initial", "late"]);
+    assert_eq!(coordinator.next("lead-1"), ReconcileDecision::Quiescent);
+    assert!(
+        coordinator
+            .intents_for_slot("lead-1")
+            .iter()
+            .all(|intent| intent.state == WorkIntentState::Completed)
+    );
+}
+
+#[test]
+fn observed_messages_remain_queued_when_the_active_batch_fails() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "initial");
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("initial message must be claimable");
+    };
+    coordinator.mark_started(&batch, "turn-1");
+    enqueue(&coordinator, WorkSource::UserMessage, "late");
+    coordinator.observe_messages("lead-1", &batch.batch_id, &["late".into()]);
+
+    let failure = coordinator.fail_batch(&batch, "turn_failed");
+    assert_eq!(failure.commit_result, CommitResult::Committed);
+    let ReconcileDecision::Claim(retry) = coordinator.next("lead-1") else {
+        panic!("observed late message must remain queued after failure");
+    };
+    assert_eq!(retry.mailbox_message_ids, vec!["late"]);
+}
+
+#[test]
+fn observed_messages_remain_queued_when_the_active_batch_is_cancelled_or_interrupted() {
+    for interruption in [false, true] {
+        let coordinator = coordinator();
+        coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+        enqueue(&coordinator, WorkSource::UserMessage, "initial");
+        let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+            panic!("initial message must be claimable");
+        };
+        coordinator.mark_started(&batch, "turn-1");
+        enqueue(&coordinator, WorkSource::UserMessage, "late");
+        coordinator.observe_messages("lead-1", &batch.batch_id, &["late".into()]);
+
+        if interruption {
+            assert_eq!(
+                coordinator
+                    .interrupt_batch(&batch, Some("replace".into()), "replacement".into())
+                    .commit_result,
+                CommitResult::Committed
+            );
+        } else {
+            assert_eq!(
+                coordinator.cancel_batch(&batch, "turn_cancelled"),
+                CommitResult::Committed
+            );
+        }
+
+        let ReconcileDecision::Claim(next) = coordinator.next("lead-1") else {
+            panic!("observed late message must survive cancellation/interruption");
+        };
+        assert_eq!(next.mailbox_message_ids, vec!["late"]);
+    }
+}
+
+/// P3: a `team_read_messages` call that was still in flight when its turn got
+/// replaced must not bind its rows to whatever batch owns the slot now — the new
+/// batch would acknowledge messages its agent never saw.
+#[test]
+fn observations_from_a_replaced_turn_are_dropped_instead_of_rebound() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "initial");
+    let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
+        panic!("initial message must be claimable");
+    };
+    coordinator.mark_started(&first, "turn-1");
+    enqueue(&coordinator, WorkSource::UserMessage, "late");
+
+    // The turn the agent was reading in gets cancelled, and the next batch takes over.
+    assert_eq!(
+        coordinator.cancel_batch(&first, "turn_cancelled"),
+        CommitResult::Committed
+    );
+    let ReconcileDecision::Claim(second) = coordinator.next("lead-1") else {
+        panic!("late message must start the next batch");
+    };
+    coordinator.mark_started(&second, "turn-2");
+    assert_ne!(first.batch_id, second.batch_id);
+
+    // The in-flight tool call finally lands, still carrying the old batch id.
+    let observed = coordinator.observe_messages("lead-1", &first.batch_id, &["late".into()]);
+    assert_eq!(observed.batch_id, None, "a stale observation is rejected");
+    assert_eq!(observed.observed_count, 0);
+    assert!(
+        coordinator
+            .slot_snapshot("lead-1")
+            .unwrap()
+            .active_batch
+            .unwrap()
+            .observed_message_ids
+            .is_empty(),
+        "the replacement batch must not inherit the stale observation"
+    );
+}
+
+#[test]
+fn active_batch_id_tracks_turn_ownership() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    assert_eq!(coordinator.active_batch_id("lead-1"), None, "no slot, no turn");
+
+    enqueue(&coordinator, WorkSource::UserMessage, "initial");
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("initial message must be claimable");
+    };
+    assert_eq!(coordinator.active_batch_id("lead-1").as_ref(), Some(&batch.batch_id));
+
+    coordinator.complete_batch_with_ack(&batch);
+    assert_eq!(
+        coordinator.active_batch_id("lead-1"),
+        None,
+        "ownership is released with the batch"
+    );
+}
+
+#[test]
+fn messages_arriving_after_observation_are_left_for_the_next_batch() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "initial");
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("initial message must be claimable");
+    };
+    coordinator.mark_started(&batch, "turn-1");
+    enqueue(&coordinator, WorkSource::UserMessage, "observed");
+    coordinator.observe_messages("lead-1", &batch.batch_id, &["observed".into()]);
+    enqueue(&coordinator, WorkSource::UserMessage, "after-read");
+
+    let completion = coordinator.complete_batch_with_ack(&batch);
+    assert_eq!(completion.ack_message_ids, vec!["initial", "observed"]);
+    let ReconcileDecision::Claim(next) = coordinator.next("lead-1") else {
+        panic!("message arriving after read must start the next batch");
+    };
+    assert_eq!(next.mailbox_message_ids, vec!["after-read"]);
+}
+
+#[test]
+fn pause_cancels_running_batch_and_retains_queued_work() {
+    let (coordinator, recorder) = coordinator_with_recorder();
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
     enqueue(&coordinator, WorkSource::UserMessage, "running");
     let ReconcileDecision::Claim(running) = coordinator.next("lead-1") else {
@@ -375,15 +780,45 @@ fn pause_cancels_running_batch_and_retains_queued_work() {
         StartCommitResult::Accepted
     );
     enqueue(&coordinator, WorkSource::McpSendMessage, "retained");
+    recorder.slot_work.lock().unwrap().clear();
 
     let paused = coordinator.pause_slot("lead-1");
     assert_eq!(paused.cancel_target.unwrap().batch, running);
+    {
+        let snapshots = recorder.slot_work.lock().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].state, SlotPhase::Paused);
+        assert_eq!(snapshots[0].active_turn_id.as_deref(), Some("turn-1"));
+    }
     assert_eq!(
         coordinator.cancel_batch(&running, "slot_paused"),
         CommitResult::Committed
     );
+    {
+        let snapshots = recorder.slot_work.lock().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[1].state, SlotPhase::Paused);
+        assert_eq!(snapshots[1].active_turn_id, None);
+    }
     assert_eq!(coordinator.next("lead-1"), ReconcileDecision::Quiescent);
     assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().queued_background_count, 1);
+}
+
+#[test]
+fn pause_queued_only_slot_publishes_paused_snapshot() {
+    let (coordinator, recorder) = coordinator_with_recorder();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::McpSendMessage, "queued");
+    recorder.slot_work.lock().unwrap().clear();
+
+    let paused = coordinator.pause_slot("lead-1");
+
+    assert!(paused.cancel_target.is_none());
+    let snapshots = recorder.slot_work.lock().unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].state, SlotPhase::Paused);
+    assert_eq!(snapshots[0].active_turn_id, None);
+    assert_eq!(snapshots[0].queued_background_count, 1);
 }
 
 #[test]
@@ -534,6 +969,130 @@ fn system_initiated_none_delegates_to_port() {
         1,
         "a None inherit must delegate to bind_system_enqueue"
     );
+}
+
+#[test]
+fn lead_intervention_interrupts_active_batch_and_runs_before_retained_queue() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "active");
+    let ReconcileDecision::Claim(active) = coordinator.next("lead-1") else {
+        panic!("active work must be claimed");
+    };
+    assert_eq!(coordinator.mark_started(&active, "turn-1"), StartCommitResult::Accepted);
+    enqueue(&coordinator, WorkSource::UserIntervention, "older-queued");
+    enqueue(&coordinator, WorkSource::LeadIntervention, "replacement");
+
+    let interrupted = coordinator.interrupt_batch(&active, Some("requirements changed".into()), "replacement".into());
+    assert_eq!(interrupted.commit_result, CommitResult::Committed);
+    assert_eq!(interrupted.terminal_message_ids, vec!["active"]);
+    assert!(coordinator.is_batch_cancelled(&active));
+    assert_eq!(
+        coordinator.take_interrupt_metadata(&active.batch_id),
+        Some(BatchInterruptMetadata {
+            reason: Some("requirements changed".into()),
+            replacement_message_id: "replacement".into(),
+        })
+    );
+
+    let ReconcileDecision::Claim(replacement) = coordinator.next("lead-1") else {
+        panic!("replacement must be next");
+    };
+    assert_eq!(replacement.mailbox_message_ids, vec!["replacement"]);
+    coordinator.complete_batch(&replacement);
+    let ReconcileDecision::Claim(retained) = coordinator.next("lead-1") else {
+        panic!("older queued work must be retained");
+    };
+    assert_eq!(retained.mailbox_message_ids, vec!["older-queued"]);
+}
+
+#[test]
+fn interrupt_compare_and_set_reports_completion_race() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "active");
+    let ReconcileDecision::Claim(active) = coordinator.next("lead-1") else {
+        panic!("active work must be claimed");
+    };
+    assert_eq!(coordinator.complete_batch(&active), CommitResult::Committed);
+
+    let result = coordinator.interrupt_batch(&active, None, "replacement".into());
+    assert_eq!(result.commit_result, CommitResult::StaleOwner);
+    assert!(result.terminal_message_ids.is_empty());
+}
+
+#[test]
+fn starting_batch_interrupt_defers_stream_cancel_until_late_start_callback() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "active");
+    let ReconcileDecision::Claim(starting) = coordinator.next("lead-1") else {
+        panic!("active work must be claimed");
+    };
+    let result = coordinator.interrupt_batch(&starting, None, "replacement".into());
+    assert_eq!(result.commit_result, CommitResult::Committed);
+    assert_eq!(
+        coordinator.mark_started(&starting, "late-turn"),
+        StartCommitResult::CancelImmediately
+    );
+    assert_eq!(
+        coordinator.take_interrupt_metadata(&starting.batch_id),
+        Some(BatchInterruptMetadata {
+            reason: None,
+            replacement_message_id: "replacement".into(),
+        })
+    );
+}
+
+#[test]
+fn discard_policy_terminalizes_unclaimed_queue_but_keeps_replacement() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserIntervention, "old-1");
+    enqueue(&coordinator, WorkSource::McpSendMessage, "old-2");
+    enqueue(&coordinator, WorkSource::LeadIntervention, "replacement");
+
+    let discarded = coordinator.discard_queued_except("lead-1", "replacement");
+    assert_eq!(discarded.len(), 2);
+    assert!(discarded.contains(&"old-1".to_owned()));
+    assert!(discarded.contains(&"old-2".to_owned()));
+    let ReconcileDecision::Claim(replacement) = coordinator.next("lead-1") else {
+        panic!("replacement must remain queued");
+    };
+    assert_eq!(replacement.mailbox_message_ids, vec!["replacement"]);
+}
+
+/// I2: Discard supersedes queued *instructions*. The Control lane carries the
+/// shutdown handshake, which has no retry path, so dropping it would strand the
+/// protocol forever.
+#[test]
+fn discard_policy_exempts_control_lane_work() {
+    for control_source in [WorkSource::McpShutdownRequest, WorkSource::ShutdownRejected] {
+        let coordinator = coordinator();
+        coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+        enqueue(&coordinator, WorkSource::UserIntervention, "instruction");
+        enqueue(&coordinator, control_source, "control");
+        enqueue(&coordinator, WorkSource::LeadIntervention, "replacement");
+
+        let discarded = coordinator.discard_queued_except("lead-1", "replacement");
+        assert_eq!(
+            discarded,
+            vec!["instruction".to_owned()],
+            "{control_source:?} must survive a discard"
+        );
+
+        // The replacement runs first (Foreground), then the retained control work.
+        let ReconcileDecision::Claim(replacement) = coordinator.next("lead-1") else {
+            panic!("replacement must remain queued");
+        };
+        assert_eq!(replacement.mailbox_message_ids, vec!["replacement"]);
+        coordinator.complete_batch(&replacement);
+
+        let ReconcileDecision::Claim(control) = coordinator.next("lead-1") else {
+            panic!("{control_source:?} must still be claimable after the discard");
+        };
+        assert_eq!(control.mailbox_message_ids, vec!["control"]);
+    }
 }
 
 // ── ELECTRON-3RN: recognized slash commands batch alone (FIFO, no preempt) ──

@@ -3,17 +3,49 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::TeamMcpStdioConfig;
 use crate::chat_file::ChatFileRef;
+use crate::{ConversationMcpStatus, SessionMcpServer};
 
 // ---------------------------------------------------------------------------
 // A. Team management — Request DTOs
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// B. Team MCP selection
+// ---------------------------------------------------------------------------
+
+/// The operator's globally enabled MCP servers, ready to freeze into a team
+/// member conversation's final runtime snapshot fields.
+///
+/// Team provisioning resolves this once per team creation and injects it into
+/// every member conversation's `extra`, so the builtin rows (e.g.
+/// `chrome-devtools`) that the generic enabled-set fallback hard-excludes still
+/// reach member sessions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMcpSelection {
+    /// Enabled non-builtin MCP row ids.
+    pub mcp_server_ids: Vec<String>,
+    /// Enabled builtin MCP servers in neutral form (stdio launch commands
+    /// already resolved).
+    pub session_mcp_servers: Vec<SessionMcpServer>,
+    /// Preclassified failures for enabled builtin rows that could not be
+    /// converted into a runtime server. Valid rows are classified per agent
+    /// when the full runtime snapshot is built.
+    pub mcp_statuses: Vec<ConversationMcpStatus>,
+}
+
+/// Stable representation used to deduplicate assistant MCP binding refreshes.
+pub fn assistant_mcp_binding_fingerprint(ids: &[String]) -> String {
+    let mut ids = ids.to_vec();
+    ids.sort();
+    ids.dedup();
+    serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_owned())
+}
 
 /// Input for a single agent when creating a team or adding an agent.
 ///
 /// Each agent gets its own conversation. Create requests must include exactly
 /// one agent with role `lead` or `leader`; that explicit role becomes the team
 /// lead.
-///
 #[derive(Debug, Clone)]
 pub struct TeamAgentInput {
     pub name: String,
@@ -267,6 +299,33 @@ pub struct SendAgentMessageRequest {
     pub files: Option<Vec<ChatFileRef>>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamQueuedPolicy {
+    #[default]
+    Retain,
+    Discard,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InterruptTeamAgentRequest {
+    pub message: String,
+    #[serde(default)]
+    pub files: Option<Vec<ChatFileRef>>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub queued_policy: TeamQueuedPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamInterruptOutcome {
+    Interrupted,
+    QueuedNoActiveTurn,
+    CompletedRace,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TeamRunTargetRole {
@@ -399,6 +458,19 @@ pub struct TeamChildTurnPayload {
     pub conversation_id: String,
     pub turn_id: String,
     pub status: TeamRunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamInterruptAgentResponse {
+    pub outcome: TeamInterruptOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupted_turn_id: Option<String>,
+    pub message_id: String,
+    pub target: TeamSlotWorkPayload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -424,6 +496,60 @@ pub struct TeamSlotWorkChangedPayload {
 // ---------------------------------------------------------------------------
 // E. Team management — Response DTOs
 // ---------------------------------------------------------------------------
+
+/// Whether a team member can start a fresh backend context right now.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamContextResetAvailability {
+    Ready,
+    Initializing,
+    Busy,
+    Dormant,
+    Failed,
+    Removing,
+    SessionStopped,
+    Unsupported,
+    LeaderNotTargetable,
+}
+
+/// Server-authoritative context-reset capability for one team member.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamContextResetCapability {
+    pub supported: bool,
+    pub availability: TeamContextResetAvailability,
+}
+
+/// Whether clearing the persisted backend session anchor took effect.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamContextResetStatus {
+    Completed,
+    NotApplied,
+}
+
+/// Terminal replacement-runtime state after a context-reset attempt.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamContextResetRuntimeStatus {
+    Ready,
+    Failed,
+}
+
+/// Structured outcome returned by both the HTTP and Lead-only MCP reset paths.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamContextResetResponse {
+    pub reset_status: TeamContextResetStatus,
+    pub runtime_status: TeamContextResetRuntimeStatus,
+    pub preserved_unread_count: usize,
+}
+
+/// Semantic payload persisted for a localized team context-reset system notice.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamContextResetNotice {
+    pub kind: String,
+    pub member_name: String,
+    pub runtime_status: TeamContextResetRuntimeStatus,
+}
 
 /// Single agent within a team response.
 ///
@@ -452,6 +578,7 @@ pub struct TeamAgentResponse {
     pub status: Option<String>,
     #[serde(default)]
     pub pending_confirmations: usize,
+    pub context_reset: TeamContextResetCapability,
 }
 
 /// Full team response returned by create, get, and list endpoints.
@@ -1097,6 +1224,10 @@ mod tests {
             assistant_id: Some("assistant-x".into()),
             status: Some("idle".into()),
             pending_confirmations: 2,
+            context_reset: TeamContextResetCapability {
+                supported: true,
+                availability: TeamContextResetAvailability::Ready,
+            },
         };
         let json = serde_json::to_value(&agent).unwrap();
         assert_eq!(json["slot_id"], "slot-1");
@@ -1129,6 +1260,10 @@ mod tests {
             assistant_id: None,
             status: None,
             pending_confirmations: 0,
+            context_reset: TeamContextResetCapability {
+                supported: true,
+                availability: TeamContextResetAvailability::Dormant,
+            },
         };
         let json = serde_json::to_value(&agent).unwrap();
         assert!(json.get("icon").is_none());
@@ -1155,6 +1290,10 @@ mod tests {
                 assistant_id: Some("assistant-x".into()),
                 status: None,
                 pending_confirmations: 0,
+                context_reset: TeamContextResetCapability {
+                    supported: false,
+                    availability: TeamContextResetAvailability::LeaderNotTargetable,
+                },
             }],
             leader_assistant_id: Some("slot-1".into()),
             created_at: 1700000000000,
@@ -1219,6 +1358,10 @@ mod tests {
                 assistant_id: None,
                 status: Some("idle".into()),
                 pending_confirmations: 0,
+                context_reset: TeamContextResetCapability {
+                    supported: true,
+                    availability: TeamContextResetAvailability::Ready,
+                },
             },
         };
         let json = serde_json::to_value(&payload).unwrap();
@@ -1270,6 +1413,10 @@ mod tests {
             assistant_id: Some("custom-1".into()),
             status: Some("working".into()),
             pending_confirmations: 1,
+            context_reset: TeamContextResetCapability {
+                supported: false,
+                availability: TeamContextResetAvailability::LeaderNotTargetable,
+            },
         };
         let json = serde_json::to_string(&agent).unwrap();
         let parsed: TeamAgentResponse = serde_json::from_str(&json).unwrap();
@@ -1296,6 +1443,10 @@ mod tests {
                     assistant_id: None,
                     status: None,
                     pending_confirmations: 0,
+                    context_reset: TeamContextResetCapability {
+                        supported: false,
+                        availability: TeamContextResetAvailability::LeaderNotTargetable,
+                    },
                 },
                 TeamAgentResponse {
                     slot_id: "s2".into(),
@@ -1310,6 +1461,10 @@ mod tests {
                     assistant_id: Some("x".into()),
                     status: Some("idle".into()),
                     pending_confirmations: 3,
+                    context_reset: TeamContextResetCapability {
+                        supported: true,
+                        availability: TeamContextResetAvailability::Ready,
+                    },
                 },
             ],
             leader_assistant_id: Some("s1".into()),
@@ -1350,11 +1505,46 @@ mod tests {
                 assistant_id: None,
                 status: None,
                 pending_confirmations: 0,
+                context_reset: TeamContextResetCapability {
+                    supported: true,
+                    availability: TeamContextResetAvailability::Dormant,
+                },
             },
         };
         let json = serde_json::to_string(&payload).unwrap();
         let parsed: TeamAgentSpawnedPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn context_reset_outcome_and_notice_use_the_final_wire_contract() {
+        let outcome = TeamContextResetResponse {
+            reset_status: TeamContextResetStatus::Completed,
+            runtime_status: TeamContextResetRuntimeStatus::Failed,
+            preserved_unread_count: 3,
+        };
+        assert_eq!(
+            serde_json::to_value(outcome).unwrap(),
+            json!({
+                "reset_status": "completed",
+                "runtime_status": "failed",
+                "preserved_unread_count": 3,
+            })
+        );
+
+        let notice = TeamContextResetNotice {
+            kind: "context_reset".into(),
+            member_name: "Writer".into(),
+            runtime_status: TeamContextResetRuntimeStatus::Ready,
+        };
+        assert_eq!(
+            serde_json::to_value(notice).unwrap(),
+            json!({
+                "kind": "context_reset",
+                "member_name": "Writer",
+                "runtime_status": "ready",
+            })
+        );
     }
 
     #[test]
@@ -1392,7 +1582,11 @@ mod tests {
             "backend": "acp",
             "model": "claude",
             "custom_agent_id": "cust-1",
-            "status": "idle"
+            "status": "idle",
+            "context_reset": {
+                "supported": false,
+                "availability": "leader_not_targetable"
+            }
         });
         let agent: TeamAgentResponse = serde_json::from_value(raw).unwrap();
         assert_eq!(agent.slot_id, "s1");
@@ -1400,6 +1594,13 @@ mod tests {
         assert_eq!(agent.assistant_id.as_deref(), Some("cust-1"));
         assert_eq!(agent.status.as_deref(), Some("idle"));
         assert_eq!(agent.pending_confirmations, 0);
+        assert_eq!(
+            agent.context_reset,
+            TeamContextResetCapability {
+                supported: false,
+                availability: TeamContextResetAvailability::LeaderNotTargetable,
+            }
+        );
     }
 
     #[test]

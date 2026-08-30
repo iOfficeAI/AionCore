@@ -13,13 +13,26 @@ pub struct MockState {
 
 pub struct MockTeamRepo {
     pub state: Mutex<MockState>,
+    peek_snapshot_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    peek_release_rx: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 impl MockTeamRepo {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(MockState::default()),
+            peek_snapshot_tx: Mutex::new(None),
+            peek_release_rx: Mutex::new(None),
         }
+    }
+
+    pub fn arm_peek_barrier(
+        &self,
+        snapshot_tx: tokio::sync::oneshot::Sender<()>,
+        release_rx: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.peek_snapshot_tx.lock().unwrap() = Some(snapshot_tx);
+        *self.peek_release_rx.lock().unwrap() = Some(release_rx);
     }
 }
 
@@ -97,14 +110,41 @@ impl ITeamRepository for MockTeamRepo {
         team_id: &str,
         to_agent_id: &str,
     ) -> Result<Vec<MailboxMessageRow>, DbError> {
+        let result = {
+            let state = self.state.lock().unwrap();
+            state
+                .messages
+                .iter()
+                .filter(|m| m.team_id == team_id && m.to_agent_id == to_agent_id && !m.read)
+                .cloned()
+                .collect()
+        };
+        if let Some(snapshot_tx) = self.peek_snapshot_tx.lock().unwrap().take() {
+            let _ = snapshot_tx.send(());
+        }
+        let release_rx = self.peek_release_rx.lock().unwrap().take();
+        if let Some(release_rx) = release_rx {
+            let _ = release_rx.await;
+        }
+        Ok(result)
+    }
+
+    /// Filters directly instead of delegating to `peek_unread` so the
+    /// snapshot/release race hooks above stay bound to `peek_unread` alone.
+    async fn peek_unread_by_ids(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        to_agent_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<MailboxMessageRow>, DbError> {
         let state = self.state.lock().unwrap();
-        let result = state
+        Ok(state
             .messages
             .iter()
-            .filter(|m| m.team_id == team_id && m.to_agent_id == to_agent_id && !m.read)
+            .filter(|m| m.team_id == team_id && m.to_agent_id == to_agent_id && !m.read && ids.contains(&m.id))
             .cloned()
-            .collect();
-        Ok(result)
+            .collect())
     }
 
     async fn mark_read_batch(&self, _user_id: &str, team_id: &str, ids: &[String]) -> Result<(), DbError> {
@@ -352,7 +392,8 @@ pub(crate) mod workspace_harness {
 
     use aionui_ai_agent::{AgentError, IWorkerTaskManager};
     use aionui_api_types::{
-        AcpConfigOptionDto, AcpConfigSelectOptionDto, CreateTeamRequest, GetConfigOptionsResponse, WebSocketMessage,
+        AcpConfigOptionDto, AcpConfigSelectOptionDto, CreateTeamRequest, GetConfigOptionsResponse, SessionMcpServer,
+        WebSocketMessage,
     };
     use aionui_common::{AgentKillReason, AgentType, PaginatedResult, now_ms};
     use aionui_db::models::{
@@ -400,6 +441,14 @@ pub(crate) mod workspace_harness {
         }
 
         pub(crate) fn mark_runtime_not_ready(&self, id: &str) {
+            self.set_extra_flag(id, "runtime_not_ready");
+        }
+
+        pub(crate) fn mark_runtime_attach_failed(&self, id: &str) {
+            self.set_extra_flag(id, "runtime_attach_failed");
+        }
+
+        fn set_extra_flag(&self, id: &str, key: &str) {
             let mut conversations = self.conversations.lock().unwrap();
             let conversation = conversations
                 .iter_mut()
@@ -407,7 +456,7 @@ pub(crate) mod workspace_harness {
                 .expect("conversation exists");
             let mut extra: serde_json::Value =
                 serde_json::from_str(&conversation.extra).unwrap_or_else(|_| serde_json::json!({}));
-            extra["runtime_not_ready"] = serde_json::Value::Bool(true);
+            extra[key] = serde_json::Value::Bool(true);
             conversation.extra = serde_json::to_string(&extra).unwrap();
         }
     }
@@ -563,12 +612,14 @@ pub(crate) mod workspace_harness {
 
     pub(crate) struct FullMockTeamRepo {
         teams: Mutex<Vec<TeamRow>>,
+        messages: Mutex<Vec<aionui_db::models::MailboxMessageRow>>,
     }
 
     impl FullMockTeamRepo {
         fn new() -> Self {
             Self {
                 teams: Mutex::new(Vec::new()),
+                messages: Mutex::new(Vec::new()),
             }
         }
     }
@@ -645,49 +696,112 @@ pub(crate) mod workspace_harness {
         async fn write_message(
             &self,
             _user_id: &str,
-            _row: &aionui_db::models::MailboxMessageRow,
+            row: &aionui_db::models::MailboxMessageRow,
         ) -> Result<(), DbError> {
+            self.messages.lock().unwrap().push(row.clone());
             Ok(())
         }
 
         async fn read_unread_and_mark(
             &self,
             _user_id: &str,
-            _team_id: &str,
-            _to_agent_id: &str,
+            team_id: &str,
+            to_agent_id: &str,
         ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-            Ok(vec![])
+            let mut messages = self.messages.lock().unwrap();
+            let mut unread = Vec::new();
+            for message in messages.iter_mut() {
+                if message.team_id == team_id && message.to_agent_id == to_agent_id && !message.read {
+                    unread.push(message.clone());
+                    message.read = true;
+                }
+            }
+            Ok(unread)
         }
 
         async fn peek_unread(
             &self,
             _user_id: &str,
-            _team_id: &str,
-            _to_agent_id: &str,
+            team_id: &str,
+            to_agent_id: &str,
         ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-            Ok(vec![])
+            Ok(self
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|message| message.team_id == team_id && message.to_agent_id == to_agent_id && !message.read)
+                .cloned()
+                .collect())
         }
 
-        async fn mark_read_batch(&self, _user_id: &str, _team_id: &str, _ids: &[String]) -> Result<(), DbError> {
+        async fn peek_unread_by_ids(
+            &self,
+            _user_id: &str,
+            team_id: &str,
+            to_agent_id: &str,
+            ids: &[String],
+        ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+            Ok(self
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|message| {
+                    message.team_id == team_id
+                        && message.to_agent_id == to_agent_id
+                        && !message.read
+                        && ids.contains(&message.id)
+                })
+                .cloned()
+                .collect())
+        }
+
+        async fn mark_read_batch(&self, _user_id: &str, team_id: &str, ids: &[String]) -> Result<(), DbError> {
+            for message in self.messages.lock().unwrap().iter_mut() {
+                if message.team_id == team_id && ids.contains(&message.id) {
+                    message.read = true;
+                }
+            }
             Ok(())
         }
 
         async fn get_history(
             &self,
             _user_id: &str,
-            _team_id: &str,
-            _to_agent_id: &str,
-            _limit: Option<i64>,
+            team_id: &str,
+            to_agent_id: &str,
+            limit: Option<i64>,
         ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-            Ok(vec![])
+            let mut messages: Vec<_> = self
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|message| message.team_id == team_id && message.to_agent_id == to_agent_id)
+                .cloned()
+                .collect();
+            messages.sort_by_key(|message| std::cmp::Reverse(message.created_at));
+            messages.truncate(limit.unwrap_or(i64::MAX).max(0) as usize);
+            Ok(messages)
         }
 
         async fn list_messages_by_team(
             &self,
-            _team_id: &str,
-            _limit: i64,
+            team_id: &str,
+            limit: i64,
         ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-            Ok(vec![])
+            let mut messages: Vec<_> = self
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|message| message.team_id == team_id)
+                .cloned()
+                .collect();
+            messages.sort_by_key(|message| std::cmp::Reverse(message.created_at));
+            messages.truncate(limit.max(0) as usize);
+            Ok(messages)
         }
 
         async fn list_messages_by_team_paged(
@@ -702,12 +816,23 @@ pub(crate) mod workspace_harness {
 
         async fn list_messages_by_ids(
             &self,
-            _ids: &[String],
+            ids: &[String],
         ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-            Ok(vec![])
+            Ok(self
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|message| ids.contains(&message.id))
+                .cloned()
+                .collect())
         }
 
-        async fn delete_mailbox_by_team(&self, _user_id: &str, _team_id: &str) -> Result<(), DbError> {
+        async fn delete_mailbox_by_team(&self, _user_id: &str, team_id: &str) -> Result<(), DbError> {
+            self.messages
+                .lock()
+                .unwrap()
+                .retain(|message| message.team_id != team_id);
             Ok(())
         }
 
@@ -820,12 +945,45 @@ pub(crate) mod workspace_harness {
                 });
             let mut extra = request.extra;
             extra["workspace"] = serde_json::Value::String(workspace.clone());
+            // Mirror the real create(): final team snapshot inputs are
+            // normalized here into all four persisted fields (empty
+            // arrays are explicit — "no user MCP" wins over preset defaults).
+            if extra.get("mcp_server_ids").is_some() || extra.get("session_mcp_servers").is_some() {
+                let ids = serde_json::from_value::<Vec<String>>(extra["mcp_server_ids"].clone()).unwrap_or_default();
+                let session_servers =
+                    serde_json::from_value::<Vec<SessionMcpServer>>(extra["session_mcp_servers"].clone())
+                        .unwrap_or_default();
+                // Names: repo rows are approximated by their ids in this fake;
+                // inline (builtin) servers carry their real names.
+                let mut names: Vec<String> = ids.clone();
+                for server in &session_servers {
+                    if !names.contains(&server.name) {
+                        names.push(server.name.clone());
+                    }
+                }
+                for status in extra["mcp_statuses"].as_array().into_iter().flatten() {
+                    if let Some(name) = status.get("name").and_then(serde_json::Value::as_str)
+                        && !names.iter().any(|value| value == name)
+                    {
+                        names.push(name.to_owned());
+                    }
+                }
+                extra["mcp_servers"] = serde_json::json!(names);
+                if extra.get("mcp_statuses").is_none() {
+                    extra["mcp_statuses"] = serde_json::json!([]);
+                }
+            }
+            let agent_type = request.agent_type.unwrap_or(AgentType::Acp);
+            if agent_type == AgentType::Acp {
+                extra["mock_has_acp_session"] = serde_json::Value::Bool(true);
+                extra["mock_acp_session_id"] = serde_json::Value::String("anchor".to_owned());
+            }
             self.repo
                 .create(&ConversationRow {
                     id: id.clone(),
                     user_id: request.user_id,
                     name: request.name,
-                    r#type: request.agent_type.unwrap_or(AgentType::Acp).serde_name().to_owned(),
+                    r#type: agent_type.serde_name().to_owned(),
                     pinned: false,
                     pinned_at: None,
                     source: None,
@@ -957,12 +1115,40 @@ pub(crate) mod workspace_harness {
             })
         }
 
+        async fn supports_context_reset(&self, user_id: &str, conversation_id: &str) -> Result<bool, TeamError> {
+            let conversation = self.repo.get(user_id, conversation_id).await?;
+            Ok(conversation.is_some_and(|row| {
+                row.r#type == AgentType::Acp.serde_name()
+                    && serde_json::from_str::<serde_json::Value>(&row.extra)
+                        .ok()
+                        .and_then(|extra| extra.get("mock_has_acp_session").and_then(serde_json::Value::as_bool))
+                        .unwrap_or(false)
+            }))
+        }
+
+        async fn clear_context_anchor(&self, user_id: &str, conversation_id: &str) -> Result<bool, TeamError> {
+            if !self.supports_context_reset(user_id, conversation_id).await? {
+                return Ok(false);
+            }
+            self.patch_runtime_config(conversation_id, serde_json::json!({ "mock_acp_session_id": null }))
+                .await?;
+            Ok(true)
+        }
+
         async fn warmup_agent_process(
             &self,
             _user_id: &str,
-            _conversation_id: &str,
+            conversation_id: &str,
             _task_manager: &Arc<dyn IWorkerTaskManager>,
         ) -> Result<(), TeamError> {
+            if self
+                .repo
+                .get_extra(conversation_id)
+                .and_then(|extra| extra.get("runtime_attach_failed").and_then(serde_json::Value::as_bool))
+                .unwrap_or(false)
+            {
+                return Err(TeamError::InvalidRequest("forced runtime attach failure".to_owned()));
+            }
             Ok(())
         }
 

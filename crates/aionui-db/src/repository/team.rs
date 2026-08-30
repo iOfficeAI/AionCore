@@ -95,6 +95,18 @@ pub trait ITeamRepository: Send + Sync {
         to_agent_id: &str,
     ) -> Result<Vec<MailboxMessageRow>, DbError>;
 
+    /// Reads the requested unread messages for `to_agent_id` without marking
+    /// them as read. Missing or already-read IDs are omitted. Rows are ordered
+    /// like `peek_unread` (`created_at ASC, id ASC`) so callers may rely on FIFO
+    /// order regardless of the order of `ids`.
+    async fn peek_unread_by_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        to_agent_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<MailboxMessageRow>, DbError>;
+
     /// Marks the given message IDs as read. IDs that don't exist are silently ignored.
     async fn mark_read_batch(&self, user_id: &str, team_id: &str, ids: &[String]) -> Result<(), DbError>;
 

@@ -11,9 +11,11 @@ use axum::routing::{get, post};
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
-    GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
-    SendTeamMessageRequest, SetModeRequest, TeamActivityPageResponse, TeamAgentResponse, TeamListResponse,
-    TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
+    GetConfigOptionsResponse, InterruptTeamAgentRequest, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest,
+    SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
+    SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
+    TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse,
+    TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -79,6 +81,93 @@ impl From<TeamError> for ApiError {
                     "reason": public_reason,
                 })),
             ),
+            TeamError::MemberBusy {
+                team_id,
+                slot_id,
+                conversation_id,
+            } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TEAM_MEMBER_BUSY",
+                "Team member is busy",
+                Some(serde_json::json!({
+                    "team_id": team_id,
+                    "slot_id": slot_id,
+                    "conversation_id": conversation_id,
+                })),
+            ),
+            TeamError::MemberRuntimeStarting {
+                team_id,
+                slot_id,
+                conversation_id,
+            } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TEAM_MEMBER_RUNTIME_STARTING",
+                "Team member runtime is starting",
+                Some(serde_json::json!({
+                    "team_id": team_id,
+                    "slot_id": slot_id,
+                    "conversation_id": conversation_id,
+                })),
+            ),
+            TeamError::MemberUnsupported {
+                team_id,
+                slot_id,
+                conversation_id,
+                backend,
+            } => ApiError::coded(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "TEAM_MEMBER_UNSUPPORTED",
+                "Team member does not support context reset",
+                Some(serde_json::json!({
+                    "team_id": team_id,
+                    "slot_id": slot_id,
+                    "conversation_id": conversation_id,
+                    "backend": backend,
+                })),
+            ),
+            TeamError::ContextResetLeaderNotTargetable {
+                team_id,
+                slot_id,
+                conversation_id,
+            } => ApiError::coded(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "TEAM_CONTEXT_RESET_LEADER_NOT_TARGETABLE",
+                "Team leaders cannot be context-reset targets",
+                Some(serde_json::json!({
+                    "team_id": team_id,
+                    "slot_id": slot_id,
+                    "conversation_id": conversation_id,
+                })),
+            ),
+            TeamError::ContextResetUnavailable {
+                team_id,
+                slot_id,
+                conversation_id,
+                availability,
+            } => {
+                let code = match availability {
+                    TeamContextResetAvailability::Initializing => "TEAM_MEMBER_RUNTIME_STARTING",
+                    TeamContextResetAvailability::Busy => "TEAM_MEMBER_BUSY",
+                    TeamContextResetAvailability::Dormant => "TEAM_MEMBER_DORMANT",
+                    TeamContextResetAvailability::Failed => "TEAM_MEMBER_RUNTIME_FAILED",
+                    TeamContextResetAvailability::Removing => "TEAM_MEMBER_REMOVING",
+                    TeamContextResetAvailability::SessionStopped => "TEAM_SESSION_STOPPED",
+                    TeamContextResetAvailability::Unsupported => "TEAM_MEMBER_UNSUPPORTED",
+                    TeamContextResetAvailability::LeaderNotTargetable => "TEAM_CONTEXT_RESET_LEADER_NOT_TARGETABLE",
+                    TeamContextResetAvailability::Ready => "TEAM_CONTEXT_RESET_UNAVAILABLE",
+                };
+                ApiError::coded(
+                    StatusCode::CONFLICT,
+                    code,
+                    "Team member context reset is unavailable",
+                    Some(serde_json::json!({
+                        "team_id": team_id,
+                        "slot_id": slot_id,
+                        "conversation_id": conversation_id,
+                        "availability": availability,
+                    })),
+                )
+            }
             TeamError::WorkspacePathUnavailable(path) => ApiError::WorkspacePathUnavailable(path),
             TeamError::WorkspacePathRuntimeUnavailable(path) => ApiError::WorkspacePathRuntimeUnavailable(path),
             TeamError::Database(db_err) => db_error_to_api_error(db_err),
@@ -102,12 +191,29 @@ pub fn team_routes(state: TeamRouterState) -> Router {
             "/api/teams/{id}/agents/{slot_id}/name",
             axum::routing::patch(rename_agent),
         )
+        .route(
+            "/api/teams/{id}/agents/{slot_id}/model",
+            axum::routing::patch(update_agent_model),
+        )
         .route("/api/teams/{id}/messages", post(send_message))
         .route("/api/teams/{id}/agents/{slot_id}/messages", post(send_message_to_agent))
+        .route("/api/teams/{id}/agents/{slot_id}/interrupt", post(interrupt_agent))
         .route("/api/teams/{id}/agents/{slot_id}/attach", post(attach_agent))
+        .route(
+            "/api/teams/{id}/agents/{slot_id}/runtime/restart",
+            post(restart_agent_runtime),
+        )
+        .route(
+            "/api/teams/{id}/agents/{slot_id}/context/reset",
+            post(reset_agent_context),
+        )
         .route(
             "/api/teams/{id}/conversations/{conversation_id}/config-options",
             get(get_conversation_config_options),
+        )
+        .route(
+            "/api/teams/{id}/conversations/{conversation_id}/config-options/{option_id}",
+            axum::routing::put(set_conversation_config_option),
         )
         .route("/api/teams/{id}/runs/{team_run_id}/cancel", post(cancel_run))
         .route(
@@ -358,6 +464,44 @@ async fn attach_agent(
     Ok(Json(ApiResponse::success()))
 }
 
+async fn update_agent_model(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<AgentPathParams>,
+    body: Result<Json<SetModelRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .service
+        .update_agent_model(&user.id, &params.id, &params.slot_id, &req.model_id)
+        .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn restart_agent_runtime(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<AgentPathParams>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .restart_agent_runtime(&user.id, &params.id, &params.slot_id)
+        .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn reset_agent_context(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<AgentPathParams>,
+) -> Result<Json<ApiResponse<TeamContextResetResponse>>, ApiError> {
+    let outcome = state
+        .service
+        .clear_agent_context(&user.id, &params.id, &params.slot_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(outcome)))
+}
+
 async fn send_message(
     State(state): State<TeamRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -370,6 +514,20 @@ async fn send_message(
         .send_message(&user.id, &id, &req.content, req.files)
         .await?;
     Ok(Json(ApiResponse::ok(ack)))
+}
+
+async fn interrupt_agent(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<AgentPathParams>,
+    body: Result<Json<InterruptTeamAgentRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TeamInterruptAgentResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let response = state
+        .service
+        .interrupt_agent(&user.id, &params.id, &params.slot_id, req)
+        .await?;
+    Ok(Json(ApiResponse::ok(response)))
 }
 
 async fn send_message_to_agent(
@@ -475,6 +633,21 @@ async fn get_conversation_config_options(
         state
             .service
             .get_conversation_config_options(&user.id, &id, &conversation_id)
+            .await?,
+    )))
+}
+
+async fn set_conversation_config_option(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, conversation_id, option_id)): Path<(String, String, String)>,
+    body: Result<Json<SetConfigOptionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<SetConfigOptionResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .set_conversation_config_option(&user.id, &id, &conversation_id, &option_id, req)
             .await?,
     )))
 }
@@ -641,6 +814,95 @@ mod tests {
             }))
         );
         assert!(!format!("{err:?}").contains("provider-secret"));
+    }
+
+    #[test]
+    fn member_busy_maps_to_coded_conflict() {
+        let err: ApiError = TeamError::MemberBusy {
+            team_id: "team-1".into(),
+            slot_id: "slot-2".into(),
+            conversation_id: "conv-2".into(),
+        }
+        .into();
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.error_code(), "TEAM_MEMBER_BUSY");
+        assert_eq!(
+            err.error_details(),
+            Some(json!({
+                "team_id": "team-1",
+                "slot_id": "slot-2",
+                "conversation_id": "conv-2",
+            }))
+        );
+    }
+
+    #[test]
+    fn member_unsupported_maps_to_coded_unprocessable_entity() {
+        let err: ApiError = TeamError::MemberUnsupported {
+            team_id: "team-1".into(),
+            slot_id: "slot-2".into(),
+            conversation_id: "conv-2".into(),
+            backend: "aionrs".into(),
+        }
+        .into();
+        assert_eq!(err.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.error_code(), "TEAM_MEMBER_UNSUPPORTED");
+        assert_eq!(
+            err.error_details(),
+            Some(json!({
+                "team_id": "team-1",
+                "slot_id": "slot-2",
+                "conversation_id": "conv-2",
+                "backend": "aionrs",
+            }))
+        );
+    }
+
+    #[test]
+    fn context_reset_leader_rejection_maps_to_coded_unprocessable_entity() {
+        let err: ApiError = TeamError::ContextResetLeaderNotTargetable {
+            team_id: "team-1".into(),
+            slot_id: "slot-1".into(),
+            conversation_id: "conv-1".into(),
+        }
+        .into();
+        assert_eq!(err.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.error_code(), "TEAM_CONTEXT_RESET_LEADER_NOT_TARGETABLE");
+        assert_eq!(
+            err.error_details(),
+            Some(json!({
+                "team_id": "team-1",
+                "slot_id": "slot-1",
+                "conversation_id": "conv-1",
+            }))
+        );
+    }
+
+    #[test]
+    fn context_reset_unavailable_maps_runtime_state_to_specific_code() {
+        let cases = [
+            (
+                TeamContextResetAvailability::Initializing,
+                "TEAM_MEMBER_RUNTIME_STARTING",
+            ),
+            (TeamContextResetAvailability::Busy, "TEAM_MEMBER_BUSY"),
+            (TeamContextResetAvailability::Dormant, "TEAM_MEMBER_DORMANT"),
+            (TeamContextResetAvailability::Failed, "TEAM_MEMBER_RUNTIME_FAILED"),
+            (TeamContextResetAvailability::Removing, "TEAM_MEMBER_REMOVING"),
+            (TeamContextResetAvailability::SessionStopped, "TEAM_SESSION_STOPPED"),
+        ];
+        for (availability, expected_code) in cases {
+            let err: ApiError = TeamError::ContextResetUnavailable {
+                team_id: "team-1".into(),
+                slot_id: "slot-2".into(),
+                conversation_id: "conv-2".into(),
+                availability,
+            }
+            .into();
+            assert_eq!(err.status_code(), StatusCode::CONFLICT);
+            assert_eq!(err.error_code(), expected_code);
+            assert_eq!(err.error_details().unwrap()["availability"], json!(availability));
+        }
     }
 
     #[test]

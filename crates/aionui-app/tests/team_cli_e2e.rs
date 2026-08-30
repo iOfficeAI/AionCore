@@ -33,7 +33,7 @@ async fn team_capabilities_prints_contract_without_runtime_env() {
     let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(stdout["success"], true);
     assert_eq!(stdout["data"]["contract"], "agent-facing-team-cli");
-    assert_eq!(stdout["data"]["tools"].as_array().unwrap().len(), 10);
+    assert_eq!(stdout["data"]["tools"].as_array().unwrap().len(), 13);
     let spawn = stdout["data"]["tools"]
         .as_array()
         .unwrap()

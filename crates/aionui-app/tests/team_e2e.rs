@@ -519,6 +519,20 @@ async fn team_api_rejects_cross_user_access() {
         ),
         json_with_token(
             "POST",
+            &format!("/api/teams/{team_id}/agents/{slot_id}/interrupt"),
+            json!({ "message": "Nope" }),
+            &other_token,
+            &other_csrf,
+        ),
+        json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/agents/{slot_id}/context/reset"),
+            json!({}),
+            &other_token,
+            &other_csrf,
+        ),
+        json_with_token(
+            "POST",
             &format!("/api/teams/{team_id}/session"),
             json!({}),
             &other_token,
@@ -566,6 +580,101 @@ async fn pause_team_slot_endpoint_requires_owned_team_and_active_run() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_json(resp).await;
     assert!(body["success"].as_bool().is_some_and(|success| !success));
+}
+
+/// I5: the interrupt endpoint had no coverage at all. Bad paths only — the happy
+/// path needs a live agent turn and is covered by the `src/session.rs` lib tests.
+#[tokio::test]
+async fn interrupt_agent_endpoint_rejects_bad_requests() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let lead_slot_id = data["assistants"][0]["slot_id"].as_str().unwrap();
+    let worker_slot_id = data["assistants"][1]["slot_id"].as_str().unwrap();
+
+    // Unauthenticated: the bearer token is not accepted.
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/{worker_slot_id}/interrupt"),
+        json!({ "message": "stop" }),
+        "not-a-real-token",
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Missing required `message`.
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/{worker_slot_id}/interrupt"),
+        json!({ "reason": "no message field" }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["code"], "BAD_REQUEST",
+        "a missing required field is a body-shape rejection"
+    );
+
+    // Empty message.
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/{worker_slot_id}/interrupt"),
+        json!({ "message": "   " }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("must not be empty"),
+        "expected the empty-message validation error, got {error:?}"
+    );
+
+    // The lead cannot be interrupted.
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/{lead_slot_id}/interrupt"),
+        json!({ "message": "stop" }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("cannot interrupt the team lead"),
+        "expected the lead-target rejection, got {error:?}"
+    );
+
+    // Unknown slot.
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/ghost-9/interrupt"),
+        json!({ "message": "stop" }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Unknown team.
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/not-a-team/agents/{worker_slot_id}/interrupt"),
+        json!({ "message": "stop" }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -1045,6 +1154,7 @@ async fn es1_ensure_session() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+// ES-1b: ensure session + team MCP list_assistants projection
 #[tokio::test]
 async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
     let (mut app, services) = build_app_with_mock_agents().await;
@@ -1134,6 +1244,464 @@ async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
     assert_eq!(stop_resp.status(), StatusCode::OK);
 }
 
+// ES-1c: member conversations carry the user's globally enabled MCP snapshot
+// (non-builtin row ids + builtin session servers, e.g. chrome-devtools), and a
+// runtime restart self-heals the snapshot after toggle changes.
+#[tokio::test]
+async fn es1c_team_conversations_carry_global_mcp_snapshot_including_builtin() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let pool = services.database.pool().clone();
+    let user_id = "system_default_user";
+    let now = aionui_common::now_ms() as i64;
+    // Absolute-path stdio command so `ensure_runtime_command` resolves it via
+    // ExplicitPath without touching the managed node runtime.
+    let stdio_command = std::env::current_exe()
+        .expect("test executable path")
+        .to_string_lossy()
+        .to_string();
+
+    // Enabled non-builtin row → repo-id snapshot field.
+    sqlx::query(
+        "INSERT INTO mcp_servers \
+         (id, user_id, name, enabled, transport_type, transport_config, builtin, created_at, updated_at) \
+         VALUES ('mcp-e2e-docs', ?, 'mcp-e2e-docs', 1, 'http', ?, 0, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(r#"{"url":"http://127.0.0.1:9999/mcp"}"#)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed enabled non-builtin mcp");
+    // Enabled builtin row (chrome-devtools shape) → session snapshot field.
+    let stdio_config = serde_json::json!({
+        "command": stdio_command,
+        "args": ["-y", "chrome-devtools-mcp@latest"],
+        "env": {},
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT INTO mcp_servers \
+         (id, user_id, name, enabled, transport_type, transport_config, builtin, created_at, updated_at) \
+         VALUES ('mcp-e2e-chrome', ?, 'chrome-devtools', 1, 'stdio', ?, 1, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(stdio_config)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed enabled builtin mcp");
+    // Disabled row → must stay out of every snapshot field.
+    sqlx::query(
+        "INSERT INTO mcp_servers \
+         (id, user_id, name, enabled, transport_type, transport_config, builtin, created_at, updated_at) \
+         VALUES ('mcp-e2e-off', ?, 'mcp-e2e-off', 0, 'http', ?, 0, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(r#"{"url":"http://127.0.0.1:8888/mcp"}"#)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed disabled mcp");
+    // Enabled but malformed builtin row → warn+skip (never fails the snapshot).
+    sqlx::query(
+        "INSERT INTO mcp_servers \
+         (id, user_id, name, enabled, transport_type, transport_config, builtin, created_at, updated_at) \
+         VALUES ('mcp-e2e-broken', ?, 'broken-builtin', 1, 'stdio', 'not-json', 1, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed malformed builtin mcp");
+    // Reserved coordination name → user row must never enter the snapshot.
+    sqlx::query(
+        "INSERT INTO mcp_servers \
+         (id, user_id, name, enabled, transport_type, transport_config, builtin, created_at, updated_at) \
+         VALUES ('mcp-e2e-reserved', ?, 'aionui-team', 1, 'http', ?, 0, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(r#"{"url":"http://127.0.0.1:7777/mcp"}"#)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed reserved-name mcp");
+
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let lead = &data["assistants"][0];
+    let lead_conversation_id = lead["conversation_id"].as_str().unwrap();
+    let lead_slot_id = lead["slot_id"].as_str().unwrap();
+    let worker_conversation_id = data["assistants"][1]["conversation_id"].as_str().unwrap();
+
+    for conversation_id in [lead_conversation_id, worker_conversation_id] {
+        let extra = conversation_extra(&services, conversation_id).await;
+        assert_eq!(extra["mcp_server_ids"], json!(["mcp-e2e-docs"]), "{conversation_id}");
+        assert_eq!(
+            extra["session_mcp_servers"][0]["name"],
+            json!("chrome-devtools"),
+            "{conversation_id}"
+        );
+        assert_eq!(
+            extra["session_mcp_servers"][0]["transport"]["command"],
+            json!(stdio_command),
+            "{conversation_id}"
+        );
+        assert_eq!(
+            extra["mcp_servers"],
+            json!(["mcp-e2e-docs", "chrome-devtools", "broken-builtin"]),
+            "{conversation_id}"
+        );
+        let statuses = extra["mcp_statuses"].as_array().unwrap();
+        assert_eq!(statuses.len(), 3, "{conversation_id}");
+        assert!(
+            statuses
+                .iter()
+                .any(|status| { status["name"] == json!("broken-builtin") && status["status"] == json!("failed") })
+        );
+        assert!(
+            !extra["mcp_servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == "aionui-team")
+        );
+        // Request-only fields must never leak into the stored row.
+        assert!(extra.get("selected_mcp_server_ids").is_none(), "{conversation_id}");
+        assert!(extra.get("selected_session_mcp_servers").is_none(), "{conversation_id}");
+    }
+
+    // Self-heal: toggle enabled flags, then force a runtime restart; the
+    // refreshed snapshot must drop the disabled row and pick up the new one.
+    sqlx::query("UPDATE mcp_servers SET enabled = 0 WHERE id = 'mcp-e2e-docs'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE mcp_servers SET enabled = 1 WHERE id = 'mcp-e2e-off'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let ensure_req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/session"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let ensure_resp = app.clone().oneshot(ensure_req).await.unwrap();
+    assert_eq!(ensure_resp.status(), StatusCode::OK);
+
+    // The noop agent fixture reports `/tmp/test` as its runtime workspace,
+    // which the first warmup persists and Windows cannot reuse on restart.
+    // Restore an existing path so this test keeps exercising MCP refresh.
+    let valid_workspace = std::env::current_dir()
+        .expect("current workspace")
+        .to_string_lossy()
+        .to_string();
+    services
+        .conversation_service
+        .update_extra(user_id, lead_conversation_id, json!({ "workspace": valid_workspace }))
+        .await
+        .expect("restore valid mock workspace before restart");
+
+    let restart_req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/{lead_slot_id}/runtime/restart"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let restart_resp = app.clone().oneshot(restart_req).await.unwrap();
+    let restart_status = restart_resp.status();
+    let restart_body = body_json(restart_resp).await;
+    assert_eq!(
+        restart_status,
+        StatusCode::OK,
+        "member runtime restart should succeed: {restart_body}"
+    );
+    let extra = conversation_extra(&services, lead_conversation_id).await;
+    assert_eq!(extra["mcp_server_ids"], json!(["mcp-e2e-off"]));
+    assert_eq!(extra["session_mcp_servers"][0]["name"], json!("chrome-devtools"));
+    assert_eq!(
+        extra["mcp_servers"],
+        json!(["mcp-e2e-off", "chrome-devtools", "broken-builtin"])
+    );
+    assert_eq!(extra["mcp_statuses"].as_array().unwrap().len(), 3);
+
+    services
+        .conversation_service
+        .update_extra(user_id, lead_conversation_id, json!({ "workspace": valid_workspace }))
+        .await
+        .expect("restore valid mock workspace before second restart");
+
+    // Idempotent: a second restart rewrites the same snapshot — no duplication.
+    let restart_req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/{lead_slot_id}/runtime/restart"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let restart_resp = app.oneshot(restart_req).await.unwrap();
+    let restart_status = restart_resp.status();
+    let restart_body = body_json(restart_resp).await;
+    assert_eq!(
+        restart_status,
+        StatusCode::OK,
+        "second member runtime restart should succeed: {restart_body}"
+    );
+    let extra = conversation_extra(&services, lead_conversation_id).await;
+    assert_eq!(extra["mcp_server_ids"], json!(["mcp-e2e-off"]));
+    assert_eq!(extra["session_mcp_servers"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        extra["mcp_servers"],
+        json!(["mcp-e2e-off", "chrome-devtools", "broken-builtin"])
+    );
+}
+
+#[tokio::test]
+async fn context_reset_rejects_leader_through_the_http_contract() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let leader_slot_id = data["assistants"][0]["slot_id"].as_str().unwrap();
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/{leader_slot_id}/context/reset"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = body_json(resp).await;
+    assert_eq!(body["code"], "TEAM_CONTEXT_RESET_LEADER_NOT_TARGETABLE");
+    assert_eq!(body["details"]["slot_id"], leader_slot_id);
+    assert!(body["details"].get("session_id").is_none());
+}
+
+#[tokio::test]
+async fn context_reset_returns_structured_success_and_projects_a_semantic_notice() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let worker = &data["assistants"][1];
+    let worker_slot_id = worker["slot_id"].as_str().unwrap();
+    let worker_conversation_id = worker["conversation_id"].as_str().unwrap();
+
+    let ensure = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/session"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(ensure).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let conversation_repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let user_id = conversation_repo
+        .owner_user_id(worker_conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let valid_workspace = std::env::current_dir()
+        .expect("current workspace")
+        .to_string_lossy()
+        .to_string();
+    services
+        .conversation_service
+        .update_extra(
+            &user_id,
+            worker_conversation_id,
+            json!({ "workspace": valid_workspace }),
+        )
+        .await
+        .expect("restore valid mock workspace before teammate attach");
+
+    let attach = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/{worker_slot_id}/attach"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(attach).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut ready = false;
+    for _ in 0..100 {
+        let snapshot = app
+            .clone()
+            .oneshot(get_with_token(&format!("/api/teams/{team_id}"), &token))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        let body = body_json(snapshot).await;
+        ready = body["data"]["assistants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|assistant| assistant["slot_id"] == worker_slot_id)
+            .is_some_and(|assistant| assistant["context_reset"]["availability"] == "ready");
+        if ready {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(ready, "teammate runtime did not become reset-ready");
+    let valid_workspace = std::env::current_dir()
+        .expect("current workspace")
+        .to_string_lossy()
+        .to_string();
+    services
+        .conversation_service
+        .update_extra(
+            &user_id,
+            worker_conversation_id,
+            json!({ "workspace": valid_workspace }),
+        )
+        .await
+        .expect("restore valid mock workspace before context reset");
+    sqlx::query(
+        "INSERT INTO mailbox \
+         (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) \
+         VALUES ('context-reset-unread', ?, ?, 'lead-slot', 'message', 'preserve me', NULL, NULL, 0, 100)",
+    )
+    .bind(team_id)
+    .bind(worker_slot_id)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO team_tasks \
+         (id, team_id, subject, description, status, owner, blocked_by, blocks, metadata, created_at, updated_at) \
+         VALUES ('context-reset-task', ?, 'Keep task', 'Keep description', 'in_progress', ?, '[\"dep-1\"]', '[\"child-1\"]', '{\"key\":\"value\"}', 10, 20)",
+    )
+    .bind(team_id)
+    .bind(worker_slot_id)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+
+    let reset = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/agents/{worker_slot_id}/context/reset"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(reset).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["reset_status"], "completed");
+    assert_eq!(body["data"]["runtime_status"], "ready");
+    assert_eq!(body["data"]["preserved_unread_count"], 1);
+    assert!(body["data"].get("session_id").is_none());
+
+    let task: (String, String, String, String, String, String, String, i64, i64) = sqlx::query_as(
+        "SELECT subject, description, status, owner, blocked_by, blocks, metadata, created_at, updated_at \
+         FROM team_tasks WHERE id = 'context-reset-task'",
+    )
+    .fetch_one(services.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        task,
+        (
+            "Keep task".into(),
+            "Keep description".into(),
+            "in_progress".into(),
+            worker_slot_id.into(),
+            "[\"dep-1\"]".into(),
+            "[\"child-1\"]".into(),
+            "{\"key\":\"value\"}".into(),
+            10,
+            20,
+        )
+    );
+
+    let messages = conversation_repo
+        .list_messages_page(
+            &user_id,
+            worker_conversation_id,
+            &MessagePageParams {
+                limit: 50,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(messages.items.iter().any(|row| {
+        serde_json::from_str::<Value>(&row.content).is_ok_and(|content| {
+            content["sender_name"] == "team_system"
+                && content["content"].as_str().is_some_and(|raw_notice| {
+                    serde_json::from_str::<Value>(raw_notice).is_ok_and(|notice| {
+                        notice["kind"] == "context_reset"
+                            && notice["member_name"] == "Worker"
+                            && notice["runtime_status"] == "ready"
+                    })
+                })
+        })
+    }));
+}
+
+#[tokio::test]
+async fn context_reset_requires_authentication() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let slot_id = data["assistants"][1]["slot_id"].as_str().unwrap();
+    let path = format!("/api/teams/{team_id}/agents/{slot_id}/context/reset");
+
+    let unauthenticated = axum::http::Request::builder()
+        .method("POST")
+        .uri(&path)
+        .header("content-type", "application/json")
+        .header("x-csrf-token", &csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"))
+        .body(axum::body::Body::from("{}"))
+        .unwrap();
+    let resp = app.oneshot(unauthenticated).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn context_reset_requires_csrf() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let slot_id = data["assistants"][1]["slot_id"].as_str().unwrap();
+    let path = format!("/api/teams/{team_id}/agents/{slot_id}/context/reset");
+    let missing_csrf = axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from("{}"))
+        .unwrap();
+    let resp = app.oneshot(missing_csrf).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+async fn conversation_extra(services: &aionui_app::AppServices, conversation_id: &str) -> Value {
+    let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let owner = repo.owner_user_id(conversation_id).await.unwrap().unwrap();
+    let row = repo.get(&owner, conversation_id).await.unwrap().unwrap();
+    serde_json::from_str(&row.extra).unwrap()
+}
 // ES-2: Ensure session is idempotent
 #[tokio::test]
 async fn es2_ensure_session_idempotent() {

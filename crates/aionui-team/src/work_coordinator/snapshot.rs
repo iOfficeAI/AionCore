@@ -149,7 +149,7 @@ impl SlotWorkCoordinator {
             role: slot.role.clone(),
             state: state_phase,
             queued_foreground_count: slot.foreground.len(),
-            queued_background_count: slot.control.len() + slot.background.len(),
+            queued_background_count: slot.directed.len() + slot.control.len() + slot.background.len(),
             active_batch,
             active_turn_id,
             active_turn_started_at_ms,

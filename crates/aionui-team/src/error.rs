@@ -1,5 +1,7 @@
 use serde_json::{Value, json};
 
+use aionui_api_types::TeamContextResetAvailability;
+
 #[derive(Debug, thiserror::Error)]
 pub enum TeamError {
     #[error("Team not found: {0}")]
@@ -41,6 +43,43 @@ pub enum TeamError {
         slot_id: String,
         conversation_id: String,
         public_reason: String,
+    },
+
+    #[error("Team member is busy: {slot_id}")]
+    MemberBusy {
+        team_id: String,
+        slot_id: String,
+        conversation_id: String,
+    },
+
+    #[error("Team member runtime is starting: {slot_id}")]
+    MemberRuntimeStarting {
+        team_id: String,
+        slot_id: String,
+        conversation_id: String,
+    },
+
+    #[error("Team member does not support context reset: {slot_id}")]
+    MemberUnsupported {
+        team_id: String,
+        slot_id: String,
+        conversation_id: String,
+        backend: String,
+    },
+
+    #[error("Team leader context cannot be reset: {slot_id}")]
+    ContextResetLeaderNotTargetable {
+        team_id: String,
+        slot_id: String,
+        conversation_id: String,
+    },
+
+    #[error("Team member context reset is unavailable ({availability:?}): {slot_id}")]
+    ContextResetUnavailable {
+        team_id: String,
+        slot_id: String,
+        conversation_id: String,
+        availability: TeamContextResetAvailability,
     },
 
     #[error("Workspace path is unavailable: {0}")]

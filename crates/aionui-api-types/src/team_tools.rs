@@ -66,7 +66,9 @@ pub enum TeamToolTransport {
 #[serde(rename_all = "snake_case")]
 pub enum TeamToolName {
     TeamMembers,
+    TeamReadMessages,
     TeamSendMessage,
+    TeamInterruptAgent,
     TeamTaskCreate,
     TeamTaskUpdate,
     TeamTaskList,
@@ -74,6 +76,7 @@ pub enum TeamToolName {
     TeamDescribeAssistant,
     TeamSpawnAgent,
     TeamRenameAgent,
+    TeamClearAgentContext,
     TeamShutdownAgent,
 }
 
@@ -81,7 +84,9 @@ impl TeamToolName {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::TeamMembers => "team_members",
+            Self::TeamReadMessages => "team_read_messages",
             Self::TeamSendMessage => "team_send_message",
+            Self::TeamInterruptAgent => "team_interrupt_agent",
             Self::TeamTaskCreate => "team_task_create",
             Self::TeamTaskUpdate => "team_task_update",
             Self::TeamTaskList => "team_task_list",
@@ -89,6 +94,7 @@ impl TeamToolName {
             Self::TeamDescribeAssistant => "team_describe_assistant",
             Self::TeamSpawnAgent => "team_spawn_agent",
             Self::TeamRenameAgent => "team_rename_agent",
+            Self::TeamClearAgentContext => "team_clear_agent_context",
             Self::TeamShutdownAgent => "team_shutdown_agent",
         }
     }
@@ -96,7 +102,9 @@ impl TeamToolName {
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "team_members" => Self::TeamMembers,
+            "team_read_messages" => Self::TeamReadMessages,
             "team_send_message" => Self::TeamSendMessage,
+            "team_interrupt_agent" => Self::TeamInterruptAgent,
             "team_task_create" => Self::TeamTaskCreate,
             "team_task_update" => Self::TeamTaskUpdate,
             "team_task_list" => Self::TeamTaskList,
@@ -104,6 +112,7 @@ impl TeamToolName {
             "team_describe_assistant" => Self::TeamDescribeAssistant,
             "team_spawn_agent" => Self::TeamSpawnAgent,
             "team_rename_agent" => Self::TeamRenameAgent,
+            "team_clear_agent_context" => Self::TeamClearAgentContext,
             "team_shutdown_agent" => Self::TeamShutdownAgent,
             _ => return None,
         })
@@ -320,6 +329,24 @@ fn tool_specs() -> Vec<TeamToolSpec> {
             input_summary: "{}",
         },
         TeamToolSpec {
+            name: TeamToolName::TeamReadMessages,
+            permission: TeamToolPermission::AnyTeamAgent,
+            description: "Peek at your own unread team mailbox messages. Returns at most the oldest 50 unread messages in FIFO order, each with a message_id. When has_more is true, call again with since_message_id set to the returned next_since_message_id to read the following page. Messages returned in full are marked read only if the current turn completes successfully; failed or cancelled turns preserve them for retry. A message with content_truncated=true is a preview only: it stays unread and is redelivered in full on a later turn, so do not act on it yet.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "since_message_id": {
+                        "type": "string",
+                        "description": "Resume after this message_id; use the next_since_message_id from the previous page"
+                    }
+                }
+            }),
+            cli_command: &["read-messages"],
+            when: "Check queued messages",
+            input_summary: "optional since_message_id",
+        },
+        TeamToolSpec {
             name: TeamToolName::TeamSendMessage,
             permission: TeamToolPermission::AnyTeamAgent,
             description: "Send a message to a teammate or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files.",
@@ -340,6 +367,25 @@ fn tool_specs() -> Vec<TeamToolSpec> {
             cli_command: &["send-message"],
             when: "Send teammate message",
             input_summary: "to, message",
+        },
+        TeamToolSpec {
+            name: TeamToolName::TeamInterruptAgent,
+            permission: TeamToolPermission::LeadOnly,
+            description: "Immediately stop a teammate's active turn and durably deliver a replacement instruction as its next highest-priority message.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "slot_id": { "type": "string", "description": "Exact teammate slot_id; wildcard is not supported" },
+                    "message": { "type": "string", "description": "Replacement instruction delivered after interruption" },
+                    "files": { "type": "array", "items": { "type": "string" }, "description": "Absolute attachment paths" },
+                    "reason": { "type": "string", "description": "Optional interruption reason" }
+                },
+                "required": ["slot_id", "message"]
+            }),
+            cli_command: &["interrupt-agent"],
+            when: "Interrupt teammate turn",
+            input_summary: "slot_id, message, optional files/reason",
         },
         TeamToolSpec {
             name: TeamToolName::TeamTaskCreate,
@@ -489,6 +535,22 @@ fn tool_specs() -> Vec<TeamToolSpec> {
             input_summary: "slot_id, new_name",
         },
         TeamToolSpec {
+            name: TeamToolName::TeamClearAgentContext,
+            permission: TeamToolPermission::LeadOnly,
+            description: "Start a fresh backend context for a teammate while preserving team membership, settings, visible chat history, tasks, files, and unread mailbox messages. Lead only.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "slot_id": { "type": "string", "description": "Agent slot_id whose context should be cleared" }
+                },
+                "required": ["slot_id"]
+            }),
+            cli_command: &["clear-agent-context"],
+            when: "Start fresh teammate context",
+            input_summary: "slot_id",
+        },
+        TeamToolSpec {
             name: TeamToolName::TeamShutdownAgent,
             permission: TeamToolPermission::LeadOnly,
             description: "Initiate shutdown of a teammate. Lead only. Sends a shutdown_request to the target agent.",
@@ -516,7 +578,7 @@ mod tests {
     #[test]
     fn descriptor_count_and_names_are_unique() {
         let descriptors = team_tool_descriptors();
-        assert_eq!(descriptors.len(), 10);
+        assert_eq!(descriptors.len(), 13);
         let names = descriptors
             .iter()
             .map(|descriptor| descriptor.name.as_str())
@@ -540,6 +602,7 @@ mod tests {
     fn cli_command_mapping_matches_spec() {
         let cases = [
             ("team_members", vec!["members"]),
+            ("team_read_messages", vec!["read-messages"]),
             ("team_send_message", vec!["send-message"]),
             ("team_task_create", vec!["task", "create"]),
             ("team_task_update", vec!["task", "update"]),
@@ -548,6 +611,7 @@ mod tests {
             ("team_describe_assistant", vec!["describe-assistant"]),
             ("team_spawn_agent", vec!["spawn-agent"]),
             ("team_rename_agent", vec!["rename-agent"]),
+            ("team_clear_agent_context", vec!["clear-agent-context"]),
             ("team_shutdown_agent", vec!["shutdown-agent"]),
         ];
         for (tool, path) in cases {
@@ -565,8 +629,39 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!names.contains(&"team_spawn_agent".to_owned()));
         assert!(!names.contains(&"team_rename_agent".to_owned()));
+        assert!(!names.contains(&"team_clear_agent_context".to_owned()));
         assert!(!names.contains(&"team_shutdown_agent".to_owned()));
+        assert!(names.contains(&"team_read_messages".to_owned()));
         assert!(names.contains(&"team_send_message".to_owned()));
+    }
+
+    #[test]
+    fn read_messages_schema_exposes_only_an_optional_cursor() {
+        let descriptor = team_tool_descriptor("team_read_messages").expect("read messages descriptor");
+        assert_eq!(descriptor.permission, TeamToolPermission::AnyTeamAgent);
+        assert_eq!(descriptor.input_schema["additionalProperties"], json!(false));
+        assert!(
+            descriptor.input_schema.get("required").is_none(),
+            "every argument must stay optional so a bare call still works"
+        );
+        let properties = descriptor.input_schema["properties"].as_object().unwrap();
+        assert_eq!(
+            properties.keys().collect::<Vec<_>>(),
+            vec!["since_message_id"],
+            "the cursor is the only accepted argument"
+        );
+        assert!(
+            descriptor.description.contains("oldest 50"),
+            "the description must state the page starts at the oldest unread message"
+        );
+        assert!(
+            descriptor.description.contains("next_since_message_id"),
+            "has_more needs a documented follow-up path"
+        );
+        assert!(
+            descriptor.description.contains("redelivered in full"),
+            "truncated messages must be documented as previews that stay unread"
+        );
     }
 
     #[test]

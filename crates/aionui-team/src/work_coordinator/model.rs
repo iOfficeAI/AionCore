@@ -3,9 +3,12 @@ use aionui_common::TimestampMs;
 
 use crate::work_source::WorkSource;
 
+pub(crate) const MAX_MESSAGE_DELIVERY_FAILURES: u8 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkPriority {
     Foreground,
+    Directed,
     Control,
     Background,
 }
@@ -23,6 +26,19 @@ pub(crate) enum RuntimeConstraint {
     Removing {
         operation_id: u64,
     },
+    SessionStopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeRestartGate {
+    pub(crate) operation_id: u64,
+    pub(crate) previous_constraint: RuntimeConstraint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeRestartRejection {
+    Busy,
+    Removing,
     SessionStopped,
 }
 
@@ -126,6 +142,11 @@ pub(crate) struct WorkBatch {
     pub(crate) slot_id: String,
     pub(crate) intent_ids: Vec<String>,
     pub(crate) mailbox_message_ids: Vec<String>,
+    /// Unread mailbox rows exposed through `team_read_messages` while this
+    /// batch owns the active turn. These rows are acknowledged only when the
+    /// turn completes successfully; failed or cancelled turns leave them
+    /// unread for the normal recovery path.
+    pub(crate) observed_message_ids: Vec<String>,
     pub(crate) highest_priority: WorkPriority,
     pub(crate) team_run_ids: Vec<String>,
     pub(crate) operation_id: u64,
@@ -151,6 +172,12 @@ pub(crate) enum CommitResult {
     Committed,
     StaleOwner,
     Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchFailureResult {
+    pub(crate) commit_result: CommitResult,
+    pub(crate) exhausted_message_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,6 +246,31 @@ pub(crate) struct ReconcileProjection {
 pub(crate) struct BatchCancelTarget {
     pub(crate) batch: WorkBatch,
     pub(crate) turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObserveMessagesResult {
+    pub(crate) batch_id: Option<String>,
+    pub(crate) observed_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchCompletionResult {
+    pub(crate) commit_result: CommitResult,
+    pub(crate) ack_message_ids: Vec<String>,
+    pub(crate) team_run_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchInterruptMetadata {
+    pub(crate) reason: Option<String>,
+    pub(crate) replacement_message_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InterruptBatchResult {
+    pub(crate) commit_result: CommitResult,
+    pub(crate) terminal_message_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
