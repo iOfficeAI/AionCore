@@ -249,6 +249,13 @@ struct RenameAgentParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ClearAgentContextParams {
+    /// Agent slot_id whose context should be cleared.
+    slot_id: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct ShutdownAgentParams {
     /// Agent slot_id to shut down.
     slot_id: String,
