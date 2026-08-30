@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1146,19 +1146,28 @@ fn enforce_skill_import_budget(
     file_path: Option<&str>,
     budget: &mut SkillImportBudget,
 ) -> Result<(), ExtensionError> {
-    if file_bytes > MAX_SKILL_IMPORT_FILE_BYTES {
+    enforce_skill_import_budget_with_limits(file_bytes, file_path, budget, skill_import_limits())
+}
+
+fn enforce_skill_import_budget_with_limits(
+    file_bytes: u64,
+    file_path: Option<&str>,
+    budget: &mut SkillImportBudget,
+    limits: SkillImportLimits,
+) -> Result<(), ExtensionError> {
+    if file_bytes > limits.max_file_bytes {
         return Err(ExtensionError::SkillImportFileTooLarge {
             file_path: file_path.map(str::to_owned),
             file_bytes,
-            limit_bytes: MAX_SKILL_IMPORT_FILE_BYTES,
+            limit_bytes: limits.max_file_bytes,
         });
     }
 
     let next_total = budget.total_bytes.saturating_add(file_bytes);
-    if next_total > MAX_SKILL_IMPORT_TOTAL_BYTES {
+    if next_total > limits.max_total_bytes {
         return Err(ExtensionError::SkillImportTotalTooLarge {
             total_bytes: next_total,
-            limit_bytes: MAX_SKILL_IMPORT_TOTAL_BYTES,
+            limit_bytes: limits.max_total_bytes,
         });
     }
 
@@ -2021,8 +2030,17 @@ async fn collect_skill_dirs_recursive(dir: &Path, result: &mut Vec<PathBuf>) -> 
 }
 
 fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<(), ExtensionError> {
+    extract_zip_archive_with_limits(archive_path, destination, skill_import_limits())
+}
+
+fn extract_zip_archive_with_limits(
+    archive_path: &Path,
+    destination: &Path,
+    limits: SkillImportLimits,
+) -> Result<(), ExtensionError> {
     let file = std::fs::File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(file).map_err(zip_error)?;
+    let mut budget = SkillImportBudget::default();
 
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(zip_error)?;
@@ -2036,11 +2054,25 @@ fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<(), Ex
             continue;
         }
 
+        let declared_size = entry.size();
+        enforce_skill_import_budget_with_limits(declared_size, Some(&entry_name), &mut budget, limits)?;
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut output = std::fs::File::create(&output_path)?;
-        io::copy(&mut entry, &mut output)?;
+        let actual_size = io::copy(&mut Read::take(&mut entry, limits.max_file_bytes + 1), &mut output)?;
+        if actual_size > limits.max_file_bytes {
+            return Err(ExtensionError::SkillImportFileTooLarge {
+                file_path: Some(entry_name),
+                file_bytes: actual_size,
+                limit_bytes: limits.max_file_bytes,
+            });
+        }
+        if actual_size != declared_size {
+            return Err(ExtensionError::SkillImportInvalidZip(format!(
+                "Zip entry size mismatch for {entry_name}: declared {declared_size} bytes, extracted {actual_size} bytes"
+            )));
+        }
     }
 
     Ok(())
@@ -3222,6 +3254,71 @@ mod tests {
         }
 
         zip.finish().unwrap();
+    }
+
+    #[test]
+    fn zip_extraction_rejects_oversized_entries_before_writing() {
+        let tmp = TempDir::new().unwrap();
+        let zip_path = tmp.path().join("oversized.zip");
+        let extract_dir = tmp.path().join("extracted");
+        write_test_zip(&zip_path, &[("bundle/skill/oversized.bin", "12345")]);
+
+        let result = extract_zip_archive_with_limits(
+            &zip_path,
+            &extract_dir,
+            SkillImportLimits {
+                max_file_bytes: 4,
+                max_total_bytes: 10,
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(ExtensionError::SkillImportFileTooLarge {
+                file_path: Some(path),
+                file_bytes,
+                limit_bytes,
+            }) if path == "bundle/skill/oversized.bin"
+                && file_bytes == 5
+                && limit_bytes == 4
+        ));
+        assert!(!extract_dir.join("bundle/skill/oversized.bin").exists());
+    }
+
+    #[test]
+    fn zip_extraction_rejects_cumulative_archive_overflow_before_next_file() {
+        let tmp = TempDir::new().unwrap();
+        let zip_path = tmp.path().join("too-large.zip");
+        let extract_dir = tmp.path().join("extracted");
+        write_test_zip(
+            &zip_path,
+            &[
+                ("bundle/skill/first.bin", "1234"),
+                ("bundle/skill/overflow.bin", "5678"),
+            ],
+        );
+
+        let result = extract_zip_archive_with_limits(
+            &zip_path,
+            &extract_dir,
+            SkillImportLimits {
+                max_file_bytes: 4,
+                max_total_bytes: 7,
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(ExtensionError::SkillImportTotalTooLarge {
+                total_bytes,
+                limit_bytes,
+            }) if total_bytes == 8 && limit_bytes == 7
+        ));
+        assert_eq!(
+            std::fs::read(extract_dir.join("bundle/skill/first.bin")).unwrap(),
+            b"1234"
+        );
+        assert!(!extract_dir.join("bundle/skill/overflow.bin").exists());
     }
 
     // -----------------------------------------------------------------------
