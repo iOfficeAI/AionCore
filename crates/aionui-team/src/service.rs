@@ -3409,7 +3409,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_agent_runtime_allows_absent_and_failed_members() {
+    async fn restart_agent_runtime_rejects_absent_and_failed_members() {
         let task_manager = Arc::new(MutableTaskManager::new());
         let (svc, _repo, _task_manager, _conv_repo, _broadcaster) =
             setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
@@ -3423,21 +3423,40 @@ mod tests {
             .find(|agent| agent.role == "teammate")
             .unwrap();
         svc.ensure_session("user-test", &created.id).await.unwrap();
-        let lead = created.assistants.iter().find(|agent| agent.role == "lead").unwrap();
-        task_manager.insert_mode_agent(&lead.conversation_id);
         task_manager.reset_kills();
 
-        svc.restart_agent_runtime("user-test", &created.id, &worker.slot_id)
+        let absent_error = svc
+            .restart_agent_runtime("user-test", &created.id, &worker.slot_id)
             .await
-            .unwrap();
-        assert_eq!(task_manager.kills(), vec![worker.conversation_id.clone()]);
-        task_manager.insert_mode_agent(&worker.conversation_id);
+            .unwrap_err();
+        assert!(matches!(
+            absent_error,
+            TeamError::RuntimeNotReady { conversation_id }
+                if conversation_id == worker.conversation_id
+        ));
+        assert!(task_manager.kills().is_empty());
 
         let session = Arc::clone(&svc.sessions.get(&created.id).unwrap().session);
         let failed_lease = match session.member_runtimes().reserve_restart(&worker.slot_id) {
             ReserveAttach::Start(lease) => lease,
             other => panic!("failed state seed must start, got {other:?}"),
         };
+        let attaching_error = svc
+            .restart_agent_runtime("user-test", &created.id, &worker.slot_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            attaching_error,
+            TeamError::MemberRuntimeStarting {
+                team_id,
+                slot_id,
+                conversation_id,
+            } if team_id == created.id
+                && slot_id == worker.slot_id
+                && conversation_id == worker.conversation_id
+        ));
+        assert!(task_manager.kills().is_empty());
+
         assert!(session.member_runtimes().commit_failed(
             &failed_lease,
             MemberRuntimeFailure {
@@ -3454,20 +3473,41 @@ mod tests {
         );
         task_manager.reset_kills();
 
-        svc.restart_agent_runtime("user-test", &created.id, &worker.slot_id)
+        let failed_error = svc
+            .restart_agent_runtime("user-test", &created.id, &worker.slot_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            failed_error,
+            TeamError::RuntimeNotReady { conversation_id }
+                if conversation_id == worker.conversation_id
+        ));
+        assert!(task_manager.kills().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_agent_runtime_does_not_start_an_unpublished_team_session() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, _broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Runtime Restart Starting"))
             .await
             .unwrap();
-        assert!(
-            task_manager
-                .kills()
-                .iter()
-                .all(|conversation_id| conversation_id == &worker.conversation_id),
-            "failed-member reconciliation and forced restart must only rebuild the requested member"
-        );
-        assert!(
-            !task_manager.kills().is_empty(),
-            "failed member must be rebuilt at least once"
-        );
+        let lead = created.assistants.first().unwrap();
+
+        let error = svc
+            .restart_agent_runtime("user-test", &created.id, &lead.slot_id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TeamError::RuntimeNotReady { conversation_id }
+                if conversation_id == lead.conversation_id
+        ));
+        assert!(!svc.sessions.contains_key(&created.id));
+        assert!(task_manager.kills().is_empty());
     }
 
     #[tokio::test]
@@ -3541,10 +3581,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            matches!(error, TeamError::InvalidRequest(ref message) if message.contains("session stopped")),
-            "unexpected stopped-member error: {error:?}"
-        );
+        assert!(matches!(
+            error,
+            TeamError::RuntimeNotReady { conversation_id }
+                if conversation_id == lead.conversation_id
+        ));
         assert!(task_manager.kills().is_empty());
     }
 
