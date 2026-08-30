@@ -487,27 +487,27 @@ impl SlotWorkCoordinator {
         }
 
         // ELECTRON-3RN: isolate recognized slash commands into single-message
-        // batches (FIFO, no preemption). The queue head decides:
-        // - head is a `UserCommand` → this batch is exactly that one command, so
-        //   the native op is not fed the rest of the turn (the flaw that ruled
-        //   out option B);
-        // - head is an ordinary message → merge the leading run of ordinary
-        //   messages but STOP at the first `UserCommand` so a command is never
-        //   folded into a plain batch (existing multi-message merge, bounded).
-        let head_is_command = state
+        // batches (FIFO, no preemption). Lead interventions are isolated for the
+        // same reason: after an interrupt they must run as the replacement turn,
+        // without absorbing retained queued work.
+        let head_source = state
             .intents
             .get(&fifo_message_intent_ids[0])
-            .is_some_and(|intent| intent.source == WorkSource::UserCommand);
-        let (message_intent_ids, is_command) = if head_is_command {
-            (vec![fifo_message_intent_ids[0].clone()], true)
+            .map(|intent| intent.source);
+        let head_is_isolated =
+            head_source.is_some_and(|source| matches!(source, WorkSource::UserCommand | WorkSource::LeadIntervention));
+        let (message_intent_ids, is_command) = if head_is_isolated {
+            (
+                vec![fifo_message_intent_ids[0].clone()],
+                head_source == Some(WorkSource::UserCommand),
+            )
         } else {
             let mut selected = Vec::new();
             for intent_id in &fifo_message_intent_ids {
-                let is_command_intent = state
-                    .intents
-                    .get(intent_id)
-                    .is_some_and(|intent| intent.source == WorkSource::UserCommand);
-                if is_command_intent {
+                let is_isolated_intent = state.intents.get(intent_id).is_some_and(|intent| {
+                    matches!(intent.source, WorkSource::UserCommand | WorkSource::LeadIntervention)
+                });
+                if is_isolated_intent {
                     break;
                 }
                 selected.push(intent_id.clone());
@@ -901,10 +901,21 @@ impl SlotWorkCoordinator {
                 };
             }
         }
+        let replacement_intent_id = state.intents.iter().find_map(|(intent_id, intent)| {
+            (intent.slot_id == batch.slot_id
+                && intent.source == WorkSource::LeadIntervention
+                && intent.mailbox_message_id.as_deref() == Some(&replacement_message_id)
+                && matches!(intent.state, WorkIntentState::Queued))
+            .then(|| intent_id.clone())
+        });
         let slot = state.slots.get_mut(&batch.slot_id).expect("current batch slot exists");
         slot.active = None;
         for message_id in &batch.mailbox_message_ids {
             slot.delivery_failure_counts.remove(message_id);
+        }
+        if let Some(replacement_intent_id) = replacement_intent_id {
+            slot.foreground.retain(|intent_id| intent_id != &replacement_intent_id);
+            slot.foreground.push_front(replacement_intent_id);
         }
         state.interrupted_batches.insert(
             batch.batch_id.clone(),
