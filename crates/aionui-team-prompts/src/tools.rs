@@ -79,6 +79,7 @@ mod tests {
                 ("team_members".to_owned(), TeamToolPermission::AnyTeamAgent),
                 ("team_read_messages".to_owned(), TeamToolPermission::AnyTeamAgent),
                 ("team_send_message".to_owned(), TeamToolPermission::AnyTeamAgent),
+                ("team_interrupt_agent".to_owned(), TeamToolPermission::LeadOnly),
                 ("team_task_create".to_owned(), TeamToolPermission::AnyTeamAgent),
                 ("team_task_update".to_owned(), TeamToolPermission::AnyTeamAgent),
                 ("team_task_list".to_owned(), TeamToolPermission::AnyTeamAgent),
