@@ -89,7 +89,8 @@ fn aborted_runtime_restart_restores_the_previous_constraint() {
     coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
 
     let gate = coordinator.begin_runtime_restart("lead-1").unwrap();
-    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().state, SlotPhase::Starting);
+    assert_eq!(gate.previous_constraint, RuntimeConstraint::Ready);
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().state, SlotPhase::Blocked);
 
     coordinator.abort_runtime_restart("lead-1", &gate);
     assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().state, SlotPhase::Idle);
