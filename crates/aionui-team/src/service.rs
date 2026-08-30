@@ -2925,8 +2925,8 @@ mod tests {
         IWorkerTaskManager, IdleCleanupCoordinator,
     };
     use aionui_api_types::{
-        AddAgentRequest, ConfigOptionConfirmation, SetConfigOptionRequest, SetConfigOptionResponse,
-        TeamContextResetAvailability, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamRunTargetRole,
+        AddAgentRequest, ConfigOptionConfirmation, SetConfigOptionResponse, TeamContextResetAvailability,
+        TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamRunTargetRole,
     };
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs, now_ms};
     use aionui_db::{IConversationRepository, ITeamRepository};

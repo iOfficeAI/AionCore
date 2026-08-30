@@ -3009,6 +3009,7 @@ async fn list_artifacts_includes_legacy_cron_trigger_messages() {
             position: Some("center".into()),
             status: Some("finish".into()),
             hidden: false,
+            backend_turn_id: None,
             created_at: 1234,
             backend_turn_id: None,
         },

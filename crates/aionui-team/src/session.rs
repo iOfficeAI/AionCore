@@ -2542,6 +2542,22 @@ mod tests {
         Arc::new(NoopCancellationPort)
     }
 
+    struct FailingCancellationPort;
+
+    #[async_trait::async_trait]
+    impl crate::ports::AgentTurnCancellationPort for FailingCancellationPort {
+        async fn cancel_agent_turn(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _turn_id: &str,
+        ) -> Result<(), crate::ports::AgentTurnExecutionError> {
+            Err(crate::ports::AgentTurnExecutionError::Failed {
+                reason: "forced cancellation failure".into(),
+            })
+        }
+    }
+
     #[derive(Default)]
     struct NoopProjectionStore;
 
