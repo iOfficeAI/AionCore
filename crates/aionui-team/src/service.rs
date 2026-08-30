@@ -2861,15 +2861,6 @@ impl TeamSessionService {
             .await
     }
 
-    pub(crate) async fn restart_agent_runtime_for_mcp_refresh(
-        &self,
-        user_id: &str,
-        team_id: &str,
-        slot_id: &str,
-    ) -> Result<(), TeamError> {
-        self.restart_agent_runtime(user_id, team_id, slot_id).await
-    }
-
     pub async fn shutdown_agent_in_session(
         &self,
         team_id: &str,
