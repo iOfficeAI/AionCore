@@ -10,6 +10,7 @@ pub(crate) enum WorkSource {
     /// a single-message turn and the wake path sends the bare command (ELECTRON-3RN).
     UserCommand,
     UserIntervention,
+    LeadIntervention,
     McpSendMessage,
     McpShutdownRequest,
     SpawnWelcome,
@@ -28,7 +29,9 @@ pub(crate) enum WorkSource {
 impl WorkSource {
     pub(crate) fn priority(self) -> WorkPriority {
         match self {
-            Self::UserMessage | Self::UserCommand | Self::UserIntervention => WorkPriority::Foreground,
+            Self::UserMessage | Self::UserCommand | Self::UserIntervention | Self::LeadIntervention => {
+                WorkPriority::Foreground
+            }
             Self::McpSendMessage => WorkPriority::Directed,
             Self::McpShutdownRequest | Self::ShutdownRejected => WorkPriority::Control,
             Self::SpawnWelcome
@@ -42,7 +45,10 @@ impl WorkSource {
     }
 
     pub(crate) fn resumes_paused_slot(self) -> bool {
-        matches!(self, Self::UserMessage | Self::UserCommand | Self::UserIntervention)
+        matches!(
+            self,
+            Self::UserMessage | Self::UserCommand | Self::UserIntervention | Self::LeadIntervention
+        )
     }
 
     pub(crate) fn requires_mailbox_message(self) -> bool {
@@ -51,6 +57,7 @@ impl WorkSource {
             Self::UserMessage
                 | Self::UserCommand
                 | Self::UserIntervention
+                | Self::LeadIntervention
                 | Self::McpSendMessage
                 | Self::McpShutdownRequest
                 | Self::SpawnWelcome
@@ -69,6 +76,7 @@ impl fmt::Display for WorkSource {
             Self::UserMessage => "user_message",
             Self::UserCommand => "user_command",
             Self::UserIntervention => "user_intervention",
+            Self::LeadIntervention => "lead_intervention",
             Self::McpSendMessage => "mcp_send_message",
             Self::McpShutdownRequest => "mcp_shutdown_request",
             Self::SpawnWelcome => "spawn_welcome",

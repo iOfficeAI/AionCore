@@ -458,6 +458,10 @@ pub struct TeamChildTurnPayload {
     pub conversation_id: String,
     pub turn_id: String,
     pub status: TeamRunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

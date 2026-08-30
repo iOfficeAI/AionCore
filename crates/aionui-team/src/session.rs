@@ -7,7 +7,7 @@ use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
     TeamAgentRuntimeStatus, TeamChildTurnPayload, TeamContextResetNotice, TeamContextResetRuntimeStatus,
     TeamInterruptAgentResponse, TeamInterruptOutcome, TeamMessageEnqueueStatus, TeamQueuedPolicy, TeamRunAckResponse,
-    TeamRunPayload, TeamRunSource, TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
+    TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
 };
 use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::ITeamRepository;
@@ -1228,6 +1228,8 @@ impl TeamSession {
                     conversation_id: agent.conversation_id,
                     turn_id,
                     status: TeamRunStatus::Cancelled,
+                    reason: None,
+                    replacement_message_id: None,
                 },
             );
         }
@@ -1268,6 +1270,8 @@ impl TeamSession {
                     conversation_id: agent.conversation_id,
                     turn_id,
                     status: TeamRunStatus::Cancelled,
+                    reason: None,
+                    replacement_message_id: None,
                 },
             );
         }
@@ -1307,6 +1311,8 @@ impl TeamSession {
                         conversation_id: agent.conversation_id,
                         turn_id,
                         status: TeamRunStatus::Cancelled,
+                        reason: None,
+                        replacement_message_id: None,
                     },
                 );
             }

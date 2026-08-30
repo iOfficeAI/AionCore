@@ -97,6 +97,7 @@ pub(super) struct CoordinatorState {
     pub(super) slots: BTreeMap<String, SlotState>,
     pub(super) intents: HashMap<String, WorkIntent>,
     pub(super) enqueue_leases: HashMap<String, EnqueueLeaseRecord>,
+    interrupted_batches: HashMap<String, BatchInterruptMetadata>,
     next_operation_id: u64,
 }
 

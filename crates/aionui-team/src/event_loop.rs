@@ -237,6 +237,8 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                                 conversation_id: started.conversation_id,
                                 turn_id: started.turn_id,
                                 status: TeamRunStatus::Running,
+                                reason: None,
+                                replacement_message_id: None,
                             },
                         );
                     }
@@ -266,6 +268,8 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                                 conversation_id: started.conversation_id,
                                 turn_id: started.turn_id,
                                 status: TeamRunStatus::Cancelled,
+                                reason: None,
+                                replacement_message_id: None,
                             },
                         );
                     }
@@ -366,11 +370,18 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                     conversation_id: outcome.conversation_id.clone(),
                     turn_id: outcome.turn_id.clone(),
                     status: status.clone(),
+                    reason: None,
+                    replacement_message_id: None,
                 },
             );
         }
     }
 
+    finalize_scheduler_turn(ctx).await;
+    ExecuteResult::ContinueDraining
+}
+
+async fn finalize_scheduler_turn(ctx: &AgentLoopContext) {
     match ctx.scheduler.finalize_turn(&ctx.slot_id).await {
         Ok(Some(wake_target)) if wake_target != ctx.slot_id => {
             if let Err(error) = ctx
@@ -395,7 +406,6 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
             "scheduler turn finalization failed"
         ),
     }
-    ExecuteResult::ContinueDraining
 }
 
 async fn finalize_failed_delivery(ctx: &AgentLoopContext, batch: &WorkBatch, failure: &BatchFailureResult) {
