@@ -37,9 +37,14 @@ pub fn workspace_field_value(sender_workspace: Option<&str>, target_workspace: O
     }
 }
 
-/// The one routing hint the block carries: it names the skill to deliver with,
-/// and never a command template — the skill body stays the single source of the
-/// actual command (`send-message`), so the block and the skill cannot drift.
+/// The one routing hint the block carries: it names the `session-message` skill
+/// to deliver with, and adds an UNCONDITIONAL `session capabilities` fallback for
+/// when that skill is unavailable (the user can uncheck the auto-inject skill in
+/// the assistant editor). It still carries no `send-message` payload command
+/// template — the skill body stays the single source of that payload shape, so
+/// the block and the skill cannot drift. `session capabilities` is different: it
+/// is a self-describing, descriptor-generated discovery command (not a payload
+/// template), so pointing at it introduces nothing that can drift.
 ///
 /// It is emitted as the FIRST in-marker line on purpose. The frontend's
 /// `parseSessionsBlock` (`sessionMarkers.ts`) renders only the text OUTSIDE the
@@ -54,18 +59,20 @@ pub fn workspace_field_value(sender_workspace: Option<&str>, target_workspace: O
 /// read only by the agent. The block is therefore written entirely in English —
 /// including the `workspace:` warning below — to match the `session-message`
 /// skill it routes to.
-const SESSIONS_BLOCK_SKILL_HINT: &str =
-    "To deliver to the conversations below, use the session-message skill (address by conversation id).";
+const SESSIONS_BLOCK_SKILL_HINT: &str = "To deliver to the conversations below, use the session-message skill (address by conversation id); if it is unavailable, run `\"$AIONUI_HELPER_BIN\" session capabilities` for the delivery contract.";
 
 /// Build the sender-side block.
 ///
-/// Spec §8.3 originally kept this block instruction-free and left sending to the
-/// auto-inject skill. That relied on the agent loading the skill's body before
-/// choosing how to deliver, which is not guaranteed: a competing built-in
-/// cross-session tool can be reached first, and in `Injected` skill-delivery
-/// mode the body is lazy-loaded. So the block now carries ONE positive routing
-/// hint ([`SESSIONS_BLOCK_SKILL_HINT`]) that points at the `session-message`
-/// skill — but still no command template, keeping §8.3's real invariant intact.
+/// The block is agent-facing and written in English. Spec §8.3 originally kept it
+/// instruction-free and left sending to the auto-inject skill. That relied on the
+/// agent loading the skill's body before choosing how to deliver, which is not
+/// guaranteed: a competing built-in cross-session tool can be reached first, in
+/// `Injected` skill-delivery mode the body is lazy-loaded, and the user can
+/// uncheck the skill entirely. So the block now carries ONE routing hint
+/// ([`SESSIONS_BLOCK_SKILL_HINT`]) that names the `session-message` skill and
+/// adds an unconditional `session capabilities` fallback for when it is
+/// unavailable — but still no `send-message` payload command template, keeping
+/// §8.3's real invariant (the payload shape lives only in the skill body) intact.
 pub fn build_sessions_block(sender_workspace: Option<&str>, targets: &[SessionMentionTargetInfo]) -> String {
     let mut block = String::from(AIONUI_SESSIONS_MARKER);
     block.push('\n');

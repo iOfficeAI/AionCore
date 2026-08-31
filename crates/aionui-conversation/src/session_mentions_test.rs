@@ -41,7 +41,7 @@ fn sessions_block_is_delimited_and_tab_separated_one_target_per_line() {
     assert_eq!(
         block,
         "[[AION_SESSIONS]]\n\
-         To deliver to the conversations below, use the session-message skill (address by conversation id).\n\
+         To deliver to the conversations below, use the session-message skill (address by conversation id); if it is unavailable, run `\"$AIONUI_HELPER_BIN\" session capabilities` for the delivery contract.\n\
          重构-鉴权模块\tconv_1\tworkspace: same\n\
          文档站改版\tconv_2\tworkspace: /w/docs (differs from yours)\n\
          [[/AION_SESSIONS]]"
@@ -64,7 +64,7 @@ fn sessions_block_routes_to_the_session_message_skill_on_its_first_line() {
     let first_inner_line = block.lines().nth(1).expect("a line after the opening marker");
     assert_eq!(
         first_inner_line,
-        "To deliver to the conversations below, use the session-message skill (address by conversation id)."
+        "To deliver to the conversations below, use the session-message skill (address by conversation id); if it is unavailable, run `\"$AIONUI_HELPER_BIN\" session capabilities` for the delivery contract."
     );
     assert!(
         !first_inner_line.contains('\t'),
@@ -73,11 +73,15 @@ fn sessions_block_routes_to_the_session_message_skill_on_its_first_line() {
 }
 
 #[test]
-fn sessions_block_carries_no_command_template() {
-    // spec §8.3 (revised): the block now names the `session-message` skill (see
-    // `sessions_block_routes_to_the_session_message_skill_on_its_first_line`),
-    // but STILL carries no command template — the skill body owns the actual
-    // command, so the two cannot drift.
+fn sessions_block_carries_the_capabilities_fallback_but_no_send_message_payload_template() {
+    // spec §8.3 (revised): the block names the `session-message` skill (see
+    // `sessions_block_routes_to_the_session_message_skill_on_its_first_line`) and
+    // now carries an unconditional `session capabilities` fallback for when that
+    // skill is unavailable. The convergence invariant is narrower than "no
+    // command at all": what must never appear is a `send-message` PAYLOAD command
+    // template (that is the shape that would drift from the skill body). A pointer
+    // to the self-describing, descriptor-generated `session capabilities`
+    // discovery command is explicitly allowed — it cannot drift.
     let block = build_sessions_block(
         Some("/w/a"),
         &[SessionMentionTargetInfo {
@@ -86,8 +90,11 @@ fn sessions_block_carries_no_command_template() {
             workspace: Some("/w/a".to_owned()),
         }],
     );
+    // Still no `send-message` payload template — the skill body owns that shape.
     assert!(!block.contains("send-message"), "{block}");
-    assert!(!block.contains("AIONUI_HELPER_BIN"), "{block}");
+    // But the capabilities discovery pointer IS present.
+    assert!(block.contains("session capabilities"), "{block}");
+    assert!(block.contains("$AIONUI_HELPER_BIN"), "{block}");
 }
 
 #[test]
