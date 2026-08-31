@@ -84,8 +84,8 @@ pub use auth::{
 pub use channel::{
     ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelAssistantSettingResponse,
     ChannelDefaultModelSetting, ChannelPlatformSettingsResponse, ChannelSessionResponse, ChannelUserResponse,
-    DisablePluginRequest, EnablePluginRequest, PairingRequestResponse, PairingRequestedPayload,
-    PluginStatusChangedPayload, PluginStatusResponse, RejectPairingRequest, RevokeUserRequest,
+    ChannelWorkspaceSetting, DisablePluginRequest, EnablePluginRequest, PairingRequestResponse,
+    PairingRequestedPayload, PluginStatusChangedPayload, PluginStatusResponse, RejectPairingRequest, RevokeUserRequest,
     SyncChannelSettingsRequest, TestPluginExtraConfig, TestPluginRequest, TestPluginResponse, UserAuthorizedPayload,
 };
 pub use chat_file::ChatFileRef;
