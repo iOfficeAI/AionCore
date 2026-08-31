@@ -1,4 +1,4 @@
-use std::net::TcpListener;
+use std::{net::TcpListener, time::Duration};
 
 use crate::error::OfficeError;
 
@@ -9,7 +9,12 @@ pub fn allocate_port() -> Result<u16, OfficeError> {
 }
 
 pub async fn is_port_listening(port: u16) -> bool {
-    tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok()
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
 }
 
 #[cfg(test)]
