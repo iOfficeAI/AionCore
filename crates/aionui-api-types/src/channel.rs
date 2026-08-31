@@ -45,6 +45,8 @@ pub struct TestPluginExtraConfig {
     pub app_id: Option<String>,
     #[serde(default)]
     pub app_secret: Option<String>,
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
