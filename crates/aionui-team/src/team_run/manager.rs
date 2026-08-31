@@ -150,6 +150,34 @@ impl TeamRunManager {
             .map(|run| run.team_run_id.clone())
     }
 
+    /// Restore a run carried over from a session that was just replaced
+    /// (e.g. after `ensure_session_inner` recreates the `TeamSession` and its
+    /// `TeamRunManager`). Without this, `team_send_message` fails with
+    /// "no active team run for run-scoped wake" because the fresh manager
+    /// has no run state even though the previous session had one active.
+    pub(crate) fn resume_run(&self, run_id: String) -> Result<(), TeamError> {
+        let mut state = self.lock_state();
+        if state.is_some() {
+            return Err(TeamError::InvalidRequest(
+                "cannot resume: a run is already active".into(),
+            ));
+        }
+        *state = Some(TeamRunRecord {
+            team_run_id: run_id,
+            source: TeamRunSource::SystemLifecycle,
+            has_user_intervention: false,
+            target_slot_id: String::new(),
+            target_role: TeamRunTargetRole::Lead,
+            status: TeamRunStatus::Accepted,
+            started_at_ms: None,
+            completed_at_ms: None,
+            cancel_reason: None,
+            summary: None,
+            accepted_emitted: false,
+        });
+        Ok(())
+    }
+
     pub(crate) fn apply_work_summary(&self, summary: RunWorkSummary) {
         let event = {
             let mut state = self.lock_state();
