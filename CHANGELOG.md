@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.4](https://github.com/suoak/AionCore/compare/v0.2.3...v0.2.4) (2026-08-31)
+
+### Features
+
+* **presentation:** add native deck orchestration API (#88)
+
+### Performance Improvements
+
+* **office:** bound preview port probes (#92)
+
 ## [0.2.2](https://github.com/suoak/AionCore/compare/v0.2.1...v0.2.2) (2026-08-29)
 
 ### Features
