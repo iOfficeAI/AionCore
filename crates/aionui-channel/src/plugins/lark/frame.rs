@@ -82,7 +82,7 @@ pub fn build_ack_frame(original: &PbFrame) -> PbFrame {
         headers: ack_headers,
         payload_encoding: String::new(),
         payload_type: String::new(),
-        payload: br#"{"code":200}"#.to_vec(),
+        payload: br#"{"code":0}"#.to_vec(),
         log_id_new: original.log_id_new.clone(),
     }
 }
@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn build_ack_frame_has_code_200_payload() {
+    fn build_ack_frame_has_code_0_payload() {
         let original = PbFrame {
             seq_id: 10,
             log_id: 20,
@@ -193,7 +193,7 @@ mod tests {
         let ack = build_ack_frame(&original);
         assert_eq!(ack.method, METHOD_DATA);
         let payload_str = String::from_utf8(ack.payload.clone()).unwrap();
-        assert!(payload_str.contains("200"));
+        assert_eq!(payload_str, r#"{"code":0}"#);
     }
 
     #[test]
