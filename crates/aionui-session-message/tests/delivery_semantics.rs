@@ -230,10 +230,12 @@ async fn an_idle_target_is_delivered_and_actually_starts_a_turn() {
     assert!(content.starts_with("[[AION_SESSION_MESSAGE]]"), "{content}");
     assert!(content.contains(&format!("reply_to: {}", from.id)), "{content}");
     assert!(content.contains("workspace: same"), "{content}");
-    // The delivered block carries the unconditional capabilities fallback, so a
-    // recipient with the skill unchecked can still fetch the full contract.
+    // The delivered block carries the capabilities fallback, so a recipient with
+    // the skill unavailable can still fetch the full contract.
     assert!(
-        content.contains("For the full delivery contract, run `\"$AIONUI_HELPER_BIN\" session capabilities`."),
+        content.contains(
+            "If the session-message skill is unavailable, run `\"$AIONUI_HELPER_BIN\" session capabilities` for the full delivery contract."
+        ),
         "{content}"
     );
     assert!(content.trim_end().ends_with("接口定完了吗？"), "{content}");

@@ -9,7 +9,7 @@ fn same_workspace_block_matches_the_spec_shape_exactly() {
          from: 重构-鉴权模块\tconv_1\n\
          workspace: same\n\
          reply_to: conv_1\t(reply: session send-message, to=reply_to)\n\
-         For the full delivery contract, run `\"$AIONUI_HELPER_BIN\" session capabilities`.\n\
+         If the session-message skill is unavailable, run `\"$AIONUI_HELPER_BIN\" session capabilities` for the full delivery contract.\n\
          [[/AION_SESSION_MESSAGE]]"
     );
 }
@@ -42,12 +42,15 @@ fn the_block_always_states_how_to_reply() {
 
 #[test]
 fn the_block_carries_an_unconditional_capabilities_fallback_without_breaking_reply_to() {
-    // Even when the `session-message` skill is unchecked, the recipient can fetch
-    // the whole contract. The pointer sits on its OWN line, so it neither matches
-    // the `reply_to:` prefix nor the `\t` the frontend splits the address on.
+    // The pointer is always emitted (no skill-toggle branch), framed as a fallback
+    // for when the skill is unavailable so the recipient can still fetch the whole
+    // contract. It sits on its OWN line, so it neither matches the `reply_to:`
+    // prefix nor the `\t` the frontend splits the address on.
     let block = build_session_message_block("A", "conv_1", "same", "conv_1");
     assert!(
-        block.contains("For the full delivery contract, run `\"$AIONUI_HELPER_BIN\" session capabilities`."),
+        block.contains(
+            "If the session-message skill is unavailable, run `\"$AIONUI_HELPER_BIN\" session capabilities` for the full delivery contract."
+        ),
         "{block}"
     );
     let reply_line = block

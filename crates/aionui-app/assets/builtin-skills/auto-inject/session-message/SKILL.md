@@ -66,7 +66,7 @@ A delivered message arrives with this block at the top:
 from: 重构-鉴权模块	conv_019f…
 workspace: same
 reply_to: conv_019f…	(reply: session send-message, to=reply_to)
-For the full delivery contract, run `"$AIONUI_HELPER_BIN" session capabilities`.
+If the session-message skill is unavailable, run `"$AIONUI_HELPER_BIN" session capabilities` for the full delivery contract.
 [[/AION_SESSION_MESSAGE]]
 ```
 
