@@ -1,0 +1,41 @@
+name: Native Presentation
+
+on:
+  push:
+    paths:
+      - '.github/workflows/native-presentation.yml'
+      - 'Cargo.lock'
+      - 'crates/aionui-api-types/**'
+      - 'crates/aionui-office/**'
+  pull_request:
+    paths:
+      - '.github/workflows/native-presentation.yml'
+      - 'Cargo.lock'
+      - 'crates/aionui-api-types/**'
+      - 'crates/aionui-office/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  presentation-contract:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-presentation-${{ matrix.os }}
+      - name: Test presentation API and Office orchestration
+        run: cargo test -p aionui-api-types -p aionui-office

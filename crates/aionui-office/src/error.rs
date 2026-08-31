@@ -29,6 +29,9 @@ pub enum OfficeError {
 
     #[error("external tool not found: {0}")]
     ToolNotFound(String),
+
+    #[error("presentation error: {0}")]
+    Presentation(String),
 }
 
 #[cfg(test)]
@@ -57,6 +60,10 @@ mod tests {
         assert_eq!(
             OfficeError::ToolNotFound("pandoc".into()).to_string(),
             "external tool not found: pandoc"
+        );
+        assert_eq!(
+            OfficeError::Presentation("invalid deck".into()).to_string(),
+            "presentation error: invalid deck"
         );
     }
 }

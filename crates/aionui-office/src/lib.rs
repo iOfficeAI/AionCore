@@ -5,6 +5,7 @@ pub mod conversion;
 pub mod error;
 mod officecli_runtime;
 pub mod port;
+pub mod presentation;
 pub mod proxy;
 pub mod routes;
 pub mod state;
@@ -13,6 +14,7 @@ pub mod watch_manager;
 
 pub use conversion::ConversionService;
 pub use error::OfficeError;
+pub use presentation::PresentationService;
 pub use proxy::{ProxyError, ProxyService};
 pub use routes::{office_proxy_routes, office_routes};
 pub use state::OfficeRouterState;

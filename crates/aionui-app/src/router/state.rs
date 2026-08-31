@@ -1003,11 +1003,13 @@ pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
 
     let conversion_service = Arc::new(ConversionService::with_data_dir(None, data_dir.to_path_buf()));
     let proxy_service = Arc::new(ProxyService::new(watch_manager.clone()));
+    let presentation_service = Arc::new(aionui_office::PresentationService::new(None));
 
     OfficeRouterState {
         watch_manager,
         conversion_service,
         proxy_service,
+        presentation_service,
         allowed_roots,
         project: Arc::new(services.project_service.clone()),
     }

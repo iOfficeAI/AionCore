@@ -9,7 +9,9 @@ use axum::routing::{get, post};
 use std::path::{Path as FsPath, PathBuf};
 
 use aionui_api_types::{
-    ApiResponse, DocumentConversionRequest, PreviewUrlResponse, RefreshPreviewRequest, RefreshPreviewResponse,
+    ApiResponse, DocumentConversionRequest, PresentationAssetImportRequest, PresentationAssetImportResponse,
+    PresentationCatalogResponse, PresentationFileRequest, PresentationRenderJob, PresentationRenderRequest,
+    PresentationValidationResponse, PreviewUrlResponse, RefreshPreviewRequest, RefreshPreviewResponse,
     StartPreviewRequest, StopPreviewRequest,
 };
 use aionui_auth::CurrentUser;
@@ -36,6 +38,13 @@ impl From<OfficeError> for ApiError {
             OfficeError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
             OfficeError::Conversion(msg) => ApiError::Internal(format!("conversion error: {msg}")),
             OfficeError::ToolNotFound(tool) => ApiError::BadRequest(format!("{tool} is not installed")),
+            OfficeError::Presentation(message) if message.starts_with("stale revision:") => ApiError::coded(
+                StatusCode::CONFLICT,
+                "PRESENTATION_STALE_REVISION",
+                message,
+                None::<serde_json::Value>,
+            ),
+            OfficeError::Presentation(message) => ApiError::BadRequest(message),
         }
     }
 }
@@ -63,6 +72,12 @@ pub fn office_routes(state: OfficeRouterState) -> Router {
         .route("/api/ppt-preview/stop", post(stop_ppt_preview))
         .route("/api/ppt-preview/refresh", post(refresh_ppt_preview))
         .route("/api/document/convert", post(convert_document))
+        .route("/api/presentations/catalog", get(presentation_catalog))
+        .route("/api/presentations/validate", post(validate_presentation))
+        .route("/api/presentations/render", post(render_presentation))
+        .route("/api/presentations/assets/import", post(import_presentation_asset))
+        .route("/api/presentations/jobs/{job_id}", get(get_presentation_job))
+        .route("/api/presentations/jobs/{job_id}/cancel", post(cancel_presentation_job))
         .with_state(state)
 }
 
@@ -343,6 +358,126 @@ async fn convert_document(
     Ok(Json(ApiResponse::ok(resp)))
 }
 
+// -- Native presentation studio -------------------------------------------
+
+async fn presentation_catalog(
+    State(state): State<OfficeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<PresentationCatalogResponse>>, ApiError> {
+    let catalog = state.presentation_service.catalog().await?;
+    Ok(Json(ApiResponse::ok(catalog)))
+}
+
+async fn validate_presentation(
+    State(state): State<OfficeRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<PresentationFileRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<PresentationValidationResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let path = resolve_presentation_path(&state, &user.id, &request, aionui_project::FileOp::Read).await?;
+    let validation = state.presentation_service.validate(&path).await?;
+    Ok(Json(ApiResponse::ok(validation)))
+}
+
+async fn render_presentation(
+    State(state): State<OfficeRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<PresentationRenderRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<PresentationRenderJob>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let path = resolve_presentation_path(&state, &user.id, &request.source, aionui_project::FileOp::Write).await?;
+    let job = state
+        .presentation_service
+        .start_render(&user.id, path, request.expected_revision)?;
+    tracing::info!(target: "presentation", job_id = %job.job_id, revision = job.revision, "presentation render queued");
+    Ok(Json(ApiResponse::ok(job)))
+}
+
+async fn import_presentation_asset(
+    State(state): State<OfficeRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<PresentationAssetImportRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<PresentationAssetImportResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let deck = resolve_presentation_path(&state, &user.id, &request.deck, aionui_project::FileOp::Write).await?;
+    let upload_root = std::env::temp_dir().join("aionui");
+    let source = state
+        .project
+        .resolve_chat_file_ref(
+            &user.id,
+            &request.source_file,
+            &upload_root,
+            aionui_project::FileOp::Read,
+        )
+        .await
+        .map(PathBuf::from)
+        .map_err(refresh_resolve_error)?;
+    let imported = state
+        .presentation_service
+        .import_asset(&deck, &source, &request.asset_id)?;
+    Ok(Json(ApiResponse::ok(imported)))
+}
+
+async fn get_presentation_job(
+    State(state): State<OfficeRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(job_id): Path<String>,
+) -> Result<Json<ApiResponse<PresentationRenderJob>>, ApiError> {
+    let job = state.presentation_service.get_job(&user.id, &job_id).ok_or_else(|| {
+        ApiError::coded(
+            StatusCode::NOT_FOUND,
+            "PRESENTATION_JOB_NOT_FOUND",
+            "Presentation render job not found.",
+            None::<serde_json::Value>,
+        )
+    })?;
+    Ok(Json(ApiResponse::ok(job)))
+}
+
+async fn cancel_presentation_job(
+    State(state): State<OfficeRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(job_id): Path<String>,
+) -> Result<Json<ApiResponse<PresentationRenderJob>>, ApiError> {
+    if !state.presentation_service.cancel(&user.id, &job_id) {
+        return Err(ApiError::coded(
+            StatusCode::CONFLICT,
+            "PRESENTATION_JOB_NOT_CANCELLABLE",
+            "Presentation render job cannot be cancelled.",
+            None::<serde_json::Value>,
+        ));
+    }
+    let job = state.presentation_service.get_job(&user.id, &job_id).ok_or_else(|| {
+        ApiError::coded(
+            StatusCode::NOT_FOUND,
+            "PRESENTATION_JOB_NOT_FOUND",
+            "Presentation render job not found.",
+            None::<serde_json::Value>,
+        )
+    })?;
+    Ok(Json(ApiResponse::ok(job)))
+}
+
+async fn resolve_presentation_path(
+    state: &OfficeRouterState,
+    user_id: &str,
+    request: &PresentationFileRequest,
+    operation: aionui_project::FileOp,
+) -> Result<PathBuf, ApiError> {
+    match &request.file {
+        Some(file) => {
+            let upload_root = std::env::temp_dir().join("aionui");
+            state
+                .project
+                .resolve_chat_file_ref(user_id, file, &upload_root, operation)
+                .await
+                .map(PathBuf::from)
+                .map_err(refresh_resolve_error)
+        }
+        None => validate_office_path(state, &request.file_path, request.workspace.as_deref()),
+    }
+}
+
 fn validate_office_path(
     state: &OfficeRouterState,
     file_path: &str,
@@ -409,7 +544,8 @@ fn preview_error_code(error: &OfficeError) -> &'static str {
         | OfficeError::Snapshot(_)
         | OfficeError::Json(_)
         | OfficeError::Conversion(_)
-        | OfficeError::ToolNotFound(_) => "OFFICECLI_START_FAILED",
+        | OfficeError::ToolNotFound(_)
+        | OfficeError::Presentation(_) => "OFFICECLI_START_FAILED",
     }
 }
 
@@ -654,6 +790,7 @@ mod tests {
             watch_manager: wm,
             conversion_service: conversion,
             proxy_service: proxy,
+            presentation_service: Arc::new(crate::presentation::PresentationService::new(None)),
             allowed_roots: vec![std::env::temp_dir()],
             project,
         }

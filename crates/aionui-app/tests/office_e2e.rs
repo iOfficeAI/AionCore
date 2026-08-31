@@ -101,6 +101,7 @@ fn build_test_office_state(
         watch_manager: wm,
         conversion_service: conversion,
         proxy_service: proxy,
+        presentation_service: Arc::new(aionui_office::PresentationService::new(None)),
         allowed_roots,
         project,
     }

@@ -145,8 +145,12 @@ pub use mcp::{
 };
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionRequest, DocumentConversionResponse,
-    ExcelSheetData, ExcelSheetImage, ExcelWorkbookData, PptJsonData, PptSlideData, PreviewState, PreviewStatusEvent,
-    PreviewUrlResponse, RefreshPreviewRequest, RefreshPreviewResponse, StartPreviewRequest, StopPreviewRequest,
+    ExcelSheetData, ExcelSheetImage, ExcelWorkbookData, PptJsonData, PptSlideData, PresentationAssetImportRequest,
+    PresentationAssetImportResponse, PresentationCatalogControl, PresentationCatalogLayout,
+    PresentationCatalogResponse, PresentationCatalogSlot, PresentationCatalogTheme, PresentationDiagnostic,
+    PresentationFileRequest, PresentationRenderJob, PresentationRenderRequest, PresentationRenderStatus,
+    PresentationValidationResponse, PreviewState, PreviewStatusEvent, PreviewUrlResponse, RefreshPreviewRequest,
+    RefreshPreviewResponse, StartPreviewRequest, StopPreviewRequest,
 };
 pub use project::{
     AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, ResolveRefRequest, ResolveRefResponse,

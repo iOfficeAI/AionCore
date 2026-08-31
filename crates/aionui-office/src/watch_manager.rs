@@ -147,6 +147,7 @@ impl OfficecliWatchManager {
                     OfficeError::Json(e) => OfficeError::StartFailed(format!("JSON error: {e}")),
                     OfficeError::Conversion(m) => OfficeError::StartFailed(m.clone()),
                     OfficeError::ToolNotFound(m) => OfficeError::StartFailed(m.clone()),
+                    OfficeError::Presentation(m) => OfficeError::StartFailed(m.clone()),
                 })
             }
         }

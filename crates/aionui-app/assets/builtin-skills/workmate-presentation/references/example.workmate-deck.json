@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "revision": 1,
+  "stage": "outline",
+  "metadata": {
+    "title": "Quarterly review",
+    "goal": "Align the team on the next quarter",
+    "audience": "Leadership team",
+    "language": "en-US",
+    "aspectRatio": "16:9"
+  },
+  "theme": { "id": "business-light" },
+  "slides": [
+    {
+      "id": "cover",
+      "role": "cover",
+      "layoutId": "cover",
+      "title": "Quarterly review",
+      "blocks": [{ "id": "cover-title", "type": "text", "slot": "title", "text": "Quarterly review" }]
+    }
+  ],
+  "assets": []
+}
