@@ -214,7 +214,22 @@ pub(crate) struct CardActionEvent {
     pub action: CardAction,
     #[serde(default)]
     pub token: Option<String>,
+    // Legacy webhook payload places these at the top level.
+    #[serde(default)]
     pub open_message_id: Option<String>,
+    #[serde(default)]
+    pub open_chat_id: Option<String>,
+    // Long-connection `card.action.trigger` event nests them under `context`.
+    #[serde(default)]
+    pub context: Option<CardActionContext>,
+}
+
+/// Context of a `card.action.trigger` event (long-connection payload).
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct CardActionContext {
+    #[serde(default)]
+    pub open_message_id: Option<String>,
+    #[serde(default)]
     pub open_chat_id: Option<String>,
 }
 
@@ -765,5 +780,27 @@ mod tests {
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["app_id"], "cli_123");
         assert_eq!(json["app_secret"], "secret_456");
+    }
+
+    // -- CardActionEvent parses the long-connection (context) payload -------
+
+    #[test]
+    fn card_action_event_parses_long_connection_context() {
+        // `event` payload of a card.action.trigger event (ids nested in context).
+        let raw = serde_json::json!({
+            "operator": { "open_id": "ou_123" },
+            "token": "c-xxx",
+            "action": { "tag": "button", "value": { "action": "system:pairing.check" } },
+            "context": { "open_message_id": "om_1", "open_chat_id": "oc_1" }
+        });
+        let evt: CardActionEvent = serde_json::from_value(raw).unwrap();
+        assert_eq!(evt.operator.open_id, "ou_123");
+        let ctx = evt.context.expect("context present");
+        assert_eq!(ctx.open_chat_id.as_deref(), Some("oc_1"));
+        assert_eq!(ctx.open_message_id.as_deref(), Some("om_1"));
+        assert_eq!(
+            evt.action.value.and_then(|v| v.get("action").and_then(|a| a.as_str().map(String::from))),
+            Some("system:pairing.check".into())
+        );
     }
 }
