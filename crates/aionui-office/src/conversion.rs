@@ -266,7 +266,8 @@ mod tests {
 
     #[test]
     fn validate_file_exists_is_directory() {
-        let result = validate_file_exists("/tmp");
+        let temp_dir = std::env::temp_dir();
+        let result = validate_file_exists(&temp_dir.to_string_lossy());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("not a file"));
