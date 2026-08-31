@@ -8,7 +8,7 @@ fn same_workspace_block_matches_the_spec_shape_exactly() {
         "[[AION_SESSION_MESSAGE]]\n\
          from: 重构-鉴权模块\tconv_1\n\
          workspace: same\n\
-         reply_to: conv_1\t（回信: session send-message, to=reply_to）\n\
+         reply_to: conv_1\t(reply: session send-message, to=reply_to)\n\
          [[/AION_SESSION_MESSAGE]]"
     );
 }
@@ -18,11 +18,13 @@ fn cross_workspace_block_carries_the_constraint_inside_the_field_value() {
     let block = build_session_message_block(
         "A",
         "conv_1",
-        "/Users/x/proj-a（与你不同，勿用相对路径，勿假设可读）",
+        "/Users/x/proj-a (differs from yours; don't use relative paths, don't assume readable)",
         "conv_1",
     );
     assert!(
-        block.contains("workspace: /Users/x/proj-a（与你不同，勿用相对路径，勿假设可读）"),
+        block.contains(
+            "workspace: /Users/x/proj-a (differs from yours; don't use relative paths, don't assume readable)"
+        ),
         "{block}"
     );
 }
@@ -53,7 +55,7 @@ fn the_recipient_workspace_field_says_same_only_when_both_sides_match() {
     assert_eq!(recipient_workspace_field(Some("/w/a"), Some("/w/a")), "same");
     assert_eq!(
         recipient_workspace_field(Some("/w/a"), Some("/w/b")),
-        "/w/a（与你不同，勿用相对路径，勿假设可读）"
+        "/w/a (differs from yours; don't use relative paths, don't assume readable)"
     );
 }
 
@@ -63,7 +65,7 @@ fn an_unknown_sender_workspace_never_collapses_to_same() {
     // relative paths are safe when we do not know that.
     let value = recipient_workspace_field(None, Some("/w/b"));
     assert!(value.starts_with("unknown"), "{value}");
-    assert!(value.contains("勿用相对路径"), "{value}");
+    assert!(value.contains("don't use relative paths"), "{value}");
 
     let both_unknown = recipient_workspace_field(None, None);
     assert!(both_unknown.starts_with("unknown"), "{both_unknown}");
@@ -74,7 +76,10 @@ fn a_known_sender_workspace_with_an_unknown_target_is_reported_as_different() {
     // The recipient block states the SENDER's path, so it stays usable even
     // when the target row records no workspace.
     let value = recipient_workspace_field(Some("/w/a"), None);
-    assert_eq!(value, "/w/a（与你不同，勿用相对路径，勿假设可读）");
+    assert_eq!(
+        value,
+        "/w/a (differs from yours; don't use relative paths, don't assume readable)"
+    );
 }
 
 // ---------------------------------------------------------------------------

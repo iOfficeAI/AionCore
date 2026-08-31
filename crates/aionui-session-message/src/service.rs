@@ -39,12 +39,16 @@ use crate::rate_limit::{RateLimiter, RateVerdict};
 /// The short reply pointer after `reply_to` is deliberate (~10-15 tokens): the
 /// recipient must know it can reply at all, or the reply path is dead. The full
 /// schema does not go here — that is what `session capabilities` is for.
+///
+/// The block is agent-facing — the frontend strips it and renders human-facing
+/// labels separately via i18n — so its text (the reply pointer and the
+/// `workspace:` warning) is written in English, not localized.
 pub fn build_session_message_block(from_name: &str, from_id: &str, workspace_field: &str, reply_to: &str) -> String {
     format!(
         "{AIONUI_SESSION_MESSAGE_MARKER}\n\
          from: {from_name}\t{from_id}\n\
          workspace: {workspace_field}\n\
-         reply_to: {reply_to}\t（回信: session send-message, to=reply_to）\n\
+         reply_to: {reply_to}\t(reply: session send-message, to=reply_to)\n\
          {AIONUI_SESSION_MESSAGE_END_MARKER}"
     )
 }
@@ -63,8 +67,8 @@ pub fn compose_delivery_content(block: &str, message: &str) -> String {
 fn recipient_workspace_field(sender_workspace: Option<&str>, target_workspace: Option<&str>) -> String {
     match (sender_workspace, target_workspace) {
         (Some(sender), Some(target)) if sender == target => "same".to_owned(),
-        (Some(sender), _) => format!("{sender}（与你不同，勿用相对路径，勿假设可读）"),
-        (None, _) => "unknown（与你不同，勿用相对路径，勿假设可读）".to_owned(),
+        (Some(sender), _) => format!("{sender} (differs from yours; don't use relative paths, don't assume readable)"),
+        (None, _) => "unknown (differs from yours; don't use relative paths, don't assume readable)".to_owned(),
     }
 }
 

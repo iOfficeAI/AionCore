@@ -32,16 +32,44 @@ pub struct SessionMentionTargetInfo {
 pub fn workspace_field_value(sender_workspace: Option<&str>, target_workspace: Option<&str>) -> String {
     match (sender_workspace, target_workspace) {
         (Some(sender), Some(target)) if sender == target => "same".to_owned(),
-        (_, Some(target)) => format!("{target}（与你不同）"),
-        (_, None) => "unknown（与你不同）".to_owned(),
+        (_, Some(target)) => format!("{target} (differs from yours)"),
+        (_, None) => "unknown (differs from yours)".to_owned(),
     }
 }
 
-/// Build the sender-side block. Deliberately carries no usage instructions
-/// (spec §8.3): the trigger is the user typing `@@`, and the auto-inject skill
-/// is what must independently explain sending.
+/// The one routing hint the block carries: it names the skill to deliver with,
+/// and never a command template — the skill body stays the single source of the
+/// actual command (`send-message`), so the block and the skill cannot drift.
+///
+/// It is emitted as the FIRST in-marker line on purpose. The frontend's
+/// `parseSessionsBlock` (`sessionMarkers.ts`) renders only the text OUTSIDE the
+/// markers and turns each in-marker line into a chip only when it splits into
+/// `name \t id \t workspace`. This line has no tab, so it is dropped from the
+/// sender's bubble AND skipped by the chip parser — while every agent backend
+/// still receives it verbatim in the message content.
+///
+/// English on purpose. Everything between the markers is agent-facing: the
+/// frontend strips this whole block from the displayed text and re-renders the
+/// human-facing chips/labels separately (via i18n), so the block's own bytes are
+/// read only by the agent. The block is therefore written entirely in English —
+/// including the `workspace:` warning below — to match the `session-message`
+/// skill it routes to.
+const SESSIONS_BLOCK_SKILL_HINT: &str =
+    "To deliver to the conversations below, use the session-message skill (address by conversation id).";
+
+/// Build the sender-side block.
+///
+/// Spec §8.3 originally kept this block instruction-free and left sending to the
+/// auto-inject skill. That relied on the agent loading the skill's body before
+/// choosing how to deliver, which is not guaranteed: a competing built-in
+/// cross-session tool can be reached first, and in `Injected` skill-delivery
+/// mode the body is lazy-loaded. So the block now carries ONE positive routing
+/// hint ([`SESSIONS_BLOCK_SKILL_HINT`]) that points at the `session-message`
+/// skill — but still no command template, keeping §8.3's real invariant intact.
 pub fn build_sessions_block(sender_workspace: Option<&str>, targets: &[SessionMentionTargetInfo]) -> String {
     let mut block = String::from(AIONUI_SESSIONS_MARKER);
+    block.push('\n');
+    block.push_str(SESSIONS_BLOCK_SKILL_HINT);
     for target in targets {
         block.push('\n');
         block.push_str(&target.name);
