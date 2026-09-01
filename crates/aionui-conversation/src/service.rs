@@ -30,8 +30,8 @@ use aionui_api_types::{
 use aionui_api_types::{ChatFileRef, SessionRef};
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    OnConversationTurnCancelled, PaginatedResult, TurnCancelCause, WorkspacePathValidationError, generate_short_id,
-    now_ms, validate_workspace_path_availability,
+    OnConversationTurnCancelled, PaginatedResult, ProviderWithModel, TurnCancelCause, WorkspacePathValidationError,
+    generate_short_id, now_ms, validate_workspace_path_availability,
 };
 use aionui_db::models::{
     AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
@@ -2408,12 +2408,41 @@ impl ConversationService {
         }
 
         if model_changed {
-            info!(
-                model_changed = true,
-                "Conversation updated, killing agent task due to model change"
-            );
-            if let Err(e) = task_manager.kill(id, None) {
-                warn!(error = %ErrorChain(&e), "Failed to kill agent after model change");
+            let same_provider = aionrs_model_change_keeps_provider(existing.model.as_deref(), req.model.as_ref());
+            if same_provider {
+                if let Some(model) = req.model.as_ref() {
+                    let selected_model = model.use_model.as_deref().unwrap_or(model.model.as_str());
+                    if let Some(agent) = task_manager.get_task(id) {
+                        match agent.set_config_option("model", selected_model).await {
+                            Ok(response) => {
+                                info!(
+                                    conversation_id = %id,
+                                    model = %selected_model,
+                                    confirmation = ?response.confirmation,
+                                    "Aionrs same-provider model change applied without rebuild"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    conversation_id = %id,
+                                    error = %ErrorChain(&e),
+                                    "Failed to hot-swap aionrs model; falling back to kill/rebuild"
+                                );
+                                if let Err(kill_err) = task_manager.kill(id, None) {
+                                    warn!(error = %ErrorChain(&kill_err), "Failed to kill agent after model hot-swap failure");
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                info!(
+                    model_changed = true,
+                    "Conversation updated, killing agent task due to model/provider change"
+                );
+                if let Err(e) = task_manager.kill(id, None) {
+                    warn!(error = %ErrorChain(&e), "Failed to kill agent after model change");
+                }
             }
         }
 
@@ -5928,6 +5957,25 @@ fn log_conversation_created(response: &ConversationResponse, extra: &serde_json:
             "Conversation created (no assistant)"
         );
     }
+}
+
+/// Same `provider_id` means the aionrs engine can hot-swap `use_model` without
+/// tearing down the agent (Auto planner/worker routing). Provider changes still
+/// require kill + rebuild.
+fn aionrs_model_change_keeps_provider(
+    existing_model_json: Option<&str>,
+    new_model: Option<&ProviderWithModel>,
+) -> bool {
+    let Some(new_model) = new_model else {
+        return false;
+    };
+    let Some(existing_json) = existing_model_json else {
+        return false;
+    };
+    let Ok(existing) = serde_json::from_str::<ProviderWithModel>(existing_json) else {
+        return false;
+    };
+    !existing.provider_id.is_empty() && existing.provider_id == new_model.provider_id
 }
 
 fn is_tool_message_type(message_type: MessageType) -> bool {
