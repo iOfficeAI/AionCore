@@ -45,17 +45,34 @@ use crate::event::{CancelReason, ProvisioningPhase, SessionEvent, StopReason, Su
 use futures_util::stream::{BoxStream, StreamExt};
 
 const CODEX_CONFIG_FLAG: &str = "-c";
+
+/// codex 0.152.0 made the `update_plan` tool opt-in: `UpdatePlanToolConfig`
+/// lost its `default = "default_true"` and now defaults to `false`
+/// (openai/codex a9519cbc, "Make the update_plan tool opt-in" #41744, verified:
+/// the same commit flips `default: true` to `default: false` under this key in
+/// `codex-rs/core/config.schema.json`).
+///
+/// Without this override the model is never offered the tool, so no plan
+/// notification is ever emitted and AionUi's plan card stays permanently empty
+/// on codex >= 0.152.0. Measured with the live suite: 0.151.0 passes
+/// `live_codex_produces_a_plan` 2/2, 0.152.0 fails it 2/2 with no `plan` frame
+/// in the stream at all.
+///
+/// Harmless on older releases, which already defaulted this to true.
+const CODEX_UPDATE_PLAN_ENABLED: &str = "tools.update_plan.enabled=true";
 const CODEX_ENV_POLICY_INHERIT_ALL: &str = "shell_environment_policy.inherit=all";
 const CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY: &str = "shell_environment_policy.include_only=[]";
 
 /// Config overrides that make Codex command-execution children inherit the
 /// runtime environment injected into the app-server process.
-pub fn codex_shell_environment_policy_args() -> [&'static str; 4] {
+pub fn codex_shell_environment_policy_args() -> [&'static str; 6] {
     [
         CODEX_CONFIG_FLAG,
         CODEX_ENV_POLICY_INHERIT_ALL,
         CODEX_CONFIG_FLAG,
         CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY,
+        CODEX_CONFIG_FLAG,
+        CODEX_UPDATE_PLAN_ENABLED,
     ]
 }
 
@@ -8215,6 +8232,8 @@ mod tests {
                 "shell_environment_policy.inherit=all",
                 "-c",
                 "shell_environment_policy.include_only=[]",
+                "-c",
+                "tools.update_plan.enabled=true",
             ],
             "every app-server spawn must explicitly propagate the parent environment to commandExecution shells"
         );
@@ -9428,6 +9447,8 @@ mod tests {
                 "shell_environment_policy.inherit=all",
                 "-c",
                 "shell_environment_policy.include_only=[]",
+                "-c",
+                "tools.update_plan.enabled=true",
             ],
             "wake must restore the same explicit commandExecution environment policy as the initial spawn"
         );
