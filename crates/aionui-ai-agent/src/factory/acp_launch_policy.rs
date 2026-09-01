@@ -178,6 +178,8 @@ mod tests {
                 "-c",
                 "shell_environment_policy.include_only=[]",
                 "-c",
+                "tools.update_plan.enabled=true",
+                "-c",
                 "sandbox_mode=\"danger-full-access\"",
                 "-c",
                 "windows.sandbox=\"unelevated\"",
