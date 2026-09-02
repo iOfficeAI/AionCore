@@ -14,8 +14,9 @@ Create a compact `*.workmate-deck.json`; never emit OOXML, HTML/CSS, or hundreds
 3. Write `stage: "outline"` with stable slide IDs, page roles, titles, theme choice, and empty semantic blocks only where useful.
 4. Ask the user to confirm the outline in Presentation Studio (goal, audience, theme, and slide titles). Do not silently advance this file to `ready`, and do not fill layouts/blocks until that confirmation.
 5. After the user confirms (studio sets `stage: "ready"`), fill layouts, typed blocks, speaker notes, and asset requirements.
-6. Run `officecli deck validate <spec> --json`. Resolve every error before export.
-7. Let WorkMate/AionCore build the PPTX; do not call low-level PPTX shape operations.
+6. Right after outline confirmation, briefly suggest Studio polish the user can do themselves: switch same-role layouts, adjust moduleCount/balance/mediaSide controls, fill pending images (upload/generate), or change the deck theme. Do not block filling content on these suggestions.
+7. Run `officecli deck validate <spec> --json`. Resolve every error before export.
+8. Let WorkMate/AionCore build the PPTX; do not call low-level PPTX shape operations.
 
 ## Media
 
