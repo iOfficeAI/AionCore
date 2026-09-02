@@ -313,6 +313,111 @@ fn canonical_key(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// The path of `target` relative to `root_key`, as a normalized forward-slash
+/// string, or `None` when `target` is not strictly inside `root_key`. Both sides
+/// are canonicalized before comparison (macOS realpath/case tolerance, matching
+/// `canonical_key`). Returns `None` for the root itself (empty relative) and for
+/// any path that would need `..` or a root/prefix component to reach: a surfaced
+/// repository must be a clean descendant, expressible as a pe-relative `FileRef`
+/// (`FileRef.relative_path` is pe-anchored — no `..`, no absolute — by contract).
+fn pe_relative_path(root_key: &Path, target: &Path) -> Option<String> {
+    let target_key = canonical_key(target);
+    let rel = target_key.strip_prefix(root_key).ok()?;
+    let mut parts = vec![];
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(segment) => parts.push(segment.to_str()?.to_owned()),
+            // `..`, a root, or a Windows prefix cannot occur inside a strict
+            // descendant; treat any of them as "not representable" rather than
+            // fabricating a path that violates the FileRef contract.
+            _ => return None,
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+/// Enumerate the linked worktrees of the repository at `repo_path`, surfacing each
+/// whose work tree lives inside `pe_root_key` (a canonicalized pe root).
+///
+/// A worktree outside the pe root is skipped with a log: it has no pe-relative
+/// path, and every SCM identity (a repo root, a resource file) is pe-anchored by
+/// contract, so it cannot be represented. This is why the enumeration is bounded
+/// to the pe subtree rather than surfacing every worktree git knows.
+///
+/// The worktree set is asked from git (`Repository::worktrees`), never scanned
+/// from the filesystem, so a submodule or nested repository is never mistaken for
+/// a worktree — and worktrees the one-level child walk cannot reach (deeper than
+/// one level, or behind a dot-directory such as `.worktrees/`) are still found.
+///
+/// Any failure — an unreadable set, a pruned/locked entry, a path that no longer
+/// opens, a transient race — drops that entry and keeps discovery going: a
+/// worktree is an enrichment, never a reason to fail the primary's discovery.
+fn enumerate_linked_worktrees(repo_path: &Path, pe_root_key: &Path) -> Vec<OpenedRepo> {
+    let repo = match Repository::open(repo_path) {
+        Ok(repo) => repo,
+        Err(err) => {
+            tracing::debug!(?repo_path, error = %err, "scm discover: reopen for worktree enumeration failed, skipping");
+            return vec![];
+        }
+    };
+    let names = match repo.worktrees() {
+        Ok(names) => names,
+        Err(err) => {
+            tracing::debug!(?repo_path, error = %err, "scm discover: worktree list failed, skipping");
+            return vec![];
+        }
+    };
+
+    let mut out = vec![];
+    for entry in names.iter() {
+        // `StringArray::iter` yields `Result<Option<&str>, _>`: an iteration error
+        // or a non-UTF-8 name is skipped (neither can address a pe-relative path).
+        let Ok(Some(name)) = entry else {
+            continue;
+        };
+        let worktree = match repo.find_worktree(name) {
+            Ok(worktree) => worktree,
+            Err(err) => {
+                tracing::debug!(name, error = %err, "scm discover: find_worktree failed, skipping");
+                continue;
+            }
+        };
+        let wt_path = worktree.path();
+        let Some(relative_path) = pe_relative_path(pe_root_key, wt_path) else {
+            tracing::debug!(
+                name,
+                ?wt_path,
+                "scm discover: linked worktree lives outside the pe root, not surfaced"
+            );
+            continue;
+        };
+        match open_repo(wt_path, relative_path) {
+            Ok(Some(opened)) => out.push(opened),
+            // A pruned, bare, or already-gone worktree opens to nothing.
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(name, error = %err, "scm discover: worktree open failed, skipping");
+            }
+        }
+    }
+    out
+}
+
+/// Drop repeated repositories by canonicalized work-tree path, keeping the first.
+///
+/// A linked worktree can be reached two ways in one discovery — enumerated from
+/// its primary, and (in the workspace-container case) also walked as an immediate
+/// child directory — and both carry the same work tree. Keeping the first
+/// preserves the child walk's `relative_path`, which for an immediate-child
+/// worktree equals the enumerated one anyway.
+fn dedup_by_workdir(opened: &mut Vec<OpenedRepo>) {
+    let mut seen = std::collections::HashSet::new();
+    opened.retain(|o| seen.insert(canonical_key(&o.workdir)));
+}
+
 /// Run one `statuses()` pass, with the stale-index fallback.
 ///
 /// Index writeback is on by default because without it a single external
@@ -839,18 +944,41 @@ impl IScmProvider for GitScmProvider {
         // returns just the plain data each surfaced repository needs; identity
         // and registry insertion stay on the async side.
         let opened = tokio::task::spawn_blocking(move || -> Result<Vec<OpenedRepo>, git2::Error> {
-            // `open` (not `discover`): a root is at most one repo — never walk up
-            // to a parent repository, never enumerate nested ones. A submodule is
-            // therefore never mis-captured, since we never descend into a repo.
-            if let Some(opened) = open_repo(&root_path, String::new())? {
-                return Ok(vec![opened]);
+            let pe_root_key = canonical_key(&root_path);
+
+            // Base set. `open` (not `discover`): a root is at most one repo — never
+            // walk up to a parent repository, never enumerate nested ones. A
+            // submodule is therefore never mis-captured, since we never descend
+            // into a repo.
+            let mut opened = if let Some(root_repo) = open_repo(&root_path, String::new())? {
+                vec![root_repo]
+            } else if discover_children {
+                // The root itself is not a repository: relax by exactly one level
+                // and surface each immediate child directory that is a repository.
+                discover_child_repos(&root_path)
+            } else {
+                vec![]
+            };
+
+            // Enrich: also surface each surfaced repo's linked worktrees that live
+            // inside the pe root tree. The worktree set comes from git, not a
+            // filesystem scan, so this reaches worktrees the child walk never would
+            // (deeper than one level, or behind a dot-directory like `.worktrees/`)
+            // while still never mis-capturing a submodule or nested repo. Bounded
+            // to the pe subtree because a worktree outside it has no pe-relative
+            // `FileRef` (see `enumerate_linked_worktrees`).
+            let mut worktrees = vec![];
+            for repo in &opened {
+                if repo.is_worktree {
+                    continue;
+                }
+                worktrees.extend(enumerate_linked_worktrees(&repo.workdir, &pe_root_key));
             }
-            if !discover_children {
-                return Ok(vec![]);
-            }
-            // The root itself is not a repository: relax by exactly one level and
-            // surface each immediate child directory that is a repository.
-            Ok(discover_child_repos(&root_path))
+            opened.extend(worktrees);
+            // A worktree can be both enumerated and (in the container case) walked
+            // as a child; surface it once.
+            dedup_by_workdir(&mut opened);
+            Ok(opened)
         })
         .await
         .map_err(|err| ScmError::OperationFailed {
