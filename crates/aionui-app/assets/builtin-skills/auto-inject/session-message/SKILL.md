@@ -36,12 +36,15 @@ When the user typed `@@`, their message carries a block like:
 
 ```
 [[AION_SESSIONS]]
+To deliver to the conversations below, use the session-message skill (address by conversation id); if it is unavailable, run `"$AIONUI_HELPER_BIN" session capabilities` for the delivery contract.
 重构-鉴权模块	conv_019f…	workspace: same
-文档站改版	conv_01a0…	workspace: /Users/x/docs（与你不同）
+文档站改版	conv_01a0…	workspace: /Users/x/docs (differs from yours)
 [[/AION_SESSIONS]]
 ```
 
-Each line is `name`, tab, `id`, tab, `workspace:`. Use the **id**.
+The first line is a hint that this skill is how to deliver, with a fallback to
+`session capabilities` when the skill is unavailable. Every following line is a
+target: `name`, tab, `id`, tab, `workspace:`. Use the **id**.
 
 ## Delivering a message
 
@@ -62,7 +65,8 @@ A delivered message arrives with this block at the top:
 [[AION_SESSION_MESSAGE]]
 from: 重构-鉴权模块	conv_019f…
 workspace: same
-reply_to: conv_019f…	（回信: session send-message, to=reply_to）
+reply_to: conv_019f…	(reply: session send-message, to=reply_to)
+If the session-message skill is unavailable, run `"$AIONUI_HELPER_BIN" session capabilities` for the full delivery contract.
 [[/AION_SESSION_MESSAGE]]
 ```
 
