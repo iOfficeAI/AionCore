@@ -9845,7 +9845,7 @@ mod session_mentions_integration {
             .unwrap();
 
         assert!(
-            resolved.contains("文档站改版\tconv_docs\tworkspace: /w/docs（与你不同）"),
+            resolved.contains("文档站改版\tconv_docs\tworkspace: /w/docs (differs from yours)"),
             "{resolved}"
         );
     }
