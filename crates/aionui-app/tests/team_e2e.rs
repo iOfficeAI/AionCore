@@ -14,7 +14,7 @@ use common::{
 };
 
 const DEFAULT_TEAM_ASSISTANT_ID: &str = "team-e2e-assistant";
-const DEFAULT_TEAM_AGENT_ID: &str = "2d23ff1c";
+const DEFAULT_TEAM_AGENT_ID: &str = "53861a53";
 
 fn team_agent(name: &str, role: &str) -> serde_json::Value {
     json!({
@@ -101,7 +101,7 @@ async fn mark_claude_backend_team_mcp_stdio_capable(services: &aionui_app::AppSe
     let result = sqlx::query(
         "UPDATE agent_metadata \
          SET agent_capabilities = ?, updated_at = unixepoch('now','subsec') * 1000 \
-         WHERE agent_type = 'acp' AND backend = 'claude'",
+         WHERE agent_type = 'acp' AND backend = 'opencode'",
     )
     .bind(capabilities)
     .execute(services.database.pool())
@@ -109,7 +109,7 @@ async fn mark_claude_backend_team_mcp_stdio_capable(services: &aionui_app::AppSe
     .expect("mark claude backend as team MCP capable");
     assert!(
         result.rows_affected() > 0,
-        "fixture must include claude ACP backend metadata"
+        "fixture must include opencode ACP backend metadata"
     );
 }
 

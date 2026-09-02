@@ -1,88 +1,38 @@
 use aionui_db::{IAgentMetadataRepository, SqliteAgentMetadataRepository, init_database_memory};
 
 #[tokio::test]
-async fn verified_registry_npx_agents_use_stable_packages_and_conservative_team_policy() {
+async fn verified_registry_npx_agents_were_removed_from_the_builtin_catalog() {
     let db = init_database_memory().await.unwrap();
     let repo = SqliteAgentMetadataRepository::new(db.pool().clone());
 
-    let cases = [
-        (
-            "autohand",
-            "autohand",
-            r#"["-y","@autohandai/autohand-acp"]"#,
-            None,
-            None,
-        ),
-        (
-            "deepagents",
-            "deepagents",
-            r#"["-y","deepagents-acp"]"#,
-            Some(r#"[".deepagents/skills","skills"]"#),
-            None,
-        ),
-        ("dimcode", "dim", r#"["-y","dimcode","acp"]"#, None, None),
-        (
-            "dirac",
-            "dirac",
-            r#"["-y","dirac-cli","--acp"]"#,
-            Some(r#"[".dirac/skills"]"#),
-            Some("yolo"),
-        ),
-        (
-            "glm-acp-agent",
-            "glm-acp-agent",
-            r#"["-y","glm-acp-agent"]"#,
-            None,
-            Some("bypass_permissions"),
-        ),
-        (
-            "grok",
-            "grok",
-            r#"["-y","@xai-official/grok","agent","stdio"]"#,
-            None,
-            None,
-        ),
-        ("kilo", "kilo", r#"["-y","@kilocode/cli","acp"]"#, None, None),
-        (
-            "mimo-code",
-            "mimo",
-            r#"["-y","@mimo-ai/cli","acp"]"#,
-            Some(r#"[".mimocode/skills",".opencode/skills"]"#),
-            Some("build"),
-        ),
-        (
-            "nova",
-            "nova",
-            r#"["-y","@compass-ai/nova","acp"]"#,
-            Some(r#"[".compass/skills"]"#),
-            None,
-        ),
-        // omp is deliberately absent: 039 moved it off the npx bridge to a
-        // direct `omp acp` launch. Its shape is asserted in
-        // `omp_direct_cli_migration.rs`.
-        ("sigit", "sigit", r#"["-y","@smbcloud/sigit"]"#, None, None),
+    let purged = [
+        "autohand",
+        "deepagents",
+        "dimcode",
+        "dirac",
+        "glm-acp-agent",
+        "grok",
+        "kilo",
+        "mimo-code",
+        "nova",
+        "sigit",
     ];
-
-    for (backend, binary_name, args, skills, yolo_id) in cases {
-        let row = repo.find_builtin_by_backend(backend).await.unwrap().unwrap();
-        assert_eq!(row.description, None, "{backend} builtin description");
-        assert_eq!(row.command.as_deref(), Some("npx"), "{backend} command");
-        let expected_icon = format!("/api/assets/logos/acp-registry/{backend}.svg");
-        assert_eq!(row.icon.as_deref(), Some(expected_icon.as_str()), "{backend} icon");
-        assert_eq!(row.args.as_deref(), Some(args), "{backend} args");
-        assert_eq!(row.native_skills_dirs.as_deref(), skills, "{backend} skills");
-        assert_eq!(row.yolo_id.as_deref(), yolo_id, "{backend} yolo_id");
-        let source: serde_json::Value = serde_json::from_str(row.agent_source_info.as_deref().unwrap()).unwrap();
-        assert_eq!(source["binary_name"], binary_name, "{backend} binary_name");
-        assert_eq!(source["bridge_binary"], "npx", "{backend} bridge_binary");
-        let policy: serde_json::Value = serde_json::from_str(row.behavior_policy.as_deref().unwrap()).unwrap();
-        // 033 retired the veto flag and the no-op `supports_team: false`; a
-        // Registry agent's team membership is inferred from its advertised MCP
-        // transports, never pinned in the stored policy.
+    for backend in purged {
         assert!(
-            policy.get("team_capable_override").is_none(),
-            "{backend} team_capable_override"
+            repo.find_builtin_by_backend(backend).await.unwrap().is_none(),
+            "{backend} must not remain a builtin after 045"
         );
-        assert!(policy.get("supports_team").is_none(), "{backend} supports_team");
     }
+}
+
+#[tokio::test]
+async fn pi_is_the_remaining_builtin_npx_agent() {
+    let db = init_database_memory().await.unwrap();
+    let repo = SqliteAgentMetadataRepository::new(db.pool().clone());
+    let row = repo.find_builtin_by_backend("pi").await.unwrap().unwrap();
+    assert_eq!(row.command.as_deref(), Some("npx"));
+    assert_eq!(row.args.as_deref(), Some(r#"["-y","pi-acp"]"#));
+    let source: serde_json::Value = serde_json::from_str(row.agent_source_info.as_deref().unwrap()).unwrap();
+    assert_eq!(source["binary_name"], "pi");
+    assert_eq!(source["bridge_binary"], "npx");
 }
