@@ -1368,96 +1368,28 @@ pub async fn materialize_skills_for_agent_with_repo_for_user(
     Ok(resolved)
 }
 
-/// Create symlinks from a set of resolved skills into the agent CLI's
-/// native skills directories inside `workspace`.
+/// Strip a `SKILL.md`'s YAML frontmatter, returning just the body.
 ///
-/// For each relative `skills_rel_dir` (e.g. `.claude/skills`):
-/// 1. Resolve the target directory. Existing `{workspace}/{skills_rel_dir}/`
-///    wins; if the requested leaf is `skills` and sibling `skill` already
-///    exists, reuse that singular directory; otherwise create the requested
-///    directory.
-/// 2. For each `{ name, source_path }` in `skills`, create a symlink
-///    `{target_skills_dir}/{name} -> {source_path}`.
+/// Lives here rather than in a consumer because BOTH skill-delivery channels
+/// hand a body to the agent -- the `[LOAD_SKILL]` text protocol and the
+/// `aioncore skills show` command -- and the two must return identical content.
+/// A second copy is how they would quietly drift apart.
 ///
-/// Existing symlinks/files at the target name are left untouched
-/// (first-write-wins, matches the frontend's lstat-then-skip behavior
-/// before symlink creation). Individual symlink failures are logged and
-/// skipped — skill discovery degrades gracefully, it is not fatal.
-///
-/// Returns the number of symlinks successfully created across all
-/// target dirs.
-pub async fn link_workspace_skills(
-    workspace: &Path,
-    skills_rel_dirs: &[&str],
-    skills: &[ResolvedAgentSkill],
-) -> Result<usize, ExtensionError> {
-    let mut created = 0usize;
-    for rel in skills_rel_dirs {
-        let target_skills_dir = resolve_workspace_skills_dir(workspace, rel).await;
-        tokio::fs::create_dir_all(&target_skills_dir).await?;
-
-        for skill in skills {
-            let target = target_skills_dir.join(&skill.name);
-            match tokio::fs::symlink_metadata(&target).await {
-                // Target already exists — leave it alone.
-                Ok(_) => continue,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    warn!(
-                        target = %target.display(),
-                        error = %e,
-                        "skipping skill link: failed to stat target"
-                    );
-                    continue;
-                }
-            }
-            match link_skill_or_fallback_copy(&skill.source_path, &target).await {
-                Ok(()) => {
-                    debug!(
-                        skill = %skill.name,
-                        target = %target.display(),
-                        "linked workspace skill"
-                    );
-                    created += 1;
-                }
-                Err(e) => {
-                    warn!(
-                        skill = %skill.name,
-                        target = %target.display(),
-                        error = %e,
-                        "failed to link workspace skill"
-                    );
-                }
-            }
-        }
-    }
-    Ok(created)
-}
-
-async fn resolve_workspace_skills_dir(workspace: &Path, skills_rel_dir: &str) -> PathBuf {
-    let requested = workspace.join(skills_rel_dir);
-    if path_is_dir(&requested).await {
-        return requested;
+/// Content without a leading `---`, or with an unterminated block, is returned
+/// unchanged: a malformed skill should still deliver something readable.
+pub fn extract_skill_body(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return content.to_string();
     }
 
-    let rel_path = Path::new(skills_rel_dir);
-    if rel_path.file_name() == Some(std::ffi::OsStr::new("skills"))
-        && let Some(parent) = rel_path.parent()
-    {
-        let singular = workspace.join(parent).join("skill");
-        if path_is_dir(&singular).await {
-            return singular;
-        }
+    let after_open = &trimmed[3..];
+    if let Some(close_idx) = after_open.find("---") {
+        let after_close = &after_open[close_idx + 3..];
+        after_close.trim_start_matches('\n').to_string()
+    } else {
+        content.to_string()
     }
-
-    requested
-}
-
-async fn path_is_dir(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|metadata| metadata.is_dir())
-        .unwrap_or(false)
 }
 
 /// Resolve a skill name to its on-disk source directory using the same
@@ -2126,7 +2058,13 @@ fn zip_error(err: zip::result::ZipError) -> ExtensionError {
 /// ---
 /// Body content here...
 /// ```
-fn parse_frontmatter_fields(content: &str) -> Option<(String, String)> {
+/// Parse a `SKILL.md`'s `name` + `description` frontmatter fields.
+///
+/// Public so the runtime skills domain can build its listing from the SAME
+/// on-disk source `show` reads, rather than from the DB catalog. That keeps the
+/// two commands consistent by construction and independent of whether a startup
+/// catalog sync has run yet.
+pub fn parse_frontmatter_fields(content: &str) -> Option<(String, String)> {
     #[derive(serde::Deserialize)]
     struct SkillFrontmatter {
         #[serde(default)]
@@ -2179,126 +2117,14 @@ fn extract_frontmatter_text(content: &str) -> Option<&str> {
 }
 
 /// Recursively copy a directory.
-async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
-    tokio::fs::create_dir_all(dst).await?;
-
-    let mut entries = tokio::fs::read_dir(src).await?;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let entry_path = entry.path();
-        let dest_path = dst.join(entry.file_name());
-
-        if entry_path.is_dir() {
-            Box::pin(copy_dir_recursive(&entry_path, &dest_path)).await?;
-        } else {
-            tokio::fs::copy(&entry_path, &dest_path).await?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Try to symlink `src` into `dst`; on failure, fall back to a recursive
-/// copy of the source directory.
-///
-/// Motivation: on Windows machines without "Developer Mode" or admin
-/// privileges, `CreateSymbolicLinkW` fails with `os error 1314`
-/// (`ERROR_PRIVILEGE_NOT_HELD`). Auto-injected builtin skills under each
-/// backend's `.<backend>/skills/` directory then become invisible to the
-/// CLI agent — silently degrading the product. Falling back to a copy
-/// keeps the skills discoverable; the trade-off is that copies do not
-/// track upstream changes until the next link pass clears them. The
-/// fallback applies on every platform (Linux/macOS shouldn't normally
-/// hit this, but we keep behavior uniform so a future EPERM/EROFS sandbox
-/// also stays healthy).
-///
-/// Logs a `warn!` with the OS error kind and `raw_os_error` so we can
-/// keep tracking 1314 vs other failure modes in telemetry. No
-/// user-identifying data is logged — only the source/target paths
-/// (already considered safe to log elsewhere in this module) and the
-/// error code.
-async fn link_skill_or_fallback_copy(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
-    match create_symlink_for_link(src, dst).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Surface the raw OS error so dashboards can keep counting 1314
-            // (ERROR_PRIVILEGE_NOT_HELD) separately from other failure modes.
-            let raw_os_error = match &e {
-                ExtensionError::Io(io_err) => io_err.raw_os_error(),
-                _ => None,
-            };
-            warn!(
-                src = %src.display(),
-                dst = %dst.display(),
-                error = %e,
-                raw_os_error = ?raw_os_error,
-                "create_symlink failed; falling back to copy_dir_recursive"
-            );
-            copy_dir_recursive(src, dst).await
-        }
-    }
-}
-
-/// Wrapper around [`create_symlink`] that allows tests to inject a
-/// synthetic failure. In non-test builds this is a thin call-through to
-/// the platform-specific [`create_symlink`] below.
-async fn create_symlink_for_link(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
-    #[cfg(test)]
-    {
-        if test_overrides::should_force_symlink_failure() {
-            // Use PermissionDenied to mimic the shape Windows returns
-            // for ERROR_PRIVILEGE_NOT_HELD. The exact raw_os_error is
-            // platform-specific so we only assert on kind in tests.
-            return Err(ExtensionError::Io(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "forced symlink failure (test)",
-            )));
-        }
-    }
-    create_symlink(src, dst).await
-}
-
-/// Test-only knob to force the symlink primitive to fail, exercising
-/// the [`copy_dir_recursive`] fallback branch on platforms where
-/// symlinking would otherwise succeed (Linux/macOS CI).
-#[cfg(test)]
-mod test_overrides {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    static FORCE_SYMLINK_FAILURE: AtomicBool = AtomicBool::new(false);
-
-    pub fn should_force_symlink_failure() -> bool {
-        FORCE_SYMLINK_FAILURE.load(Ordering::SeqCst)
-    }
-
-    /// RAII guard that flips `FORCE_SYMLINK_FAILURE` on creation and
-    /// resets it on drop. Tests using this guard must be marked
-    /// `#[serial_test::serial]` if any other test in the binary also
-    /// flips the flag — at present only one test uses it, so a guard
-    /// is enough.
-    pub struct ForceFailureGuard;
-
-    impl ForceFailureGuard {
-        pub fn new() -> Self {
-            FORCE_SYMLINK_FAILURE.store(true, Ordering::SeqCst);
-            Self
-        }
-    }
-
-    impl Drop for ForceFailureGuard {
-        fn drop(&mut self) {
-            FORCE_SYMLINK_FAILURE.store(false, Ordering::SeqCst);
-        }
-    }
-}
-
 /// Create a symlink (platform-aware).
 #[cfg(unix)]
-async fn create_symlink(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
+pub(crate) async fn create_symlink(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
     tokio::fs::symlink(src, dst).await.map_err(ExtensionError::Io)
 }
 
 #[cfg(windows)]
-async fn create_symlink(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
+pub(crate) async fn create_symlink(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
     // On Windows, directory symlinks require `SeCreateSymbolicLink`
     // (Developer Mode or Admin), which most users don't have — this is
     // the source of the Sentry I1 family of `os error 1314` failures.
@@ -3348,20 +3174,6 @@ mod tests {
             .any(|entry| entry.file_name().to_string_lossy().starts_with(IMPORT_STAGING_PREFIX))
     }
 
-    fn create_resolved_test_skill(source_root: &Path, name: &str) -> ResolvedAgentSkill {
-        let source_path = source_root.join(name);
-        std::fs::create_dir_all(&source_path).unwrap();
-        std::fs::write(
-            source_path.join(SKILL_MANIFEST_FILE),
-            format!("---\nname: {name}\ndescription: test\n---\nbody"),
-        )
-        .unwrap();
-        ResolvedAgentSkill {
-            name: name.to_owned(),
-            source_path,
-        }
-    }
-
     fn write_test_zip(path: &Path, entries: &[(&str, &str)]) {
         let file = std::fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
@@ -3707,188 +3519,5 @@ mod tests {
             .unwrap();
         assert!(!paths.data_dir.join("agent-skills").exists());
         assert!(!paths.data_dir.join("conversations").exists());
-    }
-
-    // -----------------------------------------------------------------------
-    // Windows symlink → copy_dir_recursive fallback
-    // -----------------------------------------------------------------------
-
-    /// When the platform symlink primitive fails (mirrors Windows
-    /// `os error 1314 ERROR_PRIVILEGE_NOT_HELD`), `link_workspace_skills`
-    /// must materialize the skill via `copy_dir_recursive` instead so the
-    /// CLI agent can still discover it. Forced via `ForceFailureGuard`
-    /// on Linux/macOS CI where symlinking would otherwise succeed.
-    #[tokio::test]
-    async fn link_workspace_skills_falls_back_to_copy_when_symlink_fails() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("workspace");
-        let source_root = tmp.path().join("sources");
-
-        // Seed a fake skill source directory with a SKILL.md and a
-        // nested file so we can verify the copy is recursive.
-        let skill_source = source_root.join("my-skill");
-        std::fs::create_dir_all(skill_source.join("nested")).unwrap();
-        std::fs::write(
-            skill_source.join(SKILL_MANIFEST_FILE),
-            "---\nname: my-skill\ndescription: test\n---\nbody",
-        )
-        .unwrap();
-        std::fs::write(skill_source.join("nested").join("data.txt"), "payload").unwrap();
-
-        let resolved = vec![ResolvedAgentSkill {
-            name: "my-skill".to_owned(),
-            source_path: skill_source.clone(),
-        }];
-
-        // Force the symlink primitive to fail for the duration of this
-        // test, exercising the copy fallback branch.
-        let _guard = test_overrides::ForceFailureGuard::new();
-
-        let created = link_workspace_skills(&workspace, &[".claude/skills"], &resolved)
-            .await
-            .expect("link_workspace_skills should succeed via copy fallback");
-        assert_eq!(created, 1, "exactly one skill should be materialized");
-
-        let target = workspace.join(".claude/skills").join("my-skill");
-        assert!(target.exists(), "target directory must exist");
-        // It must NOT be a symlink — fallback path uses copy_dir_recursive.
-        let meta = tokio::fs::symlink_metadata(&target).await.unwrap();
-        assert!(
-            !meta.file_type().is_symlink(),
-            "fallback must produce a real directory, not a symlink"
-        );
-        assert!(target.is_dir(), "target must be a directory");
-
-        // Verify the contents were copied recursively.
-        let manifest = std::fs::read_to_string(target.join(SKILL_MANIFEST_FILE)).unwrap();
-        assert!(manifest.contains("name: my-skill"));
-        let nested = std::fs::read_to_string(target.join("nested").join("data.txt")).unwrap();
-        assert_eq!(nested, "payload");
-    }
-
-    #[tokio::test]
-    async fn link_workspace_skills_uses_existing_singular_skill_dir() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("workspace");
-        let source_root = tmp.path().join("sources");
-        let existing_skill_dir = workspace.join(".claude").join("skill");
-        std::fs::create_dir_all(&existing_skill_dir).unwrap();
-
-        let resolved = vec![create_resolved_test_skill(&source_root, "my-skill")];
-
-        let created = link_workspace_skills(&workspace, &[".claude/skills"], &resolved)
-            .await
-            .expect("link_workspace_skills should use existing singular skill dir");
-        assert_eq!(created, 1, "exactly one skill should be materialized");
-
-        assert!(
-            existing_skill_dir.join("my-skill").exists(),
-            "existing singular skill dir should receive the skill"
-        );
-        assert!(
-            !workspace.join(".claude").join("skills").exists(),
-            "plural skills dir should not be created when singular skill dir already exists"
-        );
-    }
-
-    #[tokio::test]
-    async fn link_workspace_skills_creates_requested_dir_inside_existing_agent_dir() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("workspace");
-        let source_root = tmp.path().join("sources");
-        std::fs::create_dir_all(workspace.join(".codex")).unwrap();
-
-        let resolved = vec![create_resolved_test_skill(&source_root, "my-skill")];
-
-        let created = link_workspace_skills(&workspace, &[".codex/skills"], &resolved)
-            .await
-            .expect("link_workspace_skills should create missing skills dir");
-        assert_eq!(created, 1, "exactly one skill should be materialized");
-
-        assert!(
-            workspace.join(".codex/skills/my-skill").is_dir(),
-            "missing skills dir should be created under the existing agent dir"
-        );
-    }
-
-    #[tokio::test]
-    async fn link_workspace_skills_prefers_existing_plural_dir_over_singular_sibling() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("workspace");
-        let source_root = tmp.path().join("sources");
-        let plural_dir = workspace.join(".gemini").join("skills");
-        let singular_dir = workspace.join(".gemini").join("skill");
-        std::fs::create_dir_all(&plural_dir).unwrap();
-        std::fs::create_dir_all(&singular_dir).unwrap();
-
-        let resolved = vec![create_resolved_test_skill(&source_root, "my-skill")];
-
-        let created = link_workspace_skills(&workspace, &[".gemini/skills"], &resolved)
-            .await
-            .expect("link_workspace_skills should prefer the requested existing dir");
-        assert_eq!(created, 1, "exactly one skill should be materialized");
-
-        assert!(
-            plural_dir.join("my-skill").is_dir(),
-            "existing plural skills dir should receive the skill"
-        );
-        assert!(
-            !singular_dir.join("my-skill").exists(),
-            "singular sibling should remain untouched when requested dir exists"
-        );
-    }
-
-    /// Windows-only: directory linking must go through an NTFS junction
-    /// (created by the `junction` crate) rather than `symlink_dir`, so
-    /// the link works for users without Developer Mode. We assert the
-    /// resulting path is a reparse point (junction is reported as a
-    /// symlink by `symlink_metadata().file_type().is_symlink()`) and
-    /// that the source contents are reachable through the link.
-    ///
-    /// The test is skipped on non-Windows platforms.
-    #[cfg(target_os = "windows")]
-    #[tokio::test]
-    async fn link_workspace_skills_uses_junction_on_windows() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("workspace");
-        let source_root = tmp.path().join("sources");
-
-        let skill_source = source_root.join("my-skill");
-        std::fs::create_dir_all(skill_source.join("nested")).unwrap();
-        std::fs::write(
-            skill_source.join(SKILL_MANIFEST_FILE),
-            "---\nname: my-skill\ndescription: test\n---\nbody",
-        )
-        .unwrap();
-        std::fs::write(skill_source.join("nested").join("data.txt"), "payload").unwrap();
-
-        let resolved = vec![ResolvedAgentSkill {
-            name: "my-skill".to_owned(),
-            source_path: skill_source.clone(),
-        }];
-
-        let created = link_workspace_skills(&workspace, &[".claude/skills"], &resolved)
-            .await
-            .expect("link_workspace_skills should succeed via junction");
-        assert_eq!(created, 1, "exactly one skill should be materialized");
-
-        let target = workspace.join(".claude/skills").join("my-skill");
-        assert!(target.exists(), "target path must exist");
-
-        // Junctions are reparse points; `symlink_metadata` reports them
-        // as symlinks on Windows. The directory copy fallback would
-        // produce a real directory (is_symlink() == false).
-        let meta = std::fs::symlink_metadata(&target).unwrap();
-        assert!(
-            meta.file_type().is_symlink(),
-            "Windows directory link must be a junction (reparse point), \
-             not a copied directory"
-        );
-
-        // Reading through the link must surface the source contents.
-        let manifest = std::fs::read_to_string(target.join(SKILL_MANIFEST_FILE)).unwrap();
-        assert!(manifest.contains("name: my-skill"));
-        let nested = std::fs::read_to_string(target.join("nested").join("data.txt")).unwrap();
-        assert_eq!(nested, "payload");
     }
 }

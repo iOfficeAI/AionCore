@@ -32,15 +32,6 @@ impl SkillResolver for EmptySkillResolver {
     async fn resolve_skills(&self, _names: &[String]) -> Vec<ResolvedAgentSkill> {
         Vec::new()
     }
-
-    async fn link_workspace_skills(
-        &self,
-        _workspace: &std::path::Path,
-        _rel_dirs: &[&str],
-        _skills: &[ResolvedAgentSkill],
-    ) -> usize {
-        0
-    }
 }
 
 async fn setup_repo() -> (Arc<SqliteConversationRepository>, aionui_db::Database) {

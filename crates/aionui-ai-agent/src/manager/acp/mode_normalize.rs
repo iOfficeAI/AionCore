@@ -144,6 +144,7 @@ mod tests {
             args: vec![],
             env: vec![],
             native_skills_dirs: None,
+            skill_delivery: None,
             behavior_policy: BehaviorPolicy::default(),
             yolo_id: yolo_id.map(ToOwned::to_owned),
             sort_order: 3130,

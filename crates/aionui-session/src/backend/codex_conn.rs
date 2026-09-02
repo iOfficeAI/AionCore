@@ -476,6 +476,48 @@ fn initialize_params() -> HandshakeParams {
     }))
 }
 
+/// `skills/extraRoots/set` params, or `None` when this session has no skill view
+/// to register (a non-protocol vendor, or an empty skill snapshot).
+///
+/// Wire shape verified against codex-cli 0.146.0's own generated schema
+/// (`codex app-server generate-json-schema`, `v2/SkillsExtraRootsSetParams.json`):
+/// the only property is `extraRoots`, an array of `AbsolutePathBuf`, and it is
+/// required. A live `codex app-server --stdio` probe confirmed the behaviour
+/// end-to-end: the request answers `{}`, codex then pushes a `skills/changed`
+/// notification, and `skills/list` reports the skill with `errors: []`.
+///
+/// Two properties that probe pinned, both load-bearing here:
+///  * A SYMLINKED skill directory is discovered — which is what the whole view
+///    directory design depends on.
+///  * `path` comes back as the REAL source path, not the link. So a CLI checking
+///    canonical paths would not match a view entry, which is why allow-listing
+///    targets the real source dirs instead.
+///
+/// ⚠️ R2' HARD CONSTRAINT — DO NOT REMOVE.
+/// `extraRoots` is PROCESS-scoped, not thread-scoped. Two independent
+/// confirmations: the params carry NO `threadId` (thread-level requests such as
+/// `ThreadForkParams` do), and the live probe reported the registered skill with
+/// `scope: "user"`. Isolation (one conversation's skills staying out of another)
+/// therefore holds ONLY because this file opens one process per logical session —
+/// see the `CodexConnection` doc comment, "P1 opens one process per logical
+/// session (multiplexing is a later refinement)".
+///
+/// If thread multiplexing is ever enabled, process-wide extra roots WILL leak one
+/// conversation's skills into another. Codex layer-1 delivery and thread reuse
+/// are MUTUALLY EXCLUSIVE. Before enabling reuse, either switch to per-skill
+/// `skills/config/write { name|path, enabled }` (present in the same schema) or
+/// drop codex to `injected`, and land a cross-conversation skill isolation
+/// regression test in the SAME change.
+fn skills_extra_roots_params(config: &SessionConfig) -> Option<HandshakeParams> {
+    let root = config
+        .init
+        .skill_view_skills_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(HandshakeParams(json!({ "extraRoots": [root] })))
+}
+
 /// `thread/start` params (Fresh / lost-Resume). approvalPolicy/sandbox are valid
 /// AskForApproval/SandboxMode enum values; cwd threaded from config.
 ///
@@ -1381,6 +1423,25 @@ impl CodexSessionBackend {
         *self.resume_poison.lock().await = None;
         self.write_frame(initialize_params().into_frame(self.next_rpc_id(), "initialize"))
             .await?;
+
+        // Layer 1 (protocol): register this conversation's skill view. Sent after
+        // `initialize` (the probe order) and before thread start/resume so the
+        // first turn already sees the skills.
+        //
+        // Fire-and-forget by design: the response is an empty object, so there is
+        // nothing to claim, and a rejection must NOT fail the session — layer 2's
+        // dual channel still covers skills. A rejection therefore surfaces only as
+        // codex-side output, which is an accepted gap rather than a silent one.
+        if let Some(params) = skills_extra_roots_params(&self.wake.config) {
+            self.write_frame(params.into_frame(self.next_rpc_id(), "skills/extraRoots/set"))
+                .await?;
+            tracing::info!(
+                backend = "codex",
+                mode = "protocol",
+                "skill_delivery: registered the session skill view as a codex extra root"
+            );
+        }
+
         match mode {
             HandshakeMode::Resume(tid) => {
                 *self.thread_binding.lock().await = Some(tid.to_string());
@@ -7813,6 +7874,57 @@ mod tests {
             "experimentalApi must NOT be top-level (codex ignores it there)"
         );
         assert_eq!(frame["params"]["clientInfo"]["name"], "aionui-session");
+    }
+
+    /// Exact wire shape, per codex-cli 0.146.0's own generated schema
+    /// (`v2/SkillsExtraRootsSetParams.json`): one required `extraRoots` array of
+    /// absolute paths, and NOTHING else. The absent `threadId` is the schema-level
+    /// evidence that this request is process-scoped (see R2' on the builder).
+    #[test]
+    fn extra_roots_frame_carries_only_the_skills_root() {
+        let params = skills_extra_roots_params(&SessionConfig {
+            init: crate::backend::SessionInit {
+                skill_view_skills_dir: Some("/data/session-skills/u/c/skills".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .expect("a session with a skill view must produce a frame");
+        let frame = params.into_frame(3, "skills/extraRoots/set");
+
+        assert_eq!(frame["method"], "skills/extraRoots/set");
+        assert_eq!(frame["params"]["extraRoots"][0], "/data/session-skills/u/c/skills");
+        assert_eq!(
+            frame["params"].as_object().map(|o| o.len()),
+            Some(1),
+            "the schema declares exactly one property; anything extra is a guess"
+        );
+        assert!(
+            frame["params"].get("threadId").is_none(),
+            "no threadId in the schema — the request is process-scoped (R2')"
+        );
+    }
+
+    /// The SKILLS root, not the plugin root. codex scans `{root}/{name}/SKILL.md`
+    /// directly, so handing it the plugin root would find nothing — and it answers
+    /// `{}` either way, so the mistake would be silent.
+    #[test]
+    fn no_skill_view_means_no_extra_roots_frame() {
+        assert!(
+            skills_extra_roots_params(&SessionConfig::default()).is_none(),
+            "a conversation with no skills must not touch the process-wide extra roots"
+        );
+        assert!(
+            skills_extra_roots_params(&SessionConfig {
+                init: crate::backend::SessionInit {
+                    skill_view_skills_dir: Some("   ".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .is_none(),
+            "a blank path must be treated as absent, not registered as a root"
+        );
     }
 
     /// thread/start params thread cwd from config; approvalPolicy/sandbox are valid

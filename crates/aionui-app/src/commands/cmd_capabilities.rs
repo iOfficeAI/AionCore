@@ -121,6 +121,21 @@ fn data() -> Value {
                     "does_not_accept_identity_authority_from_stdin": true,
                     "per_user_feature_switch": "list and send-message answer feature_disabled while the user has cross-session messaging switched off; capabilities stays available because it reads no conversation data"
                 }
+            },
+            {
+                "name": "skills",
+                "mode": "read-only",
+                "description": "Read the skills enabled in THIS conversation: list them, get a skill's full body plus its absolute directory, and read its supplementary files.",
+                "contract": "agent-facing-skills-cli",
+                "contract_command": "skills capabilities",
+                "invocation": "aioncore skills capabilities",
+                "runtime_required": ["AIONUI_BASE_URL", "AIONUI_CONVERSATION_ID", "AIONUI_USER_ID", "AIONUI_RUNTIME_TOKEN"],
+                "runtime_free_commands": ["skills capabilities"],
+                "safety": {
+                    "can_write": false,
+                    "read_only": true,
+                    "scoped_to_conversation_snapshot": true
+                }
             }
         ],
         "non_agent_subcommands": [
@@ -174,7 +189,9 @@ mod tests {
 
     use super::*;
     use crate::cli::Cli;
-    use crate::commands::{config_capabilities, diagnose_capabilities, session_capabilities, team_capabilities};
+    use crate::commands::{
+        config_capabilities, diagnose_capabilities, session_capabilities, skills_capabilities, team_capabilities,
+    };
 
     /// `capabilities` is its own entrypoint — `data()` declares it under
     /// `entrypoint`, not as one of the domains it indexes.
@@ -255,6 +272,7 @@ mod tests {
             ("diagnose", diagnose_capabilities::data()),
             ("team", team_capabilities::data()),
             ("session", session_capabilities::data()),
+            ("skills", skills_capabilities::data()),
         ] {
             let entry = domains
                 .iter()
@@ -276,5 +294,22 @@ mod tests {
                 "`{name}` invocation should be runnable verbatim"
             );
         }
+    }
+
+    /// Not covered by the structural invariants above: a read-only domain must
+    /// not advertise write authority. An agent reads `safety.can_write` to decide
+    /// whether a command is safe to attempt at all.
+    #[test]
+    fn the_skills_domain_is_declared_read_only() {
+        let skills = data()["domains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|domain| domain["name"] == "skills")
+            .expect("skills domain")
+            .clone();
+        assert_eq!(skills["mode"], "read-only");
+        assert_eq!(skills["safety"]["can_write"], false);
+        assert_eq!(skills["safety"]["scoped_to_conversation_snapshot"], true);
     }
 }

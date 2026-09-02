@@ -925,15 +925,6 @@ async fn setup_with_conv_runtime_and_agent_metadata() -> (
         ) -> Vec<aionui_conversation::skill_resolver::ResolvedAgentSkill> {
             Vec::new()
         }
-
-        async fn link_workspace_skills(
-            &self,
-            _workspace: &std::path::Path,
-            _rel_dirs: &[&str],
-            _skills: &[aionui_conversation::skill_resolver::ResolvedAgentSkill],
-        ) -> usize {
-            0
-        }
     }
 
     let stub_conv_repo = Arc::new(StubConvRepo::new(pool.clone()));
@@ -1042,15 +1033,6 @@ async fn setup_with_assistant_repos() -> (
             _names: &[String],
         ) -> Vec<aionui_conversation::skill_resolver::ResolvedAgentSkill> {
             Vec::new()
-        }
-
-        async fn link_workspace_skills(
-            &self,
-            _workspace: &std::path::Path,
-            _rel_dirs: &[&str],
-            _skills: &[aionui_conversation::skill_resolver::ResolvedAgentSkill],
-        ) -> usize {
-            0
         }
     }
 
@@ -2806,6 +2788,7 @@ async fn create_for_conversation_helper_uses_codex_canonical_full_auto_mode_from
             args: codex.args.as_deref(),
             env: codex.env.as_deref(),
             native_skills_dirs: codex.native_skills_dirs.as_deref(),
+            skill_delivery: None,
             behavior_policy: codex.behavior_policy.as_deref(),
             yolo_id: None,
             agent_capabilities: codex.agent_capabilities.as_deref(),

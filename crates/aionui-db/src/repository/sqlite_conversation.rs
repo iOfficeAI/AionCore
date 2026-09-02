@@ -609,6 +609,13 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(rows)
     }
 
+    async fn list_all_conversation_ids(&self) -> Result<Vec<(String, String)>, DbError> {
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT user_id, id FROM conversations")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
+    }
+
     async fn list_associated(&self, user_id: &str, conversation_id: &str) -> Result<Vec<ConversationRow>, DbError> {
         // First get the target conversation's workspace
         let target = sqlx::query_as::<_, ConversationRow>("SELECT * FROM conversations WHERE id = ? AND user_id = ?")
@@ -2233,6 +2240,38 @@ mod tests {
 
         let result = repo.list_by_cron_job(SYSTEM_USER_ID, "cron_1").await.unwrap();
         assert_eq!(result.len(), 2);
+    }
+
+    /// Feeds the startup sweep that reaps orphan skill view directories, so it
+    /// must span USERS: scoping it to one user would make every other user's
+    /// conversation look dead and delete their views.
+    #[tokio::test]
+    async fn list_all_conversation_ids_spans_users() {
+        let (repo, db) = setup().await;
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES ('user_b', 'local', 'user_b', 'hash', 'active', 0, 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let mut a = sample_conversation(SYSTEM_USER_ID);
+        a.id = "conv_a".into();
+        repo.create(&a).await.unwrap();
+        let mut b = sample_conversation("user_b");
+        b.id = "conv_b".into();
+        repo.create(&b).await.unwrap();
+
+        let mut ids = repo.list_all_conversation_ids().await.unwrap();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                (SYSTEM_USER_ID.to_owned(), "conv_a".to_owned()),
+                ("user_b".to_owned(), "conv_b".to_owned()),
+            ]
+        );
     }
 
     #[tokio::test]

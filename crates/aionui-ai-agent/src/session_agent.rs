@@ -1502,6 +1502,11 @@ pub struct SessionBuildInputs<'a> {
     /// generic alias resumes by handing the raw alias to the backend (claude rejects
     /// an unknown permission-mode id; codex gets a non-native mode → wrong policy).
     pub metadata: &'a aionui_api_types::AgentMetadata,
+    /// This conversation's resolved skill delivery: the already-substituted
+    /// launch flags for an `argv` vendor, the skills root for a `protocol` one,
+    /// and the real skill source dirs. Resolved by the factory so this function
+    /// stays free of skill-resolution I/O.
+    pub skill_delivery: crate::factory::ResolvedSkillDelivery,
     /// The persisted runtime snapshot, when present. Its `current_mode_id` /
     /// `current_model_id` are the interactive-switch-persisted selections and take
     /// precedence over the create-time `config` values — the same precedence
@@ -1733,6 +1738,7 @@ pub async fn build_antigravity_instance(
         workspace,
         config,
         metadata,
+        skill_delivery,
         session_snapshot,
         backend_session_id,
         mcp_server_repo,
@@ -1775,7 +1781,19 @@ pub async fn build_antigravity_instance(
     let init = SessionInit {
         mcp_servers,
         skills: config.skills.clone(),
-        preset_context: config.preset_context.clone(),
+        // The COMPOSED block (preset context + skills index + dual-channel
+        // instructions), not the raw preset context: agy has no prompt pipeline,
+        // so this is its only injection channel. Falls back to the raw context so
+        // a layer-1 agy (should one ever exist) still gets its assistant rules.
+        preset_context: skill_delivery
+            .injected_prefix
+            .clone()
+            .or_else(|| config.preset_context.clone()),
+        // agy is a layer-2 vendor, so no protocol root. The skill dirs still
+        // travel: agy needs name+path to build its slash-command list, which it
+        // used to get by scanning the workspace.
+        skill_view_skills_dir: None,
+        skill_dirs: skill_delivery.skill_dirs.clone(),
         session_snapshot: None,
         resume: matches!(spec, aionui_session::SessionSpec::Resume { .. }),
     };
@@ -1790,6 +1808,9 @@ pub async fn build_antigravity_instance(
         // installs themselves, so there is no bundled path to resolve and the
         // backend always spawns the `agy` on PATH.
         cli_program: None,
+        // agy is layer 2, so this carries only the allow-list entries (one
+        // `--add-dir` per enabled skill) and never a plugin flag.
+        extra_args: skill_delivery.plan.extra_args.clone(),
         ..Default::default()
     };
     session_config.spawn_env = assemble_spawn_env(&metadata.env, runtime_env);
@@ -1845,6 +1866,7 @@ pub async fn build_session_instance(
         workspace,
         config,
         metadata,
+        skill_delivery,
         session_snapshot,
         backend_session_id,
         mcp_server_repo,
@@ -1902,6 +1924,11 @@ pub async fn build_session_instance(
         mcp_servers,
         skills: config.skills.clone(),
         preset_context: config.preset_context.clone(),
+        // Layer 1. `Some` only for a protocol vendor (codex): the backend has to
+        // send the skills root itself. An argv vendor (claude) gets its flags
+        // through `extra_args` below instead.
+        skill_view_skills_dir: skill_delivery.plan.protocol_skills_root.clone(),
+        skill_dirs: skill_delivery.skill_dirs.clone(),
         // acp/codex resume via SessionSpec::Resume; no in-band snapshot needed.
         session_snapshot: None,
         resume: matches!(spec, SessionSpec::Resume { .. }),
@@ -1923,6 +1950,17 @@ pub async fn build_session_instance(
         // keeps the bare name so the spawn error stays diagnosable. Detection
         // (cli_probe) stays PATH-only and is unaffected.
         cli_program: resolve_session_cli_program(backend_label, metadata),
+        // Layer 1 (argv). `--plugin-dir <view>` plus one `--add-dir <source>` per
+        // enabled skill, already substituted by the delivery plan. Empty for a
+        // non-argv vendor or an empty snapshot.
+        //
+        // Deliberately routed through `extra_args` rather than hard-coded in
+        // `build_claude_init_args`: that makes claude's layer-1 delivery
+        // DATA-driven like every ACP vendor's, so a flag change is a registry
+        // row rather than a code change. claude's builder positions its own init
+        // flags first and appends these after, with no de-duplication, so the
+        // repeated `--add-dir` survives intact (probe-verified).
+        extra_args: skill_delivery.plan.extra_args.clone(),
         ..Default::default()
     };
 
@@ -4764,6 +4802,7 @@ mod build_mapping_tests {
             args: vec![],
             env: vec![],
             native_skills_dirs: None,
+            skill_delivery: None,
             behavior_policy: BehaviorPolicy::default(),
             yolo_id: yolo_id.map(ToOwned::to_owned),
             sort_order: 0,
@@ -4973,6 +5012,9 @@ mod build_mapping_tests {
                     .into_owned(),
                 config: &config,
                 metadata: &metadata,
+                // This test is about MCP injection; skill delivery contributes
+                // nothing so the argv it asserts on stays unchanged.
+                skill_delivery: Default::default(),
                 session_snapshot: None,
                 backend_session_id: None,
                 mcp_server_repo: Some(&repo),

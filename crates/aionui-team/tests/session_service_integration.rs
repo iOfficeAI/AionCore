@@ -2595,6 +2595,7 @@ fn make_agent_metadata_row(id: &str, backend: &str, icon: &str) -> AgentMetadata
         args: None,
         env: None,
         native_skills_dirs: None,
+        skill_delivery: None,
         behavior_policy: None,
         yolo_id: None,
         agent_capabilities: None,

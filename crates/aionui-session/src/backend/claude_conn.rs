@@ -4028,6 +4028,58 @@ mod tests {
         );
     }
 
+    /// Layer-1 skill delivery arrives as already-substituted `extra_args`, so the
+    /// spawn must carry the plugin root AND one allow-list entry per skill.
+    ///
+    /// Load-bearing: `--add-dir` is declared variadic in `claude --help`
+    /// (`<directories...>`), so it would be easy to assume repeating the flag
+    /// collapses to the last value. A live paired probe against claude 2.1.231
+    /// showed the opposite -- with two `--add-dir` flags both out-of-cwd files
+    /// were read; with none, both were refused. This test pins the wiring half of
+    /// that: `prepend_args` is a plain concat and must not de-duplicate.
+    #[test]
+    fn every_skill_delivery_arg_survives_into_the_spawn() {
+        let init = build_claude_init_args(&SessionConfig {
+            mode: Some("default".into()),
+            ..Default::default()
+        });
+        let extra = vec![
+            "--plugin-dir".to_string(),
+            "/data/session-skills/u/c".to_string(),
+            "--add-dir".to_string(),
+            "/src/cron".to_string(),
+            "--add-dir".to_string(),
+            "/src/pdf".to_string(),
+        ];
+        let spawn = prepend_args(&init, &extra);
+
+        assert_eq!(
+            spawn.iter().filter(|arg| *arg == "--add-dir").count(),
+            2,
+            "one allow-list entry per skill must survive; the flag is repeated, not merged"
+        );
+        assert!(spawn.windows(2).any(|w| w == ["--add-dir", "/src/cron"]));
+        assert!(spawn.windows(2).any(|w| w == ["--add-dir", "/src/pdf"]));
+        assert!(
+            spawn
+                .windows(2)
+                .any(|w| w == ["--plugin-dir", "/data/session-skills/u/c"])
+        );
+        // The fail-closed flag must still be present and unmoved: skill delivery
+        // must never displace the permission mode.
+        assert!(spawn.windows(2).any(|w| w == ["--permission-mode", "default"]));
+    }
+
+    /// A vendor with no skills contributes no args, so the spawn is unchanged.
+    #[test]
+    fn no_skill_delivery_args_leaves_the_spawn_untouched() {
+        let init = build_claude_init_args(&SessionConfig {
+            mode: Some("default".into()),
+            ..Default::default()
+        });
+        assert_eq!(prepend_args(&init, &[]), init);
+    }
+
     /// `prepend_args` keeps init flags BEFORE caller `extra_args` (a duplicate caller
     /// flag then wins by appearing later on the CLI).
     #[test]

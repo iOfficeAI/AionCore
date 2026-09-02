@@ -31,6 +31,8 @@ mod session_tools;
 mod shell;
 mod sidebar;
 mod skill;
+mod skill_delivery;
+mod skill_runtime;
 mod system;
 mod team;
 mod team_mcp;
@@ -179,6 +181,12 @@ pub use skill::{
     ScanForSkillsRequest, ScanForSkillsResponse, ScannedSkillResponse, SkillImportLimitsResponse,
     SkillImportRecordResponse, SkillListItemResponse, SkillPathsResponse, SkillSourceResponse,
     WriteAssistantRuleRequest,
+};
+pub use skill_delivery::{SkillDelivery, SkillDeliveryMode, SkillDeliveryParse, parse_skill_delivery};
+pub use skill_runtime::{
+    RuntimeSkillFileQuery, RuntimeSkillFileResponse, RuntimeSkillListItem, RuntimeSkillListResponse,
+    RuntimeSkillShowResponse, SKILL_RUNTIME_SCHEMA_VERSION, SkillRuntimeEnvelope, SkillRuntimeErrorCode,
+    SkillRuntimeErrorPayload, SkillRuntimeMeta,
 };
 pub use system::{
     ClientPreferencesResponse, CurrentUserResponse, FeedbackDiagnosticsContextResponse,

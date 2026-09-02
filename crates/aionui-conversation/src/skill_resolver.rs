@@ -2,11 +2,14 @@
 //! `ConversationService` can compute the initial snapshot without forcing
 //! every test setup to stand up a real `SkillPaths` and skill repository.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use aionui_db::ISkillRepository;
 pub use aionui_extension::ResolvedAgentSkill;
+// Frontmatter stripping lives in `aionui-extension` so this channel and the
+// `aioncore skills show` command return byte-identical bodies. A local copy is
+// how the two would quietly drift.
+use aionui_extension::skill_service::extract_skill_body;
 use async_trait::async_trait;
 use tracing::warn;
 
@@ -14,6 +17,14 @@ use tracing::warn;
 pub struct LoadedAgentSkill {
     pub name: String,
     pub body: String,
+    /// Absolute skill root.
+    ///
+    /// Load-bearing, not decoration: skill bodies reference their own files
+    /// relatively (`references/workflows.md`, `scripts/init_skill.py`), and
+    /// without a stated root the agent resolves those against its CWD -- the
+    /// workspace. That either fails silently or, worse, reads an unrelated
+    /// same-named user file.
+    pub source_path: std::path::PathBuf,
 }
 
 #[async_trait]
@@ -44,11 +55,26 @@ pub trait SkillResolver: Send + Sync {
         load_resolved_skill_bodies(&resolved).await
     }
 
-    /// Create symlinks pointing at each resolved skill inside the given
-    /// workspace's per-backend native skills directories. `rel_dirs` is
-    /// the list of relative paths (e.g. `.claude/skills`) to populate.
-    /// Returns the number of symlinks successfully created.
-    async fn link_workspace_skills(&self, workspace: &Path, rel_dirs: &[&str], skills: &[ResolvedAgentSkill]) -> usize;
+    /// Rebuild this conversation's skill VIEW directory under AionUi's own data
+    /// dir, so the agent CLI can be pointed at it instead of at the user's
+    /// workspace. Returns the number of links created.
+    ///
+    /// Called unconditionally, not only for vendors that consume it: the view is
+    /// AionUi's own tree, and building it for every conversation means a delivery
+    /// mode flipped in the registry needs no per-conversation backfill.
+    ///
+    /// Defaults to a no-op so the many test stubs in this workspace do not each
+    /// need a body. The default cannot mask a PRODUCTION regression: the real
+    /// implementation is covered by
+    /// `extension_resolver_syncs_and_removes_a_real_view_directory` below, plus
+    /// the service-level tests that assert this method was actually called.
+    async fn sync_skill_view(&self, _user_id: &str, _conversation_id: &str, _skills: &[ResolvedAgentSkill]) -> usize {
+        0
+    }
+
+    /// Drop this conversation's skill view directory. No-op by default, for the
+    /// same reason as [`Self::sync_skill_view`].
+    async fn remove_skill_view(&self, _user_id: &str, _conversation_id: &str) {}
 }
 
 /// Production adapter backed by `aionui_extension::skill_service`.
@@ -71,6 +97,7 @@ async fn load_resolved_skill_bodies(skills: &[ResolvedAgentSkill]) -> Vec<Loaded
             Ok(content) => loaded.push(LoadedAgentSkill {
                 name: skill.name.clone(),
                 body: extract_skill_body(&content),
+                source_path: skill.source_path.clone(),
             }),
             Err(e) => {
                 warn!(
@@ -83,21 +110,6 @@ async fn load_resolved_skill_bodies(skills: &[ResolvedAgentSkill]) -> Vec<Loaded
         }
     }
     loaded
-}
-
-fn extract_skill_body(content: &str) -> String {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        return content.to_string();
-    }
-
-    let after_open = &trimmed[3..];
-    if let Some(close_idx) = after_open.find("---") {
-        let after_close = &after_open[close_idx + 3..];
-        after_close.trim_start_matches('\n').to_string()
-    } else {
-        content.to_string()
-    }
 }
 
 #[async_trait]
@@ -143,7 +155,7 @@ impl SkillResolver for ExtensionSkillResolver {
             &self.paths,
             self.skill_repo.as_ref(),
             user_id,
-            "workspace-link",
+            "skill-resolve",
             names,
         )
         .await
@@ -159,20 +171,34 @@ impl SkillResolver for ExtensionSkillResolver {
         }
     }
 
-    async fn link_workspace_skills(&self, workspace: &Path, rel_dirs: &[&str], skills: &[ResolvedAgentSkill]) -> usize {
-        if rel_dirs.is_empty() || skills.is_empty() {
-            return 0;
-        }
-        match aionui_extension::link_workspace_skills(workspace, rel_dirs, skills).await {
+    async fn sync_skill_view(&self, user_id: &str, conversation_id: &str, skills: &[ResolvedAgentSkill]) -> usize {
+        match aionui_extension::skill_view::rebuild_view(&self.paths.data_dir, user_id, conversation_id, skills).await {
             Ok(n) => n,
             Err(e) => {
-                tracing::warn!(
-                    workspace = %workspace.display(),
+                // `error`, not `warn`: the view is layer 1's only channel, so an
+                // unwritable one means native delivery is unavailable for this
+                // session. Not fatal -- layer 2's dual channel still covers it,
+                // so the conversation must still start.
+                tracing::error!(
+                    user_id = %user_id,
+                    conversation_id = %conversation_id,
                     error = %e,
-                    "link_workspace_skills failed"
+                    "sync_skill_view failed; native skill delivery unavailable for this session"
                 );
                 0
             }
+        }
+    }
+
+    async fn remove_skill_view(&self, user_id: &str, conversation_id: &str) {
+        if let Err(e) = aionui_extension::skill_view::remove_view(&self.paths.data_dir, user_id, conversation_id).await
+        {
+            tracing::warn!(
+                user_id = %user_id,
+                conversation_id = %conversation_id,
+                error = %e,
+                "remove_skill_view failed; the orphan view will be reaped at next startup"
+            );
         }
     }
 }
@@ -192,21 +218,13 @@ impl SkillResolver for FixedSkillResolver {
     async fn resolve_skills(&self, _names: &[String]) -> Vec<ResolvedAgentSkill> {
         Vec::new()
     }
-
-    async fn link_workspace_skills(
-        &self,
-        _workspace: &Path,
-        _rel_dirs: &[&str],
-        _skills: &[ResolvedAgentSkill],
-    ) -> usize {
-        0
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use aionui_db::{SqliteSkillRepository, UpsertSkillParams};
+    use std::path::Path;
 
     fn write_skill(dir: &Path, name: &str, description: &str) {
         let skill_dir = dir.join(name);
@@ -222,6 +240,46 @@ mod tests {
     fn extract_skill_body_removes_frontmatter() {
         let content = "---\nname: cron\ndescription: Cron\n---\nCron body";
         assert_eq!(extract_skill_body(content), "Cron body");
+    }
+
+    /// `sync_skill_view` / `remove_skill_view` default to no-ops on the trait so
+    /// the workspace's many test stubs need no bodies. This test is what keeps
+    /// that default from masking a production regression: it drives the REAL
+    /// implementation and asserts the view directory actually appears on disk
+    /// under `{data_dir}/session-skills/{user}/{conversation}/`.
+    #[tokio::test]
+    async fn extension_resolver_syncs_and_removes_a_real_view_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = Arc::new(aionui_extension::SkillPaths {
+            data_dir: tmp.path().to_path_buf(),
+            user_skills_dir: tmp.path().join("skills"),
+            cron_skills_dir: tmp.path().join("cron").join("skills"),
+            builtin_skills_dir: tmp.path().join("builtin-skills"),
+            builtin_rules_dir: tmp.path().join("builtin-rules"),
+            assistant_rules_dir: tmp.path().join("assistant-rules"),
+            assistant_skills_dir: tmp.path().join("assistant-skills"),
+        });
+        let sources = tmp.path().join("sources");
+        write_skill(&sources, "cron", "Schedule stuff");
+
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(db.pool().clone()));
+        let resolver = ExtensionSkillResolver::new(paths.clone(), repo);
+
+        let resolved = vec![ResolvedAgentSkill {
+            name: "cron".to_owned(),
+            source_path: sources.join("cron"),
+        }];
+        assert_eq!(resolver.sync_skill_view("user_a", "conv_1", &resolved).await, 1);
+
+        let view = aionui_extension::skill_view::view_dir(&paths.data_dir, "user_a", "conv_1").unwrap();
+        assert!(view.join(".claude-plugin").join("plugin.json").is_file());
+        assert!(view.join("skills").join("cron").join("SKILL.md").is_file());
+
+        resolver.remove_skill_view("user_a", "conv_1").await;
+        assert!(!view.exists());
+        // The link is gone; the real source must not be.
+        assert!(sources.join("cron").join("SKILL.md").is_file());
     }
 
     #[tokio::test]

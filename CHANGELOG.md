@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.2.1](https://github.com/iOfficeAI/AionCore/compare/v0.2.0...v0.2.1) (2026-09-01)
+
+
+### Features
+
+* **conversation:** route @@ mentions to the session-message skill ([#949](https://github.com/iOfficeAI/AionCore/issues/949)) ([1c37366](https://github.com/iOfficeAI/AionCore/commit/1c37366f5d94994282c920323f159946b38a9b30))
+* **scm:** enumerate a repository's linked worktrees during discovery ([#959](https://github.com/iOfficeAI/AionCore/issues/959)) ([8da6c31](https://github.com/iOfficeAI/AionCore/commit/8da6c31ad93f3d7f38faaaec4f1bba6f8b6129a1))
+* **session-message:** add session capabilities fallback to @@ blocks ([#952](https://github.com/iOfficeAI/AionCore/issues/952)) ([1f511e5](https://github.com/iOfficeAI/AionCore/commit/1f511e5e863e3a76a65400e6f189c7e23e8dde2a))
+
+
+### Bug Fixes
+
+* **session-message:** align recipient block capabilities wording with sender ([#955](https://github.com/iOfficeAI/AionCore/issues/955)) ([9bfb2ad](https://github.com/iOfficeAI/AionCore/commit/9bfb2adbab1aca47bcd1a644446aeee6c41aab4f))
+
+## [0.2.0](https://github.com/iOfficeAI/AionCore/compare/v0.1.72...v0.2.0) (2026-08-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* **skills:** deliver skills through an AionUi-owned view instead of the workspace ([#938](https://github.com/iOfficeAI/AionCore/issues/938))
+
+### Features
+
+* **auth:** dual-token refresh with singleflight ([#926](https://github.com/iOfficeAI/AionCore/issues/926)) ([3f5c9f9](https://github.com/iOfficeAI/AionCore/commit/3f5c9f900433dd846798a82353df03dfed8db697))
+* **skills:** deliver skills through an AionUi-owned view instead of the workspace ([#938](https://github.com/iOfficeAI/AionCore/issues/938)) ([7032b3b](https://github.com/iOfficeAI/AionCore/commit/7032b3b410440c0081fb3cfe4a09f2ccfb2dd574))
+
 ## [0.1.72](https://github.com/iOfficeAI/AionCore/compare/v0.1.71...v0.1.72) (2026-08-24)
 
 

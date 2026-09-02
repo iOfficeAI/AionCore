@@ -66,9 +66,28 @@ impl MessageMiddleware {
     }
 
     /// Process a completed agent message through the middleware pipeline.
-    pub async fn process(&self, message: &str, _user_id: &str, _conversation_id: &str) -> MiddlewareResult {
+    pub async fn process(&self, message: &str, _user_id: &str, conversation_id: &str) -> MiddlewareResult {
+        // TWO different sources, deliberately. Detection reads the RAW message
+        // because reasoning models routinely put `[LOAD_SKILL: …]` inside
+        // `<think>`; display reads the stripped text because thinking is not for
+        // the user. Sharing one `cleaned` value silently dropped every in-think
+        // request -- and with no log, so it presented as "the model said it would
+        // use a skill, then nothing happened".
+        let skill_names = detect_skill_load_requests(message);
         let cleaned = strip_think_tags(message);
-        let skill_names = detect_skill_load_requests(&cleaned);
+        if !skill_names.is_empty() {
+            // `info`: this path had NO logging at all, which is exactly why the
+            // dropped-request defect could sit unnoticed. Same structured fields
+            // as the command channel so the split between the two is measurable.
+            let visible_requests = detect_skill_load_requests(&cleaned).len();
+            tracing::info!(
+                conversation_id = %conversation_id,
+                channel = "load_skill_protocol",
+                skills = skill_names.len(),
+                from_thinking = visible_requests < skill_names.len(),
+                "skill load request detected"
+            );
+        }
         let system_responses = self.load_requested_skills(&skill_names).await;
 
         MiddlewareResult {
@@ -98,7 +117,17 @@ impl MessageMiddleware {
 
         loaded
             .into_iter()
-            .map(|skill| format!("[Skill: {}]\n{}", skill.name, skill.body))
+            .map(|skill| {
+                // The root is stated up front so the agent resolves the body's own
+                // relative references (`references/…`, `scripts/…`) inside the
+                // skill instead of against its CWD.
+                format!(
+                    "[Skill: {}]\nSkill root (resolve every relative path in this body against it): {}\n\n{}",
+                    skill.name,
+                    skill.source_path.display(),
+                    skill.body
+                )
+            })
             .collect()
     }
 }
@@ -143,27 +172,91 @@ mod tests {
         assert_eq!(requests, vec!["cron", "pdf"]);
     }
 
+    struct MockSkillLoader;
+
+    #[async_trait]
+    impl ISkillLoadService for MockSkillLoader {
+        async fn load_skill_bodies(&self, names: &[String]) -> Vec<LoadedAgentSkill> {
+            names
+                .iter()
+                .map(|name| LoadedAgentSkill {
+                    name: name.clone(),
+                    body: format!("body for {name}"),
+                    source_path: std::path::PathBuf::from(format!("/src/{name}")),
+                })
+                .collect()
+        }
+    }
+
     #[tokio::test]
     async fn middleware_loads_requested_skills() {
-        struct MockSkillLoader;
-
-        #[async_trait]
-        impl ISkillLoadService for MockSkillLoader {
-            async fn load_skill_bodies(&self, names: &[String]) -> Vec<LoadedAgentSkill> {
-                names
-                    .iter()
-                    .map(|name| LoadedAgentSkill {
-                        name: name.clone(),
-                        body: format!("body for {name}"),
-                    })
-                    .collect()
-            }
-        }
-
         let mw = MessageMiddleware::new_with_skill_loader(Some(Box::new(MockSkillLoader)));
         let result = mw.process("Need [LOAD_SKILL: cron]", "user", "conv").await;
 
         assert_eq!(result.message, "Need [LOAD_SKILL: cron]");
-        assert_eq!(result.system_responses, vec!["[Skill: cron]\nbody for cron"]);
+        // The injected block now also states the skill root -- see
+        // `the_injected_body_declares_the_skill_root_absolute_path` for why.
+        let injected = &result.system_responses[0];
+        assert!(injected.starts_with("[Skill: cron]"));
+        assert!(injected.contains("body for cron"));
+    }
+
+    /// P1: reasoning models routinely put this meta-decision INSIDE <think>.
+    /// Detecting on the STRIPPED text made the request vanish with no log at all,
+    /// so the user saw "the model said it would use a skill, then nothing".
+    #[tokio::test]
+    async fn a_load_request_inside_a_think_block_is_still_honoured() {
+        let mw = MessageMiddleware::new_with_skill_loader(Some(Box::new(MockSkillLoader)));
+        let result = mw
+            .process(
+                "<think>I need [LOAD_SKILL: cron] for this</think>Sure, on it.",
+                "user",
+                "conv",
+            )
+            .await;
+
+        assert_eq!(
+            result.system_responses.len(),
+            1,
+            "the request must be detected in the RAW text"
+        );
+        assert!(result.system_responses[0].contains("cron"));
+        assert_eq!(
+            result.message, "Sure, on it.",
+            "the VISIBLE text is still stripped -- detection and display read different sources"
+        );
+    }
+
+    /// P1 boundary: the same skill inside and outside the block is one request.
+    #[tokio::test]
+    async fn a_request_repeated_inside_and_outside_the_block_loads_once() {
+        let mw = MessageMiddleware::new_with_skill_loader(Some(Box::new(MockSkillLoader)));
+        let result = mw
+            .process(
+                "<think>[LOAD_SKILL: cron]</think>Also [LOAD_SKILL: cron]",
+                "user",
+                "conv",
+            )
+            .await;
+        assert_eq!(result.system_responses.len(), 1, "dedupe across the think boundary");
+    }
+
+    /// P2: without the root, a relative reference in the skill body resolves
+    /// against the CWD. The dangerous case is not "file missing" but "the
+    /// workspace happens to hold a same-named file", which points the agent at
+    /// unrelated user content.
+    #[tokio::test]
+    async fn the_injected_body_declares_the_skill_root_absolute_path() {
+        let mw = MessageMiddleware::new_with_skill_loader(Some(Box::new(MockSkillLoader)));
+        let result = mw.process("Need [LOAD_SKILL: cron]", "user", "conv").await;
+
+        let injected = &result.system_responses[0];
+        assert!(
+            injected.contains("/src/cron"),
+            "the skill root must be stated so `references/x.md` resolves inside the \
+             skill rather than against the workspace: {injected}"
+        );
+        assert!(injected.contains("[Skill: cron]"), "the existing header shape is kept");
+        assert!(injected.contains("body for cron"));
     }
 }

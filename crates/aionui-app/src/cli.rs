@@ -117,6 +117,10 @@ pub(crate) enum Command {
     /// Cross-session messaging: list deliverable conversations and deliver a
     /// message to one of them.
     Session(SessionArgs),
+    /// Agent-facing read-only runtime CLI for THIS conversation's skills.
+    /// Channel A of skill delivery: a normal tool call instead of the
+    /// `[LOAD_SKILL]` text-protocol round trip.
+    Skills(SkillsArgs),
     /// PreToolUse permission gate for the Antigravity CLI (spawned by agy).
     /// Reads the tool request on stdin, asks the running AionUi backend, and
     /// writes agy's decision to stdout.
@@ -156,6 +160,7 @@ impl Command {
             Self::Diagnose(_) => "diagnose",
             Self::Team(_) => "team",
             Self::Session(_) => "session",
+            Self::Skills(_) => "skills",
             Self::AntigravityHook => "antigravity-hook",
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::Doctor => "doctor",
@@ -235,6 +240,44 @@ pub(crate) enum SessionCommand {
     Capabilities,
     List,
     SendMessage,
+    #[command(external_subcommand)]
+    Unknown(Vec<OsString>),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SkillsArgs {
+    #[command(subcommand)]
+    pub command: SkillsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum SkillsCommand {
+    /// Print the agent-readable skills CLI capability contract.
+    Capabilities,
+    /// List the skills enabled in THIS conversation.
+    List,
+    // The stdin contract is spelled out in the help text below because omitting it
+    // has a measured cost: live agents that tried `skills show <name>` and then
+    // reached for `--help` found nothing about stdin, and spent three to five
+    // failed tool calls guessing. Help text stays purely instructional -- this
+    // rationale is for maintainers, so it does not belong on the page an agent
+    // reads.
+    /// Print a skill's full body plus its absolute directory.
+    ///
+    /// Takes no positional arguments. The skill name is read from stdin as a JSON
+    /// object:
+    ///
+    /// {n}  printf '%s' '{"name":"mermaid"}' | aioncore skills show
+    #[command(verbatim_doc_comment)]
+    Show,
+    /// Read one of a skill's supplementary files.
+    ///
+    /// Takes no positional arguments. The path is read from stdin as a JSON
+    /// object, and must be `<skill-name>/<relative-path>`:
+    ///
+    /// {n}  printf '%s' '{"path":"mermaid/references/syntax.md"}' | aioncore skills cat
+    #[command(verbatim_doc_comment)]
+    Cat,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
 }
@@ -1263,5 +1306,60 @@ mod tests {
             }
             other => panic!("unexpected command parsed: {other:?}"),
         }
+    }
+
+    /// Every `aioncore skills …` command line the injected skills index teaches an
+    /// agent must actually parse.
+    ///
+    /// This pins two crates together. The index text lives in `aionui-ai-agent`
+    /// and the argument grammar lives here, so nothing structural stopped them
+    /// from disagreeing -- and they did: the index taught `skills show <name>`
+    /// while `Show` accepts no positional arguments at all. Unit tests on either
+    /// side stayed green (the text side only asserted the string mentioned
+    /// `$AIONUI_HELPER_BIN`), and the mismatch only surfaced against live agents,
+    /// which spent three to five failed tool calls each recovering from it.
+    #[test]
+    fn skills_cli_commands_in_the_index_are_parseable() {
+        let index = aionui_ai_agent::build_skills_index_text(&[aionui_ai_agent::SkillIndex {
+            name: "mermaid".to_owned(),
+            description: "Render Mermaid diagrams.".to_owned(),
+        }]);
+
+        // Pull out each taught invocation: the segment that starts at the helper
+        // binary placeholder and runs to the end of its backticked command.
+        let mut checked = 0usize;
+        for segment in index.split('`') {
+            let Some((_, after_bin)) = segment.split_once("\"$AIONUI_HELPER_BIN\"") else {
+                continue;
+            };
+            let argv: Vec<&str> = after_bin.split_whitespace().collect();
+            if argv.first() != Some(&"skills") {
+                continue;
+            }
+
+            let parsed = Cli::try_parse_from(std::iter::once("aioncore").chain(argv.iter().copied()));
+            assert!(
+                parsed.is_ok(),
+                "the skills index teaches `aioncore {}`, which the CLI rejects: {}",
+                argv.join(" "),
+                parsed.err().map(|e| e.to_string()).unwrap_or_default()
+            );
+            checked += 1;
+        }
+
+        assert!(
+            checked >= 3,
+            "expected the index to teach `skills show`, `skills cat` and `skills capabilities`; \
+             only {checked} parseable invocation(s) were found -- if the wording changed, update \
+             this extraction rather than dropping the guard"
+        );
+
+        // The failure mode this test exists for, stated directly: a positional
+        // argument after `show` or `cat` is not a wording preference, it is a
+        // command the binary refuses.
+        assert!(
+            Cli::try_parse_from(["aioncore", "skills", "show", "mermaid"]).is_err(),
+            "`skills show <name>` must stay a parse error, so the index can never teach it again"
+        );
     }
 }

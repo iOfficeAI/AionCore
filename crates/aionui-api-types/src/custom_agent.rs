@@ -93,6 +93,30 @@ mod tests {
         assert!(roundtrip.get("another").is_none());
     }
 
+    /// `skill_delivery` must NOT be settable through the custom-agent overrides.
+    ///
+    /// The AionUi editor parses this struct with a per-field WHITELIST, so adding
+    /// a field here without the matching frontend change means a user can type it
+    /// in and have it silently discarded — worse than it being unsupported,
+    /// because there is no feedback. It is also a vendor capability declaration
+    /// that belongs to the registry/probe, not a user preference: a custom agent
+    /// with no declaration falls to `injected`, which works.
+    ///
+    /// Opening this up must be a single change that touches both repositories.
+    #[test]
+    fn skill_delivery_is_not_a_custom_agent_override() {
+        let payload = json!({
+            "yolo_id": "bypassPermissions",
+            "skill_delivery": { "mode": "argv", "args": ["--plugin-dir", "/tmp/x"] }
+        });
+        let parsed: CustomAgentAdvancedOverrides = serde_json::from_value(payload).unwrap();
+        let roundtrip = serde_json::to_value(&parsed).unwrap();
+        assert!(
+            roundtrip.get("skill_delivery").is_none(),
+            "skill_delivery must not round-trip through the custom-agent overrides: {roundtrip}"
+        );
+    }
+
     #[test]
     fn upsert_request_minimal_payload() {
         let payload = json!({
