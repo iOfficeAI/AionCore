@@ -10,7 +10,7 @@ Create a compact `*.workmate-deck.json`; never emit OOXML, HTML/CSS, or hundreds
 ## Two-stage workflow
 
 1. Extract the goal, audience, evidence, key conclusion, language, and suggested page count.
-2. Ask which catalog theme to use (or propose one) before filling slide content. Record the choice on `theme.id`. When offering choices, describe CSBU WorkMate theme preview strips (Studio token bands / `references/theme-strips/*.svg`) — never third-party theme grids.
+2. Ask which catalog theme to use (or propose one) before filling slide content. Prefer brand themes `csbu-workmate` / `csbu-workmate-night` when the deck should match CSBU WorkMate UI identity. Record the choice on `theme.id`. When offering choices, describe CSBU WorkMate theme preview strips (Studio token bands / `references/theme-strips/*.svg`) — never third-party theme grids. Use `officecli deck theme-remap` to change themes after fill and review layout remap suggestions.
 3. Write `stage: "outline"` with stable slide IDs, page roles, titles, theme choice, and empty semantic blocks only where useful.
 4. Ask the user to confirm the outline in Presentation Studio (goal, audience, theme, and slide titles). Do not silently advance this file to `ready`, and do not fill layouts/blocks until that confirmation.
 5. After the user confirms (studio sets `stage: "ready"`), fill layouts, typed blocks, speaker notes, and asset requirements.
@@ -49,7 +49,7 @@ Offer short, concrete next steps in the user’s language. Each case is original
    “正文已填好，但还有几张图是 pending。你要我现在按页生成配图并落到 `.assets/`，还是你在 Studio 里用「上传 / 工作区 / 生成图」自己补？跳过未用图也不会挡住导出。”
 
 3. **Theme remap with WorkMate strips** (outline stage or after fill)  
-   “主题还可以换皮：Studio 大纲区有 CSBU WorkMate 自产样张条（token 色带，不是外部主题栅格）。例如从 `consulting-clean` 换到 `boardroom-navy` 只改 `theme.id`，版式与正文槽位保留。要我按听众正式程度帮你挑一个吗？”
+   “主题还可以换皮：优先 CSBU 品牌主题 `csbu-workmate` / `csbu-workmate-night`（WorkMate UI token，不是 Dashi 克隆）。Studio 大纲区有自产样张条；也可用 `officecli deck theme-remap <spec> --to csbu-workmate --json`（`--apply` 写入 `theme.id` + `extensions.themeRemap`，并标出可能需换版式的页与 layout-query 同角色备选）。版式与正文槽位默认保留。要我按听众正式程度帮你挑一个吗？”
 
 4. **Slot visibility toggles** (after fill on layouts with toggleable slots)  
    “这一页的 insight / 模块槽在 Studio 里可以按 `slot.<id>.visible` 显隐，预览和导出一致。若某一栏暂时没证据，我可以帮你关掉对应槽并重排 moduleCount，而不是删掉整页。”
