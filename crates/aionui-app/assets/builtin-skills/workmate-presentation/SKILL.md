@@ -28,7 +28,7 @@ Create a compact `*.workmate-deck.json`; never emit OOXML, HTML/CSS, or hundreds
 
 ## Layout and role selection
 
-- Prefer `officecli deck catalog --json` (and Studio same-role alternatives) over hard-coded defaults like `bullets`.
+- Prefer `officecli deck layout-query --json` (OfficeCLI ≥ 1.0.159) to rank layouts by `--role`, `--item-count` / `--module-count`, `--has-chart`, `--needs-media` / `--has-image`, and optional `--query`. Fall back to `officecli deck catalog --json` and Studio same-role chips only when layout-query is unavailable.
 - Match page intent to a semantic role first, then pick a layout whose slots fit the content volume:
   - Narrative cover / TOC / section: `cover`, `breakdown`, `transition`
   - Evidence: `metrics`, `trend` (incl. `chart-waterfall` / `chart-funnel` when useful), `distribution`
@@ -36,6 +36,7 @@ Create a compact `*.workmate-deck.json`; never emit OOXML, HTML/CSS, or hundreds
   - Risk / next steps: `risks`, `actions`, `result`, `closing`
   - People / story: `team`, `case`, `relationship`, `context`, `observation`
 - When several layouts share a role, prefer the one whose module capacity is closest to the number of items/KPIs, and that accepts chart/image blocks when the slide needs them.
+- Optional: set `slides[].candidates` to the top-k layout ids from layout-query (Studio chips prefer these). Export still uses `layoutId` only; validate rejects unknown candidate ids.
 
 ## Safety and quality
 
