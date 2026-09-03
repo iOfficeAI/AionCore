@@ -862,16 +862,22 @@ mod tests {
     async fn seed_rows_populated_after_migrations() {
         let (repo, _db) = setup().await;
         let rows = repo.list_all().await.unwrap();
-        assert_eq!(rows.len(), 4, "builtin catalog is Aion CLI, OpenCode, Pi, DeepSeek Harness");
+        assert_eq!(
+            rows.len(),
+            4,
+            "builtin catalog is Wework Agent, OpenCode, Pi, DeepSeek Harness"
+        );
 
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
-        assert!(names.contains(&"Aion CLI"));
+        assert!(names.contains(&aionui_common::constants::AIONRS_DISPLAY_NAME));
         assert!(names.contains(&"OpenCode"));
         assert!(names.contains(&"Pi"));
         assert!(names.contains(&"DeepSeek Harness"));
         assert!(
             rows.iter()
-                .any(|r| r.name == "Aion CLI" && r.agent_source == "internal" && r.agent_type == "aionrs")
+                .any(|r| r.name == aionui_common::constants::AIONRS_DISPLAY_NAME
+                    && r.agent_source == "internal"
+                    && r.agent_type == "aionrs")
         );
         assert!(rows.iter().all(|r| {
             r.agent_source == "custom"

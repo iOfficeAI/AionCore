@@ -871,7 +871,7 @@ fn decode_row(
         warn!(
             id = %meta.id,
             name = %meta.name,
-            "Ignoring command override for internal Aion CLI agent"
+            "Ignoring command override for internal Wework Agent"
         );
     }
     let env_override = parse_env_override(&env_override_raw);
@@ -879,7 +879,7 @@ fn decode_row(
         warn!(
             id = %meta.id,
             name = %meta.name,
-            "Ignoring environment overrides for internal Aion CLI agent"
+            "Ignoring environment overrides for internal Wework Agent"
         );
     }
 
@@ -1644,7 +1644,11 @@ mod tests {
         // when none of the CLIs are installed on the test host.
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
-        assert_eq!(all.len(), 4, "builtin catalog is Aion CLI, OpenCode, Pi, DeepSeek Harness");
+        assert_eq!(
+            all.len(),
+            4,
+            "builtin catalog is Wework Agent, OpenCode, Pi, DeepSeek Harness"
+        );
     }
 
     #[tokio::test]
@@ -1758,7 +1762,7 @@ mod tests {
 
     /// On a host that has *none* of the seeded CLIs installed, the
     /// public listing collapses to the rows that don't need one
-    /// (Aion CLI is `agent_source = internal` with no `command`).
+    /// (Wework Agent is `agent_source = internal` with no `command`).
     /// This guards the pill-bar contract: never show an unusable
     /// vendor.
     #[tokio::test]
@@ -1773,7 +1777,7 @@ mod tests {
                 .map(|m| (&m.id, m.enabled, m.available))
                 .collect::<Vec<_>>()
         );
-        // Aion CLI (internal, no spawn command) is always available.
+        // Wework Agent (internal, no spawn command) is always available.
         assert!(
             visible.iter().any(|m| m.agent_type == AgentType::Aionrs),
             "internal aionrs row should survive the filter"
@@ -2150,7 +2154,7 @@ mod tests {
             id: "632f31d2".to_string(),
             user_id: None,
             icon: None,
-            name: "Aion CLI".to_string(),
+            name: aionui_common::constants::AIONRS_DISPLAY_NAME.to_string(),
             name_i18n: None,
             description: None,
             description_i18n: None,
