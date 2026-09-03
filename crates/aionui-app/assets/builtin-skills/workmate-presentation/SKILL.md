@@ -11,7 +11,7 @@ Create a compact `*.workmate-deck.json`; never emit OOXML, HTML/CSS, or hundreds
 
 1. Extract the goal, audience, evidence, key conclusion, language, and suggested page count.
 2. Ask which catalog theme to use (or propose one) before filling slide content. Prefer brand themes `csbu-workmate` / `csbu-workmate-night` when the deck should match CSBU WorkMate UI identity. Record the choice on `theme.id`. When offering choices, describe CSBU WorkMate theme preview strips (Studio token bands / `references/theme-strips/*.svg`) — never third-party theme grids. Use `officecli deck theme-remap` to change themes after fill and review layout remap suggestions.
-3. Write `stage: "outline"` with stable slide IDs, page roles, titles, theme choice, and empty semantic blocks only where useful.
+3. Write `stage: "outline"` with stable slide IDs, page roles, titles, theme choice, and empty semantic blocks only where useful. For long decks (about 12+ pages, or when the user asks for a sectioned narrative), prefer `officecli deck scaffold` (OfficeCLI ≥ 1.0.162) — or the equivalent long-deck outline heuristics below — instead of inventing a flat bullet list of pages.
 4. Ask the user to confirm the outline in Presentation Studio (goal, audience, theme, and slide titles). Do not silently advance this file to `ready`, and do not fill layouts/blocks until that confirmation.
 5. After the user confirms (studio sets `stage: "ready"`), fill layouts, typed blocks, speaker notes, and asset requirements.
 6. Right after outline confirmation — and again after the first full fill — proactively offer Studio polish (see dialogue cases below). Do not block filling content on these suggestions.
@@ -59,6 +59,27 @@ Offer short, concrete next steps in the user’s language. Each case is original
 
 6. **Candidates pin polish** (optional follow-up when user likes two layouts)  
    “这两个同角色版式你都觉得可用的话，我可以把备选 id 留在 `candidates[]`，Studio 芯片会优先展示；点芯片会走换布局并尽量保留 blocks，导出不会把候选写成第二套正文。”
+
+7. **Long-deck scaffold** (when user asks for 12+ pages / 长稿 / sectioned narrative)  
+   “页数比较多的话，我可以用 `officecli deck scaffold` 先搭大纲：封面、议程、按目标/听众偏向的角色混排，并在长稿里插入 `transition` 分节；同角色版式会预置到 `candidates[]`。种子参数可复现。你确认 goal / audience / 页数后我就生成 outline 给你在 Studio 里改标题。”
+
+8. **Wireframe candidate compare** (when several same-role layouts are plausible)  
+   “同角色有好几个版式时，可以在 Studio 检查器打开「对照版式」：并排或翻页看槽位线框（不是 HTML 截图），点线框就切换 layout 并尽量保留 blocks。需要的话我先把 top-k 写入 `candidates[]`。”
+
+
+## Long-deck scaffold (P2.7)
+
+When page count is high or the narrative needs chapter breaks, scaffold an outline first — original WorkMate heuristics, not a third-party goal-spec clone:
+
+1. Confirm goal, audience, language, theme, and target page count (4–60). Prefer theme `csbu-workmate` / `csbu-workmate-night` for CSBU identity.
+2. Run:
+   `officecli deck scaffold --goal "…" --audience "…" --pages N --theme csbu-workmate --seed <stable> -o outline.workmate-deck.json --json`
+   (If CLI < 1.0.162, hand-author the same structure: cover → optional agenda → content roles → section `transition` every ~5–7 content slides → actions/closing.)
+3. Keep `stage: "outline"`; titles may be placeholders. Same-role `candidates[]` may already be pinned — leave them for Studio chips / wireframe compare.
+4. Ask the user to confirm the outline (titles + theme) in Presentation Studio before filling blocks.
+5. Re-run with the same `--seed` when the user only tweaks wording but wants the same role spine.
+
+Role-mix bias (keyword hints in goal/audience): metrics / trend / comparison / process / risks / team / case / actions. Always bookend with `cover` and `closing`.
 
 ## Safety and quality
 
