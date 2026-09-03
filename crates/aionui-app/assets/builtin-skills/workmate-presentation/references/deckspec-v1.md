@@ -11,3 +11,5 @@ Required root fields are `schemaVersion: 1`, a non-negative `revision`, `stage`,
 - Assets use a relative `path`, type `image`, status `pending`, `ready`, or `error`, and useful `alt` text.
 
 Limits: 100 slides, 64 blocks per slide, 2 MB source, 25 MB per asset, and 200 MB total assets. `ready` decks cannot export while required slots or assets are unresolved.
+
+Theme previews for outline picking are CSBU WorkMate token strips under `references/theme-strips/` (and Studio programmatic bands). Do not embed third-party theme grids.

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="48" viewBox="0 0 240 48" role="img" aria-label="CSBU WorkMate theme editorial-report">
+  <title>CSBU WorkMate — Editorial Report</title>
+  <rect width="240" height="48" rx="6" fill="#F4EFE7"/>
+  <rect x="8" y="8" width="56" height="32" rx="4" fill="#FFFDFC"/>
+  <rect x="72" y="8" width="40" height="32" rx="4" fill="#B5492D"/>
+  <rect x="120" y="8" width="24" height="32" rx="4" fill="#28231F"/>
+  <rect x="152" y="8" width="16" height="32" rx="4" fill="#71675E"/>
+  <text x="176" y="28" font-family="Aptos, Segoe UI, sans-serif" font-size="10" fill="#28231F">editorial-report</text>
+</svg>
