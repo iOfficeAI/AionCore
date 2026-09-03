@@ -26,6 +26,17 @@ Create a compact `*.workmate-deck.json`; never emit OOXML, HTML/CSS, or hundreds
 - Record useful alt text, source, model, and a short prompt summary. Never store credentials or a full sensitive prompt.
 - On failure, set the pending asset to `error`; never delete or overwrite a previous ready asset.
 
+## Layout and role selection
+
+- Prefer `officecli deck catalog --json` (and Studio same-role alternatives) over hard-coded defaults like `bullets`.
+- Match page intent to a semantic role first, then pick a layout whose slots fit the content volume:
+  - Narrative cover / TOC / section: `cover`, `breakdown`, `transition`
+  - Evidence: `metrics`, `trend` (incl. `chart-waterfall` / `chart-funnel` when useful), `distribution`
+  - Analysis: `comparison` packs such as `swot`, `pest`, `five-forces`, `bmc-lite`, `raci`, `double-diamond`
+  - Risk / next steps: `risks`, `actions`, `result`, `closing`
+  - People / story: `team`, `case`, `relationship`, `context`, `observation`
+- When several layouts share a role, prefer the one whose module capacity is closest to the number of items/KPIs, and that accepts chart/image blocks when the slide needs them.
+
 ## Safety and quality
 
 - Use only catalog theme, layout, slot, and control IDs returned by `officecli deck catalog --json`.
