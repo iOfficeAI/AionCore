@@ -16,7 +16,7 @@ Create a compact `*.workmate-deck.json`; never emit OOXML, HTML/CSS, or hundreds
 5. After the user confirms (studio sets `stage: "ready"`), fill layouts, typed blocks, speaker notes, and asset requirements.
 6. Right after outline confirmation — and again after the first full fill — proactively offer Studio polish (see dialogue cases below). Do not block filling content on these suggestions.
 7. Run `officecli deck validate <spec> --json`. Resolve every error before export.
-8. Let WorkMate/AionCore build the PPTX; do not call low-level PPTX shape operations.
+8. Let WorkMate/AionCore build the PPTX; do not call low-level PPTX shape operations. Optional PDF: `officecli deck export-pdf` (exporter plugin / LibreOffice — same as `view <pptx> pdf`, never HTML/Chrome).
 
 ## Media
 
@@ -65,6 +65,11 @@ Offer short, concrete next steps in the user’s language. Each case is original
 
 8. **Wireframe candidate compare** (when several same-role layouts are plausible)  
    “同角色有好几个版式时，可以在 Studio 检查器打开「对照版式」：并排或翻页看槽位线框（不是 HTML 截图），点线框就切换 layout 并尽量保留 blocks。需要的话我先把 top-k 写入 `candidates[]`。”
+
+
+
+9. **PDF export (optional)**  
+   “如果要 PDF，可用 `officecli deck export-pdf <spec> -o out.pdf --json`（OfficeCLI ≥ 1.0.163）：先 `deck build` 出 PPTX，再走与 `officecli view <pptx> pdf` 相同的 exporter 插件（常见包装 LibreOffice）。未安装 exporter 时会返回 `exporter_not_found`；这不是 HTML/Chrome 导出。Studio 默认仍导出可编辑 PPTX。”
 
 
 ## Long-deck scaffold (P2.7)
