@@ -2952,7 +2952,7 @@ impl ConversationService {
 
     /// Agent identity owning capability metadata for an aionrs conversation
     /// (which has no acp_session row): the assistant snapshot's agent binding
-    /// when present, else the builtin Aion CLI row resolved through the
+    /// when present, else the builtin Wework Agent row resolved through the
     /// standard id/backend/agent_type binding ladder (aionrs's backend column
     /// is NULL, so it resolves by agent_type).
     async fn aionrs_capability_agent_id(

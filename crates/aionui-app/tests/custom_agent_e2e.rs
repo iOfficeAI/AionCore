@@ -277,10 +277,10 @@ async fn update_builtin_id_returns_403() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    // 2d23ff1c is the seeded Claude id (builtin) from migration 006.
+    // 53861a53 is the seeded OpenCode id (builtin).
     let req = json_with_token(
         "PUT",
-        "/api/agents/custom/2d23ff1c",
+        "/api/agents/custom/53861a53",
         json!({ "name": "hacked", "command": "sh" }),
         &token,
         &csrf,
@@ -300,7 +300,7 @@ async fn delete_builtin_id_returns_403() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let req = json_with_token("DELETE", "/api/agents/custom/2d23ff1c", json!(null), &token, &csrf);
+    let req = json_with_token("DELETE", "/api/agents/custom/53861a53", json!(null), &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

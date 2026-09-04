@@ -124,7 +124,7 @@ async fn t1_3b_create_persists_available_locale_fallback_rule_in_assistant_snaps
         json!({
             "id": assistant_id,
             "name": "Snapshot Assistant",
-            "agent_id": "8e1acf31"
+            "agent_id": "53861a53"
         }),
         &token,
         &csrf,
@@ -195,7 +195,7 @@ async fn t1_3b_create_persists_available_locale_fallback_rule_in_assistant_snaps
             assistant_definition_id: &definition.id,
             enabled: true,
             sort_order: 0,
-            agent_id_override: Some("8e1acf31"),
+            agent_id_override: Some("53861a53"),
             last_used_at: None,
         })
         .await
@@ -268,7 +268,7 @@ async fn t1_3b_create_persists_available_locale_fallback_rule_in_assistant_snaps
         .unwrap()
         .unwrap();
     assert_eq!(snapshot.assistant_id, assistant_id);
-    assert_eq!(snapshot.agent_id, "8e1acf31");
+    assert_eq!(snapshot.agent_id, "53861a53");
     assert_eq!(snapshot.rules_content, "zh-TW fallback snapshot rule");
     assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("workspace-write"));
     assert_eq!(snapshot.resolved_skill_ids, r#"["override-skill"]"#);
