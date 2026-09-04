@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.7](https://github.com/suoak/AionCore/compare/v0.2.6...v0.2.7) (2026-09-04)
+
+### Documentation
+
+* **skill:** suggest layout switch and image fill after outline (#99)
+* **skill:** prefer richer roles and capacity-aware layouts (#100)
+* **skill:** prefer officecli deck layout-query for layout pick (#101)
+* **skill:** post-gen prompts + WorkMate theme strips (#102)
+* **skill:** brand themes + officecli deck theme-remap (#103)
+* **skill:** long-deck scaffold + wireframe compare guidance (#104)
+
 ## [0.2.6](https://github.com/suoak/AionCore/compare/v0.2.5...v0.2.6) (2026-09-02)
 
 ### Features
