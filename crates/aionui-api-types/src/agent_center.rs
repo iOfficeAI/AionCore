@@ -206,12 +206,23 @@ pub struct AgentCenterRevisionResponse {
     pub snapshot: Option<Value>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCenterPreviewMode {
+    /// Live draft config (unpublished or edits after last publish).
+    Draft,
+    /// Running against the last published revision metadata.
+    Published,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentCenterRunPlanResponse {
     pub assistant_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision_id: Option<String>,
     pub revision: i64,
+    /// Clarifies whether this try-run uses draft or published agent config.
+    pub preview_mode: AgentCenterPreviewMode,
     /// Ready-to-POST body for `POST /api/conversations` (existing runtime path).
     pub create_conversation: CreateConversationRequestWire,
 }
