@@ -65,7 +65,9 @@ pub use remote_agent::IRemoteAgentRepository;
 pub use settings::ISettingsRepository;
 pub use sidebar::{ArchiveScope, ISidebarStore, SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin};
 pub use skill::ISkillRepository;
-pub use skill_evolution::{IExperienceArticleRepository, ISkillEvolutionProposalRepository};
+pub use skill_evolution::{
+    IExperienceArticleRepository, ISkillEvolutionProposalRepository, ISkillEvolutionSettingsRepository,
+};
 pub use sqlite_acp_session::SqliteAcpSessionRepository;
 pub use sqlite_agent_center::{SqliteAssistantAgentCenterRepository, SqliteAssistantDefinitionRevisionRepository};
 pub use sqlite_agent_metadata::SqliteAgentMetadataRepository;
@@ -86,7 +88,9 @@ pub use sqlite_remote_agent::SqliteRemoteAgentRepository;
 pub use sqlite_settings::SqliteSettingsRepository;
 pub use sqlite_sidebar::SqliteSidebarStore;
 pub use sqlite_skill::SqliteSkillRepository;
-pub use sqlite_skill_evolution::{SqliteExperienceArticleRepository, SqliteSkillEvolutionProposalRepository};
+pub use sqlite_skill_evolution::{
+    SqliteExperienceArticleRepository, SqliteSkillEvolutionProposalRepository, SqliteSkillEvolutionSettingsRepository,
+};
 pub use sqlite_team::SqliteTeamRepository;
 pub use sqlite_usage_event::SqliteUsageEventRepository;
 pub use sqlite_user::SqliteUserRepository;

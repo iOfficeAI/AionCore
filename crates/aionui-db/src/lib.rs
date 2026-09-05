@@ -31,12 +31,13 @@ pub use models::{
     CreateAssistantDefinitionRevisionParams, CreateAssistantParams, CreateExperienceArticleParams,
     CreateSkillEvolutionProposalParams, ExperienceArticleRow, ExternalUserProjection, FolderRow,
     JournalProjectionCheckpointRow, OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow, Role,
-    SkillEvolutionProposalRow, SkillImportRecordRow, SkillRegistryInstallRow, SkillRow,
+    SkillEvolutionProposalRow, SkillEvolutionSettingsRow, SkillImportRecordRow, SkillRegistryInstallRow, SkillRow,
     UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
     UpdateSkillEvolutionProposalParams, UpsertAgentMetadataParams, UpsertAssistantAgentCenterParams,
     UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams,
     UpsertConversationAssistantSnapshotParams, UpsertConversationCapabilitySnapshotParams,
-    UpsertJournalProjectionCheckpointParams, UpsertOverrideParams, UsageEventRow, UserOrderRow, UserStatus, UserType,
+    UpsertJournalProjectionCheckpointParams, UpsertOverrideParams, UpsertSkillEvolutionSettingsParams, UsageEventRow,
+    UserOrderRow, UserStatus, UserType,
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
@@ -61,18 +62,19 @@ pub use repository::{
     IAssistantPreferenceRepository, IAssistantRepository, IChannelRepository, IClientPreferenceRepository,
     IConversationRepository, ICronRepository, IExperienceArticleRepository, IFeedbackDiagnosticsRepository,
     IMcpServerRepository, IOAuthTokenRepository, IProjectStore, IProviderRepository, IRemoteAgentRepository,
-    ISettingsRepository, ISidebarStore, ISkillEvolutionProposalRepository, ISkillRepository, ITeamRepository,
-    IUsageEventRepository, IUserOrderStore, IUserRepository, InsertUsageEventParams, MoveOutcome, OrderItemRef,
-    PageDirection, PersistedSessionState, PinOutcome, PinnedCursor, SaveRuntimeStateParams, SidebarConversationThin,
-    SidebarProjectMeta, SidebarTeamThin, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
-    SqliteAssistantAgentCenterRepository, SqliteAssistantDefinitionRepository,
+    ISettingsRepository, ISidebarStore, ISkillEvolutionProposalRepository, ISkillEvolutionSettingsRepository,
+    ISkillRepository, ITeamRepository, IUsageEventRepository, IUserOrderStore, IUserRepository, InsertUsageEventParams,
+    MoveOutcome, OrderItemRef, PageDirection, PersistedSessionState, PinOutcome, PinnedCursor, SaveRuntimeStateParams,
+    SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin, SqliteAcpSessionRepository,
+    SqliteAgentMetadataRepository, SqliteAssistantAgentCenterRepository, SqliteAssistantDefinitionRepository,
     SqliteAssistantDefinitionRevisionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteChannelRepository,
     SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
     SqliteExperienceArticleRepository, SqliteFeedbackDiagnosticsRepository, SqliteMcpServerRepository,
     SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository, SqliteRemoteAgentRepository,
-    SqliteSettingsRepository, SqliteSidebarStore, SqliteSkillEvolutionProposalRepository, SqliteSkillRepository,
-    SqliteTeamRepository, SqliteUsageEventRepository, SqliteUserOrderStore, SqliteUserRepository,
+    SqliteSettingsRepository, SqliteSidebarStore, SqliteSkillEvolutionProposalRepository,
+    SqliteSkillEvolutionSettingsRepository, SqliteSkillRepository, SqliteTeamRepository, SqliteUsageEventRepository,
+    SqliteUserOrderStore, SqliteUserRepository,
 };
 
 // Re-export sqlx pool type for downstream crates

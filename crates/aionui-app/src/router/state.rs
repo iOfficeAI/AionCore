@@ -24,7 +24,8 @@ use aionui_db::{
     SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
     SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteExperienceArticleRepository,
     SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
-    SqliteSettingsRepository, SqliteSkillEvolutionProposalRepository,
+    SqliteSettingsRepository, SqliteSkillEvolutionProposalRepository, SqliteSkillEvolutionSettingsRepository,
+    SqliteTeamRepository,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -512,6 +513,8 @@ pub fn build_skill_evolution_state(
     let pool = services.database.pool().clone();
     let proposals = Arc::new(SqliteSkillEvolutionProposalRepository::new(pool.clone()));
     let experience = Arc::new(SqliteExperienceArticleRepository::new(pool.clone()));
+    let settings_repo = Arc::new(SqliteSkillEvolutionSettingsRepository::new(pool.clone()));
+    let teams_repo = Arc::new(SqliteTeamRepository::new(pool.clone()));
     let conversations = Arc::new(SqliteConversationRepository::new(pool));
     let trajectory: Arc<dyn aionui_assistant::SkillEvolutionTrajectoryPort> = Arc::new(ConversationTrajectoryAdapter {
         conversations: services.conversation_service.clone(),
@@ -526,12 +529,9 @@ pub fn build_skill_evolution_state(
     });
     let pin_port: Arc<dyn aionui_assistant::SkillEvolutionPinPort> = Arc::new(AgentCenterPinAdapter { agent_center });
     let service = Arc::new(
-        SkillEvolutionService::new(proposals, experience, conversations).with_ports(
-            Some(trajectory),
-            Some(llm),
-            Some(apply_port),
-            Some(pin_port),
-        ),
+        SkillEvolutionService::new(proposals, experience, conversations)
+            .with_settings_and_teams(Some(settings_repo), Some(teams_repo))
+            .with_ports(Some(trajectory), Some(llm), Some(apply_port), Some(pin_port)),
     );
     SkillEvolutionRouterState { service }
 }

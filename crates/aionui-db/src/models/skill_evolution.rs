@@ -15,6 +15,8 @@ pub struct ExperienceArticleRow {
     pub source_conversation_ids: String,
     pub tags: String,
     pub status: String,
+    /// private | team | owner_editors (Phase 3 ACL)
+    pub visibility: String,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -31,6 +33,7 @@ pub struct CreateExperienceArticleParams<'a> {
     pub source_conversation_ids: &'a str,
     pub tags: &'a str,
     pub status: &'a str,
+    pub visibility: &'a str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -53,6 +56,13 @@ pub struct SkillEvolutionProposalRow {
     pub applied_skill_key: Option<String>,
     pub applied_skill_version: Option<String>,
     pub previous_skill_md: Option<String>,
+    pub team_id: Option<String>,
+    pub visibility: String,
+    pub gate_mode: String,
+    pub gate_score: Option<i64>,
+    pub gate_signals: String,
+    pub gate_recommendation: Option<String>,
+    pub try_run_ok: Option<i64>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -71,6 +81,13 @@ pub struct CreateSkillEvolutionProposalParams<'a> {
     pub target_skill_key: Option<&'a str>,
     pub draft_skill_md: &'a str,
     pub draft_diff_summary: Option<&'a str>,
+    pub team_id: Option<&'a str>,
+    pub visibility: &'a str,
+    pub gate_mode: &'a str,
+    pub gate_score: Option<i64>,
+    pub gate_signals: &'a str,
+    pub gate_recommendation: Option<&'a str>,
+    pub try_run_ok: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,4 +105,32 @@ pub struct UpdateSkillEvolutionProposalParams<'a> {
     pub applied_skill_key: Option<&'a str>,
     pub applied_skill_version: Option<&'a str>,
     pub previous_skill_md: Option<&'a str>,
+    pub team_id: Option<&'a str>,
+    pub visibility: Option<&'a str>,
+    pub gate_mode: Option<&'a str>,
+    pub gate_score: Option<i64>,
+    pub gate_signals: Option<&'a str>,
+    pub gate_recommendation: Option<&'a str>,
+    pub try_run_ok: Option<i64>,
+    /// When true, clear try_run_ok to NULL (distinct from Some/None merge).
+    pub clear_try_run_ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct SkillEvolutionSettingsRow {
+    pub user_id: String,
+    pub gate_mode: String,
+    pub assist_threshold: i64,
+    pub auto_threshold: i64,
+    pub default_experience_visibility: String,
+    pub updated_at: TimestampMs,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertSkillEvolutionSettingsParams<'a> {
+    pub user_id: &'a str,
+    pub gate_mode: &'a str,
+    pub assist_threshold: i64,
+    pub auto_threshold: i64,
+    pub default_experience_visibility: &'a str,
 }

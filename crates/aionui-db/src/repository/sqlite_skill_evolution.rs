@@ -2,11 +2,13 @@
 
 use sqlx::SqlitePool;
 
-use super::skill_evolution::{IExperienceArticleRepository, ISkillEvolutionProposalRepository};
+use super::skill_evolution::{
+    IExperienceArticleRepository, ISkillEvolutionProposalRepository, ISkillEvolutionSettingsRepository,
+};
 use crate::error::DbError;
 use crate::models::{
     CreateExperienceArticleParams, CreateSkillEvolutionProposalParams, ExperienceArticleRow, SkillEvolutionProposalRow,
-    UpdateSkillEvolutionProposalParams,
+    SkillEvolutionSettingsRow, UpdateSkillEvolutionProposalParams, UpsertSkillEvolutionSettingsParams,
 };
 
 fn now_ms() -> i64 {
@@ -34,8 +36,8 @@ impl IExperienceArticleRepository for SqliteExperienceArticleRepository {
         sqlx::query(
             "INSERT INTO experience_articles (
                 id, owner_user_id, assistant_id, team_id, kind, title, body_md,
-                source_conversation_ids, tags, status, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                source_conversation_ids, tags, status, visibility, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(params.id)
         .bind(params.owner_user_id)
@@ -47,6 +49,7 @@ impl IExperienceArticleRepository for SqliteExperienceArticleRepository {
         .bind(params.source_conversation_ids)
         .bind(params.tags)
         .bind(params.status)
+        .bind(params.visibility)
         .bind(now)
         .bind(now)
         .execute(&self.pool)
@@ -71,31 +74,81 @@ impl IExperienceArticleRepository for SqliteExperienceArticleRepository {
         assistant_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<ExperienceArticleRow>, DbError> {
+        self.list_visible(owner_user_id, &[], assistant_id, None, limit).await
+    }
+
+    async fn list_visible(
+        &self,
+        owner_user_id: &str,
+        team_ids: &[String],
+        assistant_id: Option<&str>,
+        visibility: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ExperienceArticleRow>, DbError> {
         let limit = limit.clamp(1, 200);
-        if let Some(aid) = assistant_id {
-            let rows = sqlx::query_as::<_, ExperienceArticleRow>(
+        // Fetch a broader owned set then filter in Rust for team ACL (SQLite IN with dyn list is awkward).
+        let owned = if let Some(aid) = assistant_id {
+            sqlx::query_as::<_, ExperienceArticleRow>(
                 "SELECT * FROM experience_articles
                  WHERE owner_user_id = ? AND assistant_id = ? AND status = 'active'
                  ORDER BY updated_at DESC LIMIT ?",
             )
             .bind(owner_user_id)
             .bind(aid)
-            .bind(limit)
+            .bind(limit * 2)
             .fetch_all(&self.pool)
-            .await?;
-            Ok(rows)
+            .await?
         } else {
-            let rows = sqlx::query_as::<_, ExperienceArticleRow>(
+            sqlx::query_as::<_, ExperienceArticleRow>(
                 "SELECT * FROM experience_articles
                  WHERE owner_user_id = ? AND status = 'active'
                  ORDER BY updated_at DESC LIMIT ?",
             )
             .bind(owner_user_id)
-            .bind(limit)
+            .bind(limit * 2)
             .fetch_all(&self.pool)
-            .await?;
-            Ok(rows)
+            .await?
+        };
+
+        let mut team_rows = Vec::new();
+        for tid in team_ids {
+            let rows = if let Some(aid) = assistant_id {
+                sqlx::query_as::<_, ExperienceArticleRow>(
+                    "SELECT * FROM experience_articles
+                     WHERE team_id = ? AND visibility = 'team' AND status = 'active'
+                       AND owner_user_id != ? AND assistant_id = ?
+                     ORDER BY updated_at DESC LIMIT ?",
+                )
+                .bind(tid)
+                .bind(owner_user_id)
+                .bind(aid)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            } else {
+                sqlx::query_as::<_, ExperienceArticleRow>(
+                    "SELECT * FROM experience_articles
+                     WHERE team_id = ? AND visibility = 'team' AND status = 'active'
+                       AND owner_user_id != ?
+                     ORDER BY updated_at DESC LIMIT ?",
+                )
+                .bind(tid)
+                .bind(owner_user_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            };
+            team_rows.extend(rows);
         }
+
+        let mut merged = owned;
+        merged.extend(team_rows);
+        merged.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
+        if let Some(vis) = visibility {
+            merged.retain(|r| r.visibility == vis);
+        }
+        merged.truncate(limit as usize);
+        Ok(merged)
     }
 }
 
@@ -120,8 +173,9 @@ impl ISkillEvolutionProposalRepository for SqliteSkillEvolutionProposalRepositor
             "INSERT INTO skill_evolution_proposals (
                 id, owner_user_id, assistant_id, conversation_id, status, title,
                 experience_summary, experience_article_ids, action, target_skill_key,
-                draft_skill_md, draft_diff_summary, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                draft_skill_md, draft_diff_summary, team_id, visibility, gate_mode,
+                gate_score, gate_signals, gate_recommendation, try_run_ok, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(params.id)
         .bind(params.owner_user_id)
@@ -135,6 +189,13 @@ impl ISkillEvolutionProposalRepository for SqliteSkillEvolutionProposalRepositor
         .bind(params.target_skill_key)
         .bind(params.draft_skill_md)
         .bind(params.draft_diff_summary)
+        .bind(params.team_id)
+        .bind(params.visibility)
+        .bind(params.gate_mode)
+        .bind(params.gate_score)
+        .bind(params.gate_signals)
+        .bind(params.gate_recommendation)
+        .bind(params.try_run_ok)
         .bind(now)
         .bind(now)
         .execute(&self.pool)
@@ -247,6 +308,17 @@ impl ISkillEvolutionProposalRepository for SqliteSkillEvolutionProposalRepositor
             .applied_skill_version
             .or(existing.applied_skill_version.as_deref());
         let previous_skill_md = params.previous_skill_md.or(existing.previous_skill_md.as_deref());
+        let team_id = params.team_id.or(existing.team_id.as_deref());
+        let visibility = params.visibility.unwrap_or(existing.visibility.as_str());
+        let gate_mode = params.gate_mode.unwrap_or(existing.gate_mode.as_str());
+        let gate_score = params.gate_score.or(existing.gate_score);
+        let gate_signals = params.gate_signals.unwrap_or(existing.gate_signals.as_str());
+        let gate_recommendation = params.gate_recommendation.or(existing.gate_recommendation.as_deref());
+        let try_run_ok = if params.clear_try_run_ok {
+            None
+        } else {
+            params.try_run_ok.or(existing.try_run_ok)
+        };
 
         sqlx::query(
             "UPDATE skill_evolution_proposals SET
@@ -254,7 +326,8 @@ impl ISkillEvolutionProposalRepository for SqliteSkillEvolutionProposalRepositor
                 draft_skill_md = ?, draft_diff_summary = ?, target_skill_key = ?,
                 reviewer_user_id = ?, review_comment = ?, reviewed_at = ?,
                 applied_skill_key = ?, applied_skill_version = ?, previous_skill_md = ?,
-                updated_at = ?
+                team_id = ?, visibility = ?, gate_mode = ?, gate_score = ?, gate_signals = ?,
+                gate_recommendation = ?, try_run_ok = ?, updated_at = ?
              WHERE id = ?",
         )
         .bind(status)
@@ -270,11 +343,70 @@ impl ISkillEvolutionProposalRepository for SqliteSkillEvolutionProposalRepositor
         .bind(applied_skill_key)
         .bind(applied_skill_version)
         .bind(previous_skill_md)
+        .bind(team_id)
+        .bind(visibility)
+        .bind(gate_mode)
+        .bind(gate_score)
+        .bind(gate_signals)
+        .bind(gate_recommendation)
+        .bind(try_run_ok)
         .bind(now)
         .bind(id)
         .execute(&self.pool)
         .await?;
 
         self.get(id).await
+    }
+}
+
+pub struct SqliteSkillEvolutionSettingsRepository {
+    pool: SqlitePool,
+}
+
+impl SqliteSkillEvolutionSettingsRepository {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl ISkillEvolutionSettingsRepository for SqliteSkillEvolutionSettingsRepository {
+    async fn get(&self, user_id: &str) -> Result<Option<SkillEvolutionSettingsRow>, DbError> {
+        let row =
+            sqlx::query_as::<_, SkillEvolutionSettingsRow>("SELECT * FROM skill_evolution_settings WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row)
+    }
+
+    async fn upsert(
+        &self,
+        params: &UpsertSkillEvolutionSettingsParams<'_>,
+    ) -> Result<SkillEvolutionSettingsRow, DbError> {
+        let now = now_ms();
+        sqlx::query(
+            "INSERT INTO skill_evolution_settings (
+                user_id, gate_mode, assist_threshold, auto_threshold,
+                default_experience_visibility, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET
+                gate_mode = excluded.gate_mode,
+                assist_threshold = excluded.assist_threshold,
+                auto_threshold = excluded.auto_threshold,
+                default_experience_visibility = excluded.default_experience_visibility,
+                updated_at = excluded.updated_at",
+        )
+        .bind(params.user_id)
+        .bind(params.gate_mode)
+        .bind(params.assist_threshold)
+        .bind(params.auto_threshold)
+        .bind(params.default_experience_visibility)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        self.get(params.user_id)
+            .await?
+            .ok_or_else(|| DbError::Init("skill_evolution_settings upsert missing row".into()))
     }
 }

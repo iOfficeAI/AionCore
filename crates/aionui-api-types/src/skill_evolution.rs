@@ -20,6 +20,38 @@ pub enum SkillEvolutionAction {
     Patch,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillEvolutionGateMode {
+    HumanOnly,
+    HeuristicAssist,
+    AutoApplyOnPass,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillEvolutionGateRecommendation {
+    Approve,
+    Reject,
+    NeedsReview,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperienceVisibility {
+    Private,
+    Team,
+    OwnerEditors,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillEvolutionGateSignal {
+    pub id: String,
+    pub passed: bool,
+    pub weight: u32,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillEvolutionProposalResponse {
     pub id: String,
@@ -38,6 +70,20 @@ pub struct SkillEvolutionProposalResponse {
     pub reviewed_at: Option<i64>,
     pub applied_skill_key: Option<String>,
     pub applied_skill_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
+    #[serde(default)]
+    pub visibility: String,
+    #[serde(default)]
+    pub gate_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_score: Option<u32>,
+    #[serde(default)]
+    pub gate_signals: Vec<SkillEvolutionGateSignal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_recommendation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub try_run_ok: Option<bool>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -65,6 +111,12 @@ pub struct CreateSkillEvolutionProposalRequest {
     /// When true, create as pending_review instead of draft.
     #[serde(default)]
     pub submit: bool,
+    #[serde(default)]
+    pub team_id: Option<String>,
+    #[serde(default)]
+    pub visibility: Option<String>,
+    #[serde(default)]
+    pub try_run_ok: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -109,12 +161,16 @@ pub struct ApproveSkillEvolutionResponse {
 pub struct ExperienceArticleResponse {
     pub id: String,
     pub assistant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
     pub kind: String,
     pub title: String,
     pub body_md: String,
     pub source_conversation_ids: Vec<String>,
     pub tags: Vec<String>,
     pub status: String,
+    #[serde(default)]
+    pub visibility: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -129,6 +185,10 @@ pub struct CreateExperienceArticleRequest {
     #[serde(default)]
     pub assistant_id: Option<String>,
     #[serde(default)]
+    pub team_id: Option<String>,
+    #[serde(default)]
+    pub visibility: Option<String>,
+    #[serde(default)]
     pub source_conversation_ids: Option<Vec<String>>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
@@ -138,6 +198,10 @@ pub struct CreateExperienceArticleRequest {
 pub struct ExperienceListQuery {
     #[serde(default)]
     pub assistant_id: Option<String>,
+    #[serde(default)]
+    pub visibility: Option<String>,
+    #[serde(default)]
+    pub team_id: Option<String>,
     #[serde(default)]
     pub limit: Option<i64>,
 }
@@ -159,6 +223,15 @@ pub struct EvolveSkillEvolutionRequest {
     /// Optional model id override (must exist on an enabled provider).
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub team_id: Option<String>,
+    #[serde(default)]
+    pub visibility: Option<String>,
+    /// Optional override of user settings gate_mode for this evolve.
+    #[serde(default)]
+    pub gate_mode: Option<String>,
+    #[serde(default)]
+    pub try_run_ok: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -182,6 +255,8 @@ pub struct EvolveSkillEvolutionResponse {
     pub trajectory_overview: SkillEvolutionTrajectoryOverview,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_used: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_note: Option<String>,
 }
 
 /// Request body for apply — write Skills Hub / workspace + optional pin.
@@ -226,4 +301,32 @@ pub struct ApplySkillEvolutionResponse {
     pub workspace_skill_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_ref: Option<SkillEvolutionSkillRefPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillEvolutionSettingsResponse {
+    pub gate_mode: String,
+    pub assist_threshold: u32,
+    pub auto_threshold: u32,
+    pub default_experience_visibility: String,
+    pub updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct UpdateSkillEvolutionSettingsRequest {
+    #[serde(default)]
+    pub gate_mode: Option<String>,
+    #[serde(default)]
+    pub assist_threshold: Option<u32>,
+    #[serde(default)]
+    pub auto_threshold: Option<u32>,
+    #[serde(default)]
+    pub default_experience_visibility: Option<String>,
+}
+
+/// Light cross-model transfer note (Phase 3 optional; not a full experiment bench).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrossModelTransferNoteResponse {
+    pub title: String,
+    pub body_md: String,
 }

@@ -2,6 +2,7 @@
 //!
 //! Phase 1: store experience summaries + draft SKILL.md proposals.
 //! Phase 2: Maintainer/Proposer LLM evolve + apply to Skills Hub / pin.
+//! Phase 3: heuristic gate + team experience ACL + light transfer notes.
 //! Does not inject experience into inference prompts. Does not vendor community
 //! wikiskill CLI.
 
@@ -10,18 +11,20 @@ use std::sync::Arc;
 use crate::error::AssistantError;
 use aionui_api_types::{
     ApplySkillEvolutionRequest, ApplySkillEvolutionResponse, ApproveSkillEvolutionResponse,
-    CreateExperienceArticleRequest, CreateSkillEvolutionProposalRequest, EvolveSkillEvolutionRequest,
-    EvolveSkillEvolutionResponse, ExperienceArticleResponse, ReviewSkillEvolutionRequest, SkillEvolutionAction,
-    SkillEvolutionExportPayload, SkillEvolutionProposalResponse, SkillEvolutionSkillRefPayload, SkillEvolutionStatus,
-    SkillEvolutionTrajectoryOverview,
+    CreateExperienceArticleRequest, CreateSkillEvolutionProposalRequest, CrossModelTransferNoteResponse,
+    EvolveSkillEvolutionRequest, EvolveSkillEvolutionResponse, ExperienceArticleResponse, ReviewSkillEvolutionRequest,
+    SkillEvolutionAction, SkillEvolutionExportPayload, SkillEvolutionGateSignal, SkillEvolutionProposalResponse,
+    SkillEvolutionSettingsResponse, SkillEvolutionSkillRefPayload, SkillEvolutionStatus,
+    SkillEvolutionTrajectoryOverview, UpdateSkillEvolutionSettingsRequest,
 };
 use aionui_common::{generate_prefixed_id, now_ms};
 use aionui_db::{
     CreateExperienceArticleParams, CreateSkillEvolutionProposalParams, IConversationRepository,
-    IExperienceArticleRepository, ISkillEvolutionProposalRepository, SkillEvolutionProposalRow,
-    UpdateSkillEvolutionProposalParams,
+    IExperienceArticleRepository, ISkillEvolutionProposalRepository, ISkillEvolutionSettingsRepository,
+    ITeamRepository, SkillEvolutionProposalRow, UpdateSkillEvolutionProposalParams, UpsertSkillEvolutionSettingsParams,
 };
 
+use crate::skill_evolution_gate::{self, GateMode, GateRecommendation};
 use crate::skill_evolution_ports::{
     SkillEvolutionApplyPort, SkillEvolutionLlmPort, SkillEvolutionPinPort, SkillEvolutionTrajectoryPort,
     TrajectoryDigest,
@@ -52,14 +55,40 @@ fn article_row_to_response(row: aionui_db::ExperienceArticleRow) -> ExperienceAr
     ExperienceArticleResponse {
         id: row.id,
         assistant_id: row.assistant_id,
+        team_id: row.team_id,
         kind: row.kind,
         title: row.title,
         body_md: row.body_md,
         source_conversation_ids: parse_json_string_array(&row.source_conversation_ids),
         tags: parse_json_string_array(&row.tags),
         status: row.status,
+        visibility: row.visibility,
         created_at: row.created_at,
         updated_at: row.updated_at,
+    }
+}
+
+fn normalize_visibility(raw: Option<&str>, default: &str) -> Result<String, AssistantError> {
+    let v = raw.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(default);
+    match v {
+        "private" | "team" | "owner_editors" => Ok(v.to_string()),
+        other => Err(AssistantError::BadRequest(format!(
+            "invalid visibility '{other}' (expected private|team|owner_editors)"
+        ))),
+    }
+}
+
+fn parse_gate_signals(raw: &str) -> Vec<SkillEvolutionGateSignal> {
+    serde_json::from_str::<Vec<SkillEvolutionGateSignal>>(raw).unwrap_or_default()
+}
+
+fn default_settings_response() -> SkillEvolutionSettingsResponse {
+    SkillEvolutionSettingsResponse {
+        gate_mode: GateMode::HumanOnly.as_str().to_string(),
+        assist_threshold: 70,
+        auto_threshold: 90,
+        default_experience_visibility: "private".into(),
+        updated_at: None,
     }
 }
 
@@ -179,6 +208,13 @@ fn row_to_response(row: SkillEvolutionProposalRow) -> Result<SkillEvolutionPropo
         reviewed_at: row.reviewed_at,
         applied_skill_key: row.applied_skill_key,
         applied_skill_version: row.applied_skill_version,
+        team_id: row.team_id,
+        visibility: row.visibility,
+        gate_mode: row.gate_mode,
+        gate_score: row.gate_score.map(|s| s as u32),
+        gate_signals: parse_gate_signals(&row.gate_signals),
+        gate_recommendation: row.gate_recommendation,
+        try_run_ok: row.try_run_ok.map(|v| v != 0),
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
@@ -212,6 +248,8 @@ pub struct SkillEvolutionService {
     proposals: Arc<dyn ISkillEvolutionProposalRepository>,
     experience: Arc<dyn IExperienceArticleRepository>,
     conversations: Arc<dyn IConversationRepository>,
+    settings: Option<Arc<dyn ISkillEvolutionSettingsRepository>>,
+    teams: Option<Arc<dyn ITeamRepository>>,
     trajectory: Option<Arc<dyn SkillEvolutionTrajectoryPort>>,
     llm: Option<Arc<dyn SkillEvolutionLlmPort>>,
     apply_port: Option<Arc<dyn SkillEvolutionApplyPort>>,
@@ -228,11 +266,23 @@ impl SkillEvolutionService {
             proposals,
             experience,
             conversations,
+            settings: None,
+            teams: None,
             trajectory: None,
             llm: None,
             apply_port: None,
             pin_port: None,
         }
+    }
+
+    pub fn with_settings_and_teams(
+        mut self,
+        settings: Option<Arc<dyn ISkillEvolutionSettingsRepository>>,
+        teams: Option<Arc<dyn ITeamRepository>>,
+    ) -> Self {
+        self.settings = settings;
+        self.teams = teams;
+        self
     }
 
     pub fn with_ports(
@@ -310,7 +360,23 @@ impl SkillEvolutionService {
             ));
         };
 
-        let status = if req.submit { "pending_review" } else { "draft" };
+        let settings = self.load_settings(user_id).await;
+        let visibility = normalize_visibility(req.visibility.as_deref(), &settings.default_experience_visibility)?;
+        if visibility == "team" {
+            self.require_team_access(user_id, req.team_id.as_deref()).await?;
+        }
+        let gate = skill_evolution_gate::score_draft(&draft, req.try_run_ok);
+        let gate_signals = serde_json::to_string(&gate.signals).unwrap_or_else(|_| "[]".into());
+        let gate_mode = settings.gate_mode.clone();
+        let mut status = if req.submit { "pending_review" } else { "draft" };
+        // human_only: advisory only; heuristic_assist may auto-submit
+        if !req.submit
+            && GateMode::parse(&gate_mode) == GateMode::HeuristicAssist
+            && gate.score >= settings.assist_threshold
+            && gate.recommendation != GateRecommendation::Reject
+        {
+            status = "pending_review";
+        }
         let id = generate_prefixed_id("sep");
         let row = self
             .proposals
@@ -327,6 +393,13 @@ impl SkillEvolutionService {
                 target_skill_key: Some(skill_key.as_str()),
                 draft_skill_md: &draft,
                 draft_diff_summary: req.draft_diff_summary.as_deref(),
+                team_id: req.team_id.as_deref(),
+                visibility: visibility.as_str(),
+                gate_mode: gate_mode.as_str(),
+                gate_score: Some(gate.score as i64),
+                gate_signals: gate_signals.as_str(),
+                gate_recommendation: Some(gate.recommendation.as_str()),
+                try_run_ok: req.try_run_ok.map(|b| if b { 1 } else { 0 }),
             })
             .await
             .map_err(|e| AssistantError::Internal(e.to_string()))?;
@@ -465,7 +538,7 @@ impl SkillEvolutionService {
                 id: &article_id,
                 owner_user_id: user_id,
                 assistant_id: row.assistant_id.as_deref(),
-                team_id: None,
+                team_id: row.team_id.as_deref(),
                 kind: "rejected_note",
                 title: &format!("拒绝：{}", row.title),
                 body_md: &body,
@@ -475,6 +548,7 @@ impl SkillEvolutionService {
                 .unwrap_or_else(|_| "[]".into()),
                 tags: r#"["skill-evolution","rejected"]"#,
                 status: "active",
+                visibility: row.visibility.as_str(),
             })
             .await
             .map_err(|e| AssistantError::Internal(e.to_string()))?;
@@ -645,28 +719,21 @@ impl SkillEvolutionService {
         &self,
         user_id: &str,
         assistant_id: Option<&str>,
+        visibility: Option<&str>,
+        team_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<ExperienceArticleResponse>, AssistantError> {
+        let mut team_ids = self.list_user_team_ids(user_id).await;
+        if let Some(tid) = team_id {
+            self.require_team_access(user_id, Some(tid)).await?;
+            team_ids = vec![tid.to_string()];
+        }
         let rows = self
             .experience
-            .list_for_owner(user_id, assistant_id, limit)
+            .list_visible(user_id, &team_ids, assistant_id, visibility, limit)
             .await
             .map_err(|e| AssistantError::Internal(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|row| ExperienceArticleResponse {
-                id: row.id,
-                assistant_id: row.assistant_id,
-                kind: row.kind,
-                title: row.title,
-                body_md: row.body_md,
-                source_conversation_ids: parse_json_string_array(&row.source_conversation_ids),
-                tags: parse_json_string_array(&row.tags),
-                status: row.status,
-                created_at: row.created_at,
-                updated_at: row.updated_at,
-            })
-            .collect())
+        Ok(rows.into_iter().map(article_row_to_response).collect())
     }
 
     pub async fn create_experience(
@@ -676,6 +743,11 @@ impl SkillEvolutionService {
     ) -> Result<ExperienceArticleResponse, AssistantError> {
         if req.title.trim().is_empty() {
             return Err(AssistantError::BadRequest("title is required".into()));
+        }
+        let settings = self.load_settings(user_id).await;
+        let visibility = normalize_visibility(req.visibility.as_deref(), &settings.default_experience_visibility)?;
+        if visibility == "team" {
+            self.require_team_access(user_id, req.team_id.as_deref()).await?;
         }
         let id = generate_prefixed_id("ea");
         let kind = req.kind.as_deref().unwrap_or("general");
@@ -689,28 +761,82 @@ impl SkillEvolutionService {
                 id: &id,
                 owner_user_id: user_id,
                 assistant_id: req.assistant_id.as_deref(),
-                team_id: None,
+                team_id: req.team_id.as_deref(),
                 kind,
                 title: req.title.trim(),
                 body_md: &body,
                 source_conversation_ids: &source,
                 tags: &tags,
                 status: "active",
+                visibility: visibility.as_str(),
             })
             .await
             .map_err(|e| AssistantError::Internal(e.to_string()))?;
-        Ok(ExperienceArticleResponse {
-            id: row.id,
-            assistant_id: row.assistant_id,
-            kind: row.kind,
-            title: row.title,
-            body_md: row.body_md,
-            source_conversation_ids: parse_json_string_array(&row.source_conversation_ids),
-            tags: parse_json_string_array(&row.tags),
-            status: row.status,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
+        Ok(article_row_to_response(row))
+    }
+
+    pub async fn get_settings(&self, user_id: &str) -> Result<SkillEvolutionSettingsResponse, AssistantError> {
+        Ok(self.load_settings(user_id).await)
+    }
+
+    pub async fn update_settings(
+        &self,
+        user_id: &str,
+        req: UpdateSkillEvolutionSettingsRequest,
+    ) -> Result<SkillEvolutionSettingsResponse, AssistantError> {
+        let current = self.load_settings(user_id).await;
+        let gate_mode_raw = req.gate_mode.as_deref().unwrap_or(&current.gate_mode);
+        let gate_mode = GateMode::parse(gate_mode_raw);
+        if gate_mode == GateMode::AutoApplyOnPass && req.gate_mode.is_some() {
+            // Explicit enable only — still allow, but thresholds must be high.
+        }
+        let assist = req.assist_threshold.unwrap_or(current.assist_threshold).clamp(50, 100);
+        let auto = req.auto_threshold.unwrap_or(current.auto_threshold).clamp(70, 100);
+        if auto < assist {
+            return Err(AssistantError::BadRequest(
+                "auto_threshold 必须 ≥ assist_threshold".into(),
+            ));
+        }
+        let visibility = normalize_visibility(
+            req.default_experience_visibility.as_deref(),
+            &current.default_experience_visibility,
+        )?;
+        let Some(repo) = self.settings.as_ref() else {
+            return Err(AssistantError::Internal(
+                "skill evolution settings repo not configured".into(),
+            ));
+        };
+        let row = repo
+            .upsert(&UpsertSkillEvolutionSettingsParams {
+                user_id,
+                gate_mode: gate_mode.as_str(),
+                assist_threshold: assist as i64,
+                auto_threshold: auto as i64,
+                default_experience_visibility: visibility.as_str(),
+            })
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?;
+        Ok(SkillEvolutionSettingsResponse {
+            gate_mode: row.gate_mode,
+            assist_threshold: row.assist_threshold as u32,
+            auto_threshold: row.auto_threshold as u32,
+            default_experience_visibility: row.default_experience_visibility,
+            updated_at: Some(row.updated_at),
         })
+    }
+
+    /// Light cross-model transfer notes (not a full experiment bench).
+    pub async fn cross_model_transfer_notes(&self) -> Result<Vec<CrossModelTransferNoteResponse>, AssistantError> {
+        Ok(vec![
+            CrossModelTransferNoteResponse {
+                title: "跨模型迁移：先人审再 pin".into(),
+                body_md: "论文与实践表明，演进后的 SKILL.md 常可跨模型复用。WorkMate 建议：在模型 A 上提炼并通过启发式门控后，于模型 B 的智能体中心试跑，再发布 pin。经验库仅服务 Maintainer/Proposer，**永不**注入日常对话 Inference。".into(),
+            },
+            CrossModelTransferNoteResponse {
+                title: "门控阈值勿无人值守全自动上生产".into(),
+                body_md: "`auto_apply_on_pass` 仅在用户显式开启且高阈值通过时自动写入；仍会写 skill_impact，并支持一键回滚。默认 `human_only`。".into(),
+            },
+        ])
     }
 
     /// From-conversation evolve: load trajectory → Maintainer → Proposer → draft proposal.
@@ -832,6 +958,15 @@ impl SkillEvolutionService {
             ));
         }
 
+        let settings = self.load_settings(user_id).await;
+        let gate_mode_override = req.gate_mode.as_deref().map(GateMode::parse);
+        let gate_mode = gate_mode_override.unwrap_or_else(|| GateMode::parse(&settings.gate_mode));
+        let visibility = normalize_visibility(req.visibility.as_deref(), &settings.default_experience_visibility)?;
+        if visibility == "team" {
+            self.require_team_access(user_id, req.team_id.as_deref()).await?;
+        }
+        let team_id = req.team_id.clone();
+
         let pattern_title =
             extract_first_heading(&pattern_body).unwrap_or_else(|| format!("会话经验模式 · {conv_label}"));
         let article_id = generate_prefixed_id("ea");
@@ -843,13 +978,14 @@ impl SkillEvolutionService {
                 id: &article_id,
                 owner_user_id: user_id,
                 assistant_id: req.assistant_id.as_deref(),
-                team_id: None,
+                team_id: team_id.as_deref(),
                 kind: "pattern",
                 title: &pattern_title,
                 body_md: &pattern_body,
                 source_conversation_ids: &source_json,
                 tags: r#"["skill-evolution","pattern","maintainer"]"#,
                 status: "active",
+                visibility: visibility.as_str(),
             })
             .await
             .map_err(|e| AssistantError::Internal(e.to_string()))?;
@@ -865,13 +1001,14 @@ impl SkillEvolutionService {
                 id: &impact_id,
                 owner_user_id: user_id,
                 assistant_id: req.assistant_id.as_deref(),
-                team_id: None,
+                team_id: team_id.as_deref(),
                 kind: "skill_impact",
                 title: &format!("影响笔记 · {pattern_title}"),
                 body_md: &impact_body,
                 source_conversation_ids: &source_json,
                 tags: r#"["skill-evolution","skill_impact"]"#,
                 status: "active",
+                visibility: visibility.as_str(),
             })
             .await
             .map_err(|e| AssistantError::Internal(e.to_string()))?;
@@ -959,7 +1096,41 @@ impl SkillEvolutionService {
         let diff = parsed.draft_diff_summary.as_deref().map(redact_secrets);
         let article_ids = vec![pattern_article.id.clone(), impact_article.id.clone()];
         let article_ids_json = serde_json::to_string(&article_ids).unwrap_or_else(|_| "[]".into());
-        let status = if req.submit { "pending_review" } else { "draft" };
+        let gate = skill_evolution_gate::score_draft(&draft, req.try_run_ok);
+        let gate_signals = serde_json::to_string(&gate.signals).unwrap_or_else(|_| "[]".into());
+        let mut status = if req.submit { "pending_review" } else { "draft" };
+        let mut gate_note = None;
+        match gate_mode {
+            GateMode::HumanOnly => {
+                gate_note = Some(format!(
+                    "启发式评分 {}（{}）— 仅供参考，需人工审核",
+                    gate.score,
+                    gate.recommendation.as_str()
+                ));
+            }
+            GateMode::HeuristicAssist => {
+                if !req.submit {
+                    if gate.score >= settings.assist_threshold && gate.recommendation != GateRecommendation::Reject {
+                        status = "pending_review";
+                        gate_note = Some(format!(
+                            "启发式辅助：评分 {} ≥ {}，已自动提交待审核",
+                            gate.score, settings.assist_threshold
+                        ));
+                    } else {
+                        gate_note = Some(format!("启发式辅助：评分 {} 未达阈值或需复核，保持草稿", gate.score));
+                    }
+                }
+            }
+            GateMode::AutoApplyOnPass => {
+                gate_note = Some(format!(
+                    "自动应用模式：评分 {}，阈值 {}（通过后将尝试自动 apply；仍写 skill_impact，可回滚）",
+                    gate.score, settings.auto_threshold
+                ));
+                if gate.score >= settings.auto_threshold && gate.recommendation == GateRecommendation::Approve {
+                    status = "pending_review";
+                }
+            }
+        }
 
         let proposal = if let Some(pid) = existing_proposal_id {
             self.proposals
@@ -973,6 +1144,13 @@ impl SkillEvolutionService {
                         draft_skill_md: Some(draft.as_str()),
                         draft_diff_summary: diff.as_deref(),
                         target_skill_key: Some(skill_key.as_str()),
+                        team_id: team_id.as_deref(),
+                        visibility: Some(visibility.as_str()),
+                        gate_mode: Some(gate_mode.as_str()),
+                        gate_score: Some(gate.score as i64),
+                        gate_signals: Some(gate_signals.as_str()),
+                        gate_recommendation: Some(gate.recommendation.as_str()),
+                        try_run_ok: req.try_run_ok.map(|b| if b { 1 } else { 0 }),
                         ..Default::default()
                     },
                 )
@@ -995,9 +1173,59 @@ impl SkillEvolutionService {
                     target_skill_key: Some(skill_key.as_str()),
                     draft_skill_md: draft.as_str(),
                     draft_diff_summary: diff.as_deref(),
+                    team_id: team_id.as_deref(),
+                    visibility: visibility.as_str(),
+                    gate_mode: gate_mode.as_str(),
+                    gate_score: Some(gate.score as i64),
+                    gate_signals: gate_signals.as_str(),
+                    gate_recommendation: Some(gate.recommendation.as_str()),
+                    try_run_ok: req.try_run_ok.map(|b| if b { 1 } else { 0 }),
                 })
                 .await
                 .map_err(|e| AssistantError::Internal(e.to_string()))?
+        };
+
+        // auto_apply_on_pass: approve + apply when score passes high threshold
+        let proposal = if gate_mode == GateMode::AutoApplyOnPass
+            && gate.score >= settings.auto_threshold
+            && gate.recommendation == GateRecommendation::Approve
+        {
+            let pid = proposal.id.clone();
+            let _ = self
+                .approve(
+                    user_id,
+                    &pid,
+                    ReviewSkillEvolutionRequest {
+                        comment: Some(format!("auto_apply_on_pass：启发式评分 {} 通过", gate.score)),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            match self.apply(user_id, &pid, ApplySkillEvolutionRequest::default()).await {
+                Ok(_applied) => {
+                    gate_note = Some(format!(
+                        "已自动应用（评分 {}）。可一键回滚；skill_impact 已写入经验库。",
+                        gate.score
+                    ));
+                    self.proposals
+                        .get(&pid)
+                        .await
+                        .map_err(|e| AssistantError::Internal(e.to_string()))?
+                        .ok_or(AssistantError::NotFound(pid))?
+                }
+                Err(e) => {
+                    gate_note = Some(format!(
+                        "评分通过并已批准，但自动 apply 失败：{e}。请手动写入 Skills Hub。"
+                    ));
+                    self.proposals
+                        .get(&pid)
+                        .await
+                        .map_err(|e| AssistantError::Internal(e.to_string()))?
+                        .ok_or(AssistantError::NotFound(pid))?
+                }
+            }
+        } else {
+            proposal
         };
 
         let experience_articles = vec![
@@ -1010,6 +1238,7 @@ impl SkillEvolutionService {
             experience_articles,
             trajectory_overview: overview,
             model_used: Some(model_used),
+            gate_note,
         })
     }
 
@@ -1021,9 +1250,10 @@ impl SkillEvolutionService {
         assistant_id: Option<&str>,
         conversation_id: Option<&str>,
     ) -> Option<String> {
+        let team_ids = self.list_user_team_ids(user_id).await;
         let rows = self
             .experience
-            .list_for_owner(user_id, assistant_id, 80)
+            .list_visible(user_id, &team_ids, assistant_id, None, 80)
             .await
             .unwrap_or_default();
         let mut chunks: Vec<String> = Vec::new();
@@ -1065,5 +1295,51 @@ impl SkillEvolutionService {
             return Err(AssistantError::Forbidden("proposal not owned by current user".into()));
         }
         Ok(row)
+    }
+    async fn load_settings(&self, user_id: &str) -> SkillEvolutionSettingsResponse {
+        if let Some(repo) = self.settings.as_ref()
+            && let Ok(Some(row)) = repo.get(user_id).await
+        {
+            return SkillEvolutionSettingsResponse {
+                gate_mode: row.gate_mode,
+                assist_threshold: row.assist_threshold.clamp(0, 100) as u32,
+                auto_threshold: row.auto_threshold.clamp(0, 100) as u32,
+                default_experience_visibility: row.default_experience_visibility,
+                updated_at: Some(row.updated_at),
+            };
+        }
+        default_settings_response()
+    }
+
+    async fn list_user_team_ids(&self, user_id: &str) -> Vec<String> {
+        let Some(teams) = self.teams.as_ref() else {
+            return Vec::new();
+        };
+        teams
+            .list_teams_by_user(user_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| t.id)
+            .collect()
+    }
+
+    async fn require_team_access(&self, user_id: &str, team_id: Option<&str>) -> Result<(), AssistantError> {
+        let Some(tid) = team_id.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Err(AssistantError::BadRequest("visibility=team 时必须提供 team_id".into()));
+        };
+        let Some(teams) = self.teams.as_ref() else {
+            return Err(AssistantError::BadRequest(
+                "团队仓库未配置，无法设置团队可见经验".into(),
+            ));
+        };
+        let found = teams
+            .get_team(user_id, tid)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?;
+        if found.is_none() {
+            return Err(AssistantError::Forbidden(format!("无权访问团队 {tid}")));
+        }
+        Ok(())
     }
 }

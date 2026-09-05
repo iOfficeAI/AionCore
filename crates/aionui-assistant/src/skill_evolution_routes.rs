@@ -12,9 +12,10 @@ use axum::routing::{get, post};
 
 use aionui_api_types::{
     ApiResponse, ApplySkillEvolutionRequest, ApplySkillEvolutionResponse, ApproveSkillEvolutionResponse,
-    CreateExperienceArticleRequest, CreateSkillEvolutionProposalRequest, EvolveSkillEvolutionRequest,
-    EvolveSkillEvolutionResponse, ExperienceArticleResponse, ExperienceListQuery, ReviewSkillEvolutionRequest,
-    SkillEvolutionListQuery, SkillEvolutionProposalResponse,
+    CreateExperienceArticleRequest, CreateSkillEvolutionProposalRequest, CrossModelTransferNoteResponse,
+    EvolveSkillEvolutionRequest, EvolveSkillEvolutionResponse, ExperienceArticleResponse, ExperienceListQuery,
+    ReviewSkillEvolutionRequest, SkillEvolutionListQuery, SkillEvolutionProposalResponse,
+    SkillEvolutionSettingsResponse, UpdateSkillEvolutionSettingsRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -47,6 +48,8 @@ pub fn skill_evolution_routes(state: SkillEvolutionRouterState) -> Router {
             "/api/skill-evolution/experience",
             get(list_experience).post(create_experience),
         )
+        .route("/api/skill-evolution/settings", get(get_settings).put(update_settings))
+        .route("/api/skill-evolution/cross-model-notes", get(cross_model_notes))
         .with_state(state)
 }
 
@@ -192,6 +195,8 @@ async fn list_experience(
         .list_experience(
             &current_user.id,
             query.assistant_id.as_deref(),
+            query.visibility.as_deref(),
+            query.team_id.as_deref(),
             query.limit.unwrap_or(50),
         )
         .await?;
@@ -206,4 +211,33 @@ async fn create_experience(
     let Json(req) = body?;
     let created = state.service.create_experience(&current_user.id, req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(created))))
+}
+
+async fn get_settings(
+    State(state): State<SkillEvolutionRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<SkillEvolutionSettingsResponse>>, ApiError> {
+    let item = state.service.get_settings(&current_user.id).await?;
+    Ok(Json(ApiResponse::ok(item)))
+}
+
+async fn update_settings(
+    State(state): State<SkillEvolutionRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
+    body: Result<Json<UpdateSkillEvolutionSettingsRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<SkillEvolutionSettingsResponse>>, ApiError> {
+    let req = match body {
+        Ok(Json(req)) => req,
+        Err(_) => UpdateSkillEvolutionSettingsRequest::default(),
+    };
+    let item = state.service.update_settings(&current_user.id, req).await?;
+    Ok(Json(ApiResponse::ok(item)))
+}
+
+async fn cross_model_notes(
+    State(state): State<SkillEvolutionRouterState>,
+    Extension(_current_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<Vec<CrossModelTransferNoteResponse>>>, ApiError> {
+    let items = state.service.cross_model_transfer_notes().await?;
+    Ok(Json(ApiResponse::ok(items)))
 }
