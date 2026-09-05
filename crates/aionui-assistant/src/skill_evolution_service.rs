@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use crate::error::AssistantError;
 use aionui_api_types::{
     ApproveSkillEvolutionResponse, CreateExperienceArticleRequest, CreateSkillEvolutionProposalRequest,
     ExperienceArticleResponse, ReviewSkillEvolutionRequest, SkillEvolutionAction, SkillEvolutionExportPayload,
@@ -16,7 +17,6 @@ use aionui_db::{
     IExperienceArticleRepository, ISkillEvolutionProposalRepository, SkillEvolutionProposalRow,
     UpdateSkillEvolutionProposalParams,
 };
-use crate::error::AssistantError;
 
 fn redact_secrets(input: &str) -> String {
     let mut out = input.to_string();
@@ -153,7 +153,8 @@ impl SkillEvolutionService {
             SkillEvolutionAction::Create => "create",
             SkillEvolutionAction::Patch => "patch",
         };
-        if matches!(action, SkillEvolutionAction::Patch) && req.target_skill_key.as_ref().is_none_or(|s| s.trim().is_empty())
+        if matches!(action, SkillEvolutionAction::Patch)
+            && req.target_skill_key.as_ref().is_none_or(|s| s.trim().is_empty())
         {
             return Err(AssistantError::BadRequest(
                 "target_skill_key is required for patch action".into(),
@@ -236,11 +237,7 @@ impl SkillEvolutionService {
         row_to_response(row)
     }
 
-    pub async fn submit(
-        &self,
-        user_id: &str,
-        id: &str,
-    ) -> Result<SkillEvolutionProposalResponse, AssistantError> {
+    pub async fn submit(&self, user_id: &str, id: &str) -> Result<SkillEvolutionProposalResponse, AssistantError> {
         let row = self.require_owned_proposal(user_id, id).await?;
         if row.status != "draft" {
             return Err(AssistantError::BadRequest(
@@ -281,10 +278,7 @@ impl SkillEvolutionService {
             .filter(|s| !s.is_empty())
             .unwrap_or("evolved-skill")
             .to_string();
-        let version = req
-            .applied_skill_version
-            .clone()
-            .unwrap_or_else(|| "0.1.0".to_string());
+        let version = req.applied_skill_version.clone().unwrap_or_else(|| "0.1.0".to_string());
         let now = now_ms();
         let updated = self
             .proposals
@@ -378,11 +372,7 @@ impl SkillEvolutionService {
         row_to_response(updated)
     }
 
-    pub async fn apply(
-        &self,
-        user_id: &str,
-        id: &str,
-    ) -> Result<ApproveSkillEvolutionResponse, AssistantError> {
+    pub async fn apply(&self, user_id: &str, id: &str) -> Result<ApproveSkillEvolutionResponse, AssistantError> {
         let row = self.require_owned_proposal(user_id, id).await?;
         if row.status != "approved" && row.status != "applied" {
             return Err(AssistantError::BadRequest(
@@ -394,10 +384,7 @@ impl SkillEvolutionService {
             .clone()
             .or(row.target_skill_key.clone())
             .unwrap_or_else(|| "evolved-skill".into());
-        let version = row
-            .applied_skill_version
-            .clone()
-            .unwrap_or_else(|| "0.1.0".into());
+        let version = row.applied_skill_version.clone().unwrap_or_else(|| "0.1.0".into());
         let updated = self
             .proposals
             .update(

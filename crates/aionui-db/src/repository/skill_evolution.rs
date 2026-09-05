@@ -2,8 +2,8 @@
 
 use crate::error::DbError;
 use crate::models::{
-    CreateExperienceArticleParams, CreateSkillEvolutionProposalParams, ExperienceArticleRow,
-    SkillEvolutionProposalRow, UpdateSkillEvolutionProposalParams,
+    CreateExperienceArticleParams, CreateSkillEvolutionProposalParams, ExperienceArticleRow, SkillEvolutionProposalRow,
+    UpdateSkillEvolutionProposalParams,
 };
 
 #[async_trait::async_trait]

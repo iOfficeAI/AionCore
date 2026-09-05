@@ -5,8 +5,8 @@ use sqlx::SqlitePool;
 use super::skill_evolution::{IExperienceArticleRepository, ISkillEvolutionProposalRepository};
 use crate::error::DbError;
 use crate::models::{
-    CreateExperienceArticleParams, CreateSkillEvolutionProposalParams, ExperienceArticleRow,
-    SkillEvolutionProposalRow, UpdateSkillEvolutionProposalParams,
+    CreateExperienceArticleParams, CreateSkillEvolutionProposalParams, ExperienceArticleRow, SkillEvolutionProposalRow,
+    UpdateSkillEvolutionProposalParams,
 };
 
 fn now_ms() -> i64 {
@@ -146,12 +146,11 @@ impl ISkillEvolutionProposalRepository for SqliteSkillEvolutionProposalRepositor
     }
 
     async fn get(&self, id: &str) -> Result<Option<SkillEvolutionProposalRow>, DbError> {
-        let row = sqlx::query_as::<_, SkillEvolutionProposalRow>(
-            "SELECT * FROM skill_evolution_proposals WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query_as::<_, SkillEvolutionProposalRow>("SELECT * FROM skill_evolution_proposals WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row)
     }
 
@@ -238,26 +237,16 @@ impl ISkillEvolutionProposalRepository for SqliteSkillEvolutionProposalRepositor
             .experience_article_ids
             .unwrap_or(existing.experience_article_ids.as_str());
         let draft_skill_md = params.draft_skill_md.unwrap_or(existing.draft_skill_md.as_str());
-        let draft_diff_summary = params
-            .draft_diff_summary
-            .or(existing.draft_diff_summary.as_deref());
-        let target_skill_key = params
-            .target_skill_key
-            .or(existing.target_skill_key.as_deref());
-        let reviewer_user_id = params
-            .reviewer_user_id
-            .or(existing.reviewer_user_id.as_deref());
+        let draft_diff_summary = params.draft_diff_summary.or(existing.draft_diff_summary.as_deref());
+        let target_skill_key = params.target_skill_key.or(existing.target_skill_key.as_deref());
+        let reviewer_user_id = params.reviewer_user_id.or(existing.reviewer_user_id.as_deref());
         let review_comment = params.review_comment.or(existing.review_comment.as_deref());
         let reviewed_at = params.reviewed_at.or(existing.reviewed_at);
-        let applied_skill_key = params
-            .applied_skill_key
-            .or(existing.applied_skill_key.as_deref());
+        let applied_skill_key = params.applied_skill_key.or(existing.applied_skill_key.as_deref());
         let applied_skill_version = params
             .applied_skill_version
             .or(existing.applied_skill_version.as_deref());
-        let previous_skill_md = params
-            .previous_skill_md
-            .or(existing.previous_skill_md.as_deref());
+        let previous_skill_md = params.previous_skill_md.or(existing.previous_skill_md.as_deref());
 
         sqlx::query(
             "UPDATE skill_evolution_proposals SET

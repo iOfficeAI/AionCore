@@ -73,7 +73,7 @@ pub struct CreateSkillEvolutionProposalParams<'a> {
     pub draft_diff_summary: Option<&'a str>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UpdateSkillEvolutionProposalParams<'a> {
     pub status: Option<&'a str>,
     pub title: Option<&'a str>,
@@ -88,24 +88,4 @@ pub struct UpdateSkillEvolutionProposalParams<'a> {
     pub applied_skill_key: Option<&'a str>,
     pub applied_skill_version: Option<&'a str>,
     pub previous_skill_md: Option<&'a str>,
-}
-
-impl Default for UpdateSkillEvolutionProposalParams<'static> {
-    fn default() -> Self {
-        Self {
-            status: None,
-            title: None,
-            experience_summary: None,
-            experience_article_ids: None,
-            draft_skill_md: None,
-            draft_diff_summary: None,
-            target_skill_key: None,
-            reviewer_user_id: None,
-            review_comment: None,
-            reviewed_at: None,
-            applied_skill_key: None,
-            applied_skill_version: None,
-            previous_skill_md: None,
-        }
-    }
 }

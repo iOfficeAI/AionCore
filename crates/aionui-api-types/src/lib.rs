@@ -32,8 +32,8 @@ mod session_tools;
 mod shell;
 mod sidebar;
 mod skill;
-mod skill_evolution;
 mod skill_delivery;
+mod skill_evolution;
 mod skill_runtime;
 mod system;
 mod team;
@@ -212,8 +212,7 @@ pub use skill_delivery::{SkillDelivery, SkillDeliveryMode, SkillDeliveryParse, p
 pub use skill_evolution::{
     ApproveSkillEvolutionResponse, CreateExperienceArticleRequest, CreateSkillEvolutionProposalRequest,
     ExperienceArticleResponse, ExperienceListQuery, ReviewSkillEvolutionRequest, SkillEvolutionAction,
-    SkillEvolutionExportPayload, SkillEvolutionListQuery, SkillEvolutionProposalResponse,
-    SkillEvolutionStatus,
+    SkillEvolutionExportPayload, SkillEvolutionListQuery, SkillEvolutionProposalResponse, SkillEvolutionStatus,
 };
 pub use skill_runtime::{
     RuntimeSkillFileQuery, RuntimeSkillFileResponse, RuntimeSkillListItem, RuntimeSkillListResponse,

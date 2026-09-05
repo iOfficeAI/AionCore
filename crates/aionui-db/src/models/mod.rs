@@ -47,8 +47,8 @@ pub use provider::Provider;
 pub use remote_agent::RemoteAgentRow;
 pub use skill::{SkillImportRecordRow, SkillRegistryInstallRow, SkillRow};
 pub use skill_evolution::{
-    CreateExperienceArticleParams, CreateSkillEvolutionProposalParams, ExperienceArticleRow,
-    SkillEvolutionProposalRow, UpdateSkillEvolutionProposalParams,
+    CreateExperienceArticleParams, CreateSkillEvolutionProposalParams, ExperienceArticleRow, SkillEvolutionProposalRow,
+    UpdateSkillEvolutionProposalParams,
 };
 pub use system_settings::SystemSettings;
 pub use team::{MailboxMessageRow, TeamRow, TeamTaskRow};

@@ -341,9 +341,7 @@ pub async fn build_module_states(
         agent_center: build_module_state_phase(&boot, "agent_center", || {
             build_agent_center_state(services, &assistant)
         }),
-        skill_evolution: build_module_state_phase(&boot, "skill_evolution", || {
-            build_skill_evolution_state(services)
-        }),
+        skill_evolution: build_module_state_phase(&boot, "skill_evolution", || build_skill_evolution_state(services)),
     };
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
