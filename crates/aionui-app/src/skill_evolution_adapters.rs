@@ -168,7 +168,9 @@ impl SkillEvolutionApplyPort for SkillHubApplyAdapter {
     ) -> Result<SkillWriteOutcome, AssistantError> {
         let key = sanitize_skill_key(skill_key);
         if key.is_empty() {
-            return Err(AssistantError::BadRequest("invalid skill_key".into()));
+            return Err(AssistantError::BadRequest(
+                "无效的 skill_key（请使用字母数字与连字符）".into(),
+            ));
         }
 
         let mut skills_hub_path = None;
@@ -185,7 +187,7 @@ impl SkillEvolutionApplyPort for SkillHubApplyAdapter {
             let imported =
                 import_skill_with_repo_for_user(&self.skill_paths, self.skill_repo.as_ref(), user_id, &skill_dir)
                     .await
-                    .map_err(|e| AssistantError::Internal(format!("import skill failed: {e}")))?;
+                    .map_err(|e| AssistantError::BadRequest(format!("导入 Skills Hub 失败：{e}")))?;
             skills_hub_path = Some(format!("skills/{}/SKILL.md", imported.name));
         }
 
@@ -195,11 +197,11 @@ impl SkillEvolutionApplyPort for SkillHubApplyAdapter {
             let target_dir = root.join(".csbu-workmate").join("skills").join(&key);
             tokio::fs::create_dir_all(&target_dir)
                 .await
-                .map_err(|e| AssistantError::Internal(format!("create workspace skill dir: {e}")))?;
+                .map_err(|e| AssistantError::BadRequest(format!("创建工作区技能目录失败：{e}")))?;
             let target = target_dir.join("SKILL.md");
             tokio::fs::write(&target, skill_md)
                 .await
-                .map_err(|e| AssistantError::Internal(format!("write workspace SKILL.md: {e}")))?;
+                .map_err(|e| AssistantError::BadRequest(format!("写入工作区 SKILL.md 失败：{e}")))?;
             workspace_skill_path = Some(target.display().to_string());
         }
 

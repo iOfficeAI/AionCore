@@ -447,8 +447,17 @@ impl SkillEvolutionService {
         let comment = req.comment.clone().unwrap_or_default();
         let article_id = generate_prefixed_id("ea");
         let body = format!(
-            "## 被拒提案\n\n- proposal_id: `{}`\n- title: {}\n\n### 审核意见\n\n{}\n\n### 经验摘要\n\n{}\n",
-            row.id, row.title, comment, row.experience_summary
+            "## 被拒提案（经验库保留，勿重复踩坑）\n\n- proposal_id: `{}`\n- title: {}\n- target_skill_key: {}\n\n### 审核意见\n\n{}\n\n### 经验摘要\n\n{}\n\n### 草案片段\n\n```\n{}\n```\n",
+            row.id,
+            row.title,
+            row.target_skill_key.as_deref().unwrap_or("(未指定)"),
+            if comment.trim().is_empty() {
+                "（未填写具体意见）"
+            } else {
+                comment.as_str()
+            },
+            row.experience_summary,
+            truncate_chars(&row.draft_skill_md, 1200),
         );
         let article = self
             .experience
@@ -502,7 +511,7 @@ impl SkillEvolutionService {
         let row = self.require_owned_proposal(user_id, id).await?;
         if row.status != "approved" && row.status != "applied" {
             return Err(AssistantError::BadRequest(
-                "only approved proposals can be applied".into(),
+                "仅已通过（或已应用）的提案可写入 Skills Hub；请先审核通过。".into(),
             ));
         }
         let skill_key = row
@@ -532,7 +541,7 @@ impl SkillEvolutionService {
             let port = self
                 .apply_port
                 .as_ref()
-                .ok_or_else(|| AssistantError::Internal("skill apply port not configured".into()))?;
+                .ok_or_else(|| AssistantError::Internal("技能应用端口未配置：请升级 Core 后重试".into()))?;
             let outcome = port
                 .write_skill(
                     user_id,
@@ -541,7 +550,13 @@ impl SkillEvolutionService {
                     workspace.as_deref(),
                     req.write_to_skills_hub,
                 )
-                .await?;
+                .await
+                .map_err(|e| match e {
+                    AssistantError::BadRequest(msg) => {
+                        AssistantError::BadRequest(format!("写入 Skills Hub / 工作区失败：{msg}"))
+                    }
+                    other => AssistantError::Internal(format!("写入技能失败：{other}")),
+                })?;
             skills_hub_path = outcome.skills_hub_path;
             workspace_skill_path = outcome.workspace_skill_path;
         }
@@ -550,7 +565,11 @@ impl SkillEvolutionService {
             && let Some(aid) = row.assistant_id.as_deref().filter(|s| !s.is_empty())
             && let Some(pin) = self.pin_port.as_ref()
         {
-            pin.pin_skill(user_id, aid, &skill_key, &version).await?;
+            pin.pin_skill(user_id, aid, &skill_key, &version).await.map_err(|e| {
+                AssistantError::BadRequest(format!(
+                    "技能已写入，但 pin 到智能体失败：{e}。可稍后在智能体中心手动绑定。"
+                ))
+            })?;
             skill_ref = Some(SkillEvolutionSkillRefPayload {
                 skill_key: skill_key.clone(),
                 version_policy: "pin".into(),
@@ -721,9 +740,9 @@ impl SkillEvolutionService {
         req: EvolveSkillEvolutionRequest,
     ) -> Result<EvolveSkillEvolutionResponse, AssistantError> {
         let row = self.require_owned_proposal(user_id, proposal_id).await?;
-        if row.status != "draft" && row.status != "pending_review" {
+        if row.status != "draft" && row.status != "pending_review" && row.status != "rejected" {
             return Err(AssistantError::BadRequest(
-                "only draft/pending_review proposals can be evolved".into(),
+                "仅草稿、待审核或已拒绝的提案可再次智能提炼".into(),
             ));
         }
         let conversation_id = row
@@ -837,7 +856,7 @@ impl SkillEvolutionService {
 
         let impact_id = generate_prefixed_id("ea");
         let impact_body = format!(
-            "## Skill impact note\n\n- conversation: `{conv_label}`\n- model: `{model_used}`\n- pattern_article: `{}`\n\n经验库仅用于技能进化，不会注入日常对话。\n",
+            "## 技能影响笔记\n\n- 会话: `{conv_label}`\n- 模型: `{model_used}`\n- 关联 pattern: `{}`\n\n说明：经验库仅用于技能进化，**不会**注入日常对话。\n",
             pattern_article.id
         );
         let impact_article = self
@@ -857,11 +876,15 @@ impl SkillEvolutionService {
             .await
             .map_err(|e| AssistantError::Internal(e.to_string()))?;
 
+        let prior_notes = self
+            .load_prior_evolution_notes(user_id, req.assistant_id.as_deref(), conversation_id)
+            .await;
         let proposer_user = skill_evolution_prompts::proposer_user(
             &pattern_body,
             &digest.digest_md,
             req.title.as_deref(),
             req.target_skill_key.as_deref(),
+            prior_notes.as_deref(),
         );
         let (proposer_raw, model_used2) = match llm
             .complete(
@@ -988,6 +1011,43 @@ impl SkillEvolutionService {
             trajectory_overview: overview,
             model_used: Some(model_used),
         })
+    }
+
+    /// Load durable rejected_note / skill_impact articles for this conversation
+    /// (and assistant when set) so re-evolve does not repeat failed proposals.
+    async fn load_prior_evolution_notes(
+        &self,
+        user_id: &str,
+        assistant_id: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Option<String> {
+        let rows = self
+            .experience
+            .list_for_owner(user_id, assistant_id, 80)
+            .await
+            .unwrap_or_default();
+        let mut chunks: Vec<String> = Vec::new();
+        for row in rows {
+            if row.kind != "rejected_note" && row.kind != "skill_impact" {
+                continue;
+            }
+            if let Some(cid) = conversation_id {
+                let sources = parse_json_string_array(&row.source_conversation_ids);
+                if !sources.is_empty() && !sources.iter().any(|s| s == cid) {
+                    continue;
+                }
+            }
+            let body = truncate_chars(&row.body_md, 1800);
+            chunks.push(format!("### [{}] {}\n\n{}\n", row.kind, row.title, body));
+            if chunks.len() >= 6 {
+                break;
+            }
+        }
+        if chunks.is_empty() {
+            None
+        } else {
+            Some(chunks.join("\n"))
+        }
     }
 
     async fn require_owned_proposal(
