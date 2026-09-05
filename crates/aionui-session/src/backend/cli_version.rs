@@ -37,8 +37,8 @@ use crate::event::{LocalizedText, NoticeLevel};
 /// on does complete turns and passes the suite, so the gate walks forward over
 /// 0.147.0 and leaves it unverified rather than a floor anyone can install into.
 pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.236";
-pub const VERIFIED_CODEX_VERSION: &str = "0.150.1";
-pub const VERIFIED_AGY_VERSION: &str = "1.1.22";
+pub const VERIFIED_CODEX_VERSION: &str = "0.151.0";
+pub const VERIFIED_AGY_VERSION: &str = "1.1.25";
 
 /// The verified release for a direct-CLI backend, keyed by the program name the
 /// backend spawns. `None` for anything not version-gated here.
@@ -456,10 +456,10 @@ mod tests {
 
     #[test]
     fn components_compare_numerically_not_lexically() {
-        // The bug a string compare would introduce: "0.150.1" < "0.99.0"
-        // lexically, but 150 > 99.
+        // The bug a string compare would introduce: "0.151.0" < "0.99.0"
+        // lexically, but 151 > 99.
         assert_eq!(classify("0.99.0", VERIFIED_CODEX_VERSION), VersionVerdict::Older);
-        assert_eq!(classify("0.151.0", VERIFIED_CODEX_VERSION), VersionVerdict::Newer);
+        assert_eq!(classify("0.151.1", VERIFIED_CODEX_VERSION), VersionVerdict::Newer);
     }
 
     #[test]
@@ -468,6 +468,14 @@ mod tests {
         assert_eq!(parse_version("2.1.220 (Claude Code)"), Some(vec![2, 1, 220]));
         assert_eq!(parse_version("codex-cli 0.144.6"), Some(vec![0, 144, 6]));
         assert_eq!(parse_version("1.1.10"), Some(vec![1, 1, 10]));
+    }
+
+    #[test]
+    fn the_verified_agy_release_says_nothing() {
+        assert_eq!(classify("1.1.25", VERIFIED_AGY_VERSION), VersionVerdict::Verified);
+        assert!(drift_notice("agy", "1.1.25", VERIFIED_AGY_VERSION).is_none());
+        assert_eq!(classify("1.1.24", VERIFIED_AGY_VERSION), VersionVerdict::Older);
+        assert_eq!(classify("1.1.26", VERIFIED_AGY_VERSION), VersionVerdict::Newer);
     }
 
     /// Both drift directions are `Info` — the tier the frontend draws as a quiet
@@ -552,14 +560,22 @@ mod tests {
 
     #[test]
     fn local_codex_output_is_classified_as_newer() {
-        // Prefixed `codex --version` output, with a release actually newer
-        // than the current pin (0.150.1). 0.147.0 used to be Newer when the
-        // pin was 0.144.6; it is Older now.
-        assert_eq!(parse_version("codex-cli 0.151.0"), Some(vec![0, 151, 0]));
-        let (level, _, localized) =
-            drift_notice("codex", "codex-cli 0.151.0", VERIFIED_CODEX_VERSION).expect("0.151.0 drifts from 0.150.1");
+        // Real `codex --version` output shape, one release above the verified
+        // one so the newer path is what gets exercised.
+        assert_eq!(parse_version("codex-cli 0.152.0"), Some(vec![0, 152, 0]));
+        let (level, _, localized) = drift_notice("codex", "codex-cli 0.152.0", VERIFIED_CODEX_VERSION)
+            .expect("0.152.0 drifts from the verified release");
         assert_eq!(level, NoticeLevel::Info);
         assert_eq!(localized.code, CODE_CLI_VERSION_NEWER);
+
+        // Literal on purpose, same as the claude case: a user actually on the
+        // verified release is told nothing, and this breaks if a bump lands
+        // without re-verifying against that exact binary.
+        assert_eq!(
+            classify("codex-cli 0.151.0", VERIFIED_CODEX_VERSION),
+            VersionVerdict::Verified
+        );
+        assert!(drift_notice("codex", "codex-cli 0.151.0", VERIFIED_CODEX_VERSION).is_none());
     }
 
     #[test]
