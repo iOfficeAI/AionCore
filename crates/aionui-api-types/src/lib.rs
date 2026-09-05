@@ -4,6 +4,7 @@
 mod acp;
 mod acp_prompt_hook;
 mod agent_build_extra;
+mod agent_center;
 mod agent_discovery;
 mod agent_error;
 mod antigravity_hook;
@@ -55,6 +56,12 @@ pub use acp_prompt_hook::AcpPromptHookWarningPayload;
 pub use agent_build_extra::{
     AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, ForkSpec, SessionMcpServer, SessionMcpTransport,
     SlashCommandCompletionBehavior, SlashCommandItem,
+};
+pub use agent_center::{
+    AgentAclRole, AgentCenterDetailResponse, AgentCenterListItem, AgentCenterListQuery, AgentCenterMeta,
+    AgentCenterMetaPatch, AgentCenterRevisionResponse, AgentCenterRunPlanResponse, AgentMcpPolicy, AgentPublishStatus,
+    AgentRoleBinding, AgentSkillRef, AgentVisibility, CreateAgentCenterRequest, CreateConversationRequestWire,
+    KnowledgeScopeRef, PublishAgentCenterRequest, SkillVersionPolicy, UpdateAgentCenterRequest,
 };
 pub use agent_discovery::{
     AgentEnvEntry, AgentHandshake, AgentLogoEntry, AgentManagementRow, AgentManagementStatus, AgentMetadata,

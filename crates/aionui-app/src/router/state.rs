@@ -8,7 +8,8 @@ use std::time::Instant;
 
 use aionui_ai_agent::{AgentRouterState, AgentService, IWorkerTaskManager, RemoteAgentRouterState, RemoteAgentService};
 use aionui_assistant::{
-    AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
+    AgentCenterRouterState, AgentCenterService, AssistantAgentCatalogPort, AssistantError, AssistantRouterState,
+    AssistantService, BuiltinAssistantRegistry,
 };
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
@@ -18,11 +19,11 @@ use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IConversationRepository,
-    IProviderRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
-    SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
-    SqliteAssistantRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
-    SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
-    SqliteSettingsRepository,
+    IProviderRepository, SqliteAgentMetadataRepository, SqliteAssistantAgentCenterRepository,
+    SqliteAssistantDefinitionRepository, SqliteAssistantDefinitionRevisionRepository, SqliteAssistantOverlayRepository,
+    SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
+    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteFeedbackDiagnosticsRepository,
+    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -149,6 +150,7 @@ pub struct ModuleStates {
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
+    pub agent_center: AgentCenterRouterState,
 }
 
 fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
@@ -333,7 +335,10 @@ pub async fn build_module_states(
         cron,
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
-        assistant,
+        assistant: assistant.clone(),
+        agent_center: build_module_state_phase(&boot, "agent_center", || {
+            build_agent_center_state(services, &assistant)
+        }),
     };
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -471,6 +476,21 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
         services.data_dir.clone(),
     ));
     AssistantRouterState { service }
+}
+
+/// Build Agent Center router state on top of the shared AssistantService.
+pub fn build_agent_center_state(services: &AppServices, assistant: &AssistantRouterState) -> AgentCenterRouterState {
+    let pool = services.database.pool().clone();
+    let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
+    let center_repo = Arc::new(SqliteAssistantAgentCenterRepository::new(pool.clone()));
+    let revision_repo = Arc::new(SqliteAssistantDefinitionRevisionRepository::new(pool));
+    let service = Arc::new(AgentCenterService::new(
+        assistant.service.clone(),
+        definition_repo,
+        center_repo,
+        revision_repo,
+    ));
+    AgentCenterRouterState { service }
 }
 
 /// Build the default `SystemRouterState` from application services.

@@ -18,7 +18,7 @@ use aionui_ai_agent::{
 };
 use aionui_api_types::ErrorResponse;
 use aionui_assets::{AssetRouterState, asset_routes};
-use aionui_assistant::assistant_routes;
+use aionui_assistant::{agent_center_routes, assistant_routes};
 use aionui_auth::{
     AuthIdentityMode, AuthRouterState, AuthState, IRuntimeTokenVerifier, RefreshCoalescer,
     SystemDefaultFilesystemAdopter, auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
@@ -339,6 +339,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let assistant_authenticated =
         assistant_routes(states.assistant).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    let agent_center_authenticated = agent_center_routes(states.agent_center)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // Office proxy routes serve iframe content but still require auth so
     // preview ports remain scoped to the active Core user.
     let office_proxy =
@@ -397,6 +400,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(office_authenticated)
         .merge(shell_authenticated)
         .merge(assistant_authenticated)
+        .merge(agent_center_authenticated)
         .merge(session_message_authenticated);
 
     // Conditionally merge WeChat login SSE route (feature-gated)

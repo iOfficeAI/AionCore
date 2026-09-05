@@ -49,7 +49,7 @@ pub struct McpRuntimeSnapshot {
 
 // ── Request types ──────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AssistantConversationOverridesRequest {
     #[serde(default)]
     pub model: Option<String>,
@@ -65,7 +65,7 @@ pub struct AssistantConversationOverridesRequest {
     pub mcp_ids: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssistantConversationRequest {
     pub id: String,
     #[serde(default)]

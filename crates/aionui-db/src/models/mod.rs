@@ -24,9 +24,10 @@ pub use agent_metadata::{
     AgentMetadataRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
 };
 pub use assistant::{
-    AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow,
-    CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
-    UpsertAssistantPreferenceParams, UpsertOverrideParams,
+    AssistantAgentCenterRow, AssistantDefinitionRevisionRow, AssistantDefinitionRow, AssistantOverlayRow,
+    AssistantOverrideRow, AssistantPreferenceRow, AssistantRow, CreateAssistantDefinitionRevisionParams,
+    CreateAssistantParams, UpdateAssistantParams, UpsertAssistantAgentCenterParams, UpsertAssistantDefinitionParams,
+    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertOverrideParams,
 };
 pub use channel::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
 pub use client_preference::ClientPreference;

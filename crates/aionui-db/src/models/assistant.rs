@@ -201,3 +201,60 @@ pub struct UpsertAssistantPreferenceParams<'a> {
     pub last_disabled_builtin_skill_ids: &'a str,
     pub last_mcp_ids: &'a str,
 }
+
+/// Row mapping for `assistant_agent_center` (Agent Center MVP side table).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct AssistantAgentCenterRow {
+    pub assistant_definition_id: String,
+    pub visibility: String,
+    pub team_id: Option<String>,
+    pub enterprise_id: Option<String>,
+    pub status: String,
+    pub version: i64,
+    pub published_revision_id: Option<String>,
+    pub knowledge_scopes: String,
+    pub skill_refs: String,
+    pub mcp_policy: String,
+    pub role_bindings: String,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+/// Insert/update params for `assistant_agent_center`.
+#[derive(Debug, Clone)]
+pub struct UpsertAssistantAgentCenterParams<'a> {
+    pub assistant_definition_id: &'a str,
+    pub visibility: &'a str,
+    pub team_id: Option<&'a str>,
+    pub enterprise_id: Option<&'a str>,
+    pub status: &'a str,
+    pub version: i64,
+    pub published_revision_id: Option<&'a str>,
+    pub knowledge_scopes: &'a str,
+    pub skill_refs: &'a str,
+    pub mcp_policy: &'a str,
+    pub role_bindings: &'a str,
+}
+
+/// Row mapping for `assistant_definition_revisions`.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct AssistantDefinitionRevisionRow {
+    pub id: String,
+    pub assistant_definition_id: String,
+    pub revision: i64,
+    pub snapshot_json: String,
+    pub changelog: Option<String>,
+    pub created_by: Option<String>,
+    pub created_at: TimestampMs,
+}
+
+/// Insert params for a published revision snapshot.
+#[derive(Debug, Clone)]
+pub struct CreateAssistantDefinitionRevisionParams<'a> {
+    pub id: &'a str,
+    pub assistant_definition_id: &'a str,
+    pub revision: i64,
+    pub snapshot_json: &'a str,
+    pub changelog: Option<&'a str>,
+    pub created_by: Option<&'a str>,
+}

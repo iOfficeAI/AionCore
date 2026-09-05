@@ -2,9 +2,10 @@
 
 use crate::error::DbError;
 use crate::models::{
-    AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow,
-    CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
-    UpsertAssistantPreferenceParams, UpsertOverrideParams,
+    AssistantAgentCenterRow, AssistantDefinitionRevisionRow, AssistantDefinitionRow, AssistantOverlayRow,
+    AssistantOverrideRow, AssistantPreferenceRow, AssistantRow, CreateAssistantDefinitionRevisionParams,
+    CreateAssistantParams, UpdateAssistantParams, UpsertAssistantAgentCenterParams, UpsertAssistantDefinitionParams,
+    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertOverrideParams,
 };
 
 /// CRUD access for user-authored assistant rows.
@@ -219,4 +220,30 @@ pub trait IAssistantPreferenceRepository: Send + Sync {
     ) -> Result<AssistantPreferenceRow, DbError>;
     async fn delete(&self, assistant_definition_id: &str) -> Result<bool, DbError>;
     async fn delete_for_user(&self, user_id: &str, assistant_definition_id: &str) -> Result<bool, DbError>;
+}
+
+/// Agent Center metadata side-table for an assistant definition.
+#[async_trait::async_trait]
+pub trait IAssistantAgentCenterRepository: Send + Sync {
+    async fn get(&self, assistant_definition_id: &str) -> Result<Option<AssistantAgentCenterRow>, DbError>;
+    async fn list_by_visibility(&self, visibility: &str) -> Result<Vec<AssistantAgentCenterRow>, DbError>;
+    async fn list_for_team(&self, team_id: &str) -> Result<Vec<AssistantAgentCenterRow>, DbError>;
+    async fn upsert(&self, params: &UpsertAssistantAgentCenterParams<'_>) -> Result<AssistantAgentCenterRow, DbError>;
+    async fn delete(&self, assistant_definition_id: &str) -> Result<bool, DbError>;
+}
+
+/// Immutable published revision snapshots for Agent Center.
+#[async_trait::async_trait]
+pub trait IAssistantDefinitionRevisionRepository: Send + Sync {
+    async fn list(&self, assistant_definition_id: &str) -> Result<Vec<AssistantDefinitionRevisionRow>, DbError>;
+    async fn get(&self, id: &str) -> Result<Option<AssistantDefinitionRevisionRow>, DbError>;
+    async fn get_by_revision(
+        &self,
+        assistant_definition_id: &str,
+        revision: i64,
+    ) -> Result<Option<AssistantDefinitionRevisionRow>, DbError>;
+    async fn create(
+        &self,
+        params: &CreateAssistantDefinitionRevisionParams<'_>,
+    ) -> Result<AssistantDefinitionRevisionRow, DbError>;
 }
