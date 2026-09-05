@@ -33,6 +33,7 @@ mod shell;
 mod sidebar;
 mod skill;
 mod skill_delivery;
+mod skill_evolution;
 mod skill_runtime;
 mod system;
 mod team;
@@ -208,6 +209,11 @@ pub use skill::{
     SkillSourceResponse, UpdateOfficialSkillRequest, WriteAssistantRuleRequest,
 };
 pub use skill_delivery::{SkillDelivery, SkillDeliveryMode, SkillDeliveryParse, parse_skill_delivery};
+pub use skill_evolution::{
+    ApproveSkillEvolutionResponse, CreateExperienceArticleRequest, CreateSkillEvolutionProposalRequest,
+    ExperienceArticleResponse, ExperienceListQuery, ReviewSkillEvolutionRequest, SkillEvolutionAction,
+    SkillEvolutionExportPayload, SkillEvolutionListQuery, SkillEvolutionProposalResponse, SkillEvolutionStatus,
+};
 pub use skill_runtime::{
     RuntimeSkillFileQuery, RuntimeSkillFileResponse, RuntimeSkillListItem, RuntimeSkillListResponse,
     RuntimeSkillShowResponse, SKILL_RUNTIME_SCHEMA_VERSION, SkillRuntimeEnvelope, SkillRuntimeErrorCode,
