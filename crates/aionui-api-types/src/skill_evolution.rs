@@ -141,3 +141,89 @@ pub struct ExperienceListQuery {
     #[serde(default)]
     pub limit: Option<i64>,
 }
+
+/// Request body for evolve endpoints (Maintainer + Proposer LLM passes).
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct EvolveSkillEvolutionRequest {
+    #[serde(default)]
+    pub assistant_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub target_skill_key: Option<String>,
+    #[serde(default)]
+    pub action: Option<SkillEvolutionAction>,
+    /// When true, create/update as pending_review; otherwise draft for editing.
+    #[serde(default)]
+    pub submit: bool,
+    /// Optional model id override (must exist on an enabled provider).
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SkillEvolutionTrajectoryOverview {
+    pub turns: u64,
+    pub steps: u64,
+    pub tools: u64,
+    pub errors: u64,
+    pub record_count: usize,
+    pub digest_md: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvolveSkillEvolutionResponse {
+    pub proposal: SkillEvolutionProposalResponse,
+    pub experience_articles: Vec<ExperienceArticleResponse>,
+    pub trajectory_overview: SkillEvolutionTrajectoryOverview,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_used: Option<String>,
+}
+
+/// Request body for apply — write Skills Hub / workspace + optional pin.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ApplySkillEvolutionRequest {
+    #[serde(default = "default_true")]
+    pub write_to_skills_hub: bool,
+    #[serde(default = "default_true")]
+    pub pin_on_assistant: bool,
+    /// Override workspace root for `.csbu-workmate/skills/<key>/SKILL.md`.
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+}
+
+impl Default for ApplySkillEvolutionRequest {
+    fn default() -> Self {
+        Self {
+            write_to_skills_hub: true,
+            pin_on_assistant: true,
+            workspace_root: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillEvolutionSkillRefPayload {
+    pub skill_key: String,
+    pub version_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplySkillEvolutionResponse {
+    pub proposal: SkillEvolutionProposalResponse,
+    pub export: SkillEvolutionExportPayload,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills_hub_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_skill_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_ref: Option<SkillEvolutionSkillRefPayload>,
+}

@@ -210,9 +210,11 @@ pub use skill::{
 };
 pub use skill_delivery::{SkillDelivery, SkillDeliveryMode, SkillDeliveryParse, parse_skill_delivery};
 pub use skill_evolution::{
-    ApproveSkillEvolutionResponse, CreateExperienceArticleRequest, CreateSkillEvolutionProposalRequest,
-    ExperienceArticleResponse, ExperienceListQuery, ReviewSkillEvolutionRequest, SkillEvolutionAction,
-    SkillEvolutionExportPayload, SkillEvolutionListQuery, SkillEvolutionProposalResponse, SkillEvolutionStatus,
+    ApplySkillEvolutionRequest, ApplySkillEvolutionResponse, ApproveSkillEvolutionResponse,
+    CreateExperienceArticleRequest, CreateSkillEvolutionProposalRequest, EvolveSkillEvolutionRequest,
+    EvolveSkillEvolutionResponse, ExperienceArticleResponse, ExperienceListQuery, ReviewSkillEvolutionRequest,
+    SkillEvolutionAction, SkillEvolutionExportPayload, SkillEvolutionListQuery, SkillEvolutionProposalResponse,
+    SkillEvolutionSkillRefPayload, SkillEvolutionStatus, SkillEvolutionTrajectoryOverview,
 };
 pub use skill_runtime::{
     RuntimeSkillFileQuery, RuntimeSkillFileResponse, RuntimeSkillListItem, RuntimeSkillListResponse,

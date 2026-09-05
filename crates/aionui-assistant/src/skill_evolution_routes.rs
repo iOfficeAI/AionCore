@@ -11,9 +11,10 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 
 use aionui_api_types::{
-    ApiResponse, ApproveSkillEvolutionResponse, CreateExperienceArticleRequest, CreateSkillEvolutionProposalRequest,
-    ExperienceArticleResponse, ExperienceListQuery, ReviewSkillEvolutionRequest, SkillEvolutionListQuery,
-    SkillEvolutionProposalResponse,
+    ApiResponse, ApplySkillEvolutionRequest, ApplySkillEvolutionResponse, ApproveSkillEvolutionResponse,
+    CreateExperienceArticleRequest, CreateSkillEvolutionProposalRequest, EvolveSkillEvolutionRequest,
+    EvolveSkillEvolutionResponse, ExperienceArticleResponse, ExperienceListQuery, ReviewSkillEvolutionRequest,
+    SkillEvolutionListQuery, SkillEvolutionProposalResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -37,6 +38,11 @@ pub fn skill_evolution_routes(state: SkillEvolutionRouterState) -> Router {
         .route("/api/skill-evolution/proposals/{id}/reject", post(reject_proposal))
         .route("/api/skill-evolution/proposals/{id}/apply", post(apply_proposal))
         .route("/api/skill-evolution/proposals/{id}/rollback", post(rollback_proposal))
+        .route("/api/skill-evolution/proposals/{id}/evolve", post(evolve_proposal))
+        .route(
+            "/api/skill-evolution/from-conversation/{id}/evolve",
+            post(evolve_from_conversation),
+        )
         .route(
             "/api/skill-evolution/experience",
             get(list_experience).post(create_experience),
@@ -121,8 +127,44 @@ async fn apply_proposal(
     State(state): State<SkillEvolutionRouterState>,
     Extension(current_user): Extension<CurrentUser>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<ApproveSkillEvolutionResponse>>, ApiError> {
-    let item = state.service.apply(&current_user.id, &id).await?;
+    body: Result<Json<ApplySkillEvolutionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ApplySkillEvolutionResponse>>, ApiError> {
+    let req = match body {
+        Ok(Json(req)) => req,
+        Err(_) => ApplySkillEvolutionRequest::default(),
+    };
+    let item = state.service.apply(&current_user.id, &id, req).await?;
+    Ok(Json(ApiResponse::ok(item)))
+}
+
+async fn evolve_proposal(
+    State(state): State<SkillEvolutionRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<EvolveSkillEvolutionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<EvolveSkillEvolutionResponse>>, ApiError> {
+    let req = match body {
+        Ok(Json(req)) => req,
+        Err(_) => EvolveSkillEvolutionRequest::default(),
+    };
+    let item = state.service.evolve_proposal(&current_user.id, &id, req).await?;
+    Ok(Json(ApiResponse::ok(item)))
+}
+
+async fn evolve_from_conversation(
+    State(state): State<SkillEvolutionRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<EvolveSkillEvolutionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<EvolveSkillEvolutionResponse>>, ApiError> {
+    let req = match body {
+        Ok(Json(req)) => req,
+        Err(_) => EvolveSkillEvolutionRequest::default(),
+    };
+    let item = state
+        .service
+        .evolve_from_conversation(&current_user.id, &id, req)
+        .await?;
     Ok(Json(ApiResponse::ok(item)))
 }
 

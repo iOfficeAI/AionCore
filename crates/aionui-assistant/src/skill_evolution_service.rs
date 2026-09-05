@@ -1,15 +1,19 @@
 //! Skill Evolution service — WorkMate-native WikiSkill gate objects.
 //!
-//! Stores experience summaries + draft SKILL.md proposals. Does not inject
-//! experience into inference prompts. Does not vendor community wikiskill CLI.
+//! Phase 1: store experience summaries + draft SKILL.md proposals.
+//! Phase 2: Maintainer/Proposer LLM evolve + apply to Skills Hub / pin.
+//! Does not inject experience into inference prompts. Does not vendor community
+//! wikiskill CLI.
 
 use std::sync::Arc;
 
 use crate::error::AssistantError;
 use aionui_api_types::{
-    ApproveSkillEvolutionResponse, CreateExperienceArticleRequest, CreateSkillEvolutionProposalRequest,
-    ExperienceArticleResponse, ReviewSkillEvolutionRequest, SkillEvolutionAction, SkillEvolutionExportPayload,
-    SkillEvolutionProposalResponse, SkillEvolutionStatus,
+    ApplySkillEvolutionRequest, ApplySkillEvolutionResponse, ApproveSkillEvolutionResponse,
+    CreateExperienceArticleRequest, CreateSkillEvolutionProposalRequest, EvolveSkillEvolutionRequest,
+    EvolveSkillEvolutionResponse, ExperienceArticleResponse, ReviewSkillEvolutionRequest, SkillEvolutionAction,
+    SkillEvolutionExportPayload, SkillEvolutionProposalResponse, SkillEvolutionSkillRefPayload, SkillEvolutionStatus,
+    SkillEvolutionTrajectoryOverview,
 };
 use aionui_common::{generate_prefixed_id, now_ms};
 use aionui_db::{
@@ -17,6 +21,12 @@ use aionui_db::{
     IExperienceArticleRepository, ISkillEvolutionProposalRepository, SkillEvolutionProposalRow,
     UpdateSkillEvolutionProposalParams,
 };
+
+use crate::skill_evolution_ports::{
+    SkillEvolutionApplyPort, SkillEvolutionLlmPort, SkillEvolutionPinPort, SkillEvolutionTrajectoryPort,
+    TrajectoryDigest,
+};
+use crate::skill_evolution_prompts;
 
 fn redact_secrets(input: &str) -> String {
     let mut out = input.to_string();
@@ -36,6 +46,95 @@ fn redact_secrets(input: &str) -> String {
         out = "[REDACTED_PRIVATE_KEY]".to_string();
     }
     out
+}
+
+fn article_row_to_response(row: aionui_db::ExperienceArticleRow) -> ExperienceArticleResponse {
+    ExperienceArticleResponse {
+        id: row.id,
+        assistant_id: row.assistant_id,
+        kind: row.kind,
+        title: row.title,
+        body_md: row.body_md,
+        source_conversation_ids: parse_json_string_array(&row.source_conversation_ids),
+        tags: parse_json_string_array(&row.tags),
+        status: row.status,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }
+}
+
+fn extract_first_heading(md: &str) -> Option<String> {
+    for line in md.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("# ") {
+            let title = rest.trim();
+            if !title.is_empty() {
+                return Some(title.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(max).collect();
+        format!("{t}…")
+    }
+}
+
+struct ProposerDraft {
+    title: String,
+    target_skill_key: String,
+    action: String,
+    experience_summary: String,
+    draft_diff_summary: Option<String>,
+    draft_skill_md: String,
+}
+
+fn parse_proposer_json(raw: &str) -> Option<ProposerDraft> {
+    let trimmed = raw.trim();
+    let json_str = if let Some(start) = trimmed.find('{') {
+        let end = trimmed.rfind('}')?;
+        &trimmed[start..=end]
+    } else {
+        return None;
+    };
+    let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let title = v.get("title")?.as_str()?.trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+    let target_skill_key = v
+        .get("target_skill_key")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| slugify_skill_key(&title));
+    let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("create").to_string();
+    let experience_summary = v
+        .get("experience_summary")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let draft_diff_summary = v
+        .get("draft_diff_summary")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let draft_skill_md = v.get("draft_skill_md")?.as_str()?.to_string();
+    if draft_skill_md.trim().is_empty() {
+        return None;
+    }
+    Some(ProposerDraft {
+        title,
+        target_skill_key,
+        action,
+        experience_summary,
+        draft_diff_summary,
+        draft_skill_md,
+    })
 }
 
 fn parse_status(raw: &str) -> Result<SkillEvolutionStatus, AssistantError> {
@@ -113,6 +212,10 @@ pub struct SkillEvolutionService {
     proposals: Arc<dyn ISkillEvolutionProposalRepository>,
     experience: Arc<dyn IExperienceArticleRepository>,
     conversations: Arc<dyn IConversationRepository>,
+    trajectory: Option<Arc<dyn SkillEvolutionTrajectoryPort>>,
+    llm: Option<Arc<dyn SkillEvolutionLlmPort>>,
+    apply_port: Option<Arc<dyn SkillEvolutionApplyPort>>,
+    pin_port: Option<Arc<dyn SkillEvolutionPinPort>>,
 }
 
 impl SkillEvolutionService {
@@ -125,7 +228,25 @@ impl SkillEvolutionService {
             proposals,
             experience,
             conversations,
+            trajectory: None,
+            llm: None,
+            apply_port: None,
+            pin_port: None,
         }
+    }
+
+    pub fn with_ports(
+        mut self,
+        trajectory: Option<Arc<dyn SkillEvolutionTrajectoryPort>>,
+        llm: Option<Arc<dyn SkillEvolutionLlmPort>>,
+        apply_port: Option<Arc<dyn SkillEvolutionApplyPort>>,
+        pin_port: Option<Arc<dyn SkillEvolutionPinPort>>,
+    ) -> Self {
+        self.trajectory = trajectory;
+        self.llm = llm;
+        self.apply_port = apply_port;
+        self.pin_port = pin_port;
+        self
     }
 
     pub async fn create_proposal(
@@ -372,7 +493,12 @@ impl SkillEvolutionService {
         row_to_response(updated)
     }
 
-    pub async fn apply(&self, user_id: &str, id: &str) -> Result<ApproveSkillEvolutionResponse, AssistantError> {
+    pub async fn apply(
+        &self,
+        user_id: &str,
+        id: &str,
+        req: ApplySkillEvolutionRequest,
+    ) -> Result<ApplySkillEvolutionResponse, AssistantError> {
         let row = self.require_owned_proposal(user_id, id).await?;
         if row.status != "approved" && row.status != "applied" {
             return Err(AssistantError::BadRequest(
@@ -385,6 +511,54 @@ impl SkillEvolutionService {
             .or(row.target_skill_key.clone())
             .unwrap_or_else(|| "evolved-skill".into());
         let version = row.applied_skill_version.clone().unwrap_or_else(|| "0.1.0".into());
+
+        let mut skills_hub_path = None;
+        let mut workspace_skill_path = None;
+        let mut skill_ref = None;
+
+        let workspace = if let Some(ws) = req.workspace_root.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(ws.to_string())
+        } else if let Some(cid) = row.conversation_id.as_deref() {
+            if let Some(traj) = self.trajectory.as_ref() {
+                traj.load_digest(user_id, cid).await.ok().and_then(|d| d.workspace)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if req.write_to_skills_hub || workspace.is_some() {
+            let port = self
+                .apply_port
+                .as_ref()
+                .ok_or_else(|| AssistantError::Internal("skill apply port not configured".into()))?;
+            let outcome = port
+                .write_skill(
+                    user_id,
+                    &skill_key,
+                    &row.draft_skill_md,
+                    workspace.as_deref(),
+                    req.write_to_skills_hub,
+                )
+                .await?;
+            skills_hub_path = outcome.skills_hub_path;
+            workspace_skill_path = outcome.workspace_skill_path;
+        }
+
+        if req.pin_on_assistant
+            && let Some(aid) = row.assistant_id.as_deref().filter(|s| !s.is_empty())
+            && let Some(pin) = self.pin_port.as_ref()
+        {
+            pin.pin_skill(user_id, aid, &skill_key, &version).await?;
+            skill_ref = Some(SkillEvolutionSkillRefPayload {
+                skill_key: skill_key.clone(),
+                version_policy: "pin".into(),
+                pinned_version: Some(version.clone()),
+                source: Some("skill-evolution".into()),
+            });
+        }
+
         let updated = self
             .proposals
             .update(
@@ -403,11 +577,16 @@ impl SkillEvolutionService {
         let export = SkillEvolutionExportPayload {
             skill_key: skill_key.clone(),
             skill_md: updated.draft_skill_md.clone(),
-            suggested_path: format!(".csbu-workmate/skills/{skill_key}/SKILL.md"),
+            suggested_path: workspace_skill_path
+                .clone()
+                .unwrap_or_else(|| format!(".csbu-workmate/skills/{skill_key}/SKILL.md")),
         };
-        Ok(ApproveSkillEvolutionResponse {
+        Ok(ApplySkillEvolutionResponse {
             proposal: row_to_response(updated)?,
             export,
+            skills_hub_path,
+            workspace_skill_path,
+            skill_ref,
         })
     }
 
@@ -512,6 +691,302 @@ impl SkillEvolutionService {
             status: row.status,
             created_at: row.created_at,
             updated_at: row.updated_at,
+        })
+    }
+
+    /// From-conversation evolve: load trajectory → Maintainer → Proposer → draft proposal.
+    pub async fn evolve_from_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: EvolveSkillEvolutionRequest,
+    ) -> Result<EvolveSkillEvolutionResponse, AssistantError> {
+        let found = self
+            .conversations
+            .get(user_id, conversation_id)
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?;
+        if found.is_none() {
+            return Err(AssistantError::NotFound(format!("conversation {conversation_id}")));
+        }
+        let digest = self.load_trajectory_digest(user_id, conversation_id).await?;
+        self.run_evolve(user_id, Some(conversation_id), None, digest, req).await
+    }
+
+    /// Re-run evolve on an existing draft/pending proposal (keeps id).
+    pub async fn evolve_proposal(
+        &self,
+        user_id: &str,
+        proposal_id: &str,
+        req: EvolveSkillEvolutionRequest,
+    ) -> Result<EvolveSkillEvolutionResponse, AssistantError> {
+        let row = self.require_owned_proposal(user_id, proposal_id).await?;
+        if row.status != "draft" && row.status != "pending_review" {
+            return Err(AssistantError::BadRequest(
+                "only draft/pending_review proposals can be evolved".into(),
+            ));
+        }
+        let conversation_id = row
+            .conversation_id
+            .clone()
+            .ok_or_else(|| AssistantError::BadRequest("proposal has no conversation_id".into()))?;
+        let mut merged = req;
+        if merged.assistant_id.is_none() {
+            merged.assistant_id = row.assistant_id.clone();
+        }
+        if merged.title.is_none() {
+            merged.title = Some(row.title.clone());
+        }
+        if merged.target_skill_key.is_none() {
+            merged.target_skill_key = row.target_skill_key.clone();
+        }
+        let digest = self.load_trajectory_digest(user_id, &conversation_id).await?;
+        self.run_evolve(
+            user_id,
+            Some(conversation_id.as_str()),
+            Some(proposal_id),
+            digest,
+            merged,
+        )
+        .await
+    }
+
+    async fn load_trajectory_digest(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<TrajectoryDigest, AssistantError> {
+        let port = self
+            .trajectory
+            .as_ref()
+            .ok_or_else(|| AssistantError::Internal("trajectory port not configured for skill evolution".into()))?;
+        let mut digest = port.load_digest(user_id, conversation_id).await?;
+        digest.digest_md = redact_secrets(&digest.digest_md);
+        Ok(digest)
+    }
+
+    async fn run_evolve(
+        &self,
+        user_id: &str,
+        conversation_id: Option<&str>,
+        existing_proposal_id: Option<&str>,
+        digest: TrajectoryDigest,
+        req: EvolveSkillEvolutionRequest,
+    ) -> Result<EvolveSkillEvolutionResponse, AssistantError> {
+        let llm = self.llm.as_ref().ok_or_else(|| {
+            AssistantError::BadRequest("未配置可用模型：请在设置中启用至少一个模型提供商后再使用「智能提炼」".into())
+        })?;
+
+        let overview = SkillEvolutionTrajectoryOverview {
+            turns: digest.turns,
+            steps: digest.steps,
+            tools: digest.tools,
+            errors: digest.errors,
+            record_count: digest.record_count,
+            digest_md: digest.digest_md.clone(),
+            conversation_name: digest.conversation_name.clone(),
+            workspace: digest.workspace.clone(),
+        };
+
+        let conv_label = conversation_id.unwrap_or("n/a");
+        let maintainer_user = skill_evolution_prompts::maintainer_user(&digest.digest_md, conv_label);
+        let (pattern_raw, model_used) = match llm
+            .complete(
+                user_id,
+                skill_evolution_prompts::MAINTAINER_SYSTEM,
+                &maintainer_user,
+                req.model.as_deref(),
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(AssistantError::BadRequest(format!(
+                    "智能提炼失败（Maintainer）：{e}。请确认已配置可用模型。"
+                )));
+            }
+        };
+        let pattern_body = redact_secrets(pattern_raw.trim());
+        if pattern_body.is_empty() {
+            return Err(AssistantError::BadRequest(
+                "Maintainer 返回空内容，请重试或更换模型".into(),
+            ));
+        }
+
+        let pattern_title =
+            extract_first_heading(&pattern_body).unwrap_or_else(|| format!("会话经验模式 · {conv_label}"));
+        let article_id = generate_prefixed_id("ea");
+        let source_json = serde_json::to_string(&conversation_id.map(|c| vec![c.to_string()]).unwrap_or_default())
+            .unwrap_or_else(|_| "[]".into());
+        let pattern_article = self
+            .experience
+            .create(&CreateExperienceArticleParams {
+                id: &article_id,
+                owner_user_id: user_id,
+                assistant_id: req.assistant_id.as_deref(),
+                team_id: None,
+                kind: "pattern",
+                title: &pattern_title,
+                body_md: &pattern_body,
+                source_conversation_ids: &source_json,
+                tags: r#"["skill-evolution","pattern","maintainer"]"#,
+                status: "active",
+            })
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?;
+
+        let impact_id = generate_prefixed_id("ea");
+        let impact_body = format!(
+            "## Skill impact note\n\n- conversation: `{conv_label}`\n- model: `{model_used}`\n- pattern_article: `{}`\n\n经验库仅用于技能进化，不会注入日常对话。\n",
+            pattern_article.id
+        );
+        let impact_article = self
+            .experience
+            .create(&CreateExperienceArticleParams {
+                id: &impact_id,
+                owner_user_id: user_id,
+                assistant_id: req.assistant_id.as_deref(),
+                team_id: None,
+                kind: "skill_impact",
+                title: &format!("影响笔记 · {pattern_title}"),
+                body_md: &impact_body,
+                source_conversation_ids: &source_json,
+                tags: r#"["skill-evolution","skill_impact"]"#,
+                status: "active",
+            })
+            .await
+            .map_err(|e| AssistantError::Internal(e.to_string()))?;
+
+        let proposer_user = skill_evolution_prompts::proposer_user(
+            &pattern_body,
+            &digest.digest_md,
+            req.title.as_deref(),
+            req.target_skill_key.as_deref(),
+        );
+        let (proposer_raw, model_used2) = match llm
+            .complete(
+                user_id,
+                skill_evolution_prompts::PROPOSER_SYSTEM,
+                &proposer_user,
+                req.model.as_deref(),
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(AssistantError::BadRequest(format!(
+                    "智能提炼失败（Proposer）：{e}。经验库 pattern 已保存，可稍后重试。"
+                )));
+            }
+        };
+        let model_used = if model_used2 != model_used {
+            format!("{model_used}+{model_used2}")
+        } else {
+            model_used
+        };
+
+        let parsed = parse_proposer_json(&proposer_raw).unwrap_or_else(|| {
+            let title = req.title.clone().unwrap_or_else(|| pattern_title.clone());
+            let key = req
+                .target_skill_key
+                .clone()
+                .unwrap_or_else(|| slugify_skill_key(&title));
+            ProposerDraft {
+                title: title.clone(),
+                target_skill_key: key.clone(),
+                action: "create".into(),
+                experience_summary: truncate_chars(&pattern_body, 1200),
+                draft_diff_summary: Some("LLM 未返回合法 JSON，已回退为 stub 草案".into()),
+                draft_skill_md: stub_skill_md(&key, &title, &truncate_chars(&pattern_body, 800), conversation_id),
+            }
+        });
+
+        let action = match req.action {
+            Some(SkillEvolutionAction::Patch) => "patch",
+            Some(SkillEvolutionAction::Create) => "create",
+            None if parsed.action == "patch" => "patch",
+            None => "create",
+        };
+        let title = req
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(parsed.title.trim())
+            .to_string();
+        let skill_key = req
+            .target_skill_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(parsed.target_skill_key.trim())
+            .to_string();
+        let skill_key = if skill_key.is_empty() {
+            slugify_skill_key(&title)
+        } else {
+            skill_key
+        };
+        let summary = redact_secrets(parsed.experience_summary.trim());
+        let draft = redact_secrets(parsed.draft_skill_md.trim());
+        let draft = if draft.is_empty() {
+            stub_skill_md(&skill_key, &title, &summary, conversation_id)
+        } else {
+            draft
+        };
+        let diff = parsed.draft_diff_summary.as_deref().map(redact_secrets);
+        let article_ids = vec![pattern_article.id.clone(), impact_article.id.clone()];
+        let article_ids_json = serde_json::to_string(&article_ids).unwrap_or_else(|_| "[]".into());
+        let status = if req.submit { "pending_review" } else { "draft" };
+
+        let proposal = if let Some(pid) = existing_proposal_id {
+            self.proposals
+                .update(
+                    pid,
+                    &UpdateSkillEvolutionProposalParams {
+                        status: Some(status),
+                        title: Some(title.as_str()),
+                        experience_summary: Some(summary.as_str()),
+                        experience_article_ids: Some(article_ids_json.as_str()),
+                        draft_skill_md: Some(draft.as_str()),
+                        draft_diff_summary: diff.as_deref(),
+                        target_skill_key: Some(skill_key.as_str()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| AssistantError::Internal(e.to_string()))?
+                .ok_or_else(|| AssistantError::NotFound(pid.to_owned()))?
+        } else {
+            let id = generate_prefixed_id("sep");
+            self.proposals
+                .create(&CreateSkillEvolutionProposalParams {
+                    id: &id,
+                    owner_user_id: user_id,
+                    assistant_id: req.assistant_id.as_deref(),
+                    conversation_id,
+                    status,
+                    title: title.as_str(),
+                    experience_summary: summary.as_str(),
+                    experience_article_ids: article_ids_json.as_str(),
+                    action,
+                    target_skill_key: Some(skill_key.as_str()),
+                    draft_skill_md: draft.as_str(),
+                    draft_diff_summary: diff.as_deref(),
+                })
+                .await
+                .map_err(|e| AssistantError::Internal(e.to_string()))?
+        };
+
+        let experience_articles = vec![
+            article_row_to_response(pattern_article),
+            article_row_to_response(impact_article),
+        ];
+
+        Ok(EvolveSkillEvolutionResponse {
+            proposal: row_to_response(proposal)?,
+            experience_articles,
+            trajectory_overview: overview,
+            model_used: Some(model_used),
         })
     }
 
