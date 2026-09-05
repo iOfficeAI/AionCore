@@ -8,6 +8,7 @@
 mod config;
 mod router;
 mod services;
+mod skill_evolution_adapters;
 
 pub use config::{AppConfig, IdentityMode, derive_encryption_key};
 pub use router::{

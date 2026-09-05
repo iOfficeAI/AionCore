@@ -13,6 +13,8 @@ pub mod builtin;
 pub mod error;
 pub mod routes;
 pub mod service;
+pub mod skill_evolution_ports;
+pub mod skill_evolution_prompts;
 pub mod skill_evolution_routes;
 pub mod skill_evolution_service;
 pub mod state;
@@ -24,5 +26,9 @@ pub use builtin::{AvatarAsset, BuiltinAssistant, BuiltinAssistantRegistry};
 pub use error::AssistantError;
 pub use routes::{AssistantRouterState, assistant_routes};
 pub use service::AssistantService;
+pub use skill_evolution_ports::{
+    SkillEvolutionApplyPort, SkillEvolutionLlmPort, SkillEvolutionPinPort, SkillEvolutionTrajectoryPort,
+    SkillWriteOutcome, TrajectoryDigest,
+};
 pub use skill_evolution_routes::{SkillEvolutionRouterState, skill_evolution_routes};
 pub use skill_evolution_service::SkillEvolutionService;

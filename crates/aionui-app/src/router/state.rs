@@ -60,6 +60,9 @@ use crate::config::{IdentityMode, derive_encryption_key};
 use crate::router::team_capability_resolver::TeamCapabilityResolver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
+use crate::skill_evolution_adapters::{
+    AgentCenterPinAdapter, ConversationTrajectoryAdapter, ProviderLlmAdapter, SkillHubApplyAdapter,
+};
 
 #[derive(Debug)]
 pub struct RouterBuildError {
@@ -301,8 +304,14 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module states bundle started"
     );
+    let system = build_module_state_phase(&boot, "system", || build_system_state(services));
+    let agent_center =
+        build_module_state_phase(&boot, "agent_center", || build_agent_center_state(services, &assistant));
+    let skill_evolution = build_module_state_phase(&boot, "skill_evolution", || {
+        build_skill_evolution_state(services, system.provider_service.clone(), agent_center.service.clone())
+    });
     let states = ModuleStates {
-        system: build_module_state_phase(&boot, "system", || build_system_state(services)),
+        system,
         conversation: build_module_state_phase(&boot, "conversation", || {
             build_conversation_state(
                 services,
@@ -338,10 +347,8 @@ pub async fn build_module_states(
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant: assistant.clone(),
-        agent_center: build_module_state_phase(&boot, "agent_center", || {
-            build_agent_center_state(services, &assistant)
-        }),
-        skill_evolution: build_module_state_phase(&boot, "skill_evolution", || build_skill_evolution_state(services)),
+        agent_center,
+        skill_evolution,
     };
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -496,13 +503,36 @@ pub fn build_agent_center_state(services: &AppServices, assistant: &AssistantRou
     AgentCenterRouterState { service }
 }
 
-/// Build Skill Evolution router state (经验库 / 技能提案).
-pub fn build_skill_evolution_state(services: &AppServices) -> SkillEvolutionRouterState {
+/// Build Skill Evolution router state (经验库 / 技能提案 + Phase 2 evolve/apply).
+pub fn build_skill_evolution_state(
+    services: &AppServices,
+    provider_service: aionui_system::ProviderService,
+    agent_center: Arc<aionui_assistant::AgentCenterService>,
+) -> SkillEvolutionRouterState {
     let pool = services.database.pool().clone();
     let proposals = Arc::new(SqliteSkillEvolutionProposalRepository::new(pool.clone()));
     let experience = Arc::new(SqliteExperienceArticleRepository::new(pool.clone()));
     let conversations = Arc::new(SqliteConversationRepository::new(pool));
-    let service = Arc::new(SkillEvolutionService::new(proposals, experience, conversations));
+    let trajectory: Arc<dyn aionui_assistant::SkillEvolutionTrajectoryPort> = Arc::new(ConversationTrajectoryAdapter {
+        conversations: services.conversation_service.clone(),
+    });
+    let llm: Arc<dyn aionui_assistant::SkillEvolutionLlmPort> = Arc::new(ProviderLlmAdapter {
+        providers: provider_service,
+        http: reqwest::Client::new(),
+    });
+    let apply_port: Arc<dyn aionui_assistant::SkillEvolutionApplyPort> = Arc::new(SkillHubApplyAdapter {
+        skill_paths: services.skill_paths.as_ref().clone(),
+        skill_repo: services.skill_repo.clone(),
+    });
+    let pin_port: Arc<dyn aionui_assistant::SkillEvolutionPinPort> = Arc::new(AgentCenterPinAdapter { agent_center });
+    let service = Arc::new(
+        SkillEvolutionService::new(proposals, experience, conversations).with_ports(
+            Some(trajectory),
+            Some(llm),
+            Some(apply_port),
+            Some(pin_port),
+        ),
+    );
     SkillEvolutionRouterState { service }
 }
 
