@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 //! HTTP routes for `/api/skill-evolution/*` (CSBU WorkMate 技能进化).
 
 use std::sync::Arc;
