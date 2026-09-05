@@ -9,7 +9,7 @@ use std::time::Instant;
 use aionui_ai_agent::{AgentRouterState, AgentService, IWorkerTaskManager, RemoteAgentRouterState, RemoteAgentService};
 use aionui_assistant::{
     AgentCenterRouterState, AgentCenterService, AssistantAgentCatalogPort, AssistantError, AssistantRouterState,
-    AssistantService, BuiltinAssistantRegistry,
+    AssistantService, BuiltinAssistantRegistry, SkillEvolutionRouterState, SkillEvolutionService,
 };
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
@@ -22,8 +22,9 @@ use aionui_db::{
     IProviderRepository, SqliteAgentMetadataRepository, SqliteAssistantAgentCenterRepository,
     SqliteAssistantDefinitionRepository, SqliteAssistantDefinitionRevisionRepository, SqliteAssistantOverlayRepository,
     SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
-    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteFeedbackDiagnosticsRepository,
-    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
+    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteExperienceArticleRepository,
+    SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
+    SqliteSettingsRepository, SqliteSkillEvolutionProposalRepository,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -151,6 +152,7 @@ pub struct ModuleStates {
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
     pub agent_center: AgentCenterRouterState,
+    pub skill_evolution: SkillEvolutionRouterState,
 }
 
 fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
@@ -339,6 +341,9 @@ pub async fn build_module_states(
         agent_center: build_module_state_phase(&boot, "agent_center", || {
             build_agent_center_state(services, &assistant)
         }),
+        skill_evolution: build_module_state_phase(&boot, "skill_evolution", || {
+            build_skill_evolution_state(services)
+        }),
     };
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -491,6 +496,16 @@ pub fn build_agent_center_state(services: &AppServices, assistant: &AssistantRou
         revision_repo,
     ));
     AgentCenterRouterState { service }
+}
+
+/// Build Skill Evolution router state (经验库 / 技能提案).
+pub fn build_skill_evolution_state(services: &AppServices) -> SkillEvolutionRouterState {
+    let pool = services.database.pool().clone();
+    let proposals = Arc::new(SqliteSkillEvolutionProposalRepository::new(pool.clone()));
+    let experience = Arc::new(SqliteExperienceArticleRepository::new(pool.clone()));
+    let conversations = Arc::new(SqliteConversationRepository::new(pool));
+    let service = Arc::new(SkillEvolutionService::new(proposals, experience, conversations));
+    SkillEvolutionRouterState { service }
 }
 
 /// Build the default `SystemRouterState` from application services.

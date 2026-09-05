@@ -1,0 +1,143 @@
+//! HTTP contract for `/api/skill-evolution/*` (CSBU WorkMate 技能进化).
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillEvolutionStatus {
+    Draft,
+    PendingReview,
+    Approved,
+    Rejected,
+    Applied,
+    RolledBack,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillEvolutionAction {
+    Create,
+    Patch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillEvolutionProposalResponse {
+    pub id: String,
+    pub assistant_id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub status: SkillEvolutionStatus,
+    pub title: String,
+    pub experience_summary: String,
+    pub experience_article_ids: Vec<String>,
+    pub action: SkillEvolutionAction,
+    pub target_skill_key: Option<String>,
+    pub draft_skill_md: String,
+    pub draft_diff_summary: Option<String>,
+    pub reviewer_user_id: Option<String>,
+    pub review_comment: Option<String>,
+    pub reviewed_at: Option<i64>,
+    pub applied_skill_key: Option<String>,
+    pub applied_skill_version: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CreateSkillEvolutionProposalRequest {
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub assistant_id: Option<String>,
+    pub title: String,
+    #[serde(default)]
+    pub experience_summary: Option<String>,
+    #[serde(default)]
+    pub action: Option<SkillEvolutionAction>,
+    #[serde(default)]
+    pub target_skill_key: Option<String>,
+    #[serde(default)]
+    pub draft_skill_md: Option<String>,
+    #[serde(default)]
+    pub draft_diff_summary: Option<String>,
+    /// When true and draft_skill_md is empty, generate a SKILL.md stub template.
+    #[serde(default = "default_true")]
+    pub auto_stub: bool,
+    /// When true, create as pending_review instead of draft.
+    #[serde(default)]
+    pub submit: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SkillEvolutionListQuery {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub assistant_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ReviewSkillEvolutionRequest {
+    #[serde(default)]
+    pub comment: Option<String>,
+    /// On approve: skill key to apply/export (overrides target_skill_key).
+    #[serde(default)]
+    pub applied_skill_key: Option<String>,
+    #[serde(default)]
+    pub applied_skill_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillEvolutionExportPayload {
+    pub skill_key: String,
+    pub skill_md: String,
+    pub suggested_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApproveSkillEvolutionResponse {
+    pub proposal: SkillEvolutionProposalResponse,
+    pub export: SkillEvolutionExportPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperienceArticleResponse {
+    pub id: String,
+    pub assistant_id: Option<String>,
+    pub kind: String,
+    pub title: String,
+    pub body_md: String,
+    pub source_conversation_ids: Vec<String>,
+    pub tags: Vec<String>,
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CreateExperienceArticleRequest {
+    pub title: String,
+    #[serde(default)]
+    pub body_md: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub assistant_id: Option<String>,
+    #[serde(default)]
+    pub source_conversation_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ExperienceListQuery {
+    #[serde(default)]
+    pub assistant_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
