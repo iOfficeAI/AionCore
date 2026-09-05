@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.9](https://github.com/suoak/AionCore/compare/v0.2.8...v0.2.9) (2026-09-05)
+
+### Features
+
+* **skill-evolution:** Phase 2 LLM evolve + Skills Hub apply/pin (#113)
+* **skill-evolution:** MVP schema + APIs（技能进化）(#112)
+* **skill-evolution:** quality loop — prior rejected notes on re-evolve + clearer apply errors (#114)
+
+### Features (Agent Center already in 0.2.8 baseline)
+
+* Agent Center MVP + try-run `preview_mode` shipped in 0.2.8 (#109/#110); 0.2.9 adds skill-evolution stack for production Latest.
+
 ## [0.2.8](https://github.com/suoak/AionCore/compare/v0.2.7...v0.2.8) (2026-09-05)
 
 ### Features
