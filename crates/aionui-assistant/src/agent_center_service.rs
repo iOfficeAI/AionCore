@@ -6,9 +6,9 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    AgentCenterDetailResponse, AgentCenterListItem, AgentCenterMeta, AgentCenterMetaPatch, AgentCenterRevisionResponse,
-    AgentCenterRunPlanResponse, AgentMcpPolicy, AgentPublishStatus, AgentSkillRef, AgentVisibility,
-    AssistantConversationOverridesRequest, AssistantDefaultListRequest, AssistantDefaultsRequest,
+    AgentCenterDetailResponse, AgentCenterListItem, AgentCenterMeta, AgentCenterMetaPatch, AgentCenterPreviewMode,
+    AgentCenterRevisionResponse, AgentCenterRunPlanResponse, AgentMcpPolicy, AgentPublishStatus, AgentSkillRef,
+    AgentVisibility, AssistantConversationOverridesRequest, AssistantDefaultListRequest, AssistantDefaultsRequest,
     CreateAgentCenterRequest, CreateConversationRequestWire, PublishAgentCenterRequest, SkillVersionPolicy,
     UpdateAgentCenterRequest, UpdateAssistantRequest,
 };
@@ -291,10 +291,16 @@ impl AgentCenterService {
             mcp_ids,
         };
 
+        let preview_mode = match detail.meta.status {
+            AgentPublishStatus::Published => AgentCenterPreviewMode::Published,
+            _ => AgentCenterPreviewMode::Draft,
+        };
+
         Ok(AgentCenterRunPlanResponse {
             assistant_id: id.to_owned(),
             revision_id: detail.meta.published_revision_id.clone(),
             revision: detail.meta.version,
+            preview_mode,
             create_conversation: CreateConversationRequestWire::for_assistant(id, Some(overrides)),
         })
     }
