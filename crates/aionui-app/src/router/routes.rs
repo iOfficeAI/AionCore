@@ -27,7 +27,9 @@ use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
 use aionui_channel::weixin_login_route;
 use aionui_common::ApiErrorLogContext;
-use aionui_conversation::{conversation_ops_routes, conversation_routes};
+use aionui_conversation::{
+    ConversationRuntimeRouterState, conversation_ops_routes, conversation_routes, conversation_runtime_routes,
+};
 use aionui_cron::cron_routes;
 use aionui_extension::{extension_routes, hub_routes, skill_routes};
 use aionui_file::file_routes;
@@ -369,6 +371,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // Runtime routes authenticate on their own token header — deliberately NOT
     // behind auth_middleware, same as runtime_team_tools.
     let session_message_runtime = session_message_routes(states.session_message.clone());
+    // Agent-facing `conversation create`. Same runtime-token self-authentication
+    // as the two groups above, so it is also mounted after the CSRF layer.
+    let conversation_runtime = conversation_runtime_routes(ConversationRuntimeRouterState {
+        service: services.conversation_service.clone(),
+        runtime_token_service: services.runtime_token_service.clone(),
+    });
     // Channel A. Same runtime-token self-authentication: the caller is an agent
     // process holding a conversation-scoped token, not a browser session.
     let skill_runtime = skill_runtime_routes(states.skill_runtime);
@@ -428,6 +436,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     .merge(ws_routes)
     .merge(runtime_team_tools)
     .merge(session_message_runtime)
+    .merge(conversation_runtime)
     .merge(office_proxy)
     .merge(public_assets)
     .layer(middleware::from_fn(security_headers_middleware));
