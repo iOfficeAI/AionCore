@@ -774,8 +774,6 @@ impl ConversationService {
             .and_then(|guard| guard.as_ref().cloned())
     }
 
-    // Read by the assistant-override branch of `runtime_create` (next task).
-    #[allow(dead_code)]
     pub(crate) fn provider_repo(&self) -> Option<Arc<dyn IProviderRepository>> {
         self.provider_repo.read().ok().and_then(|guard| guard.as_ref().cloned())
     }

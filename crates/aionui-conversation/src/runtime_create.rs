@@ -99,8 +99,6 @@ impl ConversationCreateError {
 pub(crate) enum Inheritance {
     Snapshot,
     LegacyTriple,
-    // Constructed by the assistant-override branch (next task).
-    #[allow(dead_code)]
     AssistantOverride,
 }
 
@@ -118,8 +116,6 @@ impl Inheritance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModelResolution {
     Inherited,
-    // Constructed by the assistant-override branch (next task).
-    #[allow(dead_code)]
     ProviderMatch,
     NotRequired,
 }
@@ -370,11 +366,123 @@ impl ConversationService {
         })
     }
 
-    /// "Explicit" branch. Filled in by the next task.
-    async fn override_plan(&self, _user_id: &str, _assistant_id: &str) -> Result<CreatePlan, ConversationCreateError> {
-        Err(ConversationCreateError::TransportUnavailable {
-            reason: "assistant override not implemented".to_owned(),
+    /// "Explicit" branch: the definition must exist and be enabled; aionrs
+    /// assistants additionally need their default model matched to one of the
+    /// user's providers — NO fallback to the caller's model, which may belong
+    /// to a provider the chosen assistant was never meant to use.
+    async fn override_plan(&self, user_id: &str, assistant_id: &str) -> Result<CreatePlan, ConversationCreateError> {
+        let (Some(definition_repo), Some(state_repo)) = (self.assistant_definition_repo(), self.assistant_state_repo())
+        else {
+            return Err(ConversationCreateError::TransportUnavailable {
+                reason: "assistant repositories are not configured".to_owned(),
+            });
+        };
+
+        let definition = definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await
+            .map_err(ConversationCreateError::transport)?
+            .ok_or_else(|| ConversationCreateError::AssistantNotFound {
+                id: assistant_id.to_owned(),
+            })?;
+
+        // Overlay row absent ⇒ enabled, the same reading `aionui-assistant`'s
+        // projection applies.
+        let overlay = state_repo
+            .get_for_user(user_id, &definition.id)
+            .await
+            .map_err(ConversationCreateError::transport)?;
+        if !overlay.as_ref().is_none_or(|row| row.enabled) {
+            return Err(ConversationCreateError::AssistantDisabled {
+                id: assistant_id.to_owned(),
+            });
+        }
+
+        // Reuse the exact model/backend resolution `create` will run again, so
+        // the pre-check and the persisted snapshot cannot disagree.
+        let snapshot = self
+            .resolve_assistant_snapshot(
+                user_id,
+                assistant_id,
+                None,
+                &crate::service::AssistantConversationOverrides::default(),
+                &Value::Null,
+            )
+            .await
+            .map_err(ConversationCreateError::transport)?
+            .ok_or_else(|| ConversationCreateError::AssistantNotFound {
+                id: assistant_id.to_owned(),
+            })?;
+
+        let (model, model_resolution) = if snapshot.agent_type == AgentType::Aionrs {
+            let model_id = snapshot.resolved_defaults.model.clone().ok_or_else(|| {
+                ConversationCreateError::AssistantModelUnresolved {
+                    assistant_id: assistant_id.to_owned(),
+                    model_id: None,
+                }
+            })?;
+            let provider_id = self
+                .match_provider_for_model(user_id, &model_id)
+                .await?
+                .ok_or_else(|| {
+                    warn!(
+                        assistant_id,
+                        "aionrs assistant default model is not offered by any enabled provider"
+                    );
+                    ConversationCreateError::AssistantModelUnresolved {
+                        assistant_id: assistant_id.to_owned(),
+                        model_id: Some(model_id.clone()),
+                    }
+                })?;
+            (
+                Some(ProviderWithModel {
+                    provider_id,
+                    model: model_id.clone(),
+                    use_model: Some(model_id),
+                }),
+                ModelResolution::ProviderMatch,
+            )
+        } else {
+            (None, ModelResolution::NotRequired)
+        };
+
+        Ok(CreatePlan {
+            r#type: None,
+            assistant_id: Some(assistant_id.to_owned()),
+            model,
+            legacy_triple: Map::new(),
+            inheritance: Inheritance::AssistantOverride,
+            model_resolution,
         })
+    }
+
+    /// First ENABLED provider whose `models` JSON array lists `model_id` — the
+    /// same rule as team provisioning's `resolve_provider_for_model` and the
+    /// picker's `modelList[0]` default. `None` when no provider matches.
+    async fn match_provider_for_model(
+        &self,
+        user_id: &str,
+        model_id: &str,
+    ) -> Result<Option<String>, ConversationCreateError> {
+        let Some(provider_repo) = self.provider_repo() else {
+            return Err(ConversationCreateError::TransportUnavailable {
+                reason: "provider repository is not configured".to_owned(),
+            });
+        };
+        let providers = provider_repo
+            .list(user_id)
+            .await
+            .map_err(ConversationCreateError::transport)?;
+        Ok(providers
+            .into_iter()
+            .filter(|provider| provider.enabled)
+            .find(|provider| {
+                serde_json::from_str::<Vec<String>>(&provider.models)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|candidate| candidate == model_id)
+            })
+            .map(|provider| provider.id))
     }
 }
 
