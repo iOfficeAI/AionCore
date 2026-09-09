@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/iOfficeAI/AionCore/compare/v0.2.1...v0.2.2) (2026-09-09)
+
+
+### Features
+
+* **conversation:** add aioncore conversation create for agent-driven conversation creation ([#977](https://github.com/iOfficeAI/AionCore/issues/977)) ([23daff5](https://github.com/iOfficeAI/AionCore/commit/23daff534ceb93cfb6371fb5993a383cbbe2e223))
+
 ## [0.2.1](https://github.com/iOfficeAI/AionCore/compare/v0.2.0...v0.2.1) (2026-09-01)
 
 
