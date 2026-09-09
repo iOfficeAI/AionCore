@@ -109,6 +109,22 @@ impl AgentRuntime {
     /// Atomic: set status ← Finished AND broadcast `Finish(session_id)`.
     /// Idempotent in the Finished absorbing state (no-op).
     pub fn emit_finish(&self, session_id: Option<String>) {
+        self.emit_finish_data(FinishEventData {
+            session_id,
+            ..Default::default()
+        });
+    }
+
+    /// Atomic finish carrying provider-reported consumption for one completed turn.
+    pub fn emit_finish_with_usage(&self, session_id: Option<String>, input_tokens: u64, output_tokens: u64) {
+        self.emit_finish_data(FinishEventData {
+            session_id,
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+        });
+    }
+
+    fn emit_finish_data(&self, data: FinishEventData) {
         let already_finished = {
             let mut guard = self.status.write().unwrap_or_else(|e| e.into_inner());
             let was_finished = matches!(*guard, Some(ConversationStatus::Finished));
@@ -120,9 +136,7 @@ impl AgentRuntime {
         if already_finished {
             return;
         }
-        let _ = self
-            .event_tx
-            .send(AgentStreamEvent::Finish(FinishEventData { session_id }));
+        let _ = self.event_tx.send(AgentStreamEvent::Finish(data));
     }
 
     /// Atomic: set status ← Finished AND broadcast `Error { message }`.
@@ -188,6 +202,25 @@ mod tests {
         match ev {
             AgentStreamEvent::Finish(data) => {
                 assert_eq!(data.session_id.as_deref(), Some("sess-1"));
+            }
+            other => panic!("expected Finish, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_finish_with_usage_transitions_and_broadcasts_provider_totals() {
+        let rt = runtime();
+        let mut rx = rt.subscribe();
+
+        rt.emit_finish_with_usage(Some("sess-usage".into()), 1_200, 345);
+
+        assert_eq!(rt.status(), Some(ConversationStatus::Finished));
+        let ev = rx.recv().await.expect("finish event");
+        match ev {
+            AgentStreamEvent::Finish(data) => {
+                assert_eq!(data.session_id.as_deref(), Some("sess-usage"));
+                assert_eq!(data.input_tokens, Some(1_200));
+                assert_eq!(data.output_tokens, Some(345));
             }
             other => panic!("expected Finish, got {other:?}"),
         }
