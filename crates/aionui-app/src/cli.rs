@@ -117,6 +117,9 @@ pub(crate) enum Command {
     /// Cross-session messaging: list deliverable conversations and deliver a
     /// message to one of them.
     Session(SessionArgs),
+    /// Agent-facing conversation CLI: create a new conversation for this user
+    /// that inherits (or overrides) the current conversation's setup.
+    Conversation(ConversationArgs),
     /// Agent-facing read-only runtime CLI for THIS conversation's skills.
     /// Channel A of skill delivery: a normal tool call instead of the
     /// `[LOAD_SKILL]` text-protocol round trip.
@@ -160,6 +163,7 @@ impl Command {
             Self::Diagnose(_) => "diagnose",
             Self::Team(_) => "team",
             Self::Session(_) => "session",
+            Self::Conversation(_) => "conversation",
             Self::Skills(_) => "skills",
             Self::AntigravityHook => "antigravity-hook",
             Self::McpTeamStdio => "mcp-team-stdio",
@@ -240,6 +244,20 @@ pub(crate) enum SessionCommand {
     Capabilities,
     List,
     SendMessage,
+    #[command(external_subcommand)]
+    Unknown(Vec<OsString>),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConversationArgs {
+    #[command(subcommand)]
+    pub command: ConversationCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConversationCommand {
+    Capabilities,
+    Create,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
 }
@@ -819,8 +837,9 @@ mod tests {
     use clap::error::ErrorKind;
 
     use super::{
-        Cli, Command, ConfigArgs, ConfigCommand, ManagedResourcesModeArg, PrepareManagedResourcesArgs, SecretArgs,
-        SecretCommand, SessionCommand, TeamCommand, UserArgs, UserCommand, UserStatusArgs,
+        Cli, Command, ConfigArgs, ConfigCommand, ConversationCommand, ManagedResourcesModeArg,
+        PrepareManagedResourcesArgs, SecretArgs, SecretCommand, SessionCommand, TeamCommand, UserArgs, UserCommand,
+        UserStatusArgs,
     };
 
     #[test]
@@ -1100,6 +1119,57 @@ mod tests {
             parse_session_command(&["aioncore", "session", "definitely-not-a-command"]).is_none(),
             "the guard above only works if an unwired path resolves to Unknown"
         );
+    }
+
+    fn parse_conversation_command(argv: &[&str]) -> Option<ConversationCommand> {
+        let cli = Cli::try_parse_from(argv).ok()?;
+        let Some(Command::Conversation(args)) = cli.command else {
+            return None;
+        };
+        match args.command {
+            ConversationCommand::Unknown(_) => None,
+            command => Some(command),
+        }
+    }
+
+    /// Every tool in the conversation registry advertises a `cli_command`, and
+    /// that path is printed by `conversation capabilities` and copied into the
+    /// auto-inject skill. A registry entry with no wired subcommand sends
+    /// agents at a command that can only fail.
+    #[test]
+    fn every_registry_tool_has_a_wired_conversation_cli_subcommand() {
+        for tool in aionui_api_types::conversation_tool_descriptors() {
+            let mut argv = vec!["aioncore", "conversation"];
+            argv.extend(tool.cli_command.iter().map(String::as_str));
+            assert!(
+                parse_conversation_command(&argv).is_some(),
+                "`{}` is advertised by tool {} but is not wired into ConversationCommand",
+                argv[1..].join(" "),
+                tool.name
+            );
+        }
+    }
+
+    /// The reverse direction: every wired data subcommand has a descriptor, so
+    /// `capabilities` and the skill can describe it.
+    #[test]
+    fn every_wired_conversation_subcommand_has_a_registry_descriptor() {
+        // `create` is the only data subcommand today; add a line per new one.
+        assert!(matches!(
+            parse_conversation_command(&["aioncore", "conversation", "create"]),
+            Some(ConversationCommand::Create)
+        ));
+        assert!(
+            aionui_api_types::tool_name_for_conversation_cli_path(&["create".to_owned()]).is_some(),
+            "`conversation create` is wired but has no descriptor"
+        );
+    }
+
+    #[test]
+    fn conversation_cli_accepts_capabilities_and_reports_unknown_paths() {
+        assert!(parse_conversation_command(&["aioncore", "conversation", "capabilities"]).is_some());
+        assert!(parse_conversation_command(&["aioncore", "conversation", "definitely-not-a-command"]).is_none());
+        assert!(parse_conversation_command(&["aioncore", "conversation"]).is_none());
     }
 
     /// Every tool in the shared Team registry advertises a `cli_command`, and

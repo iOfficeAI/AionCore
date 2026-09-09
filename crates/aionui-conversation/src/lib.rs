@@ -12,7 +12,9 @@ pub mod response_middleware;
 pub mod routes;
 pub mod routes_aux;
 mod runtime_completion;
+pub mod runtime_create;
 mod runtime_persistence;
+pub mod runtime_routes;
 pub mod runtime_state;
 pub mod service;
 mod service_ops;
@@ -34,6 +36,8 @@ pub use error::ConversationError;
 pub use response_middleware::{MessageMiddleware, MiddlewareResult, strip_think_tags};
 pub use routes::conversation_routes;
 pub use routes_aux::conversation_ops_routes;
+pub use runtime_create::ConversationCreateError;
+pub use runtime_routes::{ConversationRuntimeRouterState, conversation_runtime_routes};
 pub use service::is_temp_session_workspace;
 pub use service::{
     ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,

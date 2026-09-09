@@ -123,6 +123,22 @@ fn data() -> Value {
                 }
             },
             {
+                "name": "conversation",
+                "mode": "conversation-create",
+                "description": "Create a new conversation for this user that inherits (or overrides) this conversation's workspace and assistant. Does not send, open, or switch to it.",
+                "contract": "agent-facing-conversation-cli",
+                "contract_command": "conversation capabilities",
+                "invocation": "aioncore conversation capabilities",
+                "runtime_required": ["AIONUI_BASE_URL", "AIONUI_CONVERSATION_ID", "AIONUI_USER_ID", "AIONUI_RUNTIME_TOKEN"],
+                "runtime_free_commands": ["conversation capabilities"],
+                "safety": {
+                    "can_write": true,
+                    "runtime_token_required_for_context_and_call": true,
+                    "does_not_accept_identity_authority_from_stdin": true,
+                    "refuses_team_callers": true
+                }
+            },
+            {
                 "name": "skills",
                 "mode": "read-only",
                 "description": "Read the skills enabled in THIS conversation: list them, get a skill's full body plus its absolute directory, and read its supplementary files.",
@@ -190,7 +206,8 @@ mod tests {
     use super::*;
     use crate::cli::Cli;
     use crate::commands::{
-        config_capabilities, diagnose_capabilities, session_capabilities, skills_capabilities, team_capabilities,
+        config_capabilities, conversation_capabilities, diagnose_capabilities, session_capabilities,
+        skills_capabilities, team_capabilities,
     };
 
     /// `capabilities` is its own entrypoint — `data()` declares it under
@@ -272,6 +289,7 @@ mod tests {
             ("diagnose", diagnose_capabilities::data()),
             ("team", team_capabilities::data()),
             ("session", session_capabilities::data()),
+            ("conversation", conversation_capabilities::data()),
             ("skills", skills_capabilities::data()),
         ] {
             let entry = domains

@@ -39,9 +39,9 @@ use aionui_db::models::{
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, MessagePageCursor,
-    MessagePageDirection, MessagePageParams, SaveRuntimeStateParams, UpsertConversationAssistantSnapshotParams,
-    resolve_agent_binding_from_rows,
+    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, IProviderRepository,
+    MessagePageCursor, MessagePageDirection, MessagePageParams, SaveRuntimeStateParams,
+    UpsertConversationAssistantSnapshotParams, resolve_agent_binding_from_rows,
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -72,7 +72,7 @@ const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
-struct AssistantConversationOverrides {
+pub(crate) struct AssistantConversationOverrides {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -101,9 +101,9 @@ impl From<AssistantConversationOverridesRequest> for AssistantConversationOverri
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct AssistantSnapshotResolvedDefaults {
+pub(crate) struct AssistantSnapshotResolvedDefaults {
     #[serde(default)]
-    model: Option<String>,
+    pub(crate) model: Option<String>,
     #[serde(default)]
     permission: Option<String>,
     #[serde(default)]
@@ -136,12 +136,12 @@ struct AssistantSnapshotRules {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct AssistantSnapshot {
+pub(crate) struct AssistantSnapshot {
     assistant_definition_id: String,
     assistant_id: String,
     assistant_source: String,
     #[serde(default)]
-    name: String,
+    pub(crate) name: String,
     #[serde(default)]
     avatar_type: String,
     #[serde(default)]
@@ -151,13 +151,13 @@ struct AssistantSnapshot {
     #[serde(default, deserialize_with = "deserialize_string_or_null")]
     agent_source: String,
     #[serde(default, alias = "agent_backend", deserialize_with = "deserialize_string_or_null")]
-    runtime_backend: String,
+    pub(crate) runtime_backend: String,
     #[serde(default = "default_assistant_snapshot_agent_type")]
-    agent_type: AgentType,
+    pub(crate) agent_type: AgentType,
     rules: AssistantSnapshotRules,
     #[serde(default)]
     default_modes: AssistantSnapshotDefaultModes,
-    resolved_defaults: AssistantSnapshotResolvedDefaults,
+    pub(crate) resolved_defaults: AssistantSnapshotResolvedDefaults,
     created_at: i64,
 }
 
@@ -329,6 +329,9 @@ pub struct ConversationService {
     assistant_definition_repo: Arc<RwLock<Option<Arc<dyn IAssistantDefinitionRepository>>>>,
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
+    /// Only the agent-facing `conversation create` path reads this, to match an
+    /// aionrs assistant's default model to one of the user's providers.
+    provider_repo: Arc<RwLock<Option<Arc<dyn IProviderRepository>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
     /// Project-bind side branch (optional). `None` → binding is a no-op, so
@@ -414,6 +417,7 @@ impl ConversationService {
             assistant_definition_repo: Arc::new(RwLock::new(None)),
             assistant_state_repo: Arc::new(RwLock::new(None)),
             assistant_preference_repo: Arc::new(RwLock::new(None)),
+            provider_repo: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             project_service: Arc::new(RwLock::new(None)),
@@ -607,6 +611,12 @@ impl ConversationService {
         }
     }
 
+    pub fn with_provider_repo(&self, repo: Arc<dyn IProviderRepository>) {
+        if let Ok(mut guard) = self.provider_repo.write() {
+            *guard = Some(repo);
+        }
+    }
+
     pub fn with_assistant_dispatcher(&self, dispatcher: Arc<dyn AssistantRuleDispatcher>) {
         if let Ok(mut guard) = self.assistant_dispatcher.write() {
             *guard = Some(dispatcher);
@@ -743,25 +753,29 @@ impl ConversationService {
         auto_provisioned_workspace_to_delete(&self.workspace_root, row, conversation_id)
     }
 
-    fn assistant_definition_repo(&self) -> Option<Arc<dyn IAssistantDefinitionRepository>> {
+    pub(crate) fn assistant_definition_repo(&self) -> Option<Arc<dyn IAssistantDefinitionRepository>> {
         self.assistant_definition_repo
             .read()
             .ok()
             .and_then(|guard| guard.as_ref().cloned())
     }
 
-    fn assistant_state_repo(&self) -> Option<Arc<dyn IAssistantOverlayRepository>> {
+    pub(crate) fn assistant_state_repo(&self) -> Option<Arc<dyn IAssistantOverlayRepository>> {
         self.assistant_state_repo
             .read()
             .ok()
             .and_then(|guard| guard.as_ref().cloned())
     }
 
-    fn assistant_preference_repo(&self) -> Option<Arc<dyn IAssistantPreferenceRepository>> {
+    pub(crate) fn assistant_preference_repo(&self) -> Option<Arc<dyn IAssistantPreferenceRepository>> {
         self.assistant_preference_repo
             .read()
             .ok()
             .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    pub(crate) fn provider_repo(&self) -> Option<Arc<dyn IProviderRepository>> {
+        self.provider_repo.read().ok().and_then(|guard| guard.as_ref().cloned())
     }
 
     fn assistant_dispatcher(&self) -> Option<Arc<dyn AssistantRuleDispatcher>> {
@@ -1634,7 +1648,7 @@ impl ConversationService {
         Ok(resolve_agent_binding_from_rows(&rows, value))
     }
 
-    async fn resolve_assistant_snapshot(
+    pub(crate) async fn resolve_assistant_snapshot(
         &self,
         user_id: &str,
         assistant_id: &str,
