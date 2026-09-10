@@ -131,6 +131,12 @@ async fn spawn_probe_process(
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     final_args.extend(args.iter().cloned());
+    // Validation probes spawn the real CLI; give opencode probes their own
+    // explicit server port so a config-pinned `server.port` cannot kill the
+    // probe (and thus reject valid agent definitions) while another instance
+    // already holds the port. No backend label exists yet here (that is what
+    // the probe determines), so detection falls back to the executable name.
+    crate::factory::acp_launch_policy::pin_opencode_port(&mut final_args, None, &resolved.program.to_string_lossy());
 
     let mut final_env: Vec<EnvVar> = env
         .iter()
