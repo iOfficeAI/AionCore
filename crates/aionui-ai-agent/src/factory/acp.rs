@@ -103,6 +103,58 @@ pub(super) async fn build(
         .await;
     }
 
+    // Single-process shared opencode server (opt-in): with
+    // AIONUI_OPENCODE_SHARED_SERVER on, opencode conversations ATTACH (HTTP +
+    // durable SSE) to ONE shared `opencode serve` process owned by the
+    // process pool in `opencode_shared`, instead of spawning a dedicated
+    // `opencode acp` child per conversation. The static route table below
+    // stays untouched — its table tests pin opencode→AcpManager for the
+    // DEFAULT (toggle-off) world, which this gate does not change. Fork is
+    // refused (no server-side session-fork endpoint in the v2 API).
+    if crate::opencode_shared::shared_server_enabled() && config.backend.as_deref() == Some("opencode") {
+        if config.fork.is_some() {
+            return Err(AgentError::Conflict(
+                "opencode shared-server conversations cannot be forked yet".into(),
+            ));
+        }
+        let delivery = crate::factory::resolve_skill_delivery(
+            deps.as_ref(),
+            &ctx.user_id,
+            &ctx.conversation_id,
+            &config.skills,
+            &meta,
+        )
+        .await;
+        let instance = crate::session_agent::build_opencode_instance(crate::session_agent::SessionBuildInputs {
+            conversation_id: ctx.conversation_id.clone(),
+            user_id: ctx.user_id.clone(),
+            workspace: ctx.workspace.clone(),
+            config: &config,
+            metadata: &meta,
+            skill_delivery: delivery,
+            session_snapshot: build_context.session_snapshot.as_ref(),
+            backend_session_id: build_context.session_id.clone(),
+            mcp_server_repo: deps.mcp_server_repo.as_ref(),
+            // AIONUI_BASE_URL / _USER_ID / _HELPER_BIN ride to the server
+            // (stable per user); the pool strips AIONUI_CONVERSATION_ID at
+            // spawn — a shared process must not carry one conversation's
+            // identity (documented limitation of the shared mode).
+            runtime_env: &ctx.runtime_env,
+            broadcaster: deps.broadcaster.clone(),
+            catalog_writeback: Some((meta.id.clone(), deps.agent_registry.catalog_sender())),
+            acp_session_repo: Some(deps.acp_agent_service.repo()),
+            prompt_dump_dir: None,
+            permission_hook_body: None,
+        })
+        .await?;
+        tracing::info!(
+            conversation_id = %ctx.conversation_id,
+            backend = "opencode",
+            "opencode-shared: routing conversation through the shared opencode serve process"
+        );
+        return Ok(instance);
+    }
+
     // Session-model port: claude/codex ALWAYS run through the clean-slate direct-CLI
     // SessionBackend (SessionAgentTask), NOT the ACP manager. Every other ACP vendor
     // keeps the AcpAgentManager path below. There is no fallback: a claude/codex
