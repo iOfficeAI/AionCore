@@ -369,6 +369,7 @@ dependencies = [
  "libc",
  "mime_guess",
  "regex",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
