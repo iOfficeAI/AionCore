@@ -25,6 +25,12 @@ pub enum McpError {
     #[error("OAuth error: {0}")]
     OAuth(String),
 
+    /// OAuth endpoint discovery failed — the server did not publish usable
+    /// authorization metadata. Caused by remote/config state, not an internal
+    /// fault, so it must not surface as a 500.
+    #[error("{0}")]
+    OAuthDiscovery(String),
+
     #[error("{0}")]
     Database(#[from] aionui_db::DbError),
 
