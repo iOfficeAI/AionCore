@@ -1,6 +1,6 @@
 use aionui_db::{IAgentMetadataRepository, SqliteAgentMetadataRepository, init_database_memory};
 
-/// Migration 038: the builtin aionrs agent (Aion CLI, seed id `632f31d2`)
+/// Migration 038: the builtin aionrs agent (Wework Agent, seed id `632f31d2`)
 /// carries a constructed at-turn fork capability — the same shape 036 wrote
 /// for codex (turn anchors are stamped by the aionrs manager + engine).
 #[tokio::test]
@@ -8,7 +8,7 @@ async fn aionrs_builtin_agent_declares_at_turn_fork_capability() {
     let db = init_database_memory().await.unwrap();
     let repo = SqliteAgentMetadataRepository::new(db.pool().clone());
 
-    let aionrs = repo.get("632f31d2").await.unwrap().expect("seeded Aion CLI row");
+    let aionrs = repo.get("632f31d2").await.unwrap().expect("seeded Wework Agent row");
     assert_eq!(aionrs.agent_type, "aionrs");
     assert_eq!(aionrs.backend, None, "aionrs resolves by agent_type, not backend");
 

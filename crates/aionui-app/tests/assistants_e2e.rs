@@ -329,7 +329,7 @@ async fn fixture() -> Fixture {
                 rows: vec![
                     test_agent_row("8e1acf31", Some("codex"), AgentType::Acp, "Codex CLI"),
                     test_agent_row("cc126dd5", Some("gemini"), AgentType::Acp, "Gemini CLI"),
-                    test_agent_row("632f31d2", None, AgentType::Aionrs, "Aion CLI"),
+                    test_agent_row("632f31d2", None, AgentType::Aionrs, "Wework Agent"),
                 ],
             })),
         },

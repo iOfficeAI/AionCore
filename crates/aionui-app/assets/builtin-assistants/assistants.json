@@ -222,48 +222,6 @@
       "models": []
     },
     {
-      "id": "morph-ppt-3d",
-      "sort_order": 100,
-      "default_enabled": false,
-      "name": "3D Morph PPT",
-      "name_i18n": {
-        "en-US": "3D Morph PPT",
-        "zh-CN": "3D Morph PPT"
-      },
-      "description": "Turn a GLB 3D model into a cinematic Morph presentation. The model is the visual hero — close-up for details, bird's eye for structure, low angle for drama, with smooth Morph transitions between every shot. Note: 3D models and Morph transitions require Microsoft PowerPoint to display correctly.",
-      "description_i18n": {
-        "en-US": "Turn a GLB 3D model into a cinematic Morph presentation. The model is the visual hero — close-up for details, bird's eye for structure, low angle for drama, with smooth Morph transitions between every shot. Note: 3D models and Morph transitions require Microsoft PowerPoint to display correctly.",
-        "zh-CN": "把 GLB 3D 模型变成电影感 Morph 演示文稿。模型是视觉主角——特写看细节、俯视看结构、仰拍看气势，每页之间用 Morph 转场做流畅的镜头运动。注意：3D 模型和 Morph 转场效果需要在微软 PowerPoint 中打开才能正常显示。"
-      },
-      "avatar": "avatars/morph-ppt-3d.jpg",
-      "agent_ref": "aionrs",
-      "enabled_skills": [
-        "morph-ppt-3d",
-        "morph-ppt"
-      ],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/morph-ppt-3d.{locale}.md",
-      "prompts": [
-        "Use this GLB model to create a product showcase. Content should revolve around the model — what it is, its features, its story. Each slide shows a different angle that matches the topic: close-up for details, bird's eye for structure, dramatic low angle for the climax.",
-        "Here is my GLB model. Study it carefully, then create a cinematic presentation where the model is the hero of every frame. I want varied camera work: push in for detail shots, pull back for overview, bleed the model off the edge for dramatic transitions.",
-        "Build a presentation around this 3D model that feels like a movie trailer. Big dramatic moments, intimate close-ups, sweeping overview shots. The story should match what the model actually is — don't just add generic text."
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Use this GLB model to create a product showcase. Content should revolve around the model — what it is, its features, its story. Each slide shows a different angle that matches the topic: close-up for details, bird's eye for structure, dramatic low angle for the climax.",
-          "Here is my GLB model. Study it carefully, then create a cinematic presentation where the model is the hero of every frame. I want varied camera work: push in for detail shots, pull back for overview, bleed the model off the edge for dramatic transitions.",
-          "Build a presentation around this 3D model that feels like a movie trailer. Big dramatic moments, intimate close-ups, sweeping overview shots. The story should match what the model actually is — don't just add generic text."
-        ],
-        "zh-CN": [
-          "用这个 GLB 模型做一份产品展示 PPT。内容要围绕模型展开——它是什么、有什么特点、背后的故事。每页用不同视角配合主题：讲细节就特写、讲结构就俯视、讲气势就仰拍，画面要丰富有层次。",
-          "这是我的 GLB 模型，仔细观察它，然后做一份电影感演示，模型是每一帧的主角。镜头要多变：推近看细节、拉远看全貌、模型出血到画面边缘做冲击转场。内容必须贴合模型本身。",
-          "围绕这个 3D 模型做一份像电影预告片一样的演示。要有大气的高潮时刻、细腻的特写镜头、开阔的全景俯瞰。故事要契合模型本身的特征——不要用跟模型无关的通用文案。"
-        ]
-      },
-      "models": []
-    },
-    {
       "id": "pitch-deck-creator",
       "sort_order": 80,
       "default_enabled": false,
@@ -484,62 +442,6 @@
       "models": []
     },
     {
-      "id": "openclaw-setup",
-      "sort_order": 170,
-      "default_enabled": false,
-      "name": "OpenClaw Setup Expert",
-      "name_i18n": {
-        "en-US": "OpenClaw Setup Expert",
-        "zh-CN": "OpenClaw 部署专家",
-        "ru-RU": "Эксперт по настройке OpenClaw",
-        "uk-UA": "Експерт з налаштування OpenClaw"
-      },
-      "description": "Expert guide for installing, deploying, configuring, and troubleshooting OpenClaw. Proactively helps with setup, diagnoses issues, and provides security best practices.",
-      "description_i18n": {
-        "en-US": "Expert guide for installing, deploying, configuring, and troubleshooting OpenClaw. Proactively helps with setup, diagnoses issues, and provides security best practices.",
-        "zh-CN": "OpenClaw 安装、部署、配置和故障排查专家。主动协助设置、诊断问题并提供安全最佳实践。",
-        "ru-RU": "Эксперт по установке, развёртыванию, настройке и устранению неполадок OpenClaw. Помогает пройти настройку, диагностирует проблемы и подсказывает безопасные практики.",
-        "uk-UA": "Експертний посібник зі встановлення, розгортання, налаштування та усунення несправностей OpenClaw. Допомагає з налаштуванням та безпекою."
-      },
-      "avatar": "avatars/openclaw-setup.jpg",
-      "agent_ref": "aionrs",
-      "enabled_skills": [
-        "openclaw-setup",
-        "aionui-webui-setup"
-      ],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/openclaw-setup.{locale}.md",
-      "prompts": [
-        "Help me install OpenClaw step by step",
-        "My OpenClaw isn't working, please diagnose the issue",
-        "Configure Telegram channel for OpenClaw integration"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Help me install OpenClaw step by step",
-          "My OpenClaw isn't working, please diagnose the issue",
-          "Configure Telegram channel for OpenClaw integration"
-        ],
-        "zh-CN": [
-          "帮我一步步安装 OpenClaw",
-          "我的 OpenClaw 出问题了，请帮我诊断",
-          "为 OpenClaw 配置 Telegram 渠道"
-        ],
-        "ru-RU": [
-          "Помоги мне установить OpenClaw пошагово",
-          "Мой OpenClaw не работает, пожалуйста, диагностируй проблему",
-          "Настрой Telegram-канал для интеграции с OpenClaw"
-        ],
-        "uk-UA": [
-          "Допоможи мені встановити OpenClaw крок за кроком",
-          "Мій OpenClaw не працює, будь ласка, діагностуй проблему",
-          "Налаштувати канал Telegram для інтеграції з OpenClaw"
-        ]
-      },
-      "models": []
-    },
-    {
       "id": "cowork",
       "sort_order": 160,
       "default_enabled": false,
@@ -594,59 +496,6 @@
           "Проаналізувати структуру поточного проекту та запропонувати покращення",
           "Автоматизувати процес збірки та розгортання",
           "Витягти та узагальнити ключову інформацію з усіх файлів PDF"
-        ]
-      },
-      "models": []
-    },
-    {
-      "id": "game-3d",
-      "sort_order": 130,
-      "default_enabled": false,
-      "name": "3D Game",
-      "name_i18n": {
-        "en-US": "3D Game",
-        "zh-CN": "3D 游戏生成",
-        "ru-RU": "Генератор 3D-игр",
-        "uk-UA": "Генератор 3D-ігор"
-      },
-      "description": "Generate a complete 3D platform collection game in one HTML file.",
-      "description_i18n": {
-        "en-US": "Generate a complete 3D platform collection game in one HTML file.",
-        "zh-CN": "用单个 HTML 文件生成完整的 3D 平台收集游戏。",
-        "ru-RU": "Генерирует полноценную 3D-игру-платформер со сбором предметов в одном HTML-файле.",
-        "uk-UA": "Генеруйте повноцінну 3D-гру-платформер зі збором предметів в одному HTML-файлі."
-      },
-      "avatar": "avatars/game-3d.jpg",
-      "agent_ref": "aionrs",
-      "enabled_skills": [],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/game-3d.{locale}.md",
-      "prompts": [
-        "Create a 3D platformer game with jumping mechanics",
-        "Make a coin collection game with obstacles",
-        "Build a 3D maze exploration game"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Create a 3D platformer game with jumping mechanics",
-          "Make a coin collection game with obstacles",
-          "Build a 3D maze exploration game"
-        ],
-        "zh-CN": [
-          "创建一个带跳跃机制的 3D 平台游戏",
-          "制作一个带障碍物的金币收集游戏",
-          "构建一个 3D 迷宫探索游戏"
-        ],
-        "ru-RU": [
-          "Создай 3D-платформер с механикой прыжков",
-          "Сделай игру со сбором монет и препятствиями",
-          "Построй 3D-игру с исследованием лабиринта"
-        ],
-        "uk-UA": [
-          "Створити 3D-платформер з механікою стрибків",
-          "Зробити гру зі збором монет та перешкодами",
-          "Побудувати 3D-гру з дослідженням лабіринту"
         ]
       },
       "models": []
@@ -806,62 +655,6 @@
           "Допоможи мені встановити квартальні цілі в усіх сферах життя",
           "Проаналізувати мій кар'єрний шлях та спланувати наступні кроки",
           "Створити план особистого розвитку на наступні 3 місяці"
-        ]
-      },
-      "models": []
-    },
-    {
-      "id": "social-job-publisher",
-      "sort_order": 180,
-      "default_enabled": false,
-      "name": "Social Job Publisher",
-      "name_i18n": {
-        "en-US": "Social Job Publisher",
-        "zh-CN": "社交招聘发布助手",
-        "ru-RU": "Публикатор вакансий в соцсетях",
-        "uk-UA": "Публікатор вакансій"
-      },
-      "description": "Expand hiring requests into a full JD, images, and publish to social platforms via connectors.",
-      "description_i18n": {
-        "en-US": "Expand hiring requests into a full JD, images, and publish to social platforms via connectors.",
-        "zh-CN": "扩写招聘需求为完整 JD 与图片，并通过 connector 发布到社交平台。",
-        "ru-RU": "Разворачивает запрос на найм в полноценное описание вакансии и изображения, а затем публикует это в соцсетях через коннекторы.",
-        "uk-UA": "Розгортає запит на найм у повноцінний опис вакансії та зображення, а потім публікує це в соцмережах через конектори."
-      },
-      "avatar": "avatars/social-job-publisher.jpg",
-      "agent_ref": "aionrs",
-      "enabled_skills": [
-        "xiaohongshu-recruiter",
-        "x-recruiter"
-      ],
-      "custom_skill_names": [],
-      "disabled_builtin_skills": [],
-      "rule_file": "rules/social-job-publisher.{locale}.md",
-      "prompts": [
-        "Create a comprehensive job post for Senior Full-Stack Engineer",
-        "Draft an engaging hiring tweet for social media",
-        "Create a multi-platform job posting (LinkedIn, X, Redbook)"
-      ],
-      "prompts_i18n": {
-        "en-US": [
-          "Create a comprehensive job post for Senior Full-Stack Engineer",
-          "Draft an engaging hiring tweet for social media",
-          "Create a multi-platform job posting (LinkedIn, X, Redbook)"
-        ],
-        "zh-CN": [
-          "创建一份高级全栈工程师的完整招聘启事",
-          "起草一条适合社交媒体的招聘推文",
-          "创建多平台职位发布（LinkedIn、X、小红书）"
-        ],
-        "ru-RU": [
-          "Создай развёрнутую вакансию на позицию Senior Full-Stack Engineer",
-          "Составь привлекательный твит о найме для соцсетей",
-          "Создай публикацию вакансии для нескольких платформ (LinkedIn, X, Xiaohongshu)"
-        ],
-        "uk-UA": [
-          "Створити повний опис вакансії Senior Full-Stack інженера",
-          "Написати цікавий пост про найм для соцмереж",
-          "Створити пост про вакансію для кількох платформ (LinkedIn, X)"
         ]
       },
       "models": []
@@ -1090,19 +883,19 @@
       "id": "aionui-assistant",
       "sort_order": 0,
       "default_enabled": true,
-      "name": "AionUi Butler",
+      "name": "Wework Butler",
       "name_i18n": {
-        "en-US": "AionUi Butler",
-        "zh-CN": "AionUi管家",
-        "ru-RU": "Дворецкий AionUi",
-        "uk-UA": "Дворецький AionUi"
+        "en-US": "Wework Butler",
+        "zh-CN": "Wework管家",
+        "ru-RU": "Дворецкий Wework",
+        "uk-UA": "Дворецький Wework"
       },
-      "description": "Your all-in-one AionUi butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach AionUi from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
+      "description": "Your all-in-one Wework butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach Wework from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
       "description_i18n": {
-        "en-US": "Your all-in-one AionUi butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach AionUi from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
-        "zh-CN": "你的 AionUi 全能管家：配置助手、技能、MCP 服务器与 LLM 模型；设置远程访问，让你在手机或外网也能打开 AionUi、生成分享链接；还能诊断卡住的会话、失败的模型调用，或定时任务为何没执行。",
-        "ru-RU": "Ваш универсальный дворецкий AionUi: настройка ассистентов, навыков, серверов MCP и провайдеров LLM; настройка удалённого доступа, чтобы открывать AionUi с телефона или делиться ссылкой; и диагностика проблем — зависших разговоров, сбоев моделей или почему не выполнилась запланированная задача.",
-        "uk-UA": "Ваш універсальний дворецький AionUi: налаштування асистентів, навичок, серверів MCP і провайдерів LLM; налаштування віддаленого доступу, щоб відкривати AionUi з телефона або ділитися посиланням; і діагностика проблем — зависань розмов, збоїв моделей або чому не виконалося заплановане завдання."
+        "en-US": "Your all-in-one Wework butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach Wework from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
+        "zh-CN": "你的 Wework 全能管家：配置助手、技能、MCP 服务器与 LLM 模型；设置远程访问，让你在手机或外网也能打开 Wework、生成分享链接；还能诊断卡住的会话、失败的模型调用，或定时任务为何没执行。",
+        "ru-RU": "Ваш универсальный дворецкий Wework: настройка ассистентов, навыков, серверов MCP и провайдеров LLM; настройка удалённого доступа, чтобы открывать Wework с телефона или делиться ссылкой; и диагностика проблем — зависших разговоров, сбоев моделей или почему не выполнилась запланированная задача.",
+        "uk-UA": "Ваш універсальний дворецький Wework: налаштування асистентів, навичок, серверів MCP і провайдерів LLM; налаштування віддаленого доступу, щоб відкривати Wework з телефона або ділитися посиланням; і діагностика проблем — зависань розмов, збоїв моделей або чому не виконалося заплановане завдання."
       },
       "avatar": "avatars/aionui-assistant.jpg",
       "agent_ref": "aionrs",
@@ -1116,32 +909,32 @@
       "rule_file": "rules/aionui-assistant.{locale}.md",
       "prompts": [
         "Add a new LLM provider and API key, then set it as the default model",
-        "Set up remote access for me, so I can open AionUi from my phone when I'm out",
+        "Set up remote access for me, so I can open Wework from my phone when I'm out",
         "A conversation is stuck — please diagnose what's wrong",
         "Create a new assistant and attach a skill to it"
       ],
       "prompts_i18n": {
         "en-US": [
           "Add a new LLM provider and API key, then set it as the default model",
-          "Set up remote access for me, so I can open AionUi from my phone when I'm out",
+          "Set up remote access for me, so I can open Wework from my phone when I'm out",
           "A conversation is stuck — please diagnose what's wrong",
           "Create a new assistant and attach a skill to it"
         ],
         "zh-CN": [
           "添加一个新的 LLM 模型和 API Key，并设为默认模型",
-          "帮我配置远程访问，让我在外面用手机也能打开 AionUi",
+          "帮我配置远程访问，让我在外面用手机也能打开 Wework",
           "有个会话卡住了，帮我诊断哪里出了问题",
           "创建一个新助手，并给它绑定一个技能"
         ],
         "ru-RU": [
           "Добавь нового провайдера LLM и API-ключ, затем сделай его моделью по умолчанию",
-          "Настрой удалённый доступ, чтобы я мог открывать AionUi с телефона, когда меня нет",
+          "Настрой удалённый доступ, чтобы я мог открывать Wework с телефона, когда меня нет",
           "Разговор завис — пожалуйста, диагностируй, что не так",
           "Создай нового ассистента и подключи к нему навык"
         ],
         "uk-UA": [
           "Додай нового провайдера LLM та API-ключ, потім зроби його моделлю за замовчуванням",
-          "Налаштуй віддалений доступ, щоб я міг відкривати AionUi з телефона, коли мене немає",
+          "Налаштуй віддалений доступ, щоб я міг відкривати Wework з телефона, коли мене немає",
           "Розмова зависла — будь ласка, діагностуй, що не так",
           "Створи нового асистента й підключи до нього навичку"
         ]

@@ -208,7 +208,7 @@ fn event_type_name(event: &AgentStreamEvent) -> &'static str {
 #[test]
 fn acp_build_extra_populates_skills_from_extra_json() {
     let json = serde_json::json!({
-        "backend": "claude",
+        "backend": "opencode",
         "skills": ["cron", "pdf"],
     });
     let extra: aionui_ai_agent::AcpBuildExtra = serde_json::from_value(json).unwrap();
@@ -223,12 +223,12 @@ fn acp_build_extra_populates_skills_from_extra_json() {
 #[ignore = "requires JSON-RPC mock agent"]
 async fn acp_agent_type_is_acp() {
     let _guard = serial();
-    let (agent, _rx) = make_mock_agent(r#"echo '{"type":"finish","data":{}}'"#, "claude").await;
+    let (agent, _rx) = make_mock_agent(r#"echo '{"type":"finish","data":{}}'"#, "opencode").await;
 
     assert_eq!(agent.agent_type(), aionui_common::AgentType::Acp);
     assert_eq!(agent.conversation_id(), "test-conv-1");
     assert_eq!(agent.workspace(), "/tmp");
-    assert_eq!(agent.backend(), Some("claude"));
+    assert_eq!(agent.backend(), Some("opencode"));
 }
 
 #[tokio::test]
@@ -237,7 +237,7 @@ async fn acp_agent_receives_stream_events() {
     let _guard = serial();
     let (_agent, mut rx) = make_mock_agent(
         r#"echo '{"type":"start","data":{"session_id":"sess-1"}}' && echo '{"type":"text","data":{"content":"Hello"}}' && echo '{"type":"finish","data":{"session_id":"sess-1"}}'"#,
-        "claude",
+        "opencode",
     )
     .await;
 
@@ -259,7 +259,7 @@ async fn acp_agent_session_id_captured_from_start() {
     let _guard = serial();
     let (agent, mut rx) = make_mock_agent(
         r#"echo '{"type":"start","data":{"session_id":"sess-abc"}}' && sleep 1"#,
-        "claude",
+        "opencode",
     )
     .await;
 
@@ -277,7 +277,7 @@ async fn acp_agent_status_transitions() {
     let _guard = serial();
     let (agent, mut rx) = make_mock_agent(
         r#"sleep 0.1 && echo '{"type":"start","data":{}}' && sleep 0.3 && echo '{"type":"finish","data":{}}'"#,
-        "claude",
+        "opencode",
     )
     .await;
 
@@ -299,7 +299,7 @@ async fn acp_agent_error_event_sets_finished() {
     let _guard = serial();
     let (agent, mut rx) = make_mock_agent(
         r#"echo '{"type":"start","data":{}}' && sleep 0.1 && echo '{"type":"error","data":{"message":"timeout"}}'"#,
-        "claude",
+        "opencode",
     )
     .await;
 
@@ -313,7 +313,7 @@ async fn acp_agent_model_info_captured() {
     let _guard = serial();
     let (agent, mut rx) = make_mock_agent(
         r#"echo '{"type":"acp_model_info","data":{"current_model_id":"claude-sonnet-4","current_model_label":"Claude Sonnet 4","available_models":[{"id":"claude-sonnet-4","label":"Claude Sonnet 4"},{"id":"claude-opus-4","label":"Claude Opus 4"}],"can_switch":true,"source":"models","source_detail":"acp-models"}}' && sleep 0.5"#,
-        "claude",
+        "opencode",
     )
     .await;
 
@@ -337,7 +337,7 @@ async fn acp_agent_model_info_captured() {
 #[ignore = "requires JSON-RPC mock agent"]
 async fn acp_agent_kill_terminates_process() {
     let _guard = serial();
-    let (agent, _rx) = make_mock_agent(r#"trap '' TERM; while true; do sleep 1; done"#, "claude").await;
+    let (agent, _rx) = make_mock_agent(r#"trap '' TERM; while true; do sleep 1; done"#, "opencode").await;
 
     assert!(agent.last_activity_at() > 0);
 
@@ -350,7 +350,7 @@ async fn acp_agent_kill_terminates_process() {
 #[ignore = "requires JSON-RPC mock agent"]
 async fn acp_agent_last_activity_updates() {
     let _guard = serial();
-    let (agent, _rx) = make_mock_agent(r#"sleep 10"#, "claude").await;
+    let (agent, _rx) = make_mock_agent(r#"sleep 10"#, "opencode").await;
 
     let initial = agent.last_activity_at();
     assert!(initial > 0);
@@ -367,7 +367,7 @@ async fn acp_agent_text_content_received() {
     let _guard = serial();
     let (_agent, mut rx) = make_mock_agent(
         r#"echo '{"type":"text","data":{"content":"Hello from ACP"}}'"#,
-        "claude",
+        "opencode",
     )
     .await;
 
@@ -384,8 +384,8 @@ async fn acp_agent_text_content_received() {
 async fn acp_agent_agent_status_event_captures_session() {
     let _guard = serial();
     let (agent, mut rx) = make_mock_agent(
-        r#"echo '{"type":"agent_status","data":{"backend":"claude","status":"running","session_id":"sess-xyz"}}' && sleep 1"#,
-        "claude",
+        r#"echo '{"type":"agent_status","data":{"backend":"opencode","status":"running","session_id":"sess-xyz"}}' && sleep 1"#,
+        "opencode",
     )
     .await;
 
@@ -403,7 +403,7 @@ async fn acp_agent_multiple_event_types() {
     let _guard = serial();
     let (_agent, mut rx) = make_mock_agent(
         r#"echo '{"type":"start","data":{"session_id":"sess-multi"}}' && echo '{"type":"thinking","data":{"content":"Analyzing...","subject":"code","duration":100,"status":"in_progress"}}' && echo '{"type":"text","data":{"content":"Result"}}' && echo '{"type":"finish","data":{"session_id":"sess-multi"}}'"#,
-        "claude",
+        "opencode",
     )
     .await;
 

@@ -37,7 +37,7 @@ impl AgentType {
             AgentType::OpenclawGateway => "OpenClaw Gateway",
             AgentType::Nanobot => "Nanobot",
             AgentType::Remote => "Remote",
-            AgentType::Aionrs => "Aion CLI",
+            AgentType::Aionrs => crate::constants::AIONRS_DISPLAY_NAME,
             AgentType::Antigravity => "Antigravity",
             AgentType::Gemini => "Gemini (legacy)",
             AgentType::Codex => "Codex (legacy)",
@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn test_agent_type_display_names() {
         assert_eq!(AgentType::OpenclawGateway.display_name(), "OpenClaw Gateway");
-        assert_eq!(AgentType::Aionrs.display_name(), "Aion CLI");
+        assert_eq!(AgentType::Aionrs.display_name(), crate::constants::AIONRS_DISPLAY_NAME);
         assert_eq!(AgentType::Nanobot.display_name(), "Nanobot");
         assert_eq!(AgentType::Remote.display_name(), "Remote");
         assert_eq!(AgentType::Acp.display_name(), "ACP");

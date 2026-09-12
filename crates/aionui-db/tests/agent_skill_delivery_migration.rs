@@ -28,69 +28,6 @@ async fn delivery_json(pool: &sqlx::SqlitePool, backend: &str) -> serde_json::Va
 }
 
 #[tokio::test]
-async fn claude_gets_layer_one_argv_delivery_with_allow_dir_args() {
-    let pool = migrated_pool().await;
-    let delivery = delivery_json(&pool, "claude").await;
-
-    assert_eq!(delivery["mode"], "argv");
-    assert_eq!(
-        delivery["args"],
-        serde_json::json!(["--plugin-dir", "{skill_view_dir}"])
-    );
-    // Not optional: spec §10.2 #9 measured that a `--plugin-dir` registered
-    // skill still fails claude's path check when the agent Reads its
-    // supplementary files, under AionUi's real default permission mode.
-    assert_eq!(
-        delivery["allow_dir_args"],
-        serde_json::json!(["--add-dir", "{skill_dir}"])
-    );
-}
-
-/// codebuddy is deliberately NOT on layer 1 yet. Its pinned build (2.138.0)
-/// documents `--plugin-dir` and accepts it at the argv level, but whether the
-/// flag actually makes skills discoverable is unprobed (it needs an
-/// authenticated account). Declaring `argv` on that basis would be a real
-/// regression: `argv` also switches injection to LIGHT, so an inert flag would
-/// leave codebuddy with no skills at all. This test pins the conservative
-/// choice so a future promotion is a conscious edit.
-#[tokio::test]
-async fn codebuddy_stays_injected_until_its_layer_one_behavior_is_probed() {
-    let pool = migrated_pool().await;
-    let delivery = delivery_json(&pool, "codebuddy").await;
-
-    assert_eq!(delivery["mode"], "injected");
-    assert_eq!(
-        delivery["allow_dir_args"],
-        serde_json::json!(["--add-dir", "{skill_dir}"])
-    );
-}
-
-#[tokio::test]
-async fn codex_gets_protocol_delivery() {
-    let pool = migrated_pool().await;
-    let delivery = delivery_json(&pool, "codex").await;
-
-    assert_eq!(delivery["mode"], "protocol");
-    // Verified: codex-cli 0.146.0 self-generated schema
-    // `v2/SkillsExtraRootsSetParams.json`.
-    assert_eq!(delivery["method"], "skills/extraRoots/set");
-}
-
-/// agy gets no allow-listing, and that is a MEASURED result rather than an
-/// omission: our argv always passes `--dangerously-skip-permissions`, and a live
-/// probe under exactly that argv read a file outside the cwd with its directory
-/// not allow-listed. Declaring the flag anyway would add one argument per skill
-/// for no effect, and would read as a guarantee the measurement contradicts.
-#[tokio::test]
-async fn antigravity_is_injected_with_no_allow_listing() {
-    let pool = migrated_pool().await;
-    let delivery = delivery_json(&pool, "antigravity").await;
-
-    assert_eq!(delivery["mode"], "injected");
-    assert_eq!(delivery["allow_dir_args"], serde_json::json!([]));
-}
-
-#[tokio::test]
 async fn opencode_is_injected() {
     let pool = migrated_pool().await;
     assert_eq!(delivery_json(&pool, "opencode").await["mode"], "injected");
@@ -111,15 +48,14 @@ async fn the_db_layer_accepts_an_unknown_mode() {
 }
 
 /// An unverified vendor must keep the safe NULL default (read as `injected`).
-/// Asserted so a later migration cannot quietly opt an unprobed vendor into
-/// layer 1 — G4 requires a new vendor to be zero-intrusion by default.
+/// After 044 the remaining unverified keepers are pi and deepseek.
 #[tokio::test]
 async fn unverified_vendors_stay_null() {
     let pool = migrated_pool().await;
     let null_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_metadata \
          WHERE skill_delivery IS NULL \
-         AND backend NOT IN ('claude','codex','codebuddy','antigravity','opencode')",
+         AND backend NOT IN ('opencode')",
     )
     .fetch_one(&pool)
     .await

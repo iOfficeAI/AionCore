@@ -468,7 +468,7 @@ impl IConversationRepository for StubConvRepo {
                 channel_chat_id: None,
                 extra: serde_json::json!({
                     "backend": "anthropic",
-                    "agent_name": "Aion CLI",
+                    "agent_name": "Wework Agent",
                     "workspace": ensure_named_workspace_path("aionui-cron-service-aionrs-workspace"),
                     "session_mode": "default",
                     "current_model_id": "claude-sonnet-4-20250514"
@@ -2766,6 +2766,36 @@ async fn create_for_conversation_helper_uses_assistant_metadata_full_auto_mode()
 async fn create_for_conversation_helper_uses_codex_canonical_full_auto_mode_from_fallback() {
     let (svc, cron_repo, _, _, conv_service, agent_metadata_repo, _) =
         setup_with_conv_runtime_and_agent_metadata().await;
+    agent_metadata_repo
+        .upsert(&UpsertAgentMetadataParams {
+            id: "8e1acf31",
+            icon: None,
+            name: "Codex",
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("codex"),
+            agent_type: "acp",
+            agent_source: "builtin",
+            agent_source_info: Some(r#"{"binary_name":"codex"}"#),
+            enabled: true,
+            command: Some("codex"),
+            args: Some(r#"["acp"]"#),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            skill_delivery: None,
+            behavior_policy: Some("{}"),
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 200,
+        })
+        .await
+        .unwrap();
     let codex = agent_metadata_repo
         .find_builtin_by_backend("codex")
         .await

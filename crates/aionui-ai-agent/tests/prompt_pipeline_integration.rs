@@ -101,7 +101,7 @@ fn make_pipeline() -> PromptPipeline {
 /// First prompt after session/new: prelude block injected, flag consumed.
 #[tokio::test(flavor = "current_thread")]
 async fn brand_new_first_prompt_injects_preset_context() {
-    let params = fixture_params("claude", Some("Rule A"), true).await;
+    let params = fixture_params("opencode", Some("Rule A"), true).await;
     let skill_manager = fixture_skill_manager();
     let runtime = fixture_runtime();
     let mut session = AcpSession::new(None, None, HashMap::new());
@@ -133,7 +133,7 @@ async fn brand_new_first_prompt_injects_preset_context() {
 /// Second prompt: no prelude, no reminder — pure passthrough.
 #[tokio::test(flavor = "current_thread")]
 async fn second_prompt_is_passthrough() {
-    let params = fixture_params("claude", Some("Rule A"), true).await;
+    let params = fixture_params("opencode", Some("Rule A"), true).await;
     let skill_manager = fixture_skill_manager();
     let runtime = fixture_runtime();
     let mut session = AcpSession::new(None, None, HashMap::new());
@@ -166,7 +166,7 @@ async fn second_prompt_is_passthrough() {
 /// Resume path: no mark_pending_session_new_prelude — prompt must be unchanged.
 #[tokio::test(flavor = "current_thread")]
 async fn resume_path_does_not_inject() {
-    let params = fixture_params("claude", Some("Rule A"), true).await;
+    let params = fixture_params("opencode", Some("Rule A"), true).await;
     let skill_manager = fixture_skill_manager();
     let runtime = fixture_runtime();
 
@@ -189,7 +189,7 @@ async fn resume_path_does_not_inject() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn observed_model_change_does_not_inject_model_identity_reminder() {
-    let params = fixture_params("claude", None, true).await;
+    let params = fixture_params("opencode", None, true).await;
     let skill_manager = fixture_skill_manager();
     let runtime = fixture_runtime();
     let mut session = AcpSession::new(None, None, HashMap::new());
@@ -221,5 +221,5 @@ async fn prelude_io_failure_emits_prompt_hook_warning() {
     // must then receive an AgentStreamEvent::AcpPromptHookWarning whose
     // payload deserializes to AcpPromptHookWarningPayload with
     // hook == "session_new_prelude".
-    let _ = fixture_params("claude", Some("ctx"), true).await;
+    let _ = fixture_params("opencode", Some("ctx"), true).await;
 }

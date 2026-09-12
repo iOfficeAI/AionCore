@@ -368,7 +368,7 @@ async fn management_rows_mark_installed_agents_without_health_check_unchecked() 
 async fn hydrate_continues_when_agent_metadata_config_options_has_invalid_utf8() {
     let db = init_database_memory().await.unwrap();
     sqlx::query("UPDATE agent_metadata SET config_options = CAST(x'FF' AS TEXT) WHERE agent_id = ?")
-        .bind("2d23ff1c")
+        .bind("53861a53")
         .execute(db.pool())
         .await
         .unwrap();
@@ -378,10 +378,10 @@ async fn hydrate_continues_when_agent_metadata_config_options_has_invalid_utf8()
 
     registry.hydrate().await.unwrap();
 
-    let claude = registry.get("2d23ff1c").await.expect("row remains in registry");
-    assert_eq!(claude.name, "Claude Code");
-    assert!(claude.handshake.config_options.is_none());
-    let repaired = repo.get("2d23ff1c").await.unwrap().expect("row remains in database");
+    let opencode = registry.get("53861a53").await.expect("row remains in registry");
+    assert_eq!(opencode.name, "OpenCode");
+    assert!(opencode.handshake.config_options.is_none());
+    let repaired = repo.get("53861a53").await.unwrap().expect("row remains in database");
     assert!(repaired.config_options.is_none());
 }
 
@@ -390,7 +390,7 @@ async fn hydrate_keeps_valid_utf8_invalid_json_config_options_non_fatal() {
     let db = init_database_memory().await.unwrap();
     sqlx::query("UPDATE agent_metadata SET config_options = ? WHERE agent_id = ?")
         .bind("not json")
-        .bind("2d23ff1c")
+        .bind("53861a53")
         .execute(db.pool())
         .await
         .unwrap();
@@ -400,9 +400,9 @@ async fn hydrate_keeps_valid_utf8_invalid_json_config_options_non_fatal() {
 
     registry.hydrate().await.unwrap();
 
-    let claude = registry.get("2d23ff1c").await.expect("row remains in registry");
-    assert!(claude.handshake.config_options.is_none());
-    let persisted = repo.get("2d23ff1c").await.unwrap().expect("row remains in database");
+    let opencode = registry.get("53861a53").await.expect("row remains in registry");
+    assert!(opencode.handshake.config_options.is_none());
+    let persisted = repo.get("53861a53").await.unwrap().expect("row remains in database");
     assert_eq!(persisted.config_options.as_deref(), Some("not json"));
 }
 

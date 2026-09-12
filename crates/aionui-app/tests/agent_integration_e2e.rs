@@ -285,18 +285,18 @@ async fn management_endpoint_keeps_deprecated_runtime_rows_for_diagnostics() {
 }
 
 #[tokio::test]
-async fn management_endpoint_handles_openclaw_as_acp_backend() {
+async fn management_endpoint_handles_opencode_as_acp_backend() {
     let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
 
     let meta = services
         .agent_registry
-        .find_builtin_by_backend("openclaw")
+        .find_builtin_by_backend("opencode")
         .await
-        .expect("OpenClaw ACP builtin row should exist");
+        .expect("OpenCode ACP builtin row should exist");
     assert_eq!(meta.agent_type, AgentType::Acp);
-    assert_eq!(meta.backend.as_deref(), Some("openclaw"));
-    assert_eq!(meta.command.as_deref(), Some("openclaw"));
+    assert_eq!(meta.backend.as_deref(), Some("opencode"));
+    assert_eq!(meta.command.as_deref(), Some("opencode"));
     assert_eq!(meta.args, vec!["acp"]);
     assert_eq!(meta.agent_source, AgentSource::Builtin);
 
@@ -307,14 +307,14 @@ async fn management_endpoint_handles_openclaw_as_acp_backend() {
     let body = body_json(resp).await;
     let agents = body["data"].as_array().expect("data should be array");
 
-    let openclaw = agents
+    let opencode = agents
         .iter()
-        .find(|agent| agent["backend"].as_str() == Some("openclaw"))
-        .expect("OpenClaw ACP row should be visible from /api/agents/management");
-    assert!(meta.available || openclaw["status"] != "available");
-    assert_eq!(openclaw["agent_type"], "acp");
-    assert_eq!(openclaw["command"], "openclaw");
-    assert_eq!(openclaw["args"], json!(["acp"]));
+        .find(|agent| agent["backend"].as_str() == Some("opencode"))
+        .expect("OpenCode ACP row should be visible from /api/agents/management");
+    assert!(meta.available || opencode["status"] != "available");
+    assert_eq!(opencode["agent_type"], "acp");
+    assert_eq!(opencode["command"], "opencode");
+    assert_eq!(opencode["args"], json!(["acp"]));
 }
 
 #[tokio::test]
@@ -339,15 +339,15 @@ async fn agent_logos_endpoint_returns_backend_to_logo_catalog() {
 
     // Seeded builtin agents project their stored icon URL.
     assert_eq!(
-        logo_for("claude").as_deref(),
-        Some("/api/assets/logos/ai-major/claude.svg")
+        logo_for("opencode").as_deref(),
+        Some("/api/assets/logos/tools/coding/opencode-light.svg")
     );
     assert_eq!(
-        logo_for("codex").as_deref(),
-        Some("/api/assets/logos/tools/coding/codex.svg")
+        logo_for("deepseek").as_deref(),
+        Some("/api/assets/logos/ai-major/deepseek.svg")
     );
 
-    // Aion CLI has no vendor `backend` (NULL); it must still be keyed by its
+    // Wework Agent has no vendor `backend` (NULL); it must still be keyed by its
     // agent_type ("aionrs") so aionrs conversations resolve a logo.
     assert_eq!(logo_for("aionrs").as_deref(), Some("/api/assets/logos/brand/aion.svg"));
 

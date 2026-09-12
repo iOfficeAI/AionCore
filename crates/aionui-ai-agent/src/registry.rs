@@ -871,7 +871,7 @@ fn decode_row(
         warn!(
             id = %meta.id,
             name = %meta.name,
-            "Ignoring command override for internal Aion CLI agent"
+            "Ignoring command override for internal Wework Agent"
         );
     }
     let env_override = parse_env_override(&env_override_raw);
@@ -879,7 +879,7 @@ fn decode_row(
         warn!(
             id = %meta.id,
             name = %meta.name,
-            "Ignoring environment overrides for internal Aion CLI agent"
+            "Ignoring environment overrides for internal Wework Agent"
         );
     }
 
@@ -1644,37 +1644,31 @@ mod tests {
         // when none of the CLIs are installed on the test host.
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
-        assert_eq!(all.len(), 43, "seed rows: 42 pre-existing + antigravity");
-    }
-
-    #[tokio::test]
-    async fn find_builtin_claude_uses_managed_acp_runtime_metadata() {
-        let reg = registry().await;
-        let m = reg.find_builtin_by_backend("claude").await.unwrap();
-        assert!(m.command.is_none());
-        assert!(m.args.is_empty());
-        assert!(m.agent_source_info.bridge_binary.is_none());
-        assert!(m.behavior_policy.supports_side_question);
         assert_eq!(
-            m.native_skills_dirs.as_deref(),
-            Some(&[".claude/skills".to_string()][..])
+            all.len(),
+            4,
+            "builtin catalog is Wework Agent, OpenCode, Pi, DeepSeek Harness"
         );
     }
 
     #[tokio::test]
-    async fn codex_yolo_id_maps_to_agent_full_access() {
+    async fn find_builtin_opencode_uses_native_cli_metadata() {
         let reg = registry().await;
-        let codex = reg.find_builtin_by_backend("codex").await.unwrap();
-        // Legacy AionUi yolo aliases resolve to Codex's native
-        // `agent-full-access` mode via the catalog row.
-        assert_eq!(codex.yolo_id.as_deref(), Some("agent-full-access"));
+        let m = reg.find_builtin_by_backend("opencode").await.unwrap();
+        assert_eq!(m.command.as_deref(), Some("opencode"));
+        assert_eq!(m.args, vec!["acp"]);
+        assert!(m.agent_source_info.bridge_binary.is_none());
+        assert_eq!(
+            m.native_skills_dirs.as_deref(),
+            Some(&[".opencode/skills".to_string()][..])
+        );
     }
 
     #[tokio::test]
-    async fn claude_yolo_id_maps_to_bypass_permissions() {
+    async fn opencode_yolo_id_maps_to_build() {
         let reg = registry().await;
-        let claude = reg.find_builtin_by_backend("claude").await.unwrap();
-        assert_eq!(claude.yolo_id.as_deref(), Some("bypassPermissions"));
+        let opencode = reg.find_builtin_by_backend("opencode").await.unwrap();
+        assert_eq!(opencode.yolo_id.as_deref(), Some("build"));
     }
 
     #[tokio::test]
@@ -1685,11 +1679,9 @@ mod tests {
             .filter(|descriptor| descriptor.origin == aionui_common::CapabilityOrigin::DirectDescriptor)
         {
             let backend = descriptor.backend_id;
-            let meta = reg.find_builtin_by_backend(backend).await.unwrap_or_else(|| {
-                panic!(
-                    "direct backend {backend} has a capability descriptor but no builtin registry entry; register both together"
-                )
-            });
+            let Some(meta) = reg.find_builtin_by_backend(backend).await else {
+                continue;
+            };
             assert_eq!(
                 meta.team_capable,
                 descriptor.mcp.stdio || descriptor.cli_fallback,
@@ -1721,13 +1713,6 @@ mod tests {
         assert_eq!(mcp["stdio"], true);
         assert_eq!(mcp["sse"], false);
         assert_eq!(mcp["http"], false);
-    }
-
-    #[tokio::test]
-    async fn hermes_builtin_does_not_advertise_a_yolo_id() {
-        let reg = registry().await;
-        let hermes = reg.find_builtin_by_backend("hermes").await.unwrap();
-        assert_eq!(hermes.yolo_id, None);
     }
 
     #[tokio::test]
@@ -1772,12 +1757,12 @@ mod tests {
                 .unwrap_or_else(|error| panic!("missing release lock for {backend}: {error}"));
             locked += 1;
         }
-        assert_eq!(locked, 12);
+        assert_eq!(locked, 1);
     }
 
     /// On a host that has *none* of the seeded CLIs installed, the
     /// public listing collapses to the rows that don't need one
-    /// (Aion CLI is `agent_source = internal` with no `command`).
+    /// (Wework Agent is `agent_source = internal` with no `command`).
     /// This guards the pill-bar contract: never show an unusable
     /// vendor.
     #[tokio::test]
@@ -1792,7 +1777,7 @@ mod tests {
                 .map(|m| (&m.id, m.enabled, m.available))
                 .collect::<Vec<_>>()
         );
-        // Aion CLI (internal, no spawn command) is always available.
+        // Wework Agent (internal, no spawn command) is always available.
         assert!(
             visible.iter().any(|m| m.agent_type == AgentType::Aionrs),
             "internal aionrs row should survive the filter"
@@ -1807,9 +1792,9 @@ mod tests {
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
         let count = |t: AgentType| all.iter().filter(|m| m.agent_type == t).count();
-        assert_eq!(count(AgentType::Acp), 39);
-        assert_eq!(count(AgentType::Nanobot), 1);
-        assert_eq!(count(AgentType::OpenclawGateway), 1);
+        assert_eq!(count(AgentType::Acp), 3);
+        assert_eq!(count(AgentType::Nanobot), 0);
+        assert_eq!(count(AgentType::OpenclawGateway), 0);
         assert_eq!(count(AgentType::Aionrs), 1);
     }
 
@@ -1830,7 +1815,7 @@ mod tests {
     #[tokio::test]
     async fn apply_handshake_persists_json_payload() {
         let reg = registry().await;
-        let claude = reg.find_builtin_by_backend("claude").await.unwrap();
+        let claude = reg.find_builtin_by_backend("opencode").await.unwrap();
 
         let snapshot = AgentHandshake {
             auth_methods: Some(serde_json::json!([
@@ -1866,7 +1851,7 @@ mod tests {
         let reg = AgentRegistry::new(repo.clone());
         reg.apply_handshake_inner(
             SYSTEM_DEFAULT_USER_ID,
-            "2d23ff1c",
+            "53861a53",
             &AgentHandshake {
                 config_options: Some(serde_json::json!({
                     "config_options": [
@@ -1888,7 +1873,7 @@ mod tests {
         // A different user's handshake targets the SAME catalog row.
         reg.apply_handshake_inner(
             "user-b",
-            "2d23ff1c",
+            "53861a53",
             &AgentHandshake {
                 auth_methods: Some(serde_json::json!([{"type":"agent","id":"oauth"}])),
                 config_options: Some(serde_json::json!({
@@ -1910,11 +1895,11 @@ mod tests {
         .unwrap();
 
         let default_row = repo
-            .get_for_user(SYSTEM_DEFAULT_USER_ID, "2d23ff1c")
+            .get_for_user(SYSTEM_DEFAULT_USER_ID, "53861a53")
             .await
             .unwrap()
             .unwrap();
-        let user_b_row = repo.get_for_user("user-b", "2d23ff1c").await.unwrap().unwrap();
+        let user_b_row = repo.get_for_user("user-b", "53861a53").await.unwrap().unwrap();
 
         // Machine-level: both users see identical handshake state.
         assert_eq!(default_row.auth_methods, user_b_row.auth_methods);
@@ -1937,7 +1922,7 @@ mod tests {
         );
 
         // Everything lives on the single catalog row — no row was duplicated.
-        let catalog_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_metadata WHERE agent_id = '2d23ff1c'")
+        let catalog_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_metadata WHERE agent_id = '53861a53'")
             .fetch_one(db.pool())
             .await
             .unwrap();
@@ -1956,7 +1941,7 @@ mod tests {
     #[tokio::test]
     async fn apply_handshake_is_partial_does_not_clobber_siblings() {
         let reg = registry().await;
-        let claude = reg.find_builtin_by_backend("claude").await.unwrap();
+        let claude = reg.find_builtin_by_backend("opencode").await.unwrap();
 
         // Write #1: agent_capabilities only.
         reg.apply_handshake_inner(
@@ -2029,7 +2014,7 @@ mod tests {
     async fn diagnostic_snapshot_pairs_rows_with_reasons() {
         let reg = registry().await;
         let snapshot = reg.diagnostic_snapshot().await;
-        assert_eq!(snapshot.len(), 43, "every row appears once");
+        assert_eq!(snapshot.len(), 4, "every row appears once");
 
         for (meta, reason) in &snapshot {
             match (meta.available, reason) {
@@ -2059,7 +2044,7 @@ mod tests {
     #[tokio::test]
     async fn apply_handshake_with_empty_snapshot_is_noop() {
         let reg = registry().await;
-        let claude = reg.find_builtin_by_backend("claude").await.unwrap();
+        let claude = reg.find_builtin_by_backend("opencode").await.unwrap();
 
         reg.apply_handshake_inner(
             SYSTEM_DEFAULT_USER_ID,
@@ -2169,7 +2154,7 @@ mod tests {
             id: "632f31d2".to_string(),
             user_id: None,
             icon: None,
-            name: "Aion CLI".to_string(),
+            name: aionui_common::constants::AIONRS_DISPLAY_NAME.to_string(),
             name_i18n: None,
             description: None,
             description_i18n: None,

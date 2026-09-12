@@ -4,21 +4,21 @@ use aionui_db::{
 };
 
 #[tokio::test]
-async fn resolves_legacy_backend_to_agent_metadata_id() {
+async fn resolves_builtin_backend_to_agent_metadata_id() {
     let db = init_database_memory().await.unwrap();
 
-    let resolved = resolve_agent_binding(db.pool(), "codex")
+    let resolved = resolve_agent_binding(db.pool(), "opencode")
         .await
         .unwrap()
-        .expect("codex should resolve");
+        .expect("opencode should resolve");
 
     assert_eq!(
         resolved,
         AgentBindingResolution {
-            agent_id: "8e1acf31".to_owned(),
+            agent_id: "53861a53".to_owned(),
             agent_source: "builtin".to_owned(),
             agent_type: "acp".to_owned(),
-            runtime_backend: "codex".to_owned(),
+            runtime_backend: "opencode".to_owned(),
         }
     );
 }

@@ -1,15 +1,19 @@
 use aionui_db::{IAgentMetadataRepository, SqliteAgentMetadataRepository, init_database_memory};
 
 #[tokio::test]
-async fn builtin_acp_launch_contracts_follow_verified_registry_entries() {
+async fn remaining_builtin_acp_launch_contracts() {
     let db = init_database_memory().await.unwrap();
     let repo = SqliteAgentMetadataRepository::new(db.pool().clone());
 
     let cases = [
-        ("gemini", "gemini", r#"["--acp"]"#, Some("yolo")),
-        ("qwen", "qwen", r#"["--acp","--experimental-skills"]"#, None),
-        ("droid", "droid", r#"["acp-daemon"]"#, None),
+        ("opencode", "opencode", r#"["acp"]"#, Some("build")),
         ("pi", "npx", r#"["-y","pi-acp"]"#, None),
+        (
+            "deepseek",
+            "node",
+            r#"["/path/to/dsh-catl-plugins/scripts/run.mjs"]"#,
+            None,
+        ),
     ];
     for (backend, command, args, yolo_id) in cases {
         let row = repo
@@ -21,32 +25,18 @@ async fn builtin_acp_launch_contracts_follow_verified_registry_entries() {
         assert_eq!(row.args.as_deref(), Some(args), "{backend} args");
         assert_eq!(row.yolo_id.as_deref(), yolo_id, "{backend} yolo_id");
     }
+}
 
-    let cursor = repo.find_builtin_by_backend("cursor").await.unwrap().unwrap();
-    assert_eq!(cursor.command.as_deref(), Some("cursor-agent"));
-    assert_eq!(cursor.args.as_deref(), Some(r#"["acp"]"#));
-    assert_eq!(
-        cursor.agent_source_info.as_deref(),
-        Some(r#"{"binary_name":"cursor-agent"}"#)
-    );
-    assert_eq!(cursor.yolo_id, None);
-
-    let codebuddy = repo.find_builtin_by_backend("codebuddy").await.unwrap().unwrap();
-    assert_eq!(codebuddy.command.as_deref(), Some("npx"));
-    assert_eq!(
-        codebuddy.args.as_deref(),
-        Some(r#"["-y","--package","@tencent-ai/codebuddy-code","codebuddy","--acp"]"#)
-    );
-    assert_eq!(
-        codebuddy.agent_source_info.as_deref(),
-        Some(r#"{"binary_name":"codebuddy","bridge_binary":"npx"}"#)
-    );
-
-    for backend in ["goose", "auggie", "kimi", "copilot"] {
-        let row = repo.find_builtin_by_backend(backend).await.unwrap().unwrap();
-        assert_eq!(
-            row.yolo_id, None,
-            "{backend} must not advertise an unverified yolo mode"
+#[tokio::test]
+async fn purged_acp_registry_backends_are_absent() {
+    let db = init_database_memory().await.unwrap();
+    let repo = SqliteAgentMetadataRepository::new(db.pool().clone());
+    for backend in [
+        "gemini", "qwen", "droid", "cursor", "codebuddy", "goose", "auggie", "kimi", "copilot",
+    ] {
+        assert!(
+            repo.find_builtin_by_backend(backend).await.unwrap().is_none(),
+            "{backend} must not remain a builtin after 045"
         );
     }
 }

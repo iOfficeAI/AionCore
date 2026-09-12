@@ -62,6 +62,9 @@ pub const UPLOAD_MAX_SIZE: usize = 30 * 1024 * 1024;
 /// Runtime backend that supports Team MCP without ACP capability metadata.
 pub const AIONRS_RUNTIME_BACKEND: &str = "aionrs";
 
+/// User-visible name of the builtin in-process aionrs engine.
+pub const AIONRS_DISPLAY_NAME: &str = "Wework Agent";
+
 /// Determine if an agent supports team mode through MCP or CLI fallback.
 pub fn is_team_capable(backend: &str, agent_capabilities: Option<&serde_json::Value>) -> bool {
     if backend.trim().is_empty() {

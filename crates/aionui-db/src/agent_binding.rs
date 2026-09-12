@@ -84,17 +84,17 @@ mod tests {
     async fn resolve_agent_binding_uses_safe_agent_metadata_reads() {
         let db = init_database_memory().await.unwrap();
         sqlx::query("UPDATE agent_metadata SET config_options = CAST(x'FF' AS TEXT) WHERE agent_id = ?")
-            .bind("2d23ff1c")
+            .bind("53861a53")
             .execute(db.pool())
             .await
             .unwrap();
 
-        let binding = resolve_agent_binding(db.pool(), "claude")
+        let binding = resolve_agent_binding(db.pool(), "opencode")
             .await
             .unwrap()
-            .expect("claude backend resolves");
+            .expect("opencode backend resolves");
 
-        assert_eq!(binding.agent_id, "2d23ff1c");
-        assert_eq!(binding.runtime_backend, "claude");
+        assert_eq!(binding.agent_id, "53861a53");
+        assert_eq!(binding.runtime_backend, "opencode");
     }
 }
