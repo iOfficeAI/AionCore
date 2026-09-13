@@ -34,8 +34,49 @@ pub async fn run_config(args: ConfigArgs) -> ExitCode {
     }
 }
 
+/// Returns true when `base_url` points at this machine.
+///
+/// Used to decide whether the proxy environment applies. Parse failures are
+/// treated as non-loopback so an unusual base URL keeps the previous behaviour.
+fn is_loopback_base_url(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    // `host_str` keeps the brackets around an IPv6 literal.
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// Builds the HTTP client used for every backend call.
+///
+/// `reqwest::Client::new()` honours `HTTP_PROXY`/`HTTPS_PROXY` and has no
+/// loopback exemption, so a proxy exported for unrelated traffic captures these
+/// local calls. The request never reaches the backend, and the CLI reports
+/// `CONFIG_HTTP_STATUS_ERROR ... AionUi backend returned an error status`,
+/// which points at a backend that is healthy and serving the same route.
+///
+/// Bypass the proxy when the backend is local. A remote base URL still uses the
+/// proxy environment, since reaching it may depend on the proxy.
+fn build_client() -> reqwest::Client {
+    let bypass_proxy = std::env::var(ENV_BASE_URL)
+        .map(|base_url| is_loopback_base_url(&base_url))
+        .unwrap_or(true);
+
+    let builder = reqwest::Client::builder();
+    let builder = if bypass_proxy { builder.no_proxy() } else { builder };
+
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
 async fn run(args: ConfigArgs) -> Result<(), ConfigError> {
-    let client = reqwest::Client::new();
+    let client = build_client();
     match args.command {
         ConfigCommand::Capabilities => print_envelope(config_capabilities::data(), meta(None), "config capabilities"),
         ConfigCommand::Context => run_context(&client).await,
@@ -1814,6 +1855,25 @@ mod tests {
     #[test]
     fn path_segments_are_percent_encoded() {
         assert_eq!(encode_path_segment("a/b c"), "a%2Fb%20c");
+    }
+
+    #[test]
+    fn loopback_base_urls_bypass_the_proxy() {
+        assert!(is_loopback_base_url("http://127.0.0.1:56820"));
+        assert!(is_loopback_base_url("http://127.1.2.3:56820"));
+        assert!(is_loopback_base_url("http://localhost:56820"));
+        assert!(is_loopback_base_url("http://LocalHost:56820"));
+        assert!(is_loopback_base_url("http://[::1]:56820"));
+    }
+
+    #[test]
+    fn remote_base_urls_keep_the_proxy() {
+        assert!(!is_loopback_base_url("http://192.168.1.10:56820"));
+        assert!(!is_loopback_base_url("https://aionui.example.com"));
+        // A host that merely starts with the loopback label is not loopback.
+        assert!(!is_loopback_base_url("https://localhost.example.com"));
+        // An unparseable base URL keeps the previous behaviour.
+        assert!(!is_loopback_base_url("not a url"));
     }
 
     #[tokio::test]
