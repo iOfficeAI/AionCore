@@ -197,6 +197,17 @@ pub enum McpTransport {
     },
 }
 
+/// One resolved skill: its bare snapshot name and its real on-disk directory.
+///
+/// NB: the name here is the `extra.skills` name (`cron`). Under plugin-based
+/// delivery the agent sees a PREFIXED name (`aionui:cron`) — do not assume the
+/// two sides match when correlating.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillDirSpec {
+    pub name: String,
+    pub path: String,
+}
+
 /// The session-INITIALIZATION surface (Wave 0c) the legacy ai-agent factory
 /// provided, carried neutrally so each backend's `open_session` serializes it into
 /// its own wire shape. `Default` = empty = byte-identical to the pre-0c handshake,
@@ -210,14 +221,25 @@ pub struct SessionInit {
     /// Skill ids/names to surface to the agent on the first turn (acp/aionrs
     /// deliver these via the first prompt, not a `session/new` param).
     ///
-    /// NB: claude/codex direct-CLI backends intentionally do NOT consume this —
-    /// skills reach them as workspace symlinks (conversation service links the
-    /// resolved skills into the agent's `native_skills_dirs`, e.g.
-    /// `.claude/skills` / `.codex/skills`) and both CLIs discover them natively
-    /// (codex LIVE-verified 0.144.1: `skills/list` returns a `<cwd>/.codex/skills`
-    /// entry as scope=repo; see samples/codex-cli/0.144.1/_probe_workspace_skills.py).
+    /// NB: claude/codex direct-CLI backends intentionally do NOT consume this.
+    /// They receive skills through AionUi's own per-conversation view directory
+    /// instead — claude via a `--plugin-dir` launch flag, codex via a
+    /// `skills/extraRoots/set` request carrying [`Self::skill_view_skills_dir`].
     /// The field is carried for the aionrs/acp first-prompt delivery path only.
     pub skills: Vec<String>,
+    /// Absolute path to this conversation's SKILLS ROOT inside AionUi's own view
+    /// directory (`{view}/skills`, which directly holds `{name}/SKILL.md`).
+    ///
+    /// Populated only for protocol-mode delivery, where the backend has to send
+    /// the path itself. `None` = no protocol delivery for this session, which is
+    /// also what an empty skill snapshot produces.
+    pub skill_view_skills_dir: Option<String>,
+    /// The conversation's resolved skills as REAL source directories.
+    ///
+    /// For backends that need name+path without reading the workspace — agy
+    /// builds its slash-command list from these rather than scanning
+    /// `{cwd}/.agents/skills`, which AionUi no longer creates. Empty = no skills.
+    pub skill_dirs: Vec<SkillDirSpec>,
     /// Composed system prompt / preset context (the `compose_preset_context`
     /// output + aionrs `preset_rules`-merged prompt). Delivered first-message.
     pub preset_context: Option<String>,

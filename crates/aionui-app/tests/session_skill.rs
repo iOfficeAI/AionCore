@@ -100,16 +100,24 @@ fn the_skill_states_the_non_negotiable_rules() {
 #[test]
 fn the_skill_points_at_capabilities_only_as_a_fallback() {
     let body = skill_body();
-    let capabilities_at = body
-        .find("session capabilities")
-        .expect("the skill must name the capabilities fallback");
+    // Anchor on the runnable, copyable commands (start-of-line inside a ```bash
+    // fence), not on bare substrings. The quoted `[[AION_SESSIONS]]` /
+    // `[[AION_SESSION_MESSAGE]]` example blocks now mention `session capabilities`
+    // inline as a CONDITIONAL fallback ("if it is unavailable, run ..."), which is
+    // exactly the framing this guard is named for — a hint, not a command to copy.
+    // §8.5 only cares that the copyable SEND command precedes the copyable
+    // CAPABILITIES command, and their order is unchanged (send still first), so
+    // the agent never needs a round trip to send its first message.
     let send_at = body
-        .find("session send-message")
-        .expect("the skill must document sending");
+        .find("\n\"$AIONUI_HELPER_BIN\" session send-message")
+        .expect("the skill must carry a copyable send command");
+    let capabilities_at = body
+        .find("\n\"$AIONUI_HELPER_BIN\" session capabilities")
+        .expect("the skill must carry a copyable capabilities fallback command");
     assert!(
         send_at < capabilities_at,
-        "the copyable send example must come before the capabilities fallback, \
-         so the agent never needs a round trip to send its first message"
+        "the copyable send command must come before the copyable capabilities \
+         fallback, so the agent never needs a round trip to send its first message"
     );
 }
 

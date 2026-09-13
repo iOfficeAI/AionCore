@@ -89,11 +89,13 @@ impl Default for AppConfig {
     }
 }
 
-/// Derive a 32-byte encryption key from the JWT secret using SHA-256.
-pub fn derive_encryption_key(jwt_secret: &str) -> [u8; 32] {
+/// Derive a 32-byte encryption key from the storage-encryption secret using
+/// SHA-256. The domain-separation prefix is part of the on-disk contract and
+/// must never change — doing so would orphan every stored ciphertext.
+pub fn derive_encryption_key(secret: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"aionui-encryption-key:");
-    hasher.update(jwt_secret.as_bytes());
+    hasher.update(secret.as_bytes());
     hasher.finalize().into()
 }
 

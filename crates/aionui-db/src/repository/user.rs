@@ -95,8 +95,12 @@ pub trait IUserRepository: Send + Sync {
     /// Updates a user's last login timestamp to the current time.
     async fn update_last_login(&self, user_id: &str) -> Result<(), DbError>;
 
-    /// Updates a user's JWT secret.
+    /// Updates a user's JWT signing secret.
     async fn update_jwt_secret(&self, user_id: &str, jwt_secret: &str) -> Result<(), DbError>;
+
+    /// Updates a user's storage-encryption secret (the root the at-rest
+    /// AES-256-GCM key is derived from). Independent of `update_jwt_secret`.
+    async fn update_encryption_secret(&self, user_id: &str, encryption_secret: &str) -> Result<(), DbError>;
 
     /// Updates a user's status. Transitioning into `disabled` also revokes
     /// existing sessions by incrementing `session_generation`.

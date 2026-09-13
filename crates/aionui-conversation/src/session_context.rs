@@ -862,6 +862,7 @@ mod tests {
                 args: None,
                 env: None,
                 native_skills_dirs: None,
+                skill_delivery: None,
                 behavior_policy: None,
                 yolo_id: None,
                 agent_capabilities: None,

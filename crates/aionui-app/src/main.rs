@@ -83,9 +83,13 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
         Some(Command::Diagnose(args)) => Ok(commands::run_diagnose(args).await),
         Some(Command::Team(args)) => Ok(commands::run_team(args).await),
         Some(Command::Session(args)) => Ok(commands::run_session(args).await),
+        Some(Command::Conversation(args)) => Ok(commands::run_conversation(args).await),
+        Some(Command::Skills(args)) => Ok(commands::run_skills(args).await),
         Some(Command::AntigravityHook) => Ok(commands::run_antigravity_hook().await),
         Some(Command::McpTeamStdio) => Ok(commands::run_team_stdio().await),
         Some(Command::Doctor) => Ok(commands::run_doctor(&cli, &merged_path).await?),
+        Some(Command::User(ref args)) => Ok(commands::run_user(&cli, args).await?),
+        Some(Command::Secret(ref args)) => Ok(commands::run_secret(&cli, args).await?),
         Some(Command::PrepareManagedResources(args)) => Ok(commands::run_prepare_managed_resources(args).await?),
         None => {
             let mut env = bootstrap::init_environment(&cli, &merged_path)?;

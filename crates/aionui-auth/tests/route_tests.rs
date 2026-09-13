@@ -13,8 +13,8 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use aionui_auth::{
-    AuthIdentityMode, AuthRouterState, CookieConfig, JwtService, QrTokenStore, SessionRevokedHook, auth_routes,
-    hash_password,
+    AuthIdentityMode, AuthRouterState, CookieConfig, JwtService, QrTokenStore, RefreshCoalescer, SessionRevokedHook,
+    auth_routes, hash_password,
 };
 use aionui_db::{IUserRepository, SqliteUserRepository, UserStatus, init_database_memory};
 
@@ -52,6 +52,7 @@ async fn test_app_with_options_and_hook(
 
     let state = AuthRouterState {
         jwt_service: jwt_service.clone(),
+        refresh_coalescer: RefreshCoalescer::new(),
         user_repo: user_repo.clone(),
         fs_adopter: None,
         cookie_config,
@@ -189,6 +190,44 @@ fn extract_session_token(resp: &axum::response::Response) -> Option<String> {
                 .and_then(|value| value.split(';').next())
                 .map(str::to_owned)
         })
+}
+
+fn extract_refresh_token(resp: &axum::response::Response) -> Option<String> {
+    resp.headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|cookie| {
+            cookie
+                .split(',')
+                .find(|part| part.trim_start().starts_with("aionui-refresh="))
+                .and_then(|part| part.trim_start().strip_prefix("aionui-refresh="))
+                .and_then(|value| value.split(';').next())
+                .map(str::to_owned)
+        })
+}
+
+/// Return every raw `Set-Cookie` header value on the response.
+fn set_cookie_values(resp: &axum::response::Response) -> Vec<String> {
+    resp.headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// POST carrying a `Cookie` header, used to exercise the refresh-cookie path.
+/// The JSON body is intentionally empty: when the cookie is present the handler
+/// must not read the body at all.
+fn post_with_cookie(uri: &str, cookie: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("cookie", cookie)
+        .body(Body::from("{}"))
+        .unwrap()
 }
 
 /// Helper: login and return (token, user_id).
@@ -679,6 +718,159 @@ async fn refresh_rejects_local_user_token_in_aionpro_mode() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let json = body_json(resp).await;
     assert_eq!(json["code"], "USER_CONTEXT_REQUIRED");
+}
+
+#[tokio::test]
+async fn refresh_via_cookie_success() {
+    let (app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    // Login issues both the access (session) and refresh cookies.
+    let login_resp = app
+        .clone()
+        .oneshot(json_post("/login", r#"{"username":"admin","password":"StrongP@ss1"}"#))
+        .await
+        .unwrap();
+    assert_eq!(login_resp.status(), StatusCode::OK);
+    let refresh_cookie = extract_refresh_token(&login_resp).expect("login should set a refresh cookie");
+
+    // Present ONLY the refresh cookie (no body token) to the refresh endpoint.
+    let req = post_with_cookie("/api/auth/refresh", &format!("aionui-refresh={refresh_cookie}"));
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    // The minted token is a usable access token.
+    let new_access = json["token"].as_str().unwrap();
+    assert!(ctx.jwt_service.verify_access(new_access).is_ok());
+}
+
+#[tokio::test]
+async fn refresh_via_cookie_rotates_both_cookies() {
+    let (app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let login_resp = app
+        .clone()
+        .oneshot(json_post("/login", r#"{"username":"admin","password":"StrongP@ss1"}"#))
+        .await
+        .unwrap();
+    let refresh_cookie = extract_refresh_token(&login_resp).expect("login should set a refresh cookie");
+
+    let req = post_with_cookie("/api/auth/refresh", &format!("aionui-refresh={refresh_cookie}"));
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A refresh rotates BOTH cookies (sliding refresh): a new access cookie and
+    // a new refresh cookie, the latter still HttpOnly and scoped to the refresh
+    // path so it is never sent on ordinary requests.
+    let cookies = set_cookie_values(&resp);
+    assert!(
+        cookies.iter().any(|c| c.starts_with("aionui-session=")),
+        "missing rotated session cookie: {cookies:?}"
+    );
+    let refresh_set = cookies
+        .iter()
+        .find(|c| c.starts_with("aionui-refresh="))
+        .unwrap_or_else(|| panic!("missing rotated refresh cookie: {cookies:?}"));
+    assert!(
+        refresh_set.contains("Path=/api/auth/refresh"),
+        "refresh cookie not path-scoped: {refresh_set}"
+    );
+    assert!(
+        refresh_set.contains("HttpOnly"),
+        "refresh cookie must be HttpOnly: {refresh_set}"
+    );
+}
+
+#[tokio::test]
+async fn refresh_rejects_access_token_in_refresh_cookie() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    // The token login returns is an ACCESS token.
+    let (access, _) = login(&mut app, "admin", "StrongP@ss1").await;
+
+    // Presenting it via the refresh cookie must be rejected: only refresh tokens
+    // are accepted on the cookie path (verify_refresh), so a stolen access token
+    // cannot be replayed to mint a long-lived session.
+    let req = post_with_cookie("/api/auth/refresh", &format!("aionui-refresh={access}"));
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+    // Sanity: the same token still verifies fine as an access token.
+    assert!(ctx.jwt_service.verify_access(&access).is_ok());
+}
+
+#[tokio::test]
+async fn refresh_rejects_invalid_refresh_cookie() {
+    let (app, _ctx) = test_app().await;
+
+    let req = post_with_cookie("/api/auth/refresh", "aionui-refresh=not.a.jwt");
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn refresh_after_session_revocation_fails() {
+    let (app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let login_resp = app
+        .clone()
+        .oneshot(json_post("/login", r#"{"username":"admin","password":"StrongP@ss1"}"#))
+        .await
+        .unwrap();
+    let refresh_cookie = extract_refresh_token(&login_resp).expect("login should set a refresh cookie");
+    let user_id = body_json(login_resp).await["user"]["id"].as_str().unwrap().to_owned();
+
+    // Revoke all sessions for the user (logout-everywhere / password change).
+    ctx.user_repo.increment_session_generation(&user_id).await.unwrap();
+
+    // The old refresh cookie now carries a stale session generation and must be
+    // rejected — revocation reaches refresh tokens too.
+    let req = post_with_cookie("/api/auth/refresh", &format!("aionui-refresh={refresh_cookie}"));
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn refresh_concurrent_same_cookie_all_succeed() {
+    let (app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let login_resp = app
+        .clone()
+        .oneshot(json_post("/login", r#"{"username":"admin","password":"StrongP@ss1"}"#))
+        .await
+        .unwrap();
+    let refresh_cookie = extract_refresh_token(&login_resp).expect("login should set a refresh cookie");
+    let cookie = format!("aionui-refresh={refresh_cookie}");
+
+    // Fire several concurrent refreshes with the SAME refresh cookie — the shape
+    // of a real access-token-expiry storm. The backend coalescer must let them
+    // all succeed; exactly-once execution is asserted in the singleflight unit
+    // tests.
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        handles.push(tokio::spawn(async move {
+            app.oneshot(post_with_cookie("/api/auth/refresh", &cookie))
+                .await
+                .unwrap()
+        }));
+    }
+    for handle in handles {
+        let resp = handle.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(ctx.jwt_service.verify_access(json["token"].as_str().unwrap()).is_ok());
+    }
 }
 
 // ===========================================================================

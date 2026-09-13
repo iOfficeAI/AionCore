@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use tempfile::TempDir;
 
 use super::{SidebarError, SidebarService};
-use crate::ports::RemoveProjectPorts;
+use crate::ports::{ArchiveTeardownPorts, RemoveProjectPorts};
 
 const USER: &str = "user-1";
 const OTHER: &str = "user-2";
@@ -883,6 +883,45 @@ impl RemoveProjectPorts for FakePorts {
     }
 }
 
+/// An `ArchiveTeardownPorts` that only records which ids it was asked to stop.
+/// Teardown is a pure process op in production (no DB write), so the fake just
+/// captures the calls; tests assert the archive path drives it. A `fail` id
+/// forces one call to error, exercising the best-effort warn-and-continue path.
+struct FakeTeardownPorts {
+    fail: HashSet<String>,
+    stopped_convs: Mutex<Vec<String>>,
+    stopped_teams: Mutex<Vec<String>>,
+}
+
+impl FakeTeardownPorts {
+    fn new(fail: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            fail: fail.iter().map(|s| s.to_string()).collect(),
+            stopped_convs: Mutex::new(Vec::new()),
+            stopped_teams: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl ArchiveTeardownPorts for FakeTeardownPorts {
+    async fn stop_conversation(&self, _user_id: &str, conversation_id: &str) -> Result<(), String> {
+        self.stopped_convs.lock().unwrap().push(conversation_id.to_owned());
+        if self.fail.contains(conversation_id) {
+            return Err(format!("forced teardown failure {conversation_id}"));
+        }
+        Ok(())
+    }
+
+    async fn stop_team(&self, _user_id: &str, team_id: &str) -> Result<(), String> {
+        self.stopped_teams.lock().unwrap().push(team_id.to_owned());
+        if self.fail.contains(team_id) {
+            return Err(format!("forced teardown failure {team_id}"));
+        }
+        Ok(())
+    }
+}
+
 /// A `user_order` store over the same pool the service uses — `SqliteUserOrderStore`
 /// is stateless over the pool, so a fresh instance behaves identically.
 fn uo_store(pool: &SqlitePool) -> Arc<dyn IUserOrderStore> {
@@ -1213,6 +1252,86 @@ async fn archive_conversation_moves_slice_and_unpins() {
         vec!["c1"],
         "surfaces in archive"
     );
+}
+
+/// Archiving a conversation tears down its agent process (like delete) but,
+/// unlike delete, keeps the row: only `archived_at` flips, the conversation is
+/// still on disk (unarchiving cold-starts a fresh agent).
+#[tokio::test]
+async fn archive_conversation_tears_down_process_but_keeps_row() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_conv(pool, USER, "c1", None, "{}", 100).await;
+    let teardown = FakeTeardownPorts::new(&[]);
+    fx.service.set_archive_teardown_ports(teardown.clone());
+
+    fx.service.archive_conversation(USER, "c1").await.unwrap();
+
+    assert_eq!(
+        *teardown.stopped_convs.lock().unwrap(),
+        vec!["c1"],
+        "archive stops the agent process"
+    );
+    assert!(teardown.stopped_teams.lock().unwrap().is_empty(), "no team teardown");
+    assert!(conv_exists(pool, "c1").await, "row preserved (data not deleted)");
+    assert!(conv_archived_at(pool, "c1").await.is_some(), "only archived_at flipped");
+}
+
+/// Archiving a team tears down its runtime + member agents (like delete) but
+/// keeps every row: team and folded members only get `archived_at`.
+#[tokio::test]
+async fn archive_team_tears_down_runtime_but_keeps_rows() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_team(pool, USER, "T1", "", None, 100).await;
+    insert_member(pool, USER, "m1", "T1", 90).await;
+    let teardown = FakeTeardownPorts::new(&[]);
+    fx.service.set_archive_teardown_ports(teardown.clone());
+
+    fx.service.archive_team(USER, "T1").await.unwrap();
+
+    assert_eq!(
+        *teardown.stopped_teams.lock().unwrap(),
+        vec!["T1"],
+        "archive stops the team runtime (member kills happen inside the team service)"
+    );
+    assert!(
+        teardown.stopped_convs.lock().unwrap().is_empty(),
+        "team teardown is one call, not per-member from the sidebar"
+    );
+    assert!(
+        team_archived_at(pool, "T1").await.is_some(),
+        "team row preserved + archived"
+    );
+    assert!(conv_exists(pool, "m1").await, "member row preserved");
+    assert!(
+        conv_archived_at(pool, "m1").await.is_some(),
+        "member archived_at flipped"
+    );
+}
+
+/// Teardown is best-effort: a failing stop only warns, so the archive flip
+/// still succeeds (the row already moved slice — a lingering process is a leak
+/// to log, not a reason to fail the archive).
+#[tokio::test]
+async fn archive_succeeds_even_when_teardown_fails() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_conv(pool, USER, "c1", None, "{}", 100).await;
+    let teardown = FakeTeardownPorts::new(&["c1"]); // forced teardown failure
+    fx.service.set_archive_teardown_ports(teardown.clone());
+
+    fx.service
+        .archive_conversation(USER, "c1")
+        .await
+        .expect("archive still succeeds despite teardown failure");
+
+    assert_eq!(
+        *teardown.stopped_convs.lock().unwrap(),
+        vec!["c1"],
+        "teardown attempted"
+    );
+    assert!(conv_archived_at(pool, "c1").await.is_some(), "flip committed anyway");
 }
 
 /// Archiving an unknown id, or another user's conversation, is a 404

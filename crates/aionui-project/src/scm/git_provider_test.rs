@@ -293,6 +293,63 @@ async fn workspace_worktree_without_primary_has_none_owner() {
 }
 
 #[tokio::test]
+async fn root_repo_surfaces_its_internal_linked_worktree() {
+    // The pe root is itself a repository (the common "open the repo directly"
+    // case, discover_children = false). A linked worktree living inside the repo
+    // tree (e.g. `.worktrees/<name>`) is enumerated from git — never by scanning
+    // the filesystem — and surfaced as a child nested under the primary.
+    let tmp = TempDir::new().expect("tempdir");
+    let primary = init_committed_repo(tmp.path());
+    std::fs::create_dir_all(tmp.path().join(".worktrees")).expect("mkdir .worktrees");
+    let wt_path = tmp.path().join(".worktrees").join("feature");
+    primary.worktree("feature", &wt_path, None).expect("add worktree");
+
+    let provider = GitScmProvider::new();
+    // Attached-style root: discovery never scans children, yet the worktree must
+    // still surface — it comes from git enumeration, not the child-directory walk.
+    let root = root_at("pe1", tmp.path(), "zumi");
+    let repos = provider.discover(&root).await.expect("discover ok");
+
+    let primary_repo = by_child(&repos, ""); // relative_path == "" is the pe root itself
+    let worktree = by_child(&repos, ".worktrees/feature");
+
+    assert!(!primary_repo.is_worktree, "the pe root repo is the primary");
+    assert!(worktree.is_worktree, "the linked worktree is flagged");
+    assert_eq!(
+        worktree.worktree_of.as_deref(),
+        Some(primary_repo.repo_id.as_str()),
+        "the internal worktree points at its primary's repo_id"
+    );
+}
+
+#[tokio::test]
+async fn root_repo_skips_linked_worktree_outside_its_tree() {
+    // A linked worktree living OUTSIDE the pe root tree has no pe-relative path,
+    // so it cannot be represented as a FileRef and is not surfaced. Only the
+    // primary shows — the same one-repo result as a repo with no worktrees.
+    let tmp = TempDir::new().expect("tempdir repo");
+    let primary = init_committed_repo(tmp.path());
+    let outside = TempDir::new().expect("tempdir outside");
+    let wt_path = outside.path().join("feature");
+    primary.worktree("feature", &wt_path, None).expect("add worktree");
+
+    let provider = GitScmProvider::new();
+    let root = root_at("pe1", tmp.path(), "zumi");
+    let repos = provider.discover(&root).await.expect("discover ok");
+
+    assert_eq!(
+        repos.len(),
+        1,
+        "only the primary surfaces; the outside worktree is skipped"
+    );
+    assert!(!repos[0].is_worktree);
+    assert!(
+        repos[0].root.relative_path.is_empty(),
+        "the sole surfaced repo is the pe root itself"
+    );
+}
+
+#[tokio::test]
 async fn status_reports_untracked_as_created_unstaged() {
     let tmp = TempDir::new().expect("tempdir");
     let repo = init_repo(tmp.path());

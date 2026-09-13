@@ -69,4 +69,15 @@ fn resolve_secret_priority_order() {
     // Generated secrets are unique
     let (secret2, _) = resolve_jwt_secret(None, None);
     assert_ne!(secret, secret2);
+
+    // An empty value from either source is treated as absent — an empty string is
+    // never a usable encryption root, so it must not shadow a lower-priority
+    // source or be adopted verbatim.
+    let (secret, generated) = resolve_jwt_secret(Some(""), Some("db"));
+    assert_eq!(secret, "db", "empty env must fall through to the database value");
+    assert!(!generated);
+
+    let (secret, generated) = resolve_jwt_secret(Some(""), Some(""));
+    assert!(!secret.is_empty(), "both sources empty → generate a real secret");
+    assert!(generated);
 }

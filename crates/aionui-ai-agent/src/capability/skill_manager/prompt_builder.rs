@@ -1,23 +1,83 @@
 use super::{SkillDefinition, SkillIndex};
 
-/// Build a formatted text block listing available skills for injection.
+/// Per-skill description budget, in CHARS.
 ///
-/// The output includes skill names with descriptions and instructions
-/// on how to request loading via `[LOAD_SKILL: name]`.
+/// The injection block was measured at roughly 1545 characters with a SINGLE
+/// 687-character description accounting for 47% of it. 200 keeps every compliant
+/// description intact (the well-behaved builtins sit at 133-142) and cuts only
+/// the genuinely oversized ones.
+///
+/// Truncating is safe only BECAUSE channel A exists: an agent that sees a cut
+/// description and suspects the skill is relevant can fetch the full text with
+/// `skills show`. Without that escape hatch, truncation would degrade the
+/// agent's ability to decide when a skill applies.
+const DESCRIPTION_CHAR_BUDGET: usize = 200;
+
+fn truncate_description(description: &str) -> String {
+    // chars(), not bytes: a byte slice would split a multi-byte codepoint and
+    // produce invalid UTF-8 for any non-ASCII description.
+    if description.chars().count() <= DESCRIPTION_CHAR_BUDGET {
+        return description.to_owned();
+    }
+    let mut out: String = description.chars().take(DESCRIPTION_CHAR_BUDGET).collect();
+    out.push('…');
+    out
+}
+
+/// Build the skills index block injected for `injected`-mode agents.
+///
+/// Two channels are offered and the AGENT chooses. We deliberately do not try to
+/// predict whether it can execute commands: permission mode (plan / read-only)
+/// is agent-side runtime state that no CLI capability query exposes. Channel B
+/// requires no vendor capability at all, which is what makes it a true fallback,
+/// and channel A is listed first because it is a normal tool call rather than
+/// text-matching plus an extra turn.
 pub fn build_skills_index_text(skills: &[SkillIndex]) -> String {
     if skills.is_empty() {
         return String::new();
     }
 
-    let mut lines = Vec::with_capacity(skills.len() + 4);
+    // Sorted: the upstream discovery returns from a HashMap, so without this the
+    // same conversation could be injected a differently-ordered block on each
+    // open -- churning the agent's context for no reason and defeating any
+    // prefix caching.
+    let mut ordered: Vec<&SkillIndex> = skills.iter().collect();
+    ordered.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut lines = Vec::with_capacity(ordered.len() + 5);
     lines.push("## Available Skills".to_string());
     lines.push(String::new());
-    lines.push("To load a skill, include `[LOAD_SKILL: skill-name]` in your response.".to_string());
-    lines.push(String::new());
-
-    for skill in skills {
-        lines.push(format!("- **{}**: {}", skill.name, skill.description));
+    for skill in ordered {
+        lines.push(format!(
+            "- **{}**: {}",
+            skill.name,
+            truncate_description(&skill.description)
+        ));
     }
+    lines.push(String::new());
+    // These command lines are the CONTRACT, not prose: both subcommands read their
+    // arguments as a JSON object on STDIN and reject positional arguments outright
+    // (`aionui-app/src/cli.rs` declares them as argument-less variants). An earlier
+    // wording taught `skills show <name>`, which cost live agents three to five
+    // failed tool calls each before they guessed the real shape -- and `--help` did
+    // not mention stdin either, so the obvious self-service path was a dead end.
+    // `skills_cli_commands_in_the_index_are_parseable` in `aionui-app` pins the two
+    // sides together so they cannot drift apart again.
+    lines.push(
+        "To get a skill's full content, prefer running \
+         `printf '%s' '{\"name\":\"<name>\"}' | \"$AIONUI_HELPER_BIN\" skills show` — it also \
+         returns the skill's absolute directory, and \
+         `printf '%s' '{\"path\":\"<name>/<relative-path>\"}' | \"$AIONUI_HELPER_BIN\" skills cat` \
+         reads its supplementary files. Both read their arguments as a JSON object on stdin and \
+         take no positional arguments; run `\"$AIONUI_HELPER_BIN\" skills capabilities` for the \
+         full contract."
+            .to_string(),
+    );
+    lines.push(
+        "If you cannot execute commands, output `[LOAD_SKILL: <name>]` in your response instead \
+         and the content will be provided on the next turn."
+            .to_string(),
+    );
 
     lines.join("\n")
 }
@@ -145,9 +205,88 @@ mod tests {
         ];
         let text = build_skills_index_text(&skills);
         assert!(text.contains("## Available Skills"));
-        assert!(text.contains("[LOAD_SKILL: skill-name]"));
         assert!(text.contains("- **review**: Code review"));
         assert!(text.contains("- **debug**: Debugging helper"));
+    }
+
+    /// 200 CHARS, not bytes: a byte slice would cut a Chinese description
+    /// mid-codepoint and emit invalid UTF-8.
+    #[test]
+    fn a_long_description_is_truncated_at_200_chars_on_a_char_boundary() {
+        let text = build_skills_index_text(&[SkillIndex {
+            name: "verbose".into(),
+            description: "重".repeat(400),
+        }]);
+        let line = text.lines().find(|line| line.contains("verbose")).unwrap();
+        let rendered = line.split_once(": ").unwrap().1;
+        assert_eq!(rendered.chars().count(), 201, "200 chars plus the ellipsis");
+        assert!(rendered.ends_with('…'));
+    }
+
+    #[test]
+    fn a_compliant_description_is_kept_verbatim() {
+        let text = build_skills_index_text(&[SkillIndex {
+            name: "cron".into(),
+            description: "Scheduled task management.".into(),
+        }]);
+        assert!(text.contains("- **cron**: Scheduled task management."));
+        assert!(!text.contains('…'));
+    }
+
+    /// A description exactly at the budget must NOT gain an ellipsis -- an
+    /// off-by-one here would mark compliant skills as truncated.
+    #[test]
+    fn a_description_exactly_at_the_budget_is_not_truncated() {
+        let text = build_skills_index_text(&[SkillIndex {
+            name: "edge".into(),
+            description: "x".repeat(200),
+        }]);
+        assert!(!text.contains('…'), "200 is within budget, not over it");
+    }
+
+    /// Truncation is only SAFE because channel A exists, so the block must
+    /// advertise both channels -- with the command first, since it is a normal
+    /// tool call rather than text-matching plus an extra turn.
+    #[test]
+    fn the_index_block_advertises_both_channels_with_the_command_first() {
+        let text = build_skills_index_text(&[SkillIndex {
+            name: "cron".into(),
+            description: "d".into(),
+        }]);
+        let command_at = text.find("skills show").expect("channel A must be advertised");
+        let protocol_at = text.find("[LOAD_SKILL:").expect("channel B must stay as the fallback");
+        assert!(command_at < protocol_at, "channel A is the preferred path");
+        assert!(text.contains("$AIONUI_HELPER_BIN"));
+        assert!(text.contains("skills cat"), "supplementary files need their own hint");
+    }
+
+    /// Discovery upstream returns from a HashMap, so an unsorted block would vary
+    /// between opens of the SAME conversation -- churning context and defeating
+    /// prefix caching.
+    #[test]
+    fn the_index_is_ordered_regardless_of_input_order() {
+        let forward = build_skills_index_text(&[
+            SkillIndex {
+                name: "alpha".into(),
+                description: "a".into(),
+            },
+            SkillIndex {
+                name: "zeta".into(),
+                description: "z".into(),
+            },
+        ]);
+        let reversed = build_skills_index_text(&[
+            SkillIndex {
+                name: "zeta".into(),
+                description: "z".into(),
+            },
+            SkillIndex {
+                name: "alpha".into(),
+                description: "a".into(),
+            },
+        ]);
+        assert_eq!(forward, reversed);
+        assert!(forward.find("alpha").unwrap() < forward.find("zeta").unwrap());
     }
 
     // -----------------------------------------------------------------------
@@ -248,7 +387,13 @@ mod tests {
         assert!(result.starts_with("Base prompt"));
         assert!(result.contains("## Available Skills"));
         assert!(result.contains("- **helper**: A helper skill"));
-        assert!(result.contains("[LOAD_SKILL: skill-name]"));
+        // The placeholder text changed from `skill-name` to `<name>` when the
+        // block gained its second channel. Asserting the PROTOCOL MARKER instead
+        // of the exact placeholder keeps the meaningful part of the check --
+        // that this builder still carries a load instruction -- without pinning
+        // wording that channel A's arrival legitimately rewrote.
+        assert!(result.contains("[LOAD_SKILL:"));
+        assert!(result.contains("skills show"), "both channels travel with the index");
     }
 
     #[test]

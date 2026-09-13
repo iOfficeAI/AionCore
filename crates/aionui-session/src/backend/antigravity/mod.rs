@@ -16,7 +16,6 @@ mod argv;
 pub(crate) const CODE_STEPS_FAILED: &str = "ANTIGRAVITY_STEPS_FAILED";
 
 mod conn;
-mod mcp_config;
 mod models;
 mod skills;
 mod translate;

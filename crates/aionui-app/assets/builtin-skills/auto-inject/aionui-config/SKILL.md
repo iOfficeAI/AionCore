@@ -1,7 +1,6 @@
 ---
 name: aionui-config
-description: >-
-  Configure AionUi itself through the bundled aioncore config CLI: create and edit assistants, update assistant rules, inspect and import skills, manage MCP servers, configure model providers, update settings, manage agents, configure scheduled tasks, and manage app configuration from an agent conversation. Use when the user wants you to set up or modify an AionUi assistant, attach skills, change an assistant's system prompt, add MCP or model provider configuration, schedule recurring work, or otherwise configure their AionUi installation, including when the user needs to know whether assistant changes affect the current conversation or only new conversations.
+description: Configure AionUi itself with the bundled aioncore CLI. Use when asked to set up or change assistants, assistant rules, skills, MCP servers, model providers, agents, scheduled tasks, or settings.
 ---
 
 # AionUi Config

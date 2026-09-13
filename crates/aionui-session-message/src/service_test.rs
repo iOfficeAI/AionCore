@@ -8,7 +8,8 @@ fn same_workspace_block_matches_the_spec_shape_exactly() {
         "[[AION_SESSION_MESSAGE]]\n\
          from: 重构-鉴权模块\tconv_1\n\
          workspace: same\n\
-         reply_to: conv_1\t（回信: session send-message, to=reply_to）\n\
+         reply_to: conv_1\t(reply: session send-message, to=reply_to)\n\
+         If the session-message skill is unavailable, run `\"$AIONUI_HELPER_BIN\" session capabilities` for the full delivery contract.\n\
          [[/AION_SESSION_MESSAGE]]"
     );
 }
@@ -18,11 +19,13 @@ fn cross_workspace_block_carries_the_constraint_inside_the_field_value() {
     let block = build_session_message_block(
         "A",
         "conv_1",
-        "/Users/x/proj-a（与你不同，勿用相对路径，勿假设可读）",
+        "/Users/x/proj-a (differs from yours; don't use relative paths, don't assume readable)",
         "conv_1",
     );
     assert!(
-        block.contains("workspace: /Users/x/proj-a（与你不同，勿用相对路径，勿假设可读）"),
+        block.contains(
+            "workspace: /Users/x/proj-a (differs from yours; don't use relative paths, don't assume readable)"
+        ),
         "{block}"
     );
 }
@@ -35,6 +38,37 @@ fn the_block_always_states_how_to_reply() {
     let block = build_session_message_block("A", "conv_1", "same", "conv_1");
     assert!(block.contains("session send-message"), "{block}");
     assert!(block.contains("to=reply_to"), "{block}");
+}
+
+#[test]
+fn the_block_carries_an_unconditional_capabilities_fallback_without_breaking_reply_to() {
+    // The pointer is always emitted (no skill-toggle branch), framed as a fallback
+    // for when the skill is unavailable so the recipient can still fetch the whole
+    // contract. It sits on its OWN line, so it neither matches the `reply_to:`
+    // prefix nor the `\t` the frontend splits the address on.
+    let block = build_session_message_block("A", "conv_1", "same", "conv_1");
+    assert!(
+        block.contains(
+            "If the session-message skill is unavailable, run `\"$AIONUI_HELPER_BIN\" session capabilities` for the full delivery contract."
+        ),
+        "{block}"
+    );
+    let reply_line = block
+        .lines()
+        .find(|line| line.starts_with("reply_to: "))
+        .expect("a reply_to line");
+    assert!(
+        !reply_line.contains("session capabilities"),
+        "the capabilities pointer must not ride the reply_to line: {reply_line}"
+    );
+    // The address is the first tab-separated segment of the reply_to line, exactly
+    // as the frontend parses it — the new line must not perturb that.
+    assert_eq!(
+        reply_line
+            .strip_prefix("reply_to: ")
+            .and_then(|rest| rest.split('\t').next()),
+        Some("conv_1")
+    );
 }
 
 #[test]
@@ -53,7 +87,7 @@ fn the_recipient_workspace_field_says_same_only_when_both_sides_match() {
     assert_eq!(recipient_workspace_field(Some("/w/a"), Some("/w/a")), "same");
     assert_eq!(
         recipient_workspace_field(Some("/w/a"), Some("/w/b")),
-        "/w/a（与你不同，勿用相对路径，勿假设可读）"
+        "/w/a (differs from yours; don't use relative paths, don't assume readable)"
     );
 }
 
@@ -63,7 +97,7 @@ fn an_unknown_sender_workspace_never_collapses_to_same() {
     // relative paths are safe when we do not know that.
     let value = recipient_workspace_field(None, Some("/w/b"));
     assert!(value.starts_with("unknown"), "{value}");
-    assert!(value.contains("勿用相对路径"), "{value}");
+    assert!(value.contains("don't use relative paths"), "{value}");
 
     let both_unknown = recipient_workspace_field(None, None);
     assert!(both_unknown.starts_with("unknown"), "{both_unknown}");
@@ -74,7 +108,10 @@ fn a_known_sender_workspace_with_an_unknown_target_is_reported_as_different() {
     // The recipient block states the SENDER's path, so it stays usable even
     // when the target row records no workspace.
     let value = recipient_workspace_field(Some("/w/a"), None);
-    assert_eq!(value, "/w/a（与你不同，勿用相对路径，勿假设可读）");
+    assert_eq!(
+        value,
+        "/w/a (differs from yours; don't use relative paths, don't assume readable)"
+    );
 }
 
 // ---------------------------------------------------------------------------

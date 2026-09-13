@@ -1141,17 +1141,9 @@ mod tests {
                 .map(|name| LoadedAgentSkill {
                     name: name.clone(),
                     body: format!("{name} body"),
+                    source_path: std::path::PathBuf::from(format!("/src/{name}")),
                 })
                 .collect()
-        }
-
-        async fn link_workspace_skills(
-            &self,
-            _workspace: &std::path::Path,
-            _rel_dirs: &[&str],
-            _skills: &[aionui_extension::ResolvedAgentSkill],
-        ) -> usize {
-            0
         }
     }
 

@@ -238,6 +238,60 @@ impl AcpSkillManager {
         }
     }
 
+    /// Resolve `names` to their REAL on-disk skill directories.
+    ///
+    /// Deliberately routed through the same `materialize_skills_for_agent_*`
+    /// resolution the conversation service uses to build the view directory, so
+    /// the directories a CLI gets allow-listed and the directories the view
+    /// links to agree by construction rather than by coincidence.
+    ///
+    /// Unknown or unreadable names are skipped (the helper warns); the result is
+    /// sorted by name for a deterministic spawn argv.
+    pub async fn resolve_skill_dirs_for_user(
+        &self,
+        user_id: &str,
+        names: &[String],
+    ) -> Vec<aionui_session::SkillDirSpec> {
+        if names.is_empty() {
+            return Vec::new();
+        }
+        let resolved = match &self.skill_repo {
+            Some(repo) => {
+                aionui_extension::materialize_skills_for_agent_with_repo_for_user(
+                    &self.paths,
+                    repo.as_ref(),
+                    user_id,
+                    "skill-delivery",
+                    names,
+                )
+                .await
+            }
+            // Same dev/no-DB fallback as `list_available_skills_for_user`, which
+            // is not per-user isolated; production always injects the repo.
+            None => {
+                tracing::warn!(
+                    user_id,
+                    "skill_repo not configured; resolving skill dirs without user scoping \
+                     (must not happen in production)"
+                );
+                aionui_extension::materialize_skills_for_agent(&self.paths, "skill-delivery", names).await
+            }
+        };
+        match resolved {
+            Ok(list) => list
+                .into_iter()
+                .map(|skill| aionui_session::SkillDirSpec {
+                    name: skill.name,
+                    path: skill.source_path.to_string_lossy().into_owned(),
+                })
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "resolve_skill_dirs_for_user failed; delivering no skill directories");
+                Vec::new()
+            }
+        }
+    }
+
     /// Return the current skill index without re-scanning.
     pub async fn get_skills_index(&self) -> Vec<SkillIndex> {
         let cache = self.cache.read().await;

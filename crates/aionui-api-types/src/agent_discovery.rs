@@ -11,6 +11,7 @@
 //! depend on the ACP protocol SDK — the ai-agent crate typed-decodes
 //! them when it needs to.
 
+use crate::skill_delivery::SkillDelivery;
 use aionui_common::{AgentType, TimestampMs};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -191,6 +192,14 @@ pub struct AgentMetadata {
     pub env: Vec<AgentEnvEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_skills_dirs: Option<Vec<String>>,
+    /// How this vendor receives the conversation's skills. `None` behaves as
+    /// `injected` (the safe default), so an unprobed vendor is zero-intrusion.
+    ///
+    /// This — not `native_skills_dirs` — is the delivery signal. The old field
+    /// conflated "declares a workspace skills dir" with "can discover skills
+    /// natively" and is now historical/display data only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_delivery: Option<SkillDelivery>,
 
     #[serde(default)]
     pub behavior_policy: BehaviorPolicy,
@@ -279,6 +288,8 @@ pub struct AgentManagementRow {
     pub env: Vec<AgentEnvEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_skills_dirs: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_delivery: Option<SkillDelivery>,
     #[serde(default)]
     pub behavior_policy: BehaviorPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -361,6 +372,7 @@ mod tests {
             args: vec![],
             env: vec![],
             native_skills_dirs: None,
+            skill_delivery: None,
             behavior_policy: BehaviorPolicy::default(),
             yolo_id: None,
             sort_order: 3100,

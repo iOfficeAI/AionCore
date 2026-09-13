@@ -112,6 +112,14 @@ pub(super) async fn build(
     if let Some(backend_label) = config.backend.as_deref()
         && matches!(route_for_backend(Some(backend_label)), BackendRoute::DirectCli)
     {
+        let delivery = crate::factory::resolve_skill_delivery(
+            deps.as_ref(),
+            &ctx.user_id,
+            &ctx.conversation_id,
+            &config.skills,
+            &meta,
+        )
+        .await;
         let instance = crate::session_agent::build_session_instance(
             backend_label,
             crate::session_agent::SessionBuildInputs {
@@ -120,6 +128,7 @@ pub(super) async fn build(
                 workspace: ctx.workspace.clone(),
                 config: &config,
                 metadata: &meta,
+                skill_delivery: delivery,
                 session_snapshot: build_context.session_snapshot.as_ref(),
                 backend_session_id: build_context.session_id.clone(),
                 mcp_server_repo: deps.mcp_server_repo.as_ref(),
@@ -178,6 +187,24 @@ pub(super) async fn build(
             runtime_env: &ctx.runtime_env,
         },
     );
+
+    // Skill delivery args for the ACP lane. These come straight from
+    // `agent_metadata`, so giving a newly probed vendor an equivalent flag is a
+    // one-row config change with no code change and no release.
+    //
+    // Appended AFTER the launch policy so a vendor's own configured args keep
+    // their position; the CLI we spawn here is the vendor binary itself, so its
+    // argv is exactly `agent_metadata.args` plus these.
+    let acp_delivery = crate::factory::resolve_skill_delivery(
+        deps.as_ref(),
+        &ctx.user_id,
+        &ctx.conversation_id,
+        &config.skills,
+        &meta,
+    )
+    .await;
+    command_spec.args.extend(acp_delivery.plan.extra_args.iter().cloned());
+
     let session_snapshot = build_context.session_snapshot;
 
     // Load user-configured MCP servers from the DB so they reach
@@ -703,6 +730,7 @@ mod tests {
             args: Some("[]"),
             env: Some("[]"),
             native_skills_dirs: None,
+            skill_delivery: None,
             behavior_policy: None,
             yolo_id: None,
             agent_capabilities: None,
@@ -895,6 +923,7 @@ mod tests {
                 description: None,
             }],
             native_skills_dirs: None,
+            skill_delivery: None,
             behavior_policy: aionui_api_types::BehaviorPolicy::default(),
             yolo_id: None,
             sort_order: 0,

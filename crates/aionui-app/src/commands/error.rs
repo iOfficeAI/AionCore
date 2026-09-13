@@ -12,6 +12,14 @@ pub(crate) enum CliBoundaryCode {
     CliDoctorDatabaseFailed,
     CliDoctorRegistryHydrateFailed,
     CliPrepareManagedResourcesFailed,
+    CliUserInputInvalid,
+    CliUserNotFound,
+    CliUserAlreadyExists,
+    CliUserDatabaseFailed,
+    CliUserHashFailed,
+    CliSecretInputInvalid,
+    CliSecretConflict,
+    CliSecretDatabaseFailed,
     McpEnvMissing,
     McpEnvInvalidPort,
     McpStdinTty,
@@ -41,6 +49,14 @@ impl CliBoundaryCode {
             Self::CliDoctorDatabaseFailed => "CLI_DOCTOR_DATABASE_FAILED",
             Self::CliDoctorRegistryHydrateFailed => "CLI_DOCTOR_REGISTRY_HYDRATE_FAILED",
             Self::CliPrepareManagedResourcesFailed => "CLI_PREPARE_MANAGED_RESOURCES_FAILED",
+            Self::CliUserInputInvalid => "CLI_USER_INPUT_INVALID",
+            Self::CliUserNotFound => "CLI_USER_NOT_FOUND",
+            Self::CliUserAlreadyExists => "CLI_USER_ALREADY_EXISTS",
+            Self::CliUserDatabaseFailed => "CLI_USER_DATABASE_FAILED",
+            Self::CliUserHashFailed => "CLI_USER_HASH_FAILED",
+            Self::CliSecretInputInvalid => "CLI_SECRET_INPUT_INVALID",
+            Self::CliSecretConflict => "CLI_SECRET_CONFLICT",
+            Self::CliSecretDatabaseFailed => "CLI_SECRET_DATABASE_FAILED",
             Self::McpEnvMissing => "MCP_ENV_MISSING",
             Self::McpEnvInvalidPort => "MCP_ENV_INVALID_PORT",
             Self::McpStdinTty => "MCP_STDIN_TTY",
@@ -71,7 +87,12 @@ impl CliBoundaryCode {
             | Self::McpStdinTty
             | Self::McpStdinFrameInvalid
             | Self::McpStdinJsonInvalid
-            | Self::McpFrameTooLarge => ExitKind::Config,
+            | Self::McpFrameTooLarge
+            | Self::CliUserInputInvalid
+            | Self::CliUserNotFound
+            | Self::CliUserAlreadyExists
+            | Self::CliSecretInputInvalid
+            | Self::CliSecretConflict => ExitKind::Config,
             Self::McpTcpConnectFailed | Self::McpHttpConnectOrTimeout | Self::McpHttpStatusError => {
                 ExitKind::Unavailable
             }

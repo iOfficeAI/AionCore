@@ -6,12 +6,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use aionui_ai_agent::{AgentRouterState, AgentService, RemoteAgentRouterState, RemoteAgentService};
+use aionui_ai_agent::{AgentRouterState, AgentService, IWorkerTaskManager, RemoteAgentRouterState, RemoteAgentService};
 use aionui_assistant::{
     AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
 };
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
+use aionui_common::AgentKillReason;
 use aionui_conversation::{ConversationRouterState, ConversationService};
 use aionui_cron::{CronEventEmitter, CronRouterState, service::CronServiceDeps};
 use aionui_db::{
@@ -40,7 +41,8 @@ use aionui_session_message::drainer::Drainer;
 use aionui_session_message::state::SessionMessageRouterState;
 use aionui_session_message::targets::MentionableTargets;
 use aionui_shell::ShellRouterState;
-use aionui_sidebar::{SidebarRouterState, SidebarService};
+use aionui_sidebar::{ArchiveTeardownPorts, SidebarRouterState, SidebarService};
+use aionui_skill_runtime::{SkillRuntimeRouterState, SkillRuntimeService};
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
     ProtocolDetectionService, ProviderService, RuntimePrepareService, SettingsService, SystemRouterState,
@@ -142,6 +144,7 @@ pub struct ModuleStates {
     pub channel: ChannelRouterState,
     pub team: TeamRouterState,
     pub session_message: SessionMessageRouterState,
+    pub skill_runtime: SkillRuntimeRouterState,
     pub cron: CronRouterState,
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
@@ -277,7 +280,7 @@ pub async fn build_module_states(
 
     let pool = services.database.pool().clone();
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
     let agent_service = AgentService::new(
         services.agent_registry.clone(),
         services.event_bus.clone(),
@@ -326,6 +329,7 @@ pub async fn build_module_states(
             )
         }),
         session_message: build_module_state_phase(&boot, "session_message", || build_session_message_state(services)),
+        skill_runtime: build_module_state_phase(&boot, "skill_runtime", || build_skill_runtime_state(services)),
         cron,
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
@@ -346,6 +350,17 @@ pub async fn build_module_states(
             team: states.team.service.clone(),
             project: services.project_service.clone(),
         }));
+    // Same late-injection as above: the archive paths release the agent runtime
+    // via the worker task manager (per-conversation kill) and the team service
+    // (team runtime + member kills), neither of which exists when the sidebar
+    // state is built. `set_archive_teardown_ports` is set-once.
+    states
+        .sidebar
+        .service
+        .set_archive_teardown_ports(Arc::new(ArchiveTeardownAdapter {
+            task_manager: services.worker_task_manager.clone(),
+            team: states.team.service.clone(),
+        }));
     states
         .conversation
         .service
@@ -360,6 +375,21 @@ pub async fn build_module_states(
 /// The drainer is spawned here rather than in `routes.rs` because this is where
 /// this crate already starts background work — see
 /// `spawn_assistant_mcp_binding_watcher`, called from `build_assistant_state`.
+/// Channel A's state. Read-only, so it takes the conversation repo (for the
+/// snapshot allow-list), the skill paths + repo (to resolve and read), and the
+/// runtime token service (to authenticate). Deliberately NOT the skill WRITE
+/// surface's state: this domain can never import, delete, or enable a skill.
+pub fn build_skill_runtime_state(services: &AppServices) -> SkillRuntimeRouterState {
+    SkillRuntimeRouterState {
+        service: Arc::new(SkillRuntimeService::new(
+            services.conversation_repo.clone(),
+            services.skill_paths.clone(),
+            services.skill_repo.clone(),
+        )),
+        runtime_token_service: services.runtime_token_service.clone(),
+    }
+}
+
 pub fn build_session_message_state(services: &AppServices) -> SessionMessageRouterState {
     let state = SessionMessageRouterState {
         service: services.session_message_service.clone(),
@@ -446,7 +476,7 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
 
 /// Build the default `SystemRouterState` from application services.
 pub fn build_system_state(services: &AppServices) -> SystemRouterState {
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
     let pool = services.database.pool().clone();
     let provider_repo = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let http_client = reqwest::Client::new();
@@ -495,7 +525,7 @@ pub fn build_conversation_state(
 
 /// Build the default `RemoteAgentRouterState` from application services.
 pub fn build_remote_agent_state(services: &AppServices) -> RemoteAgentRouterState {
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
     let pool = services.database.pool().clone();
     let repo = Arc::new(SqliteRemoteAgentRepository::new(pool));
     RemoteAgentRouterState {
@@ -595,6 +625,36 @@ impl aionui_sidebar::RemoveProjectPorts for RemoveProjectAdapter {
     async fn delete_project_record(&self, user_id: &str, project_id: &str) -> Result<(), String> {
         self.project
             .delete_project(user_id, project_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
+/// Adapts the process-teardown paths to the sidebar's
+/// [`aionui_sidebar::ArchiveTeardownPorts`] trait so the archive flip can
+/// release the agent runtime the same way delete does — kill the conversation's
+/// agent process, tear down the team runtime — without deleting any data and
+/// without the sidebar crate depending on the ai-agent / team crates.
+struct ArchiveTeardownAdapter {
+    task_manager: Arc<dyn IWorkerTaskManager>,
+    team: Arc<TeamSessionService>,
+}
+
+#[async_trait::async_trait]
+impl ArchiveTeardownPorts for ArchiveTeardownAdapter {
+    async fn stop_conversation(&self, _user_id: &str, conversation_id: &str) -> Result<(), String> {
+        // Ownership was already verified by the owner-scoped archive flip; this
+        // is a pure process kill (no DB write). `kill_and_wait` is a no-op for a
+        // conversation with no live runtime, so an already-idle agent is fine.
+        self.task_manager
+            .kill_and_wait(conversation_id, Some(AgentKillReason::Archived))
+            .await;
+        Ok(())
+    }
+
+    async fn stop_team(&self, user_id: &str, team_id: &str) -> Result<(), String> {
+        self.team
+            .stop_team_processes(user_id, team_id)
             .await
             .map_err(|err| err.to_string())
     }
@@ -708,7 +768,7 @@ pub async fn build_channel_state(
 ) -> (ChannelRouterState, ChannelOrchestratorComponents) {
     let pool = services.database.pool().clone();
     let repo: Arc<dyn aionui_db::IChannelRepository> = Arc::new(aionui_db::SqliteChannelRepository::new(pool));
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
 
     let (message_tx, message_rx) = tokio::sync::mpsc::channel(256);
     let (confirm_tx, confirm_rx) = tokio::sync::mpsc::channel(256);

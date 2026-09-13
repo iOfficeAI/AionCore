@@ -96,6 +96,7 @@ fn test_agent_row(id: &str, backend: Option<&str>, agent_type: AgentType, name: 
         args: Vec::new(),
         env: Vec::new(),
         native_skills_dirs: None,
+        skill_delivery: None,
         behavior_policy: BehaviorPolicy {
             supports_team: true,
             ..Default::default()

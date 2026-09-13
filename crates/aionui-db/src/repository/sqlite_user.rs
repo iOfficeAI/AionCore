@@ -107,6 +107,7 @@ impl IUserRepository for SqliteUserRepository {
             password_hash: Some(password_hash.to_string()),
             avatar_path: None,
             jwt_secret: None,
+            encryption_secret: None,
             status: UserStatus::Active,
             session_generation: 0,
             created_at: now,
@@ -398,6 +399,22 @@ impl IUserRepository for SqliteUserRepository {
         Ok(())
     }
 
+    async fn update_encryption_secret(&self, user_id: &str, encryption_secret: &str) -> Result<(), DbError> {
+        let now = aionui_common::now_ms();
+        let result = sqlx::query("UPDATE users SET encryption_secret = ?, updated_at = ? WHERE id = ?")
+            .bind(encryption_secret)
+            .bind(now)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("User '{user_id}' not found")));
+        }
+
+        Ok(())
+    }
+
     async fn set_status(&self, user_id: &str, status: UserStatus) -> Result<(), DbError> {
         let now = aionui_common::now_ms();
         let result = sqlx::query(
@@ -533,6 +550,7 @@ mod tests {
         assert!(user.email.is_none());
         assert!(user.avatar_path.is_none());
         assert!(user.jwt_secret.is_none());
+        assert!(user.encryption_secret.is_none());
         assert!(user.last_login.is_none());
         assert!(user.created_at > 0);
         assert_eq!(user.created_at, user.updated_at);
@@ -696,6 +714,27 @@ mod tests {
 
         let updated = repo.find_by_id(&user.id).await.unwrap().unwrap();
         assert_eq!(updated.jwt_secret.as_deref(), Some("secret123"));
+    }
+
+    #[tokio::test]
+    async fn update_encryption_secret_succeeds() {
+        let (repo, _db) = setup().await;
+        let user = repo.create_user("nadia", "h").await.unwrap();
+        assert!(user.encryption_secret.is_none());
+
+        repo.update_encryption_secret(&user.id, "enc-secret-456").await.unwrap();
+
+        let updated = repo.find_by_id(&user.id).await.unwrap().unwrap();
+        assert_eq!(updated.encryption_secret.as_deref(), Some("enc-secret-456"));
+        // The signing secret is a separate column and stays untouched.
+        assert!(updated.jwt_secret.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_encryption_secret_nonexistent_user() {
+        let (repo, _db) = setup().await;
+        let err = repo.update_encryption_secret("no_such_id", "e").await.unwrap_err();
+        assert!(matches!(err, DbError::NotFound(_)));
     }
 
     #[tokio::test]

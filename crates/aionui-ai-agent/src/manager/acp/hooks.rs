@@ -25,10 +25,19 @@ impl PreSendHook for SessionNewPreludeHook {
             user_id: &ctx.params.user_id,
             preset_context: ctx.params.preset_context.as_deref(),
             skills: &ctx.params.config.skills,
-            native_skill_support: metadata
-                .native_skills_dirs
+            // Read from `skill_delivery`, not `native_skills_dirs`. The old
+            // signal meant "declares a workspace skills directory", which is not
+            // the same as "can discover skills", and it is the field this
+            // refactor retires from delivery decisions entirely.
+            //
+            // A missing declaration falls to `injected`: the safe default, since
+            // an unprobed vendor getting the index still works while one wrongly
+            // marked layer-1 would get no skills at all.
+            delivery_mode: metadata
+                .skill_delivery
                 .as_ref()
-                .is_some_and(|v: &Vec<String>| !v.is_empty()),
+                .map(|delivery| delivery.mode.clone())
+                .unwrap_or(aionui_api_types::SkillDeliveryMode::Injected),
         };
 
         // inject_first_message_prefix currently swallows I/O errors and

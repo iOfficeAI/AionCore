@@ -368,7 +368,7 @@ pub struct AppServices {
     pub agent_registry: Arc<AgentRegistry>,
     pub conversation_repo: Arc<dyn IConversationRepository>,
     pub acp_session_sync: Arc<AcpSessionSyncService>,
-    pub jwt_secret_raw: String,
+    pub encryption_secret_raw: String, // 存储加密根密钥，与 JWT 签名密钥解耦
     pub data_dir: String,
     pub local: bool,
     pub app_version: String,

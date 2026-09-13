@@ -26,6 +26,25 @@ use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
 use crate::runtime_status::conversation_runtime_reporter;
 use crate::session_context::AionrsSessionBuildContext;
 use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig};
+
+/// Render this conversation's skills index, or `""` when there is nothing to add.
+async fn skill_index_text(deps: &AgentFactoryDeps, user_id: &str, skills: &[String]) -> String {
+    let index = deps.skill_manager.discover_by_names_for_user(user_id, skills).await;
+    crate::capability::skill_manager::build_skills_index_text(&index)
+}
+
+/// Append the index to the system prompt, keeping the assistant's own rules in
+/// the leading position.
+///
+/// Pure so the composition rules are testable without standing up a factory.
+fn merge_skill_index_into_system_prompt(system_prompt: Option<String>, index: &str) -> Option<String> {
+    match (system_prompt, index.is_empty()) {
+        (prompt, true) => prompt,
+        (Some(prompt), false) => Some(format!("{prompt}\n\n{index}")),
+        (None, false) => Some(index.to_owned()),
+    }
+}
+
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AionrsSessionBuildContext,
@@ -39,15 +58,38 @@ pub(super) async fn build(
     // in aionrs's build_system_prompt). Mirrors the old architecture's
     // `init_history` injection of `[Assistant System Rules]`.
     // AionrsBuildExtra parses `skills` so Team preset snapshots preserve the
-    // target contract. Native skill materialization for Aionrs is tracked as a
-    // separate follow-up because this factory currently has no stable Aionrs
-    // skill-loading path.
+    // target contract.
     if let Some(rules) = overrides.preset_rules.take() {
         overrides.system_prompt = Some(match overrides.system_prompt.take() {
             Some(existing) => format!("{existing}\n\n{rules}"),
             None => rules,
         });
     }
+
+    // Fold the skills index into the system prompt.
+    //
+    // aionrs is a layer-2 vendor with no prompt pipeline: index injection has
+    // always lived in the ACP hook, which this factory never runs. Its skills
+    // reached it only through the workspace `.aionrs/skills` links that this
+    // refactor removes, so without this the backend would lose skills outright.
+    // `system_prompt` is its one always-present channel.
+    //
+    // Deliberately NOT routed through `resolve_skill_delivery` (unlike the ACP
+    // and Antigravity lanes), and it emits no "resolved delivery plan" anchor
+    // log. That is intentional, not an oversight: aionrs is an in-process agent
+    // compiled into aioncore, so it has neither a launch-argument channel (argv)
+    // nor a wire protocol (protocol) -- `system_prompt` injection is the only
+    // delivery it can physically perform. Its `skill_delivery` column therefore
+    // has no applicable value other than `injected` (its NULL default), so
+    // reading it would only ever fetch a metadata row and compute a plan this
+    // lane cannot use. If aionrs ever gains a real native skill channel (e.g.
+    // reading the session-skills view directory directly), that is a change in
+    // the aionrs crate itself, and this is where it would re-join the shared
+    // delivery decision.
+    overrides.system_prompt = merge_skill_index_into_system_prompt(
+        overrides.system_prompt.take(),
+        &skill_index_text(&deps, &ctx.user_id, &resolved_skills).await,
+    );
 
     let mut extra_mcp_servers = resolve_mcp_servers(&overrides);
     if let Some(repo) = deps.mcp_server_repo.as_ref() {
@@ -2253,6 +2295,53 @@ mod tests {
     #[test]
     fn resolve_bedrock_config_none_when_json_invalid() {
         assert!(resolve_bedrock_config(Some("not-json")).is_none());
+    }
+
+    /// aionrs is layer 2 and has no prompt pipeline, so `system_prompt` is its
+    /// only injection channel. Its skills used to arrive solely through the
+    /// workspace `.aionrs/skills` links this refactor removes.
+    #[test]
+    fn the_skills_index_is_appended_after_the_assistant_rules() {
+        let index = crate::capability::skill_manager::build_skills_index_text(&[
+            crate::capability::skill_manager::SkillIndex {
+                name: "cron".into(),
+                description: "Schedule stuff".into(),
+            },
+        ]);
+        let merged =
+            merge_skill_index_into_system_prompt(Some("Be concise.".to_owned()), &index).expect("a prompt exists");
+
+        assert!(
+            merged.starts_with("Be concise."),
+            "assistant rules keep the lead: {merged}"
+        );
+        assert!(merged.contains("## Available Skills"));
+        assert!(merged.contains("- **cron**: Schedule stuff"));
+        assert!(merged.contains("skills show"), "channel A first");
+        assert!(merged.contains("[LOAD_SKILL:"), "channel B as the fallback");
+    }
+
+    #[test]
+    fn no_skills_leaves_the_system_prompt_untouched() {
+        assert_eq!(
+            merge_skill_index_into_system_prompt(Some("Be concise.".to_owned()), ""),
+            Some("Be concise.".to_owned())
+        );
+        assert_eq!(merge_skill_index_into_system_prompt(None, ""), None);
+    }
+
+    /// An assistant with no rules but with skills must still get the index —
+    /// otherwise a default assistant silently loses every skill.
+    #[test]
+    fn skills_alone_still_produce_a_system_prompt() {
+        let index = crate::capability::skill_manager::build_skills_index_text(&[
+            crate::capability::skill_manager::SkillIndex {
+                name: "cron".into(),
+                description: "d".into(),
+            },
+        ]);
+        let merged = merge_skill_index_into_system_prompt(None, &index).expect("skills alone produce a prompt");
+        assert!(merged.starts_with("## Available Skills"));
     }
 
     #[test]

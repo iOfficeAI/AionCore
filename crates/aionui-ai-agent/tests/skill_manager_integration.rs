@@ -306,7 +306,15 @@ fn build_index_text_contains_load_protocol() {
     ];
     let text = build_skills_index_text(&skills);
 
-    assert!(text.contains("[LOAD_SKILL: skill-name]"));
+    // The placeholder wording changed from `skill-name` to `<name>` when the
+    // block gained its second channel. Asserting the PROTOCOL MARKER keeps the
+    // meaningful check -- that the fallback protocol is still advertised -- and
+    // the new assertion below pins the channel the block now prefers.
+    assert!(text.contains("[LOAD_SKILL:"));
+    assert!(
+        text.contains("skills show"),
+        "the command channel must be advertised alongside the protocol: {text}"
+    );
     assert!(text.contains("- **security**: Security review"));
     assert!(text.contains("- **tdd**: Test-driven development"));
 }

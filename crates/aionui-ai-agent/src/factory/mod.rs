@@ -73,6 +73,113 @@ pub fn build_agent_factory(deps: AgentFactoryDeps) -> AgentFactory {
     })
 }
 
+/// This conversation's skill delivery, resolved once per session build.
+///
+/// `pub` because it travels through the `pub` `SessionBuildInputs`. `Default` is
+/// the "deliver nothing" shape, which is what a test that does not exercise skill
+/// delivery wants.
+#[derive(Default)]
+pub struct ResolvedSkillDelivery {
+    /// Already-substituted launch args / protocol root for this vendor.
+    pub plan: crate::skill_delivery_plan::SkillDeliveryPlan,
+    /// The conversation's skills as real source directories. Carried into
+    /// `SessionInit` for backends that need name+path without touching the
+    /// workspace.
+    pub skill_dirs: Vec<aionui_session::SkillDirSpec>,
+    /// The composed `[Assistant Rules]` block for an `injected`-mode vendor.
+    ///
+    /// Populated only by factory branches whose backend has NO prompt pipeline of
+    /// its own — agy and aionrs. The ACP lane leaves this `None` because its
+    /// `SessionNewPreludeHook` composes the same block at prompt time (through
+    /// the same function, so the wording cannot diverge); computing it here too
+    /// would be dead work.
+    pub injected_prefix: Option<String>,
+}
+
+/// Resolve the per-vendor delivery for one session build.
+///
+/// Shared by every factory branch so the decision is made in ONE place: which
+/// mode applies, which paths get substituted, and what gets logged. Splitting it
+/// per branch is how the old `native_skills_dirs` logic drifted between the
+/// create path and the build path.
+pub(crate) async fn resolve_skill_delivery(
+    deps: &AgentFactoryDeps,
+    user_id: &str,
+    conversation_id: &str,
+    skills: &[String],
+    metadata: &aionui_api_types::AgentMetadata,
+) -> ResolvedSkillDelivery {
+    let skill_dirs = deps.skill_manager.resolve_skill_dirs_for_user(user_id, skills).await;
+
+    // A rejected id yields no view path. `plan_skill_delivery` then contributes
+    // no plugin flag rather than a half-substituted one.
+    let view_dir = aionui_extension::skill_view::view_dir(&deps.data_dir, user_id, conversation_id)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    let view_skills_dir = aionui_extension::skill_view::view_skills_dir(&deps.data_dir, user_id, conversation_id)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+
+    let plan = crate::skill_delivery_plan::plan_skill_delivery(crate::skill_delivery_plan::SkillDeliveryPlanInput {
+        delivery: metadata.skill_delivery.clone(),
+        view_dir,
+        view_skills_dir,
+        skill_dirs: skill_dirs.clone(),
+    });
+
+    for placeholder in &plan.unknown_placeholders {
+        tracing::warn!(
+            conversation_id,
+            backend = metadata.backend.as_deref().unwrap_or("unknown"),
+            placeholder = %placeholder,
+            "skill_delivery: unrecognized placeholder kept verbatim in the spawn args"
+        );
+    }
+    // `info`, not `debug`: this is the anchor for "why did this vendor not pick
+    // up native skills" in a production log at default level.
+    tracing::info!(
+        conversation_id,
+        backend = metadata.backend.as_deref().unwrap_or("unknown"),
+        mode = ?plan.mode,
+        skills = skill_dirs.len(),
+        // Count only -- a full path list would put user directory names in logs.
+        delivery_args = plan.extra_args.len(),
+        protocol_root = plan.protocol_skills_root.is_some(),
+        "skill_delivery: resolved delivery plan for session"
+    );
+
+    ResolvedSkillDelivery {
+        plan,
+        skill_dirs,
+        injected_prefix: None,
+    }
+}
+
+/// Compose the `[Assistant Rules]` block for a backend with no prompt pipeline.
+///
+/// Only agy and aionrs need this: index injection has always lived in the ACP
+/// prompt pipeline, and those two backends never run it — which is why, before
+/// this existed, an `injected`-mode agy or aionrs session received no skills
+/// index at all and (for agy) not even its preset context.
+pub(crate) async fn compose_injected_prefix_for(
+    deps: &AgentFactoryDeps,
+    user_id: &str,
+    preset_context: Option<&str>,
+    skills: &[String],
+    mode: &aionui_api_types::SkillDeliveryMode,
+) -> Option<String> {
+    crate::capability::first_message_injector::compose_injected_prefix(
+        &deps.skill_manager,
+        crate::capability::first_message_injector::InjectionConfig {
+            user_id,
+            preset_context,
+            skills,
+            delivery_mode: mode.clone(),
+        },
+    )
+    .await
+}
+
 async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> Result<AgentInstance, AgentError> {
     let context = options.context;
     let ctx = FactoryContext::resolve(&context).await?;

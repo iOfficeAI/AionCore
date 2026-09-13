@@ -93,6 +93,21 @@ pub trait IConversationRepository: Send + Sync {
     /// The conversation identified by `conversation_id` is excluded.
     async fn list_associated(&self, user_id: &str, conversation_id: &str) -> Result<Vec<ConversationRow>, DbError>;
 
+    /// Every live `(user_id, id)` pair, across all users.
+    ///
+    /// Ids only, deliberately: the one caller is the startup sweep that reaps
+    /// per-conversation skill view directories whose conversation is gone, and
+    /// loading full rows for that would read every `extra` blob on the
+    /// installation to answer a question about directory names.
+    ///
+    /// Defaults to an empty list so the many repository stubs in this workspace
+    /// need no body. An empty answer makes the sweep reap nothing, which is the
+    /// safe direction: a leaked view costs disk, a wrongly-deleted one costs a
+    /// session its skills.
+    async fn list_all_conversation_ids(&self) -> Result<Vec<(String, String)>, DbError> {
+        Ok(Vec::new())
+    }
+
     /// Returns the persisted assistant snapshot for a conversation, if any.
     async fn get_assistant_snapshot(
         &self,

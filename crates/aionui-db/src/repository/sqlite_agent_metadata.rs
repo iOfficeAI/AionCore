@@ -26,7 +26,7 @@ const DEFAULT_USER_ID: &str = "system_default_user";
 const AGENT_METADATA_SAFE_COLUMNS: &str = "\
     am.agent_id AS id, am.user_id, am.icon, am.name, am.name_i18n, am.description, am.description_i18n, \
     am.backend, am.agent_type, am.agent_source, am.agent_source_info, \
-    am.enabled, am.command, am.args, am.env, am.native_skills_dirs, \
+    am.enabled, am.command, am.args, am.env, am.native_skills_dirs, am.skill_delivery, \
     am.behavior_policy, am.yolo_id, \
     CAST(am.agent_capabilities AS BLOB) AS agent_capabilities, \
     CAST(am.auth_methods AS BLOB) AS auth_methods, \
@@ -84,6 +84,7 @@ struct AgentMetadataSafeRow {
     args: Option<String>,
     env: Option<String>,
     native_skills_dirs: Option<String>,
+    skill_delivery: Option<String>,
     behavior_policy: Option<String>,
     yolo_id: Option<String>,
     agent_capabilities: Option<Vec<u8>>,
@@ -127,6 +128,7 @@ impl AgentMetadataSafeRow {
             args: row.try_get("args")?,
             env: row.try_get("env")?,
             native_skills_dirs: row.try_get("native_skills_dirs")?,
+            skill_delivery: row.try_get("skill_delivery")?,
             behavior_policy: row.try_get("behavior_policy")?,
             yolo_id: row.try_get("yolo_id")?,
             agent_capabilities: row.try_get("agent_capabilities")?,
@@ -203,6 +205,7 @@ impl AgentMetadataSafeRow {
                 args: self.args,
                 env: self.env,
                 native_skills_dirs: self.native_skills_dirs,
+                skill_delivery: self.skill_delivery,
                 behavior_policy: self.behavior_policy,
                 yolo_id: self.yolo_id,
                 agent_capabilities,
@@ -684,12 +687,12 @@ impl SqliteAgentMetadataRepository {
             "INSERT INTO agent_metadata \
                 (id, agent_id, user_id, icon, name, name_i18n, description, description_i18n, \
                  backend, agent_type, agent_source, agent_source_info, \
-                 enabled, command, args, env, native_skills_dirs, \
+                 enabled, command, args, env, native_skills_dirs, skill_delivery, \
                  behavior_policy, yolo_id, \
                  agent_capabilities, auth_methods, config_options, \
                  available_modes, available_models, available_commands, \
                  sort_order, created_at, updated_at) \
-             VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              {conflict_target} \
                 icon = excluded.icon, \
                 name = excluded.name, \
@@ -705,6 +708,7 @@ impl SqliteAgentMetadataRepository {
                 args = excluded.args, \
                 env = excluded.env, \
                 native_skills_dirs = excluded.native_skills_dirs, \
+                skill_delivery = excluded.skill_delivery, \
                 behavior_policy = excluded.behavior_policy, \
                 yolo_id = excluded.yolo_id, \
                 agent_capabilities = excluded.agent_capabilities, \
@@ -735,6 +739,7 @@ impl SqliteAgentMetadataRepository {
             .bind(params.args)
             .bind(params.env)
             .bind(params.native_skills_dirs)
+            .bind(params.skill_delivery)
             .bind(params.behavior_policy)
             .bind(params.yolo_id)
             .bind(params.agent_capabilities)
@@ -840,6 +845,7 @@ mod tests {
             args: Some("[]"),
             env: Some("[]"),
             native_skills_dirs: Some(r#"[".claude/skills"]"#),
+            skill_delivery: None,
             behavior_policy: Some(r#"{"supports_side_question":true}"#),
             yolo_id: Some("bypassPermissions"),
             agent_capabilities: None,
@@ -1165,6 +1171,7 @@ mod tests {
                 args: None,
                 env: None,
                 native_skills_dirs: None,
+                skill_delivery: None,
                 behavior_policy: None,
                 yolo_id: None,
                 agent_capabilities: None,

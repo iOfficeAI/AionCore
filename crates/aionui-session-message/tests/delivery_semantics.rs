@@ -230,6 +230,14 @@ async fn an_idle_target_is_delivered_and_actually_starts_a_turn() {
     assert!(content.starts_with("[[AION_SESSION_MESSAGE]]"), "{content}");
     assert!(content.contains(&format!("reply_to: {}", from.id)), "{content}");
     assert!(content.contains("workspace: same"), "{content}");
+    // The delivered block carries the capabilities fallback, so a recipient with
+    // the skill unavailable can still fetch the full contract.
+    assert!(
+        content.contains(
+            "If the session-message skill is unavailable, run `\"$AIONUI_HELPER_BIN\" session capabilities` for the full delivery contract."
+        ),
+        "{content}"
+    );
     assert!(content.trim_end().ends_with("接口定完了吗？"), "{content}");
 }
 
@@ -246,7 +254,7 @@ async fn a_cross_workspace_delivery_states_the_absolute_path_and_the_constraint(
 
     let content = ctx.last_user_message_content("conv_target").await;
     assert!(
-        content.contains("workspace: /w/a（与你不同，勿用相对路径，勿假设可读）"),
+        content.contains("workspace: /w/a (differs from yours; don't use relative paths, don't assume readable)"),
         "{content}"
     );
 }

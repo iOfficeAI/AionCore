@@ -313,7 +313,11 @@ fn build_system_instructions_with_skills_index_appends_index() {
     assert!(result.contains("## Available Skills"));
     assert!(result.contains("- **review**: Code review"));
     assert!(result.contains("- **debug**: Debugging"));
-    assert!(result.contains("[LOAD_SKILL: skill-name]"));
+    // The placeholder wording changed from `skill-name` to `<name>` when the
+    // block gained a second channel. Assert the protocol MARKER plus the new
+    // command channel: that is the meaningful part of the original check.
+    assert!(result.contains("[LOAD_SKILL:"));
+    assert!(result.contains("skills show"));
 }
 
 // ---------------------------------------------------------------------------

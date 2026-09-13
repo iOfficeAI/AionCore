@@ -26,9 +26,8 @@ use futures_util::stream::BoxStream;
 use tokio::sync::{Mutex, broadcast, oneshot};
 
 use super::argv::{ArgvInput, build_argv};
-use super::mcp_config::write_mcp_config;
 use super::models::probe_models;
-use super::skills::scan_skill_commands;
+use super::skills::skill_commands_from_dirs;
 use super::translate::Translator;
 use super::wire::parse_line;
 use crate::backend::cli_version::session_drift_notice;
@@ -250,21 +249,22 @@ impl BackendConnection for AntigravityConnection {
                 ));
             }
         };
-        // agy reads MCP servers from files only — there is no per-run flag — so
-        // the session's servers (team coordination first, then the user's) have
-        // to land in the workspace before the first turn spawns.
-        if let Some(cwd) = config.cwd.as_deref()
-            && let Err(e) = write_mcp_config(std::path::Path::new(cwd), &config.init.mcp_servers)
-        {
-            // Not fatal: the session still runs, just without MCP tools.
-            tracing::warn!(error = %e, "antigravity: could not write mcp_config.json; MCP tools will be unavailable");
-        }
+        // No workspace MCP file is written. agy does NOT read
+        // `{workspace}/.agents/mcp_config.json`: measured with a purpose-built
+        // stdio MCP server under `--dangerously-skip-permissions` (which
+        // `argv.rs` always passes), the same server is invoked when configured
+        // in `~/.gemini/config/mcp_config.json` and is NOT invoked from the
+        // workspace file, where agy logs `empty component: prompt section
+        // "mcp_servers"`. Its own docs list only the global path and
+        // `plugins/<name>/mcp_config.json`, and `descriptor.rs` already declares
+        // agy with no MCP transport, which routes Team coordination down the CLI
+        // it was silently using anyway. So the writer was producing a file with
+        // no consumer -- and doing it inside the user's workspace.
 
-        let slash_commands = config
-            .cwd
-            .as_deref()
-            .map(|cwd| scan_skill_commands(std::path::Path::new(cwd)))
-            .unwrap_or_default();
+        // From the session's resolved skill dirs, not from the workspace: AionUi
+        // no longer writes `.agents/skills`, and this source is exactly the
+        // conversation's enabled set.
+        let slash_commands = skill_commands_from_dirs(&config.init.skill_dirs);
 
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let backend = Arc::new(AntigravitySessionBackend {
@@ -658,6 +658,13 @@ impl AntigravitySessionBackend {
             workspace: self.config.cwd.clone(),
             model: self.effective_model(),
             mode: self.effective_mode(),
+            // agy has no prompt pipeline of its own, so the composed rules block
+            // rides in through `init.preset_context` and `build_argv` prepends it
+            // on the first invocation only. Before this, the backend read nothing
+            // from `init` except `mcp_servers` — dropping both the assistant's
+            // preset context and its skills index.
+            injected_prefix: self.config.init.preset_context.clone(),
+            extra_args: self.config.extra_args.clone(),
         };
         let mut spawn_env = self.config.spawn_env.clone();
         if let Some(cwd) = self.config.cwd.as_deref() {
