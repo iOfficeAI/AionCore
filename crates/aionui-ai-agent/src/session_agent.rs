@@ -1843,6 +1843,145 @@ pub async fn build_antigravity_instance(
     Ok(crate::agent_task::AgentInstance::Session(task))
 }
 
+/// opencode conversation on the SHARED `opencode serve` process
+/// (`AIONUI_OPENCODE_SHARED_SERVER` opt-in). Same shape as
+/// [`build_antigravity_instance`]: the blessed template for a third session
+/// backend that must NOT inherit the claude/codex spawn plumbing (cc-switch
+/// env, codex sandbox/approval derivation, claude thinking flags, the
+/// claude/codex-keyed dev prompt dumps, initial-cost seeding — none of it
+/// applies to a backend that never spawns a per-conversation process).
+///
+/// The connection talks opencode's HTTP/SSE v2 API; the SERVER lifecycle is
+/// owned by the process pool in `opencode_shared`, not by this conversation:
+/// every opencode conversation reuses one `opencode serve` and merely holds a
+/// lease. Killing this session interrupts its turn and releases the lease;
+/// the server goes down only when the last lease does.
+pub async fn build_opencode_instance(
+    inputs: SessionBuildInputs<'_>,
+) -> Result<crate::agent_task::AgentInstance, AgentError> {
+    use aionui_session::{BackendConnection, McpServerSpec, SessionConfig, SessionInit};
+
+    let SessionBuildInputs {
+        conversation_id,
+        user_id,
+        workspace,
+        config,
+        metadata,
+        skill_delivery,
+        session_snapshot,
+        backend_session_id,
+        mcp_server_repo,
+        runtime_env,
+        broadcaster,
+        catalog_writeback,
+        acp_session_repo,
+        // Shared-server mode has no per-conversation spawn to dump the input
+        // of; the dev dump lane is claude/codex-keyed — skip it (agy precedent).
+        prompt_dump_dir: _,
+        // opencode owns permission prompting natively (permission.v2 events);
+        // the claude hook-body channel is meaningless here.
+        permission_hook_body: _,
+    } = inputs;
+
+    let (spec, mode, model) = spec_mode_model(&conversation_id, backend_session_id, config, session_snapshot, metadata);
+
+    // Same neutral MCP init surface as every session backend. opencode loads
+    // MCP from its own config files, so the backend records but cannot yet
+    // push these; they still travel for parity and future wiring (documented
+    // limitation of the shared path).
+    let mut neutral = match mcp_server_repo {
+        Some(repo) => {
+            crate::mcp_resolve::resolve_session_mcp_servers(
+                repo.as_ref(),
+                &user_id,
+                config.mcp_server_ids.as_deref(),
+                &conversation_id,
+                broadcaster.clone(),
+            )
+            .await
+        }
+        None => Vec::new(),
+    };
+    neutral.retain(|server| server.name != TEAM_MCP_SERVER_NAME);
+    neutral.extend(
+        config
+            .session_mcp_servers
+            .iter()
+            .filter(|server| server.name != TEAM_MCP_SERVER_NAME)
+            .cloned(),
+    );
+    let mut mcp_servers: Vec<McpServerSpec> = neutral.iter().map(session_server_to_spec).collect();
+    if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
+        let mut coordination = vec![team_mcp_server_spec(cfg)];
+        coordination.append(&mut mcp_servers);
+        mcp_servers = coordination;
+    }
+
+    let init = SessionInit {
+        mcp_servers,
+        skills: config.skills.clone(),
+        // The COMPOSED block (assistant rules + skills index): the shared
+        // backend has no CLI-flag channel, so preset_context ahead of the
+        // FIRST prompt is the only injection lane (agy precedent).
+        preset_context: skill_delivery
+            .injected_prefix
+            .clone()
+            .or_else(|| config.preset_context.clone()),
+        // Layer-2 only: no process flags on a shared server.
+        skill_view_skills_dir: None,
+        skill_dirs: skill_delivery.skill_dirs.clone(),
+        session_snapshot: None,
+        resume: matches!(spec, aionui_session::SessionSpec::Resume { .. }),
+    };
+
+    let mut session_config = SessionConfig {
+        cwd: Some(workspace.clone()),
+        model,
+        mode,
+        init,
+        // The SERVER binary: a user-selected path wins; otherwise resolve
+        // `opencode` the same way the ACP path does (bundled path or PATH —
+        // npm installs ship `opencode.cmd` shims on Windows, so a bare name
+        // would not be found by CreateProcess).
+        cli_program: resolve_session_cli_program("opencode", metadata),
+        // No per-conversation flags on a shared process.
+        extra_args: Vec::new(),
+        ..Default::default()
+    };
+    session_config.spawn_env = assemble_spawn_env(&metadata.env, runtime_env);
+
+    let backend = crate::opencode_shared::OpencodeConnection::new()
+        .open_session(spec, session_config)
+        .await
+        .map_err(|e| match e {
+            aionui_session::BackendError::WorkspaceUnavailable(path) => {
+                AgentError::workspace_path_runtime_unavailable(path)
+            }
+            e => AgentError::bad_gateway(format!("open opencode shared session: {e}")),
+        })?;
+
+    if let Some((agent_id, catalog_tx)) = catalog_writeback {
+        spawn_catalog_writeback(agent_id, user_id.clone(), backend.clone(), catalog_tx);
+    }
+
+    // AgentType::Acp, not a new variant: the conversations table rows for
+    // opencode already carry the vendor's original type, and the session seam
+    // dispatches off the backend object — the claude/codex session builders
+    // likewise pass Acp here.
+    let task = SessionAgentTask::new_with_preload(
+        AgentType::Acp,
+        conversation_id,
+        user_id,
+        workspace,
+        backend,
+        acp_session_repo,
+        &metadata.handshake,
+        None,
+        Some(broadcaster),
+    );
+    Ok(crate::agent_task::AgentInstance::Session(task))
+}
+
 /// claude/codex session started through the ACP factory is byte-equivalent to one
 /// started through the clean-slate registry.
 pub async fn build_session_instance(
