@@ -128,6 +128,7 @@ mod tests {
             "grok",
             "kilo",
             "mimo-code",
+            "minimax-code",
             "nova",
             "omp",
             "sigit",

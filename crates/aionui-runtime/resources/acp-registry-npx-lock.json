@@ -45,6 +45,11 @@
       "package": "@mimo-ai/cli",
       "version": "0.1.9"
     },
+    "minimax-code": {
+      "registry_json_id": "minimax-code",
+      "package": "@minimax-ai/code",
+      "version": "0.2.7"
+    },
     "nova": {
       "registry_json_id": "nova",
       "package": "@compass-ai/nova",

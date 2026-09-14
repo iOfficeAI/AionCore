@@ -111,7 +111,7 @@ async fn probed_registry_agents_carry_seeded_auth_methods() {
         assert!(!raw.contains("/home/"), "{backend} auth_methods leaks a host path");
     }
 
-    for backend in ["cortex-code", "dimcode", "poolside", "vtcode", "junie"] {
+    for backend in ["cortex-code", "dimcode", "poolside", "vtcode", "junie", "minimax-code"] {
         let row = repo
             .find_builtin_by_backend(backend)
             .await
@@ -137,7 +137,7 @@ async fn probed_registry_agents_carry_seeded_mcp_capabilities() {
     // (backend, http, sse) — `None` means the agent advertises no usable
     // mcp_capabilities (absent or empty object), which keeps Team on the CLI
     // transport for it. Covers EVERY agent added by migrations 025/029/031.
-    let cases: [(&str, Option<(bool, bool)>); 20] = [
+    let cases: [(&str, Option<(bool, bool)>); 21] = [
         // npx distributions (025 + 029 + 031)
         ("autohand", Some((true, true))),
         ("deepagents", Some((false, false))),
@@ -147,6 +147,8 @@ async fn probed_registry_agents_carry_seeded_mcp_capabilities() {
         ("grok", Some((true, true))),
         ("kilo", Some((true, true))),
         ("mimo-code", Some((true, true))),
+        // 044 (Registry npx, probed 2026-09-14 at @minimax-ai/code@0.2.7)
+        ("minimax-code", Some((true, true))),
         ("nova", Some((true, true))),
         ("sigit", Some((false, false))),
         // direct CLI launch (031 seeded it on npx; 039 moved it off the bridge)
