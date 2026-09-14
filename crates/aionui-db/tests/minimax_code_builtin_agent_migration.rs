@@ -69,7 +69,10 @@ async fn seeds_probed_capabilities_and_leaves_unprobed_fields_null() {
     let caps: serde_json::Value =
         serde_json::from_str(row.agent_capabilities.as_deref().expect("agent_capabilities seeded")).unwrap();
     assert_eq!(caps["load_session"], true);
-    assert_eq!(caps["mcp_capabilities"]["http"], true, "Team must route it to the MCP transport");
+    assert_eq!(
+        caps["mcp_capabilities"]["http"], true,
+        "Team must route it to the MCP transport"
+    );
     assert_eq!(caps["mcp_capabilities"]["sse"], true);
     assert_eq!(caps["prompt_capabilities"]["image"], false);
     assert!(caps["session_capabilities"].get("resume").is_some());
@@ -79,15 +82,30 @@ async fn seeds_probed_capabilities_and_leaves_unprobed_fields_null() {
         "handshake columns are stored snake_case (migration 003 contract)"
     );
 
-    assert_eq!(row.auth_methods, None, "initialize advertised no auth methods; nothing is synthesized");
-    assert_eq!(row.yolo_id, None, "its ACP session modes are default/plan only; bypassPermissions is a config option");
-    assert_eq!(row.native_skills_dirs, None, "no project-relative skills directory is documented or in source");
+    assert_eq!(
+        row.auth_methods, None,
+        "initialize advertised no auth methods; nothing is synthesized"
+    );
+    assert_eq!(
+        row.yolo_id, None,
+        "its ACP session modes are default/plan only; bypassPermissions is a config option"
+    );
+    assert_eq!(
+        row.native_skills_dirs, None,
+        "no project-relative skills directory is documented or in source"
+    );
 
     let policy: serde_json::Value =
         serde_json::from_str(row.behavior_policy.as_deref().expect("behavior_policy")).unwrap();
     assert_eq!(policy["supports_side_question"], false);
-    assert!(policy.get("supports_team").is_none(), "no negative team flag (retired by 033)");
-    assert!(policy.get("team_capable_override").is_none(), "team_capable_override was retired by 033");
+    assert!(
+        policy.get("supports_team").is_none(),
+        "no negative team flag (retired by 033)"
+    );
+    assert!(
+        policy.get("team_capable_override").is_none(),
+        "team_capable_override was retired by 033"
+    );
 }
 
 /// The lock manifest is the only place the Registry version lives. The entry
@@ -102,12 +120,18 @@ fn minimax_code_is_pinned_in_the_npx_release_lock() {
         .get(BACKEND)
         .unwrap_or_else(|| panic!("{BACKEND} must be pinned in the npx release lock"));
     assert_eq!(entry["package"], "@minimax-ai/code");
-    assert_eq!(entry["registry_json_id"], "minimax-code", "lookup alias lives in the lock, not in metadata");
+    assert_eq!(
+        entry["registry_json_id"], "minimax-code",
+        "lookup alias lives in the lock, not in metadata"
+    );
 
     let version = entry["version"].as_str().expect("version is a string");
     let parts: Vec<&str> = version.split('.').collect();
     assert!(
-        parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
         "version must be an exact semver, got {version:?}"
     );
 }
