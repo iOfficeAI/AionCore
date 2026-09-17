@@ -299,7 +299,7 @@ impl AcpError {
             ErrorCode::ParseError => AcpError::ProtocolParseError { message: err.message },
             ErrorCode::InvalidRequest => AcpError::InvalidRequest { message: err.message },
             ErrorCode::ResourceNotFound => {
-                if let Some(sid) = extract_session_not_found(err.data.as_ref()) {
+                if let Some(sid) = extract_session_not_found(err.data.as_ref(), &err.message) {
                     AcpError::SessionNotFound { session_id: sid }
                 } else if extract_resource_not_found(err.data.as_ref()).is_none() && is_session_load_method(context) {
                     AcpError::SessionNotFound {
@@ -316,14 +316,14 @@ impl AcpError {
                 method: context.to_owned(),
             },
             ErrorCode::InvalidParams => {
-                if let Some(sid) = extract_session_not_found(err.data.as_ref()) {
+                if let Some(sid) = extract_session_not_found(err.data.as_ref(), &err.message) {
                     AcpError::SessionNotFound { session_id: sid }
                 } else {
                     AcpError::InvalidParams { message: err.message }
                 }
             }
             ErrorCode::InternalError => {
-                if let Some(sid) = extract_session_not_found(err.data.as_ref()) {
+                if let Some(sid) = extract_session_not_found(err.data.as_ref(), &err.message) {
                     AcpError::SessionNotFound { session_id: sid }
                 } else {
                     AcpError::AgentInternal {
@@ -341,7 +341,7 @@ impl AcpError {
                     AcpError::SessionNotFound {
                         session_id: context.to_owned(),
                     }
-                } else if let Some(sid) = extract_session_not_found(err.data.as_ref()) {
+                } else if let Some(sid) = extract_session_not_found(err.data.as_ref(), &err.message) {
                     AcpError::SessionNotFound { session_id: sid }
                 } else {
                     AcpError::OtherProtocolError {
@@ -375,18 +375,55 @@ fn is_session_load_method(context: &str) -> bool {
 /// (live case: a missing `Z_AI_API_KEY`) stays permanently hidden behind
 /// `Session not found`. Scanning the object's string values keeps recovery
 /// working for agents we have never probed.
-fn extract_session_not_found(data: Option<&serde_json::Value>) -> Option<String> {
+/// Helper to parse a session id out of text string containing known session-not-found patterns.
+fn extract_session_not_found_from_text(msg: &str) -> Option<String> {
+    let prefix = "Session not found: ";
+    if let Some(sid) = msg.strip_prefix(prefix) {
+        let sid = sid.trim();
+        if !sid.is_empty() {
+            return Some(sid.to_owned());
+        }
+    }
+    // Pattern: "...unknown session: <sid>" (e.g. DeepSeek Harness / dsh ACP error)
+    if let Some(idx) = msg.find("unknown session:") {
+        let rest = &msg[idx + "unknown session:".len()..];
+        let sid = rest.trim();
+        let sid = sid.split_whitespace().next().unwrap_or(sid).trim_end_matches('.');
+        if !sid.is_empty() {
+            return Some(sid.to_owned());
+        }
+    }
+    // Pattern: "...unknown session <sid>"
+    if let Some(idx) = msg.find("unknown session") {
+        let rest = &msg[idx + "unknown session".len()..];
+        let sid = rest.trim().trim_start_matches(':').trim();
+        let sid = sid.split_whitespace().next().unwrap_or(sid).trim_end_matches('.');
+        if !sid.is_empty() {
+            return Some(sid.to_owned());
+        }
+    }
+    None
+}
+
+/// If `message` or `data` carries a session-not-found payload:
+/// - OpenCode/Codex: `data: {"error": "Session not found: <sid>"}`
+/// - DeepSeek Harness: `message: "Invalid params: unknown session: <sid>"`
+/// Returns `None` for any other shape so callers can fall through to
+/// the default `code`-based mapping.
+fn extract_session_not_found(data: Option<&serde_json::Value>, message: &str) -> Option<String> {
+    if let Some(sid) = extract_session_not_found_from_text(message) {
+        return Some(sid);
+    }
     let value = data?;
     let obj = match value {
         serde_json::Value::Object(_) => value.clone(),
         serde_json::Value::String(s) => serde_json::from_str(s).ok()?,
         _ => return None,
     };
-    let prefix = "Session not found: ";
-    obj.as_object()?.values().filter_map(|v| v.as_str()).find_map(|msg| {
-        let sid = msg.strip_prefix(prefix)?.trim();
-        (!sid.is_empty()).then(|| sid.to_owned())
-    })
+    obj.as_object()?
+        .values()
+        .filter_map(|v| v.as_str())
+        .find_map(extract_session_not_found_from_text)
 }
 
 fn extract_resource_not_found(data: Option<&serde_json::Value>) -> Option<String> {
@@ -929,5 +966,20 @@ mod tests {
             !display.contains('\n'),
             "data must be appended on a single line, not pretty-printed; got {display}"
         );
+    }
+
+    #[test]
+    fn from_sdk_dsh_unknown_session_in_message_is_mapped_to_session_not_found() {
+        // Exact shape emitted by DeepSeek Harness when resuming a session that hasn't been loaded in memory:
+        // {"code": -32602, "message": "Invalid params: unknown session: d5de83c8-c46b-4735-8dc6-f632dd93c0b9"}
+        let mut sdk_err = SdkError::invalid_params();
+        sdk_err.message = "Invalid params: unknown session: d5de83c8-c46b-4735-8dc6-f632dd93c0b9".to_string();
+        let acp = AcpError::from_sdk(sdk_err, "session/prompt");
+        match acp {
+            AcpError::SessionNotFound { session_id } => {
+                assert_eq!(session_id, "d5de83c8-c46b-4735-8dc6-f632dd93c0b9");
+            }
+            other => panic!("expected SessionNotFound, got {other:?}"),
+        }
     }
 }

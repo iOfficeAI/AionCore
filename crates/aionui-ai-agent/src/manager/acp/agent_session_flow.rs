@@ -11,7 +11,7 @@ use crate::shared_kernel::SessionId as DomainSessionId;
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::v1::{
     AudioContent, AuthMethod, ContentBlock, ForkSessionRequest, ImageContent, LoadSessionRequest, PromptRequest,
-    PromptResponse, SessionId, StopReason, Usage, UsageUpdate,
+    PromptResponse, ResumeSessionRequest, SessionId, StopReason, Usage, UsageUpdate,
 };
 use aionui_api_types::SlashCommandItem;
 use serde_json::Value;
@@ -173,13 +173,54 @@ impl AcpAgentManager {
             };
         }
 
-        let (supports_load, preloaded_mode) = {
+        let (supports_resume, supports_load, preloaded_mode) = {
             let session = self.session.read().await;
             (
+                session
+                    .agent_capabilities()
+                    .map(|c| c.session_capabilities.resume.is_some())
+                    .unwrap_or(false)
+                    || self.params.metadata.backend.as_deref() == Some("dsh"),
                 session.agent_capabilities().map(|c| c.load_session).unwrap_or(false),
                 session.modes().map(|m| m.current_mode_id.to_string()),
             )
         };
+
+        if supports_resume {
+            let mut resume_req = ResumeSessionRequest::new(SessionId::new(session_id), &self.params.workspace.path);
+            if !self.params.mcp_servers.is_empty() {
+                resume_req = resume_req.mcp_servers(self.params.mcp_servers.clone());
+            }
+            let resume_response = match self.protocol.resume_session(resume_req).await {
+                Ok(r) => r,
+                Err(e) if is_acp_session_not_found(&e) => {
+                    return self.rebuild_after_acp_session_not_found(session_id, e).await;
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            {
+                let mut session = self.session.write().await;
+                if let Some(mut modes) = resume_response.modes {
+                    if let Some(db_current) = preloaded_mode {
+                        modes.current_mode_id = db_current.into();
+                    }
+                    session.apply_advertised_modes(modes);
+                }
+                if let Some(config_options) = resume_response.config_options {
+                    session.apply_advertised_config_options(config_options);
+                }
+                session.set_session_id(DomainSessionId::new(session_id.to_owned()));
+                self.commit_session_changes(&mut session).await;
+            }
+            self.emit_snapshot_events().await;
+
+            return match self.reconcile_session(session_id).await {
+                Ok(()) => Ok(session_id.to_owned()),
+                Err(e) if is_acp_session_not_found(&e) => self.rebuild_after_session_not_found(session_id, &e).await,
+                Err(e) => Err(e.into()),
+            };
+        }
 
         if supports_load {
             let mut load_req = LoadSessionRequest::new(SessionId::new(session_id), &self.params.workspace.path);
@@ -1060,6 +1101,22 @@ mod tests {
             .map(|c| c.session_capabilities.fork.is_some())
             .unwrap_or(false);
         assert!(!supports_fork, "a handshake without the fork key must be refused");
+    }
+
+    #[test]
+    fn advertised_resume_capability_drives_supports_resume() {
+        let mut session = make_session();
+        let mut caps = AgentCapabilities::new();
+        caps.session_capabilities.resume = Some(Default::default());
+        session.apply_advertised_capabilities(caps);
+        let supports_resume = session
+            .agent_capabilities()
+            .map(|c| c.session_capabilities.resume.is_some())
+            .unwrap_or(false);
+        assert!(
+            supports_resume,
+            "ACP spec `sessionCapabilities.resume = {{}}` must enable session/resume"
+        );
     }
 
     /// Simulate the aggregate-state effect of a successful warmup that
