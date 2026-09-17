@@ -408,6 +408,7 @@ fn extract_session_not_found_from_text(msg: &str) -> Option<String> {
 /// If `message` or `data` carries a session-not-found payload:
 /// - OpenCode/Codex: `data: {"error": "Session not found: <sid>"}`
 /// - DeepSeek Harness: `message: "Invalid params: unknown session: <sid>"`
+///
 /// Returns `None` for any other shape so callers can fall through to
 /// the default `code`-based mapping.
 fn extract_session_not_found(data: Option<&serde_json::Value>, message: &str) -> Option<String> {

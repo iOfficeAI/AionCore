@@ -1644,7 +1644,11 @@ mod tests {
         // when none of the CLIs are installed on the test host.
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
-        assert_eq!(all.len(), 45, "seed rows: 42 pre-existing + antigravity + minimax-code + dsh");
+        assert_eq!(
+            all.len(),
+            45,
+            "seed rows: 42 pre-existing + antigravity + minimax-code + dsh"
+        );
     }
 
     #[tokio::test]
