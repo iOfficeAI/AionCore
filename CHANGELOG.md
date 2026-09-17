@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/iOfficeAI/AionCore/compare/v0.2.2...v0.2.3) (2026-09-17)
+
+
+### Features
+
+* **acp:** add MiniMax Code as a builtin Registry npx agent ([#990](https://github.com/iOfficeAI/AionCore/issues/990)) ([0268ceb](https://github.com/iOfficeAI/AionCore/commit/0268ceb03273ffbe884e28b958882c421cbf4f38))
+
 ## [0.2.2](https://github.com/iOfficeAI/AionCore/compare/v0.2.1...v0.2.2) (2026-09-09)
 
 
