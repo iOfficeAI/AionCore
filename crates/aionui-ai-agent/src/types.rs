@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use aion_config::compat::OpenAiApiMode;
@@ -125,6 +125,10 @@ pub struct AionrsCompatOverrides {
     pub(crate) image_input: Option<ImageInputCapability>,
     pub max_tokens_field: Option<String>,
     pub api_path: Option<String>,
+    /// Headers added to every request to this provider. Empty for providers
+    /// that ask for none, which is all of them except the ones resolved in
+    /// `factory::aionrs`.
+    pub extra_headers: BTreeMap<String, String>,
 }
 
 /// Fully resolved Aionrs configuration passed to the agent manager.
