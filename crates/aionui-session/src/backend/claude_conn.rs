@@ -1232,28 +1232,27 @@ impl ClaudeSessionBackend {
         let event_tx = self.event_tx.clone();
         let turn_gen = Arc::clone(&self.turn_gen);
         tokio::spawn(async move {
-            let Some((level, message, localized)) =
-                crate::backend::cli_version::session_drift_notice(&spawner, "claude", &program, &session_id).await
-            else {
-                return;
-            };
+            let notices =
+                crate::backend::cli_version::session_drift_notice(&spawner, "claude", &program, &session_id).await;
             // Retry until subscribed: a broadcast send with no receiver is
-            // discarded, and this notice has no second chance.
-            crate::backend::cli_version::broadcast_notice(
-                &event_tx,
-                SessionEnvelope {
-                    session_id: session_id.clone(),
-                    turn_gen: turn_gen.load(Ordering::SeqCst),
-                    event: SessionEvent::Notice {
-                        level,
-                        message,
-                        localized: Some(localized),
-                        supersedes_key: None,
+            // discarded, and these notices have no second chance.
+            for (level, message, localized) in notices {
+                crate::backend::cli_version::broadcast_notice(
+                    &event_tx,
+                    SessionEnvelope {
+                        session_id: session_id.clone(),
+                        turn_gen: turn_gen.load(Ordering::SeqCst),
+                        event: SessionEvent::Notice {
+                            level,
+                            message,
+                            localized: Some(localized),
+                            supersedes_key: None,
+                        },
                     },
-                },
-                "claude",
-            )
-            .await;
+                    "claude",
+                )
+                .await;
+            }
         });
     }
 
