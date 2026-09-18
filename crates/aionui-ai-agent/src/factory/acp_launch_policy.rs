@@ -101,9 +101,150 @@ fn codex_sandbox_mode_for_requested_mode(mode: Option<&str>) -> &'static str {
     }
 }
 
+/// True when argv already pins the opencode ACP server port, either as
+/// `--port N` or `--port=N` (vendor-configured or user override). We must not
+/// append a second `--port`: last-one-wins would silently defeat the
+/// operator's explicit choice.
+pub(crate) fn command_spec_has_port(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--port" || arg.starts_with("--port="))
+}
+
+/// Ask the OS for a currently free TCP port on loopback. The listener is
+/// dropped immediately; the window between drop and opencode's own bind is
+/// tiny and a collision degrades to the pre-fix behaviour (single conversation
+/// on a shared machine), so we accept the race rather than hold the socket
+/// across the spawn.
+pub(crate) fn reserve_available_tcp_port() -> Option<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+    Some(listener.local_addr().ok()?.port())
+}
+
+/// True when this launch targets opencode: either the catalog backend says so
+/// (conversation runtime path) or the executable is literally `opencode` /
+/// `opencode.exe` (custom-agent probe path, where no backend label exists yet).
+/// The name fallback must stay narrow — other ACP CLIs (claude, codex, gemini,
+/// …) would die on an unknown `--port` flag.
+pub(crate) fn is_opencode_acp_launch(backend: Option<&str>, command: &str) -> bool {
+    if backend == Some("opencode") {
+        return true;
+    }
+    // `command` is either a bare program ("opencode"), a program path (which
+    // may itself contain spaces on Windows, e.g. "C:\Program Files\…"), or a
+    // program with embedded arguments ("npx -y pkg"-style). Test both the
+    // whole-string basename (covers paths with spaces) and the first-token
+    // basename (covers embedded args).
+    let basename = |candidate: &str| {
+        std::path::Path::new(candidate)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| candidate.to_owned())
+    };
+    let whole = basename(command);
+    if whole.eq_ignore_ascii_case("opencode") || whole.eq_ignore_ascii_case("opencode.exe") {
+        return true;
+    }
+    match command.split_whitespace().next() {
+        Some(first) => {
+            let head = basename(first);
+            head.eq_ignore_ascii_case("opencode") || head.eq_ignore_ascii_case("opencode.exe")
+        }
+        None => false,
+    }
+}
+
+/// Append a dedicated `--port <free>` to an opencode ACP launch argv unless
+/// one is already pinned.
+///
+/// Why: opencode's ACP adapter boots an internal HTTP server per process. Its
+/// `--port` CLI *default* (0 = random) loses to a user-pinned `server.port` in
+/// the global opencode config (`~/.config/opencode/opencode.jsonc`): yargs
+/// defaults do not override config values. A pinned port serialises spawns —
+/// the second concurrent conversation fails to bind, dies with `ServeError`
+/// before the ACP `initialize` handshake completes, and the UI surfaces
+/// `USER_AGENT_STARTUP_FAILED`. Passing an *explicit* `--port` does win over
+/// the config, so every spawn gets its own free port. Covers BOTH spawn paths:
+/// the conversation factory and the custom-agent validation probe.
+///
+/// Returns the assigned port when one was appended.
+pub(crate) fn pin_opencode_port(args: &mut Vec<String>, backend: Option<&str>, command: &str) -> Option<u16> {
+    if !is_opencode_acp_launch(backend, command) || command_spec_has_port(args) {
+        return None;
+    }
+    match reserve_available_tcp_port() {
+        Some(port) => {
+            args.extend(["--port".to_string(), port.to_string()]);
+            tracing::info!(
+                port,
+                "opencode: assigned dedicated ACP server port to avoid config-pinned collisions"
+            );
+            Some(port)
+        }
+        None => {
+            tracing::warn!(
+                "opencode: could not reserve a free port; falling back to opencode's default port selection"
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_spec_has_port_detects_both_spellings() {
+        assert!(command_spec_has_port(&["acp".into(), "--port".into(), "4711".into()]));
+        assert!(command_spec_has_port(&["acp".into(), "--port=4711".into()]));
+        assert!(!command_spec_has_port(&["acp".into()]));
+        // `--portmap` style lookalikes must not count as a pinned port.
+        assert!(!command_spec_has_port(&["acp".into(), "--portmap".into()]));
+    }
+
+    #[test]
+    fn reserve_available_tcp_port_returns_a_bindable_port() {
+        let port = reserve_available_tcp_port().expect("loopback ephemeral port must be available");
+        assert_ne!(port, 0);
+        // Port must still be bindable right after reservation (nothing else
+        // grabbed it), i.e. opencode's later bind would succeed.
+        let probe = std::net::TcpListener::bind(("127.0.0.1", port));
+        assert!(probe.is_ok(), "reserved port {port} was taken immediately");
+    }
+
+    #[test]
+    fn opencode_detection_accepts_backend_and_executable_name() {
+        assert!(is_opencode_acp_launch(Some("opencode"), "whatever"));
+        assert!(is_opencode_acp_launch(None, "opencode"));
+        assert!(is_opencode_acp_launch(None, "opencode.exe"));
+        assert!(is_opencode_acp_launch(
+            None,
+            r"C:\Program Files\x\resources\opencode-cli\opencode.exe"
+        ));
+        // Whole string is the path (may contain spaces) AND program-with-args form.
+        assert!(is_opencode_acp_launch(None, r"C:\tools\opencode.exe"));
+        assert!(is_opencode_acp_launch(None, "opencode acp"));
+        // Other ACP vendors must never receive an injected --port.
+        assert!(!is_opencode_acp_launch(Some("claude"), "claude"));
+        assert!(!is_opencode_acp_launch(None, "codex"));
+        assert!(!is_opencode_acp_launch(None, "gemini"));
+    }
+
+    #[test]
+    fn pin_opencode_port_appends_once_and_respects_explicit_choice() {
+        let mut args = vec!["acp".to_string()];
+        let port = pin_opencode_port(&mut args, Some("opencode"), "opencode").expect("port assigned");
+        assert_eq!(args, vec!["acp".to_string(), "--port".to_string(), port.to_string()]);
+        // Second call must be a no-op (already pinned now).
+        assert!(pin_opencode_port(&mut args, Some("opencode"), "opencode").is_none());
+        assert_eq!(args.len(), 3);
+        // User-pinned port is never overridden, and non-opencode is untouched.
+        let mut pinned = vec!["acp".to_string(), "--port".to_string(), "9999".to_string()];
+        assert!(pin_opencode_port(&mut pinned, Some("opencode"), "opencode").is_none());
+        assert_eq!(pinned.len(), 3);
+        let mut claude = vec!["acp".to_string()];
+        assert!(pin_opencode_port(&mut claude, Some("claude"), "claude").is_none());
+        assert_eq!(claude, vec!["acp".to_string()]);
+    }
 
     fn agent_metadata_with_backend(backend: Option<&str>) -> AgentMetadata {
         AgentMetadata {

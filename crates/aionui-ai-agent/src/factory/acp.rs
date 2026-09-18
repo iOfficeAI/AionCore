@@ -205,6 +205,15 @@ pub(super) async fn build(
     .await;
     command_spec.args.extend(acp_delivery.plan.extra_args.iter().cloned());
 
+    // Give every opencode spawn its own explicit server port so a user-pinned
+    // `server.port` in the global opencode config cannot serialise concurrent
+    // conversations (see `pin_opencode_port` docs).
+    super::acp_launch_policy::pin_opencode_port(
+        &mut command_spec.args,
+        meta.backend.as_deref(),
+        &command_spec.command.to_string_lossy(),
+    );
+
     let session_snapshot = build_context.session_snapshot;
 
     // Load user-configured MCP servers from the DB so they reach
