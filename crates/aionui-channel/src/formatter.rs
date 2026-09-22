@@ -2,7 +2,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::types::PluginType;
+use crate::types::{ParseMode, PluginType};
 
 /// Convert text to the target IM platform format.
 ///
@@ -19,6 +19,19 @@ pub fn format_text_for_platform(text: &str, platform: PluginType) -> String {
         PluginType::Slack => markdown_to_slack_mrkdwn(text),
         PluginType::Discord => text.to_string(),
         PluginType::Weixin => strip_html(text),
+    }
+}
+
+/// The parse mode that matches the output of [`format_text_for_platform`].
+///
+/// Telegram receives HTML (see `markdown_to_telegram_html`), so the outgoing
+/// message must declare `parse_mode=HTML` or Telegram renders the tags as
+/// literal text. Other platforms either take markdown directly or do not
+/// support a parse mode.
+pub fn parse_mode_for_platform(platform: PluginType) -> Option<ParseMode> {
+    match platform {
+        PluginType::Telegram => Some(ParseMode::HTML),
+        _ => None,
     }
 }
 
@@ -55,10 +68,50 @@ static RE_ITALIC_STAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*(.+?)\*
 static RE_ITALIC_UNDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"_(.+?)_").unwrap());
 static RE_LINK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
 
+static RE_HEADING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$").unwrap());
+
 fn markdown_to_telegram_html(text: &str) -> String {
-    let s = escape_html(text);
-    let s = RE_CODE_BLOCK.replace_all(&s, "<pre><code>$1</code></pre>");
-    let s = RE_INLINE_CODE.replace_all(&s, "<code>$1</code>");
+    // Telegram's HTML mode has no heading tag, so headings are rendered as
+    // bold standalone lines. Fenced code blocks are emitted directly (and
+    // never passed through the inline converters) so that comment lines such
+    // as `# note` inside a code block are not mistaken for headings.
+    let mut out = String::new();
+    let mut last = 0usize;
+    for cap in RE_CODE_BLOCK.captures_iter(text) {
+        let whole = cap.get(0).unwrap();
+        out.push_str(&telegram_plain_segment(&text[last..whole.start()]));
+        out.push_str("<pre><code>");
+        out.push_str(&escape_html(cap.get(1).map(|m| m.as_str()).unwrap_or("")));
+        out.push_str("</code></pre>");
+        last = whole.end();
+    }
+    out.push_str(&telegram_plain_segment(&text[last..]));
+    out
+}
+
+/// Format a non-code segment: headings first (per line), then inline styles.
+fn telegram_plain_segment(segment: &str) -> String {
+    let mut out = String::new();
+    for (idx, line) in segment.split('\n').enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        match RE_HEADING.captures(line) {
+            Some(cap) => {
+                let body = escape_html(cap.get(2).map(|m| m.as_str()).unwrap_or(""));
+                out.push_str("<b>");
+                out.push_str(&telegram_inline(&body));
+                out.push_str("</b>");
+            }
+            None => out.push_str(&telegram_inline(&escape_html(line))),
+        }
+    }
+    out
+}
+
+fn telegram_inline(text: &str) -> String {
+    let s = RE_INLINE_CODE.replace_all(text, "<code>$1</code>");
     let s = RE_BOLD_STAR.replace_all(&s, "<b>$1</b>");
     let s = RE_BOLD_UNDER.replace_all(&s, "<b>$1</b>");
     let s = RE_ITALIC_STAR.replace_all(&s, "<i>$1</i>");
