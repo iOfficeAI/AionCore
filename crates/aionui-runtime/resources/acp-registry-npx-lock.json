@@ -19,12 +19,12 @@
     "dimcode": {
       "registry_json_id": "dimcode",
       "package": "dimcode",
-      "version": "0.5.8"
+      "version": "0.5.10"
     },
     "dirac": {
       "registry_json_id": "dirac",
       "package": "dirac-cli",
-      "version": "0.5.13"
+      "version": "0.5.15"
     },
     "glm-acp-agent": {
       "registry_json_id": "glm-acp-agent",
@@ -34,12 +34,12 @@
     "grok": {
       "registry_json_id": "grok-build",
       "package": "@xai-official/grok",
-      "version": "1.0.40"
+      "version": "1.0.41"
     },
     "kilo": {
       "registry_json_id": "kilo",
       "package": "@kilocode/cli",
-      "version": "7.7.5"
+      "version": "7.7.7"
     },
     "mimo-code": {
       "package": "@mimo-ai/cli",
