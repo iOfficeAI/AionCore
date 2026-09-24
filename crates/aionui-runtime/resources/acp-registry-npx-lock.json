@@ -9,7 +9,7 @@
     "codebuddy": {
       "registry_json_id": "codebuddy-code",
       "package": "@tencent-ai/codebuddy-code",
-      "version": "2.156.0"
+      "version": "2.157.0"
     },
     "deepagents": {
       "registry_json_id": "deepagents",
@@ -19,12 +19,12 @@
     "dimcode": {
       "registry_json_id": "dimcode",
       "package": "dimcode",
-      "version": "0.5.10"
+      "version": "0.5.11"
     },
     "dirac": {
       "registry_json_id": "dirac",
       "package": "dirac-cli",
-      "version": "0.5.15"
+      "version": "0.5.16"
     },
     "glm-acp-agent": {
       "registry_json_id": "glm-acp-agent",
@@ -39,7 +39,7 @@
     "kilo": {
       "registry_json_id": "kilo",
       "package": "@kilocode/cli",
-      "version": "7.7.7"
+      "version": "7.7.9"
     },
     "mimo-code": {
       "package": "@mimo-ai/cli",
