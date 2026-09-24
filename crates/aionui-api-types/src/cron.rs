@@ -143,8 +143,16 @@ pub struct CronJobResponse {
 // D. Create / Update request DTOs
 // ---------------------------------------------------------------------------
 
+/// Create request for `POST /api/cron/jobs`.
+///
+/// Accepts both the legacy flat shape (`message` / `conversation_id` /
+/// `created_by` as top-level fields) and the nested shape returned by
+/// `GET /api/cron/jobs` (`target.payload.text` / `target.execution_mode`,
+/// `enabled`). Agents typically build a create body by mirroring the GET
+/// response, so the nested form must deserialize here. Unknown fields are
+/// ignored rather than rejected so a body that is valid for `PUT /{id}` also
+/// works for create; see issue iOfficeAI/AionUi#4042.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CreateCronJobRequest {
     pub name: String,
     #[serde(default)]
@@ -154,10 +162,22 @@ pub struct CreateCronJobRequest {
     pub prompt: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
-    pub conversation_id: String,
+    /// Nested message/execution target, mirroring the GET response shape.
+    /// `target.payload.text` is used as the job message and
+    /// `target.execution_mode` as the execution mode when the corresponding
+    /// flat fields are absent.
+    #[serde(default)]
+    pub target: Option<CronJobTargetDto>,
+    /// Initial enabled state. Defaults to `true` to preserve prior behavior.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
     #[serde(default)]
     pub conversation_title: Option<String>,
-    pub created_by: String,
+    /// Defaults to `"agent"` when omitted (the CLI/agent create path).
+    #[serde(default)]
+    pub created_by: Option<String>,
     #[serde(default)]
     pub execution_mode: Option<String>,
     #[serde(default)]
@@ -711,8 +731,8 @@ mod tests {
         let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.name, "Daily task");
         assert_eq!(req.message.as_deref(), Some("Do the thing"));
-        assert_eq!(req.conversation_id, "conv_1");
-        assert_eq!(req.created_by, "user");
+        assert_eq!(req.conversation_id.as_deref(), Some("conv_1"));
+        assert_eq!(req.created_by.as_deref(), Some("user"));
         assert_eq!(req.execution_mode.as_deref(), Some("new_conversation"));
         assert!(req.agent_config.is_some());
     }
@@ -731,6 +751,46 @@ mod tests {
         assert!(req.prompt.is_none());
         assert!(req.execution_mode.is_none());
         assert!(req.agent_config.is_none());
+    }
+
+    /// The nested shape returned by `GET /api/cron/jobs` must also deserialize,
+    /// since agents build create bodies by mirroring it. Regression test for
+    /// iOfficeAI/AionUi#4042.
+    #[test]
+    fn create_request_nested_response_shape() {
+        let raw = json!({
+            "name": "probe",
+            "enabled": true,
+            "schedule": {"kind": "cron", "expr": "17 9 * * *", "tz": "Asia/Shanghai"},
+            "target": {
+                "payload": {"kind": "message", "text": "hi"},
+                "execution_mode": "new_conversation"
+            }
+        });
+        let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.name, "probe");
+        assert_eq!(req.enabled, Some(true));
+        let target = req.target.expect("target should deserialize");
+        assert_eq!(target.execution_mode.as_deref(), Some("new_conversation"));
+        assert_eq!(target.payload, CronJobPayloadDto::Message { text: "hi".to_owned() });
+        // Flat fields are absent in the nested shape.
+        assert!(req.message.is_none());
+        assert!(req.conversation_id.is_none());
+        assert!(req.created_by.is_none());
+    }
+
+    /// Unknown fields must be ignored rather than rejected with a 400, so a
+    /// body valid for `PUT /{id}` also works for create.
+    #[test]
+    fn create_request_ignores_unknown_fields() {
+        let raw = json!({
+            "name": "Ping",
+            "schedule": {"kind": "every", "every_ms": 60000},
+            "some_future_field": {"nested": true},
+            "metadata": {"agent_config": {"name": "Claude"}}
+        });
+        let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.name, "Ping");
     }
 
     #[test]
@@ -769,16 +829,21 @@ mod tests {
 
     #[test]
     fn create_request_missing_conversation_id() {
+        // conversation_id is optional: only required at the service layer for
+        // `existing` execution mode, not at deserialize time. See #4042.
         let raw = json!({
             "name": "X",
             "schedule": {"kind": "every", "every_ms": 1000},
             "created_by": "user"
         });
-        assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
+        let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.conversation_id.is_none());
     }
 
     #[test]
-    fn create_request_rejects_legacy_agent_type() {
+    fn create_request_ignores_legacy_agent_type() {
+        // Unknown / deprecated fields are ignored rather than rejected, so a
+        // body shaped like the GET response (or a PUT body) still deserializes.
         let raw = json!({
             "name": "X",
             "schedule": {"kind": "every", "every_ms": 1000},
@@ -786,18 +851,20 @@ mod tests {
             "agent_type": "acp",
             "created_by": "user"
         });
-        let err = serde_json::from_value::<CreateCronJobRequest>(raw).expect_err("legacy agent_type must be rejected");
-        assert!(err.to_string().contains("agent_type"));
+        let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.name, "X");
     }
 
     #[test]
     fn create_request_missing_created_by() {
+        // created_by is optional and defaults to "agent" in the service layer.
         let raw = json!({
             "name": "X",
             "schedule": {"kind": "every", "every_ms": 1000},
             "conversation_id": "c1",
         });
-        assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
+        let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.created_by.is_none());
     }
 
     // -- E. UpdateCronJobRequest ----------------------------------------------
