@@ -19,6 +19,7 @@ thiserror.workspace = true
 oauth2.workspace = true
 open.workspace = true
 toml.workspace = true
+url.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
