@@ -142,6 +142,7 @@ pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
         Box::pin(async move {
             Ok(AgentInstance::Mock(std::sync::Arc::new(NoopMockAgent {
                 conversation_id: opts.conversation_id().to_owned(),
+                workspace: opts.context.workspace.path.clone(),
             })))
         })
     });
@@ -157,6 +158,7 @@ pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
 
 struct NoopMockAgent {
     conversation_id: String,
+    workspace: String,
 }
 
 #[async_trait::async_trait]
@@ -168,7 +170,7 @@ impl IAgentTask for NoopMockAgent {
         &self.conversation_id
     }
     fn workspace(&self) -> &str {
-        "/tmp/test"
+        &self.workspace
     }
     fn status(&self) -> Option<aionui_common::ConversationStatus> {
         None
