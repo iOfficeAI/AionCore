@@ -1538,7 +1538,72 @@ async fn run_backend_thinking(backend: &str) {
 /// (five sites in codex_conn.rs; claude and agy have none), and the card is
 /// pure side-channel — a turn that stops emitting plans still answers
 /// perfectly, so nothing else in this suite would notice.
+/// Whether this machine's codex will offer the `update_plan` tool at all.
+///
+/// From 0.152.0 it is opt-in (openai/codex `a9519cbc`, #41744) and AionUi
+/// deliberately does not turn it on — `-c` would override the user's own
+/// `~/.codex/config.toml`, and this is a preference rather than a compatibility
+/// requirement. So on a machine that has not enabled it there is no plan frame
+/// to assert, and failing would report an intentional product decision as a
+/// regression.
+///
+/// This is a targeted skip, not a blanket one: an operator who HAS enabled the
+/// tool still gets the full assertions, and older codex still gets them because
+/// the tool was on by default there. The only case that skips is the one where
+/// the frame genuinely cannot exist.
+///
+/// Reads the config; never writes it. Pointing codex at a throwaway `CODEX_HOME`
+/// was tried instead and abandoned — that directory also holds `auth.json`, and
+/// copying credentials into an alternate home breaks token refresh.
+fn codex_offers_plan_tool() -> Result<(), String> {
+    // Bare name on purpose: the qualification runs put the candidate first on
+    // PATH via a shim, and this must read the same binary the suite drives.
+    let version = std::process::Command::new("codex")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    // Same parser the backend uses, so "0.152.0" here means what it means there.
+    let opt_in_release = aionui_session::parse_cli_version(&version)
+        .map(|v| {
+            let mut v = v;
+            v.resize(3, 0);
+            v[..3] >= [0u32, 152, 0][..]
+        })
+        .unwrap_or(false);
+    if !opt_in_release {
+        return Ok(());
+    }
+    let home = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")));
+    let config = home
+        .map(|h| h.join("config.toml"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    // Deliberately crude: any `enabled = true` under a `[tools.update_plan]`
+    // header. A real TOML parse would be more precise, but a false NEGATIVE here
+    // only skips a test, while a false positive would fail one — so the crude
+    // check errs in the safe direction.
+    let enabled = config
+        .split('[')
+        .any(|section| section.starts_with("tools.update_plan]") && section.contains("enabled = true"));
+    if enabled {
+        Ok(())
+    } else {
+        Err(format!(
+            "codex {} makes the update_plan tool opt-in and this machine has not enabled it,              so no plan frame can exist. Add `[tools.update_plan]` / `enabled = true` to              ~/.codex/config.toml to run this test. AionUi does not set it for you (see the              CODEX_PLAN_OPT_IN notice).",
+            version.trim()
+        ))
+    }
+}
+
 async fn run_codex_plan() {
+    if let Err(why) = codex_offers_plan_tool() {
+        println!("[codex] SKIPPED live_codex_produces_a_plan: {why}");
+        return;
+    }
     let app = start_live_app().await;
     let conv_id = conversation_for(&app, "codex", "plan").await;
 
