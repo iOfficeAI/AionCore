@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn pins_direct_npx_package() {
         let args = pin_registry_npx_args("pi", &strings(&["-y", "pi-acp"])).unwrap();
-        assert_eq!(args, ["-y", "pi-acp@0.0.33"]);
+        assert_eq!(args, ["-y", "pi-acp@0.0.34"]);
     }
 
     #[test]
@@ -120,7 +120,7 @@ mod tests {
             [
                 "-y",
                 "--package",
-                "@tencent-ai/codebuddy-code@2.157.0",
+                "@tencent-ai/codebuddy-code@2.159.0",
                 "codebuddy",
                 "--acp"
             ]
