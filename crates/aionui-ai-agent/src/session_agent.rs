@@ -39,6 +39,9 @@ use aionui_realtime::EventBroadcaster;
 
 const EVENT_CHANNEL_CAPACITY: usize = 512;
 
+mod tool_output;
+use tool_output::{PREVIEW_PERIOD, PREVIEW_QUEUE_HIGH_WATER, ToolOutputPreviews};
+
 // Option ids for the generic tool-approval card. `confirm()` maps the incoming
 // `data` string against these to pick the PermissionDecision; anything else is
 // treated as an AskUserQuestion answer label (Approved + `selected`).
@@ -2707,14 +2710,13 @@ fn spawn_event_pump(
     // removing it from the manager map) drops that Arc → backend `Drop` → reader
     // abort + `kill_on_drop` → `event_tx` drops → this stream Closes → the loop ends.
     tokio::spawn(async move {
-        // Per-tool accumulated live output for codex `ToolOutputDelta` (streamed
-        // command stdout). The frontend merges `tool_call` frames by call_id with a
-        // shallow REPLACE of `output` (hooks.ts: `{...existing, ...new}`), so we must
-        // send the CUMULATIVE text each time, not the delta — otherwise each chunk
-        // overwrites the last and only the final chunk shows. Keyed by item_id (==
-        // the ToolCall tool_use_id). The authoritative full output still arrives on
-        // the completed ToolResult, which harmlessly replaces this live view.
-        let mut tool_output: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        // Replace-style live output: coalesce deltas into bounded UTF-8 tails,
+        // NOT an ever-growing string cloned into the 512-slot broadcast queue on
+        // every delta (#946). Small outputs remain cumulative. Large previews
+        // explicitly mark truncation; ToolResult uses the existing full-result
+        // path, bypassing this buffer. The timer admits at most 16 queued previews
+        // (1 MiB of output payload); other event types retain their existing policy.
+        let mut tool_output = ToolOutputPreviews::default();
         // In-flight workflow/subagent refs, mirroring `state::background_active`
         // (any non-terminal roster entry ⇒ in-flight). claude's non-blocking
         // Workflow turn emits MULTIPLE `result` frames: the LAUNCH result arrives
@@ -2812,12 +2814,35 @@ fn spawn_event_pump(
         // select arm is disabled entirely while no card is open.
         let mut progress_tick = tokio::time::interval(std::time::Duration::from_secs(1));
         progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut preview_tick = tokio::time::interval_at(tokio::time::Instant::now() + PREVIEW_PERIOD, PREVIEW_PERIOD);
+        preview_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let env = tokio::select! {
                 maybe_env = events.next() => match maybe_env {
                     Some(env) => env,
                     None => break,
                 },
+                _ = preview_tick.tick(), if tool_output.has_pending() => {
+                    // Reset relative to NOW: even after a stall, consecutive
+                    // previews stay >=100ms apart (no catch-up burst).
+                    preview_tick.reset();
+                    if runtime.tx.len() < PREVIEW_QUEUE_HIGH_WATER
+                        && let Some((call_id, output)) = tool_output.take_next()
+                    {
+                        let name = tool_name.get(&call_id).cloned().unwrap_or_default();
+                        let _ = runtime.tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+                            call_id,
+                            name,
+                            args: serde_json::Value::Null,
+                            status: ToolCallStatus::Running,
+                            input: None,
+                            output: Some(output),
+                            description: None,
+                            parent_call_id: None,
+                        }));
+                    }
+                    continue;
+                }
                 _ = progress_tick.tick(), if !workflow_cards.is_empty() => {
                     let now = aionui_common::now_ms();
                     for card in workflow_cards.values_mut() {
@@ -2849,6 +2874,9 @@ fn spawn_event_pump(
                         to = env.turn_gen,
                         "session-pump: turn gen advanced; per-turn suppression state reset"
                     );
+                }
+                if last_seen_turn_gen > 0 {
+                    tool_output.retain(|id| open_tools.contains_key(id) && is_detached_exec_call(tool_args.get(id)));
                 }
                 last_seen_turn_gen = env.turn_gen;
                 runtime.set_status(ConversationStatus::Running);
@@ -2919,20 +2947,14 @@ fn spawn_event_pump(
             if let SessionEvent::ToolOutputDelta { item_id, text } = &env.event {
                 // Streamed tool stdout is user-visible output — this turn is not blank.
                 saw_visible_output = true;
-                let acc = tool_output.entry(item_id.clone()).or_default();
-                acc.push_str(text);
-                let _ = runtime.tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
-                    call_id: item_id.clone(),
-                    // The wire delta carries no name; use the remembered one so this
-                    // live-output frame doesn't overwrite the persisted row's name to "".
-                    name: tool_name.get(item_id).cloned().unwrap_or_default(),
-                    args: serde_json::Value::Null,
-                    status: ToolCallStatus::Running,
-                    input: None,
-                    output: Some(acc.clone()),
-                    description: None,
-                    parent_call_id: None,
-                }));
+                if tool_output.append(item_id, text) {
+                    tracing::info!(
+                        conv_id = %conversation_id,
+                        call_id = %item_id,
+                        preview_limit_bytes = tool_output::PREVIEW_BYTES,
+                        "session-pump: live tool preview truncated; final result is unaffected"
+                    );
+                }
                 continue;
             }
 
@@ -3132,13 +3154,14 @@ fn spawn_event_pump(
                             // close every tool call left open as Canceled BEFORE the
                             // Finish (the relay stops forwarding the turn at Finish).
                             for (call_id, name) in open_tools.drain() {
+                                let output = tool_output.remove(&call_id);
                                 let _ = runtime.tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
                                     call_id,
                                     name,
                                     args: serde_json::Value::Null,
                                     status: ToolCallStatus::Canceled,
                                     input: None,
-                                    output: None,
+                                    output,
                                     description: None,
                                     parent_call_id: None,
                                 }));
@@ -3202,6 +3225,10 @@ fn spawn_event_pump(
                     tool_args.insert(tool_use_id.clone(), input.clone());
                 }
                 SessionEvent::ToolResult { tool_use_id, .. } => {
+                    // A full terminal result supersedes any pending live preview.
+                    // Remove it BEFORE forwarding the result; no later timer may
+                    // regress the card to Running or overwrite its full output.
+                    tool_output.discard(tool_use_id);
                     open_tools.remove(tool_use_id);
                 }
                 SessionEvent::TurnResult { .. } | SessionEvent::Detached { .. } if !suppress_intermediate_finish => {
@@ -3265,13 +3292,14 @@ fn spawn_event_pump(
                             tool = %name,
                             "session-pump: closing tool call left open at turn end as canceled"
                         );
+                        let output = tool_output.remove(&call_id);
                         let _ = runtime.tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
                             call_id,
                             name,
                             args: serde_json::Value::Null,
                             status: ToolCallStatus::Canceled,
                             input: None,
-                            output: None,
+                            output,
                             description: None,
                             parent_call_id: None,
                         }));
@@ -3308,7 +3336,7 @@ fn spawn_event_pump(
                     // still open past this turn end (detached exec): their terminal
                     // arrives minutes later and `stamp_tool_name` must still find the
                     // name, or the card re-renders nameless.
-                    tool_output.retain(|call_id, _| open_tools.contains_key(call_id));
+                    tool_output.retain(|call_id| open_tools.contains_key(call_id));
                     tool_name.retain(|call_id, _| open_tools.contains_key(call_id));
                     // Reset the per-turn visibility flag for the next turn.
                     saw_visible_output = false;
@@ -3419,6 +3447,25 @@ fn spawn_event_pump(
                 // A send error only means no live subscribers — harmless.
                 let _ = runtime.tx.send(ev);
             }
+        }
+
+        // Preserve the latest bounded output even if the stream ends before a
+        // ToolResult (including delta-only streams). Never flush it as Running.
+        for (call_id, output) in tool_output.drain() {
+            let name = open_tools
+                .remove(&call_id)
+                .or_else(|| tool_name.remove(&call_id))
+                .unwrap_or_default();
+            let _ = runtime.tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+                call_id,
+                name,
+                args: serde_json::Value::Null,
+                status: ToolCallStatus::Canceled,
+                input: None,
+                output: Some(output),
+                description: None,
+                parent_call_id: None,
+            }));
         }
 
         // The event stream ended: the backend (and its process group) is being
@@ -9768,8 +9815,9 @@ mod pump_tests {
                 _ => None,
             })
             .collect();
-        // Two frames: first the 1st chunk, then the cumulative 1st+2nd (not just "line-2").
-        assert_eq!(outputs, vec!["line-1\n".to_string(), "line-1\nline-2\n".to_string()]);
+        // Adjacent chunks are coalesced; stream-end preserves the latest cumulative
+        // preview. Timed delivery/backpressure is covered by tool_output_preview.rs.
+        assert_eq!(outputs, vec!["line-1\nline-2\n".to_string()]);
     }
 
     // ── Defect 1: process-reap on task drop ───────────────────────────────
