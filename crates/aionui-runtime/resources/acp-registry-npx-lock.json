@@ -9,7 +9,7 @@
     "codebuddy": {
       "registry_json_id": "codebuddy-code",
       "package": "@tencent-ai/codebuddy-code",
-      "version": "2.159.0"
+      "version": "2.160.0"
     },
     "deepagents": {
       "registry_json_id": "deepagents",
@@ -19,22 +19,22 @@
     "dimcode": {
       "registry_json_id": "dimcode",
       "package": "dimcode",
-      "version": "0.5.12"
+      "version": "0.5.15"
     },
     "dirac": {
       "registry_json_id": "dirac",
       "package": "dirac-cli",
-      "version": "0.5.16"
+      "version": "0.5.17"
     },
     "glm-acp-agent": {
       "registry_json_id": "glm-acp-agent",
       "package": "glm-acp-agent",
-      "version": "1.12.0"
+      "version": "1.13.0"
     },
     "grok": {
       "registry_json_id": "grok-build",
       "package": "@xai-official/grok",
-      "version": "1.0.43"
+      "version": "1.0.45"
     },
     "kilo": {
       "registry_json_id": "kilo",
@@ -53,7 +53,7 @@
     "nova": {
       "registry_json_id": "nova",
       "package": "@compass-ai/nova",
-      "version": "1.1.47"
+      "version": "1.1.48"
     },
     "pi": {
       "registry_json_id": "pi-acp",
@@ -63,7 +63,7 @@
     "sigit": {
       "registry_json_id": "sigit",
       "package": "@smbcloud/sigit",
-      "version": "1.5.10",
+      "version": "1.5.11",
       "skip_version_probe": true
     }
   }
