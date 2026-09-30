@@ -437,6 +437,9 @@ async fn cj5b_run_now_legacy_workspace_with_whitespace_succeeds() {
             schedule_description: Some("every minute".into()),
             payload_message: "test message".into(),
             execution_mode: "new_conversation".into(),
+            action: "agent".into(),
+            shell_workspace: None,
+            shell_timeout_ms: None,
             agent_config: Some(
                 json!({
                     "name": "Cron Agent",

@@ -36,6 +36,7 @@ impl From<CronError> for ApiError {
             CronError::InvalidSchedule(msg) => ApiError::BadRequest(msg),
             CronError::InvalidCronExpression(msg) => ApiError::BadRequest(msg),
             CronError::InvalidExecutionMode(msg) => ApiError::BadRequest(msg),
+            CronError::InvalidShellAction(msg) => ApiError::BadRequest(msg),
             CronError::InvalidCreatedBy(msg) => ApiError::BadRequest(msg),
             CronError::InvalidJobStatus(msg) => ApiError::BadRequest(msg),
             CronError::InvalidTimezone(msg) => ApiError::BadRequest(msg),

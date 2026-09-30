@@ -22,9 +22,10 @@ use crate::prompt::{
     build_existing_conversation_prompt, build_new_conversation_prompt_with_skill_suggest,
     build_new_conversation_with_skill_prompt,
 };
+use crate::shell;
 use crate::skill_file::{cron_skill_name, read_skill_content, write_raw_skill_file, write_skill_file};
 use crate::skill_suggest::SkillSuggestDetector;
-use crate::types::{CronJob, ExecutionMode};
+use crate::types::{CronAction, CronJob, ExecutionMode};
 
 pub const RETRY_INTERVAL_MS: u64 = 30_000;
 pub const MAX_RETRIES_DEFAULT: i64 = 3;
@@ -90,6 +91,9 @@ impl JobExecutor {
     }
 
     pub async fn execute(&self, job: &CronJob) -> ExecutionResult {
+        if job.action == CronAction::Shell {
+            return self.execute_shell(job).await;
+        }
         let prepared = match self.prepare_scheduled(job).await {
             Ok(prepared) => prepared,
             Err(result) => return result,
@@ -154,6 +158,16 @@ impl JobExecutor {
     }
 
     pub(crate) async fn prepare_run_now(&self, job: &CronJob) -> Result<PreparedRunNow, CronError> {
+        if job.action == CronAction::Shell {
+            let conversation_id = self
+                .prepare_shell(job)
+                .await
+                .map_err(|result| CronError::Scheduler(execution_result_message(&result)))?;
+            return Ok(PreparedRunNow::Ready(PreparedExecution {
+                conversation_id,
+                saved_skill: None,
+            }));
+        }
         let saved_skill = match self.prepare_saved_skill(job).await {
             Ok(skill) => skill,
             Err(err) => {
@@ -185,6 +199,9 @@ impl JobExecutor {
     }
 
     pub(crate) async fn execute_prepared(&self, job: &CronJob, prepared: PreparedExecution) -> ExecutionResult {
+        if job.action == CronAction::Shell {
+            return self.execute_shell_prepared(job, &prepared.conversation_id).await;
+        }
         self.execute_inner_with_busy_retry(job, &prepared.conversation_id, prepared.saved_skill.as_ref(), false)
             .await
     }
@@ -194,6 +211,9 @@ impl JobExecutor {
         job: &CronJob,
         prepared: PreparedExecution,
     ) -> ExecutionResult {
+        if job.action == CronAction::Shell {
+            return self.execute_shell_prepared(job, &prepared.conversation_id).await;
+        }
         self.execute_inner_with_busy_retry(job, &prepared.conversation_id, prepared.saved_skill.as_ref(), true)
             .await
     }
@@ -496,6 +516,147 @@ impl JobExecutor {
 }
 
 impl JobExecutor {
+    /// Scheduled entry point for shell-action jobs: validate, resolve the
+    /// bound conversation, run the command, and report the outcome as a tips
+    /// message in that conversation. No agent turn is started.
+    async fn execute_shell(&self, job: &CronJob) -> ExecutionResult {
+        let conversation_id = match self.prepare_shell(job).await {
+            Ok(conversation_id) => conversation_id,
+            Err(result) => return result,
+        };
+        self.execute_shell_prepared(job, &conversation_id).await
+    }
+
+    /// Validates a shell-action job and resolves its target conversation.
+    /// Unlike the agent flow, a missing bound conversation is an error —
+    /// there is no agent to back a materialized replacement conversation.
+    async fn prepare_shell(&self, job: &CronJob) -> Result<String, ExecutionResult> {
+        if let Err(error) = shell::validate_shell_command(&job.message) {
+            return Err(ExecutionResult::Error {
+                message: error.to_string(),
+            });
+        }
+        if matches!(job.execution_mode, ExecutionMode::NewConversation) {
+            return Err(ExecutionResult::Error {
+                message: "shell action jobs must run in the 'existing' execution mode".into(),
+            });
+        }
+
+        let conversation_id = job.conversation_id.trim();
+        if conversation_id.is_empty() {
+            return Err(ExecutionResult::Error {
+                message: format!("cron job {} has no bound conversation", job.id),
+            });
+        }
+        let owner_user_id = match self.conversation_repo.owner_user_id(conversation_id).await {
+            Ok(owner) => owner,
+            Err(error) => {
+                return Err(ExecutionResult::Error {
+                    message: error.to_string(),
+                });
+            }
+        };
+        let Some(owner_user_id) = owner_user_id else {
+            return Err(ExecutionResult::Error {
+                message: format!("conversation {conversation_id} not found"),
+            });
+        };
+        if !job.user_id.trim().is_empty() && owner_user_id != job.user_id {
+            return Err(ExecutionResult::Error {
+                message: format!(
+                    "cron job {} targets conversation {} owned by another user",
+                    job.id, conversation_id
+                ),
+            });
+        }
+        Ok(conversation_id.to_owned())
+    }
+
+    async fn execute_shell_prepared(&self, job: &CronJob, conversation_id: &str) -> ExecutionResult {
+        let command = job.message.clone();
+        let description = shell_command_description(&command);
+        let workspace = match self.resolve_shell_workspace(job, conversation_id).await {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                return ExecutionResult::Error {
+                    message: error.to_string(),
+                };
+            }
+        };
+        let timeout_ms = shell::effective_timeout_ms(job.shell_timeout_ms);
+        info!(
+            job_id = %job.id,
+            conversation_id,
+            timeout_ms,
+            workspace = %workspace.display(),
+            "Running shell cron action"
+        );
+
+        let outcome = shell::run_shell_command(&command, &workspace, timeout_ms).await;
+        info!(
+            job_id = %job.id,
+            conversation_id,
+            timed_out = outcome.timed_out,
+            exit_code = outcome.exit_code,
+            duration_ms = outcome.duration_ms,
+            "Shell cron action finished"
+        );
+
+        let (content, tip_type) = shell::build_result_message(&description, &outcome);
+        if let Err(error) = self.insert_tips_message(conversation_id, &content, tip_type).await {
+            warn!(
+                job_id = %job.id,
+                conversation_id,
+                error = %error,
+                "Failed to persist shell cron result message"
+            );
+        }
+
+        if outcome.succeeded() {
+            ExecutionResult::Success {
+                conversation_id: conversation_id.to_owned(),
+            }
+        } else {
+            ExecutionResult::Error { message: content }
+        }
+    }
+
+    /// Shell working directory: explicit override → bound conversation's
+    /// workspace → executor-managed scratch dir under the work dir.
+    async fn resolve_shell_workspace(&self, job: &CronJob, conversation_id: &str) -> Result<PathBuf, CronError> {
+        if let Some(workspace) = job
+            .shell_workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let path = PathBuf::from(workspace);
+            if !path.is_dir() {
+                return Err(CronError::WorkspacePathRuntimeUnavailable(workspace.to_owned()));
+            }
+            return Ok(path);
+        }
+
+        if let Ok(Some(row)) = self.get_conversation_row(conversation_id).await {
+            let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(workspace) = extra
+                .get("workspace")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                && Path::new(workspace).is_dir()
+            {
+                return Ok(PathBuf::from(workspace));
+            }
+        }
+
+        let fallback = self.work_dir.join("cron-shell").join(&job.id);
+        std::fs::create_dir_all(&fallback).map_err(|error| {
+            CronError::Scheduler(format!("create shell cron workspace {}: {error}", fallback.display()))
+        })?;
+        Ok(fallback)
+    }
+
     fn handle_busy(&self, job: &CronJob) -> ExecutionResult {
         if job.queue_enabled {
             info!(job_id = %job.id, "Cron queue is enabled; skipping overlapping execution");
@@ -1242,6 +1403,34 @@ async fn build_conversation_extra(
     serde_json::Value::Object(extra)
 }
 
+/// Single-line, truncated preview of a shell command for user-facing result
+/// messages. Never logged at production levels (see AGENTS.md logging rules).
+fn shell_command_description(command: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let first_line = command.lines().next().unwrap_or_default().trim();
+    let mut description: String = first_line.chars().take(MAX_CHARS).collect();
+    if first_line.chars().count() > MAX_CHARS {
+        description.push('…');
+    }
+    if description.is_empty() {
+        description = "(empty command)".to_owned();
+    }
+    description
+}
+
+/// Flattens an `ExecutionResult` into a message string for error paths that
+/// surface through `CronError::Scheduler`.
+fn execution_result_message(result: &ExecutionResult) -> String {
+    match result {
+        ExecutionResult::Success { conversation_id } => {
+            format!("shell cron action completed in conversation {conversation_id}")
+        }
+        ExecutionResult::Retrying { attempt } => format!("shell cron action busy, retry attempt {attempt}"),
+        ExecutionResult::Skipped => "shell cron action skipped".to_owned(),
+        ExecutionResult::Error { message } => message.clone(),
+    }
+}
+
 fn schedule_description_text(schedule: &crate::types::CronSchedule) -> String {
     match schedule {
         crate::types::CronSchedule::At { at_ms, description } => {
@@ -1332,6 +1521,9 @@ mod tests {
 
     fn sample_job() -> CronJob {
         CronJob {
+            action: CronAction::AgentTurn,
+            shell_workspace: None,
+            shell_timeout_ms: None,
             id: "cron_test1".into(),
             user_id: "user1".into(),
             name: "Test Job".into(),
