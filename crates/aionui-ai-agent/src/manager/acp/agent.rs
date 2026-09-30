@@ -275,6 +275,16 @@ async fn spawn_and_connect_acp_once(
         notification_tx,
         &params.conversation_id,
         Some(std::path::PathBuf::from(&params.workspace.path)),
+        // ACP `terminal/create` subprocesses are children of this daemon, not
+        // of the agent process — forward the session's AIONUI_* runtime env so
+        // the agent-facing `aioncore` helper CLI works inside them.
+        params
+            .command_spec
+            .env
+            .iter()
+            .filter(|e| e.name.starts_with("AIONUI_"))
+            .map(|e| (e.name.clone(), e.value.clone()))
+            .collect(),
         crate::protocol::acp_init_budget::init_budget(&params.command_spec),
     );
     tokio::pin!(connect_fut);

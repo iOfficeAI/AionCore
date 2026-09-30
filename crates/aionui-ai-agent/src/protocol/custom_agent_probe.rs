@@ -212,6 +212,7 @@ async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
         notification_tx,
         "custom-agent-probe",
         None,
+        Vec::new(),
         InitBudget {
             timeout: Duration::from_secs(INIT_TIMEOUT_SECS),
             cold_start: false,
