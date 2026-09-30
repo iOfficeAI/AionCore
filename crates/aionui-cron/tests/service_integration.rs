@@ -1099,6 +1099,9 @@ async fn setup_with_assistant_repos() -> (
 
 fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobRequest {
     CreateCronJobRequest {
+        action: None,
+        shell_workspace: None,
+        shell_timeout_ms: None,
         name: name.into(),
         description: Some("test description".into()),
         schedule,
@@ -1125,6 +1128,9 @@ fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobReques
 fn make_cron_row_with_workspace(id: &str, user_id: &str, conversation_id: &str, workspace: &str) -> CronJobRow {
     let now = now_ms();
     CronJobRow {
+        action: "agent".into(),
+        shell_workspace: None,
+        shell_timeout_ms: None,
         id: id.into(),
         user_id: user_id.into(),
         name: id.into(),
@@ -1554,6 +1560,9 @@ async fn list_jobs_allows_legacy_custom_agent_id_without_assistant_id() {
     let (svc, cron_repo, _) = setup().await;
     cron_repo
         .insert(&CronJobRow {
+            action: "agent".into(),
+            shell_workspace: None,
+            shell_timeout_ms: None,
             id: "cron_legacy_custom_agent".into(),
             user_id: "u1".into(),
             name: "Legacy custom agent job".into(),
@@ -1656,6 +1665,9 @@ async fn cj8_update_job() {
     bc.take_events();
 
     let req = UpdateCronJobRequest {
+        action: None,
+        shell_workspace: None,
+        shell_timeout_ms: None,
         name: Some("Updated Name".into()),
         description: Some("Updated description".into()),
         enabled: Some(false),
@@ -1691,6 +1703,9 @@ async fn update_existing_conversation_job_rejects_agent_config_changes() {
         .unwrap();
 
     let req = UpdateCronJobRequest {
+        action: None,
+        shell_workspace: None,
+        shell_timeout_ms: None,
         name: None,
         description: None,
         enabled: None,
@@ -1730,6 +1745,9 @@ async fn update_existing_conversation_job_rejects_agent_config_even_when_switchi
         .unwrap();
 
     let req = UpdateCronJobRequest {
+        action: None,
+        shell_workspace: None,
+        shell_timeout_ms: None,
         name: None,
         description: None,
         enabled: None,
@@ -1775,6 +1793,9 @@ async fn update_existing_job_to_new_conversation_keeps_owner_anchor() {
             "u1",
             &created.id,
             UpdateCronJobRequest {
+                action: None,
+                shell_workspace: None,
+                shell_timeout_ms: None,
                 name: None,
                 description: None,
                 enabled: None,
@@ -1836,6 +1857,9 @@ async fn update_existing_job_to_new_conversation_clears_previous_auto_workspace(
         "u1",
         &created.id,
         UpdateCronJobRequest {
+            action: None,
+            shell_workspace: None,
+            shell_timeout_ms: None,
             name: None,
             description: None,
             enabled: None,
@@ -1881,6 +1905,9 @@ async fn update_existing_job_to_new_conversation_preserves_custom_workspace() {
         "u1",
         &created.id,
         UpdateCronJobRequest {
+            action: None,
+            shell_workspace: None,
+            shell_timeout_ms: None,
             name: None,
             description: None,
             enabled: None,
@@ -1916,6 +1943,9 @@ async fn update_team_conversation_job_rejects_execution_mode_change() {
     let created = svc.add_job("u1", create_req).await.unwrap();
 
     let req = UpdateCronJobRequest {
+        action: None,
+        shell_workspace: None,
+        shell_timeout_ms: None,
         name: None,
         description: None,
         enabled: None,
@@ -1941,6 +1971,9 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
     let created = svc.add_job("u1", create_req).await.unwrap();
 
     let req = UpdateCronJobRequest {
+        action: None,
+        shell_workspace: None,
+        shell_timeout_ms: None,
         name: None,
         description: None,
         enabled: None,
@@ -1978,6 +2011,9 @@ async fn update_job_rejects_when_assistant_id_cannot_resolve() {
     let created = svc.add_job("u1", create_req).await.unwrap();
 
     let req = UpdateCronJobRequest {
+        action: None,
+        shell_workspace: None,
+        shell_timeout_ms: None,
         name: None,
         description: None,
         enabled: None,
@@ -2022,6 +2058,9 @@ async fn cj9_update_schedule_type() {
         .unwrap();
 
     let req = UpdateCronJobRequest {
+        action: None,
+        shell_workspace: None,
+        shell_timeout_ms: None,
         name: None,
         description: None,
         enabled: None,
@@ -2048,6 +2087,9 @@ async fn cj9_update_schedule_type() {
 async fn cj10_update_nonexistent() {
     let (svc, _, _) = setup().await;
     let req = UpdateCronJobRequest {
+        action: None,
+        shell_workspace: None,
+        shell_timeout_ms: None,
         name: Some("x".into()),
         description: None,
         enabled: None,
@@ -3214,6 +3256,9 @@ async fn update_max_retries() {
     assert_eq!(job.max_retries, 3);
 
     let req = UpdateCronJobRequest {
+        action: None,
+        shell_workspace: None,
+        shell_timeout_ms: None,
         name: None,
         description: None,
         enabled: None,
@@ -3245,6 +3290,9 @@ async fn create_and_update_queue_enabled() {
             UpdateCronJobRequest {
                 queue_enabled: Some(false),
                 ..UpdateCronJobRequest {
+                    action: None,
+                    shell_workspace: None,
+                    shell_timeout_ms: None,
                     name: None,
                     description: None,
                     enabled: None,
@@ -3608,4 +3656,273 @@ async fn cd4_on_conversation_delete_preserves_all_cron_jobs() {
     let events = bc.take_events();
     let removed_events: Vec<_> = events.iter().filter(|e| e.name == "cron.job-removed").collect();
     assert!(removed_events.is_empty());
+}
+
+// ── Shell action jobs ────────────────────────────────────────────────
+
+impl StubConvRepo {
+    fn inserted_messages(&self) -> Vec<MessageRow> {
+        self.messages.lock().unwrap().clone()
+    }
+}
+
+fn shell_create_req(name: &str, command: &str) -> CreateCronJobRequest {
+    let mut req = make_create_req(name, every_60s());
+    req.message = Some(command.to_owned());
+    req.action = Some("shell".into());
+    req.agent_config = None;
+    req
+}
+
+#[tokio::test]
+async fn create_shell_job_persists_and_reports_shell_agent_type() {
+    let (svc, _repo, _bc) = setup().await;
+
+    let job = svc
+        .add_job("u1", shell_create_req("Mirror repos", "echo shell-cron-ok"))
+        .await
+        .unwrap();
+
+    let loaded = svc.get_job("u1", &job.id).await.unwrap();
+    assert_eq!(loaded.agent_type, "shell");
+
+    let resp = CronService::to_response(&loaded);
+    assert_eq!(
+        resp.target.payload,
+        aionui_api_types::CronJobPayloadDto::Shell {
+            command: "echo shell-cron-ok".into(),
+            workspace: None,
+            timeout_ms: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn create_shell_job_rejects_empty_command() {
+    let (svc, _repo, _bc) = setup().await;
+
+    let err = svc
+        .add_job("u1", shell_create_req("Empty command", "   \n\t "))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("non-empty command"), "got: {err}");
+}
+
+#[tokio::test]
+async fn create_shell_job_rejects_new_conversation_mode() {
+    let (svc, _repo, _bc) = setup().await;
+
+    let mut req = shell_create_req("Shell new conversation", "echo hi");
+    req.execution_mode = Some("new_conversation".into());
+    let err = svc.add_job("u1", req).await.unwrap_err();
+    assert!(err.to_string().contains("'existing'"), "got: {err}");
+}
+
+#[tokio::test]
+async fn create_shell_job_rejects_agent_config() {
+    let (svc, _repo, _bc) = setup().await;
+
+    let mut req = shell_create_req("Shell with agent", "echo hi");
+    req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
+        name: "Claude".into(),
+        cli_path: None,
+        assistant_id: Some("assistant-default".into()),
+        mode: None,
+        model_id: None,
+        model: None,
+        config_options: None,
+        workspace: None,
+    });
+    let err = svc.add_job("u1", req).await.unwrap_err();
+    assert!(err.to_string().contains("agent_config"), "got: {err}");
+}
+
+#[tokio::test]
+async fn create_shell_job_rejects_out_of_range_timeout() {
+    let (svc, _repo, _bc) = setup().await;
+
+    let mut req = shell_create_req("Shell bad timeout", "echo hi");
+    req.shell_timeout_ms = Some(0);
+    let err = svc.add_job("u1", req).await.unwrap_err();
+    assert!(err.to_string().contains("shell_timeout_ms"), "got: {err}");
+}
+
+#[tokio::test]
+async fn update_shell_job_rejects_action_change() {
+    let (svc, _repo, _bc) = setup().await;
+    let job = svc
+        .add_job("u1", shell_create_req("Shell job", "echo hi"))
+        .await
+        .unwrap();
+
+    let err = svc
+        .update_job(
+            "u1",
+            &job.id,
+            UpdateCronJobRequest {
+                action: Some("agent".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("cannot be changed"), "got: {err}");
+}
+
+#[tokio::test]
+async fn update_shell_job_updates_workspace_and_timeout() {
+    let (svc, _repo, _bc) = setup().await;
+    let job = svc
+        .add_job("u1", shell_create_req("Shell job", "echo hi"))
+        .await
+        .unwrap();
+
+    let updated = svc
+        .update_job(
+            "u1",
+            &job.id,
+            UpdateCronJobRequest {
+                shell_workspace: Some("/tmp".into()),
+                shell_timeout_ms: Some(60_000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.shell_workspace.as_deref(), Some("/tmp"));
+    assert_eq!(updated.shell_timeout_ms, Some(60_000));
+
+    let cleared = svc
+        .update_job(
+            "u1",
+            &job.id,
+            UpdateCronJobRequest {
+                shell_workspace: Some("   ".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.shell_workspace, None);
+}
+
+#[tokio::test]
+async fn agent_jobs_reject_shell_fields() {
+    let (svc, _repo, _bc) = setup().await;
+    let job = svc
+        .add_job("u1", make_create_req("Agent job", every_60s()))
+        .await
+        .unwrap();
+
+    let err = svc
+        .update_job(
+            "u1",
+            &job.id,
+            UpdateCronJobRequest {
+                shell_timeout_ms: Some(60_000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("only apply to shell action jobs"),
+        "got: {err}"
+    );
+}
+
+async fn wait_for_last_status(svc: &CronService, job_id: &str, expected: &str) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("timed out waiting for last_status == {expected}"));
+        }
+        let job = svc.get_job("u1", job_id).await.map_err(|e| e.to_string())?;
+        if job.last_status.map(|status| status.as_str()) == Some(expected) {
+            return Ok(());
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn run_now_shell_job_executes_and_persists_result_tips() {
+    let (svc, _repo, bc, conv_repo) = setup_with_conv_repo().await;
+
+    let job = svc
+        .add_job("u1", shell_create_req("Shell run now", "echo shell-cron-run-now-ok"))
+        .await
+        .unwrap();
+    bc.take_events();
+
+    let response = svc.run_now("u1", &job.id).await.unwrap();
+    assert_eq!(response.conversation_id, "conv_1");
+
+    wait_for_last_status(&svc, &job.id, "ok")
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let messages = conv_repo.inserted_messages();
+    let tip = messages
+        .iter()
+        .find(|m| m.r#type == "tips" && m.content.contains("shell-cron-run-now-ok"))
+        .expect("shell result tips message should be persisted");
+    assert!(tip.content.contains("exit 0"), "got: {}", tip.content);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn run_now_shell_job_reports_failure_status() {
+    let (svc, _repo, _bc, conv_repo) = setup_with_conv_repo().await;
+
+    let job = svc
+        .add_job("u1", shell_create_req("Shell failing", "echo boom >&2; exit 7"))
+        .await
+        .unwrap();
+
+    svc.run_now("u1", &job.id).await.unwrap();
+    wait_for_last_status(&svc, &job.id, "error")
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let messages = conv_repo.inserted_messages();
+    let tip = messages
+        .iter()
+        .find(|m| m.r#type == "tips" && m.content.contains("boom"))
+        .expect("stderr tail should be reported in the tips message");
+    assert!(tip.content.contains("exit code 7"), "got: {}", tip.content);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn run_now_shell_job_times_out_and_is_killed() {
+    let (svc, _repo, _bc, _conv_repo) = setup_with_conv_repo().await;
+
+    let mut req = shell_create_req("Shell timeout", "sleep 30");
+    req.shell_timeout_ms = Some(1_000);
+    let job = svc.add_job("u1", req).await.unwrap();
+
+    svc.run_now("u1", &job.id).await.unwrap();
+    wait_for_last_status(&svc, &job.id, "error")
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let loaded = svc.get_job("u1", &job.id).await.unwrap();
+    assert!(loaded.last_error.as_deref().unwrap_or_default().contains("timed out"));
+}
+
+#[tokio::test]
+async fn run_now_shell_job_with_missing_workspace_fails() {
+    let (svc, _repo, _bc, _conv_repo) = setup_with_conv_repo().await;
+
+    let mut req = shell_create_req("Shell bad workspace", "echo hi");
+    req.shell_workspace = Some("/nonexistent/aionui-shell-cron-test".into());
+    let job = svc.add_job("u1", req).await.unwrap();
+
+    svc.run_now("u1", &job.id).await.unwrap();
+    wait_for_last_status(&svc, &job.id, "error")
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let loaded = svc.get_job("u1", &job.id).await.unwrap();
+    assert!(loaded.last_error.as_deref().unwrap_or_default().contains("unavailable"));
 }

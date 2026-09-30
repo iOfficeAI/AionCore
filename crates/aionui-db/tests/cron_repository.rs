@@ -53,6 +53,9 @@ fn make_job(id: &str) -> CronJobRow {
         schedule_description: Some("Every minute".into()),
         payload_message: "Run report".into(),
         execution_mode: "existing".into(),
+        action: "agent".into(),
+        shell_workspace: None,
+        shell_timeout_ms: None,
         agent_config: None,
         conversation_id: "conv_1".into(),
         conversation_title: Some("Conv 1".into()),
@@ -530,4 +533,47 @@ async fn insert_new_conversation_mode() {
 
     let found = r.get_by_id_system("cron_nc1").await.unwrap().unwrap();
     assert_eq!(found.execution_mode, "new_conversation");
+}
+
+// ── Shell action columns ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn insert_shell_action_row_and_update_fields() {
+    let (r, _db) = repo().await;
+    let mut job = make_job("cron_shell1");
+    job.action = "shell".into();
+    job.payload_message = "gh repo fork owner/repo --clone".into();
+    job.shell_workspace = Some("/tmp/forks".into());
+    job.shell_timeout_ms = Some(300_000);
+    r.insert(&job).await.unwrap();
+
+    let found = r.get_by_id_system("cron_shell1").await.unwrap().unwrap();
+    assert_eq!(found.action, "shell");
+    assert_eq!(found.payload_message, "gh repo fork owner/repo --clone");
+    assert_eq!(found.shell_workspace.as_deref(), Some("/tmp/forks"));
+    assert_eq!(found.shell_timeout_ms, Some(300_000));
+
+    let params = UpdateCronJobParams {
+        shell_workspace: Some(None),
+        shell_timeout_ms: Some(Some(60_000)),
+        payload_message: Some("git fetch --all --prune".into()),
+        ..Default::default()
+    };
+    r.update_for_user("user_1", "cron_shell1", &params).await.unwrap();
+
+    let updated = r.get_by_id_system("cron_shell1").await.unwrap().unwrap();
+    assert_eq!(updated.shell_workspace, None);
+    assert_eq!(updated.shell_timeout_ms, Some(60_000));
+    assert_eq!(updated.payload_message, "git fetch --all --prune");
+    assert_eq!(updated.action, "shell");
+}
+
+#[tokio::test]
+async fn agent_rows_default_to_agent_action() {
+    let (r, _db) = repo().await;
+    r.insert(&make_job("cron_agent_default")).await.unwrap();
+    let found = r.get_by_id_system("cron_agent_default").await.unwrap().unwrap();
+    assert_eq!(found.action, "agent");
+    assert_eq!(found.shell_workspace, None);
+    assert_eq!(found.shell_timeout_ms, None);
 }
