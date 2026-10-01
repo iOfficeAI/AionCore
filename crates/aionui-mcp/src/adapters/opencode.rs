@@ -144,12 +144,12 @@ impl McpAgentAdapter for OpencodeAdapter {
 // ---------------------------------------------------------------------------
 
 /// Returns `~/.config/opencode/` if HOME is available.
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("opencode"))
 }
 
 /// Returns `~/.config/opencode/opencode.json` if HOME is available.
-fn config_file_path() -> Option<PathBuf> {
+pub(crate) fn config_file_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("opencode.json"))
 }
 
@@ -217,7 +217,7 @@ fn strip_json_comments(input: &str) -> String {
 }
 
 /// Parse JSONC (JSON with comments) into a `serde_json::Value`.
-fn parse_jsonc(input: &str) -> Result<serde_json::Value, McpError> {
+pub(crate) fn parse_jsonc(input: &str) -> Result<serde_json::Value, McpError> {
     let stripped = strip_json_comments(input);
     serde_json::from_str(&stripped).map_err(McpError::from)
 }
