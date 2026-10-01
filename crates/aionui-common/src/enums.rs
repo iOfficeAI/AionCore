@@ -322,6 +322,7 @@ pub enum McpSource {
     OpenCode,
     Aionrs,
     Nanobot,
+    Kimi,
     Aionui,
 }
 
@@ -480,6 +481,7 @@ mod tests {
             (McpSource::OpenCode, r#""opencode""#),
             (McpSource::Aionrs, r#""aionrs""#),
             (McpSource::Nanobot, r#""nanobot""#),
+            (McpSource::Kimi, r#""kimi""#),
             (McpSource::Aionui, r#""aionui""#),
         ];
         for (variant, expected_json) in cases {
