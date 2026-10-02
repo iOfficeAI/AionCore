@@ -8,6 +8,7 @@ use crate::types::PluginType;
 ///
 /// - Telegram: escape HTML, then convert markdown → HTML tags
 /// - Lark/DingTalk: convert HTML tags → markdown
+/// - Mattermost: strip HTML tags while preserving markdown
 /// - Slack: escape `&<>`, then convert markdown → Slack mrkdwn
 /// - Discord: pass markdown through unchanged (Discord renders it natively;
 ///   accidental @mentions are suppressed at send time via `allowed_mentions`)
@@ -16,6 +17,7 @@ pub fn format_text_for_platform(text: &str, platform: PluginType) -> String {
     match platform {
         PluginType::Telegram => markdown_to_telegram_html(text),
         PluginType::Lark | PluginType::Dingtalk => html_to_markdown(text),
+        PluginType::Mattermost => strip_tags_loop(text),
         PluginType::Slack => markdown_to_slack_mrkdwn(text),
         PluginType::Discord => text.to_string(),
         PluginType::Weixin => strip_html(text),
