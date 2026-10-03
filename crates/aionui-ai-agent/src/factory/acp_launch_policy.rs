@@ -21,6 +21,7 @@ pub(super) fn apply_acp_launch_policy(command_spec: &mut CommandSpec, input: Acp
     );
     append_runtime_env(command_spec, input.runtime_env);
     append_claude_provider_env(command_spec, input.metadata);
+    apply_dsh_launch_policy(command_spec, input.metadata);
 }
 
 fn append_runtime_env(command_spec: &mut CommandSpec, runtime_env: &[(String, String)]) {
@@ -98,6 +99,55 @@ fn codex_sandbox_mode_for_requested_mode(mode: Option<&str>) -> &'static str {
     match mode.map(str::trim) {
         Some("agent-full-access" | "full-access" | "yoloNoSandbox") => "danger-full-access",
         _ => "workspace-write",
+    }
+}
+
+const DSH_DEFAULT_PATCH_CONTENT: &str = r#"# DeepSeek Harness (DSH) OpenAI-compatible Protocol Patch
+- id: llm-deepseek
+  config:
+    protocol: chat-completions
+"#;
+
+fn resolve_dsh_patch_path() -> std::path::PathBuf {
+    if let Ok(env_path) = std::env::var("AIONUI_DSH_PATCH") {
+        let p = std::path::PathBuf::from(env_path.trim());
+        if p.exists() {
+            return p;
+        }
+    }
+
+    let candidate_rel_paths = [
+        "resources/dsh/dsh.patch.yml",
+        "../resources/dsh/dsh.patch.yml",
+        "../../resources/dsh/dsh.patch.yml",
+    ];
+    for rel in candidate_rel_paths {
+        let candidate = std::path::PathBuf::from(rel);
+        if candidate.exists() {
+            if let Ok(abs) = candidate.canonicalize() {
+                return abs;
+            }
+            return candidate;
+        }
+    }
+
+    let fallback_dir = std::env::temp_dir().join("aionui").join("dsh");
+    let _ = std::fs::create_dir_all(&fallback_dir);
+    let fallback_file = fallback_dir.join("dsh.patch.yml");
+    let _ = std::fs::write(&fallback_file, DSH_DEFAULT_PATCH_CONTENT);
+    fallback_file
+}
+
+fn apply_dsh_launch_policy(command_spec: &mut CommandSpec, metadata: &AgentMetadata) {
+    if metadata.backend.as_deref() != Some("dsh") {
+        return;
+    }
+
+    if !command_spec.args.iter().any(|arg| arg == "--patch") {
+        let patch_file = resolve_dsh_patch_path();
+        command_spec.args.push("--patch".to_string());
+        command_spec.args.push(patch_file.to_string_lossy().to_string());
+        tracing::info!(patch = %patch_file.display(), "DSH: chat-completions patch injected");
     }
 }
 
@@ -306,5 +356,29 @@ mod tests {
             initial_mode_from_build_context(&agent_metadata_with_backend(Some("codex")), &config, Some(&snapshot));
 
         assert_eq!(mode.as_deref(), Some("agent-full-access"));
+    }
+
+    #[test]
+    fn apply_acp_launch_policy_injects_dsh_patch() {
+        let mut command_spec = CommandSpec {
+            command: "dsh".into(),
+            args: vec!["--profile".into(), "acp".into()],
+            env: vec![],
+            cwd: None,
+        };
+        let metadata = agent_metadata_with_backend(Some("dsh"));
+        let config = AcpBuildExtra::default();
+
+        apply_acp_launch_policy(
+            &mut command_spec,
+            AcpLaunchPolicyInput {
+                metadata: &metadata,
+                config: &config,
+                session_snapshot: None,
+                runtime_env: &[],
+            },
+        );
+
+        assert!(command_spec.args.contains(&"--patch".to_string()));
     }
 }
