@@ -7,7 +7,8 @@ use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{
     ActiveLeaseRegistry, AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager,
-    RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+    RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, audited_runtime_capabilities,
+    resolve_planning_isolation,
 };
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
@@ -16,15 +17,15 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 use crate::runtime_state::ConversationRuntimeStateService;
 use crate::stream_persistence::canonical_event_id;
 use aionui_api_types::{
-    ASSISTANT_MCP_BINDING_CHANGED_EVENT, AcceptanceCriterionResponse, AcceptanceCriterionStatus, ApprovalCheckResponse,
-    AssistantConversationOverridesRequest, AssistantMcpBindingChanged, CancelConversationResponse,
-    CancellationChangedEvent, CancellationState, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
-    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    ASSISTANT_MCP_BINDING_CHANGED_EVENT, AcceptanceCriterionResponse, AcceptanceCriterionStatus, AgentIntegrationMode,
+    ApprovalCheckResponse, AssistantConversationOverridesRequest, AssistantMcpBindingChanged,
+    CancelConversationResponse, CancellationChangedEvent, CancellationState, CloneConversationRequest, ConfirmRequest,
+    ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
     ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
     CreateTaskSessionRequest, DecideTaskApprovalRequest, EnsureConversationRuntimeResponse, ExecuteApprovedPlanRequest,
     ForkCapabilityView, ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot,
-    MessageListResponse, MessageResponse, MessageSearchResponse, PromptCapabilityView,
+    MessageListResponse, MessageResponse, MessageSearchResponse, PlanningIsolationResponse, PromptCapabilityView,
     RETIRED_DEEPSEEK_HARNESS_BACKEND, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
     SessionMcpTransport, SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TEAM_MCP_SERVER_NAME,
     TaskApprovalDecision, TaskApprovalResponse, TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse,
@@ -148,6 +149,79 @@ fn parse_persisted<T: std::str::FromStr>(value: &str, name: &str) -> Result<T, C
     value
         .parse()
         .map_err(|_| ConversationError::internal(format!("Persisted {name} has an invalid value")))
+}
+
+fn integration_mode_evidence(agent_type: &str, runtime_backend: &str) -> (AgentIntegrationMode, Vec<String>) {
+    match (agent_type, runtime_backend) {
+        ("codex", "codex") => (
+            AgentIntegrationMode::NativeSandbox,
+            vec![
+                "Native session config applies the Codex read-only sandbox before the turn".to_owned(),
+                "MCP, external network, plugin, and delegated-tool enforcement are not host-proven".to_owned(),
+            ],
+        ),
+        ("claude", "claude") => (
+            AgentIntegrationMode::NativePermissionMode,
+            vec![
+                "Native session config applies Claude permission mode".to_owned(),
+                "MCP and delegated-agent mutation coverage is not host-proven".to_owned(),
+            ],
+        ),
+        ("aionrs", _) | (_, "aionrs") => (
+            AgentIntegrationMode::InProcessToolRegistry,
+            vec![
+                "Aion tool definitions are filtered through the in-process registry".to_owned(),
+                "The registry execution entry point has no WorkMate capability-policy hook".to_owned(),
+            ],
+        ),
+        ("acp", _) => (
+            AgentIntegrationMode::GenericAcp,
+            vec![
+                "ACP request_permission is advisory and is not a mandatory proxy for internal or MCP tools".to_owned(),
+            ],
+        ),
+        _ => (
+            AgentIntegrationMode::Unknown,
+            vec![format!(
+                "No audited planning enforcement profile exists for agent_type={agent_type}, runtime_backend={runtime_backend}"
+            )],
+        ),
+    }
+}
+
+#[cfg(test)]
+mod planning_isolation_tests {
+    use super::*;
+
+    #[test]
+    fn active_integration_selects_runtime_profile_without_assigning_a_brand_level() {
+        assert_eq!(
+            integration_mode_evidence("codex", "codex").0,
+            AgentIntegrationMode::NativeSandbox,
+        );
+        assert_eq!(
+            integration_mode_evidence("claude", "claude").0,
+            AgentIntegrationMode::NativePermissionMode,
+        );
+        assert_eq!(
+            integration_mode_evidence("acp", "codebuddy").0,
+            AgentIntegrationMode::GenericAcp,
+        );
+        assert_eq!(
+            integration_mode_evidence("aionrs", "aionrs").0,
+            AgentIntegrationMode::InProcessToolRegistry,
+        );
+    }
+
+    #[test]
+    fn unknown_and_generic_acp_profiles_fail_closed() {
+        for (agent_type, backend) in [("acp", "codebuddy"), ("future", "future")] {
+            let (mode, evidence) = integration_mode_evidence(agent_type, backend);
+            let assessment = resolve_planning_isolation(audited_runtime_capabilities(mode), evidence);
+            assert_eq!(assessment.level, aionui_api_types::PlanningIsolationLevel::Unsupported);
+            assert!(!assessment.automatic_planning_enabled);
+        }
+    }
 }
 
 fn task_artifact_response(row: TaskArtifactRow) -> Result<TaskArtifactResponse, ConversationError> {
@@ -734,6 +808,30 @@ impl ConversationService {
             .await?
             .ok_or_else(|| ConversationError::not_found_reason(format!("Task session '{id}' not found")))?;
         task_session_response(row)
+    }
+
+    pub async fn get_task_planning_isolation(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<PlanningIsolationResponse, ConversationError> {
+        let task = self
+            .task_session_repo()?
+            .get(user_id, id)
+            .await?
+            .ok_or_else(|| ConversationError::not_found_reason(format!("Task session '{id}' not found")))?;
+        let binding = self.resolve_assistant_agent_binding(user_id, &task.agent_type).await?;
+        let (integration_mode, evidence) = match binding {
+            Some(binding) => integration_mode_evidence(&binding.agent_type, &binding.runtime_backend),
+            None => (
+                AgentIntegrationMode::Unknown,
+                vec!["No agent_metadata binding was resolved for this runtime instance".to_owned()],
+            ),
+        };
+        Ok(resolve_planning_isolation(
+            audited_runtime_capabilities(integration_mode),
+            evidence,
+        ))
     }
 
     pub async fn update_task_session(

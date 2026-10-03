@@ -14,10 +14,10 @@ use aionui_api_types::{
     CreateConversationRequest, CreateTaskSessionRequest, DecideTaskApprovalRequest, EnsureConversationRuntimeResponse,
     ExecuteApprovedPlanRequest, ForkConversationRequest, ListConversationInputsQuery, ListConversationsQuery,
     ListMessagesQuery, ListTaskSessionsQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
-    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SubmitConversationInputRequest,
-    SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TaskApprovalResponse, TaskArtifactResponse, TaskRunResponse,
-    TaskSessionResponse, UpdateConversationArtifactRequest, UpdateConversationRequest, UpdateTaskSessionRequest,
-    VerifyAcceptanceCriterionRequest,
+    PlanningIsolationResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    SubmitConversationInputRequest, SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TaskApprovalResponse,
+    TaskArtifactResponse, TaskRunResponse, TaskSessionResponse, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, UpdateTaskSessionRequest, VerifyAcceptanceCriterionRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -139,6 +139,10 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
             get(get_task_session).patch(update_task_session),
         )
         .route(
+            "/api/task-sessions/{id}/planning-isolation",
+            get(get_task_planning_isolation),
+        )
+        .route(
             "/api/task-sessions/{id}/artifacts",
             post(submit_task_artifact).get(list_task_artifacts),
         )
@@ -234,6 +238,16 @@ async fn get_task_session(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(session)))
+}
+
+async fn get_task_planning_isolation(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<PlanningIsolationResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.get_task_planning_isolation(&user.id, &id).await?,
+    )))
 }
 
 async fn update_task_session(

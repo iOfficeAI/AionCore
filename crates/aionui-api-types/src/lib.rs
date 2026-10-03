@@ -244,10 +244,11 @@ pub use system::{
 };
 pub use task_session::{
     AcceptanceCriterionResponse, AcceptanceCriterionStatus, AcceptanceEvidence, AcceptanceEvidenceKind,
-    CreateTaskSessionRequest, DecideTaskApprovalRequest, ExecuteApprovedPlanRequest, ListTaskSessionsQuery,
+    AgentIntegrationMode, CreateTaskSessionRequest, DecideTaskApprovalRequest, ExecuteApprovedPlanRequest,
+    ListTaskSessionsQuery, PlanningIsolationLevel, PlanningIsolationResponse, PolicyDecision, PolicyDecisionKind,
     SubmitTaskArtifactRequest, SubmitTaskArtifactResponse, TaskApprovalDecision, TaskApprovalResponse,
     TaskApprovalStatus, TaskArtifactKind, TaskArtifactResponse, TaskArtifactStatus, TaskRunResponse, TaskRunStatus,
-    TaskSessionMode, TaskSessionResponse, TaskSessionStatus, UpdateTaskSessionRequest,
+    TaskSessionMode, TaskSessionResponse, TaskSessionStatus, ToolCapability, UpdateTaskSessionRequest,
     VerifyAcceptanceCriterionRequest,
 };
 pub use team::{

@@ -9,6 +9,7 @@ pub(crate) mod backend_protocol_sink;
 pub(crate) mod cli_process;
 pub(crate) mod first_message_injector;
 pub(crate) mod image_input;
+pub mod planning_policy;
 pub mod prompt_pipeline;
 pub(crate) mod skill_manager;
 

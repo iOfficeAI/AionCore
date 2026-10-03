@@ -1,5 +1,62 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCapability {
+    FilesystemRead,
+    FilesystemWrite,
+    ShellReadonly,
+    ShellExecute,
+    GitRead,
+    GitWrite,
+    McpRead,
+    McpWrite,
+    NetworkInternal,
+    NetworkExternal,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyDecisionKind {
+    Allow,
+    Ask,
+    Deny,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyDecision {
+    pub decision: PolicyDecisionKind,
+    pub reason: String,
+    pub rule_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningIsolationLevel {
+    Guaranteed,
+    BestEffort,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentIntegrationMode {
+    NativeSandbox,
+    NativePermissionMode,
+    GenericAcp,
+    InProcessToolRegistry,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanningIsolationResponse {
+    pub level: PlanningIsolationLevel,
+    pub integration_mode: AgentIntegrationMode,
+    pub automatic_planning_enabled: bool,
+    pub reason: String,
+    pub evidence: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskSessionMode {
