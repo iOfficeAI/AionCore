@@ -5,6 +5,30 @@ use aionui_api_types::{
     TaskSessionMode, ToolCapability,
 };
 
+pub const AION_STRICT_PLANNING_ALLOWED_TOOLS: [&str; 4] = ["Read", "Grep", "Glob", "ViewImage"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AionToolClassification {
+    Capability(ToolCapability),
+    DeniedControl,
+}
+
+/// Classify every tool registered by the pinned Aion bootstrap.
+/// Dynamic names return `None` and are denied by the exact-name policy.
+pub fn classify_aion_registered_tool(name: &str) -> Option<AionToolClassification> {
+    match name {
+        "Read" | "Grep" | "Glob" | "ViewImage" => {
+            Some(AionToolClassification::Capability(ToolCapability::FilesystemRead))
+        }
+        "Write" | "Edit" => Some(AionToolClassification::Capability(ToolCapability::FilesystemWrite)),
+        "ExecCommand" => Some(AionToolClassification::Capability(ToolCapability::ShellExecute)),
+        "Skill" | "Spawn" | "ToolSearch" | "EnterPlanMode" | "ExitPlanMode" => {
+            Some(AionToolClassification::DeniedControl)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyContext {
     pub task_id: String,
@@ -24,6 +48,8 @@ pub struct ToolPolicyRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeEnforcementCapabilities {
     pub integration_mode: AgentIntegrationMode,
+    pub mandatory_gateway: bool,
+    pub all_registered_tools_classified: bool,
     pub filesystem_mutation_blocked: bool,
     pub shell_mutation_blocked: bool,
     pub git_mutation_blocked: bool,
@@ -31,6 +57,8 @@ pub struct RuntimeEnforcementCapabilities {
     pub external_network_blocked: bool,
     pub delegated_tools_inherit_policy: bool,
     pub unknown_tools_fail_closed: bool,
+    pub mutation_hard_denied: bool,
+    pub mcp_mediated: bool,
     pub known_bypass: bool,
 }
 
@@ -38,6 +66,8 @@ impl RuntimeEnforcementCapabilities {
     pub const fn unknown() -> Self {
         Self {
             integration_mode: AgentIntegrationMode::Unknown,
+            mandatory_gateway: false,
+            all_registered_tools_classified: false,
             filesystem_mutation_blocked: false,
             shell_mutation_blocked: false,
             git_mutation_blocked: false,
@@ -45,6 +75,8 @@ impl RuntimeEnforcementCapabilities {
             external_network_blocked: false,
             delegated_tools_inherit_policy: false,
             unknown_tools_fail_closed: false,
+            mutation_hard_denied: false,
+            mcp_mediated: false,
             known_bypass: true,
         }
     }
@@ -54,6 +86,8 @@ pub const fn audited_runtime_capabilities(integration_mode: AgentIntegrationMode
     match integration_mode {
         AgentIntegrationMode::NativeSandbox => RuntimeEnforcementCapabilities {
             integration_mode,
+            mandatory_gateway: false,
+            all_registered_tools_classified: false,
             filesystem_mutation_blocked: true,
             shell_mutation_blocked: true,
             git_mutation_blocked: true,
@@ -61,10 +95,14 @@ pub const fn audited_runtime_capabilities(integration_mode: AgentIntegrationMode
             external_network_blocked: false,
             delegated_tools_inherit_policy: false,
             unknown_tools_fail_closed: false,
+            mutation_hard_denied: false,
+            mcp_mediated: false,
             known_bypass: false,
         },
         AgentIntegrationMode::NativePermissionMode => RuntimeEnforcementCapabilities {
             integration_mode,
+            mandatory_gateway: false,
+            all_registered_tools_classified: false,
             filesystem_mutation_blocked: true,
             shell_mutation_blocked: true,
             git_mutation_blocked: true,
@@ -72,6 +110,8 @@ pub const fn audited_runtime_capabilities(integration_mode: AgentIntegrationMode
             external_network_blocked: false,
             delegated_tools_inherit_policy: false,
             unknown_tools_fail_closed: false,
+            mutation_hard_denied: false,
+            mcp_mediated: false,
             known_bypass: false,
         },
         AgentIntegrationMode::GenericAcp | AgentIntegrationMode::InProcessToolRegistry => {
@@ -82,6 +122,30 @@ pub const fn audited_runtime_capabilities(integration_mode: AgentIntegrationMode
             }
         }
         AgentIntegrationMode::Unknown => RuntimeEnforcementCapabilities::unknown(),
+    }
+}
+
+/// Audited capability set for the exact-name Aion strict-planning profile.
+///
+/// The profile advertises and executes only Read, Grep, Glob, and ViewImage.
+/// Every other built-in, dynamically registered, or delegated tool is denied
+/// before approval. MCP processes, hooks, and native plan tools are disabled
+/// before bootstrap.
+pub const fn audited_aion_strict_runtime_capabilities() -> RuntimeEnforcementCapabilities {
+    RuntimeEnforcementCapabilities {
+        integration_mode: AgentIntegrationMode::InProcessToolRegistry,
+        mandatory_gateway: true,
+        all_registered_tools_classified: true,
+        filesystem_mutation_blocked: true,
+        shell_mutation_blocked: true,
+        git_mutation_blocked: true,
+        mcp_mutation_blocked: true,
+        external_network_blocked: true,
+        delegated_tools_inherit_policy: true,
+        unknown_tools_fail_closed: true,
+        mutation_hard_denied: true,
+        mcp_mediated: true,
+        known_bypass: false,
     }
 }
 
@@ -147,13 +211,17 @@ pub fn resolve_planning_isolation(
     runtime: RuntimeEnforcementCapabilities,
     evidence: Vec<String>,
 ) -> PlanningIsolationResponse {
-    let all_mutation_paths_blocked = runtime.filesystem_mutation_blocked
+    let all_mutation_paths_blocked = runtime.mandatory_gateway
+        && runtime.all_registered_tools_classified
+        && runtime.filesystem_mutation_blocked
         && runtime.shell_mutation_blocked
         && runtime.git_mutation_blocked
         && runtime.mcp_mutation_blocked
         && runtime.external_network_blocked
         && runtime.delegated_tools_inherit_policy
-        && runtime.unknown_tools_fail_closed;
+        && runtime.unknown_tools_fail_closed
+        && runtime.mutation_hard_denied
+        && runtime.mcp_mediated;
 
     let level = if all_mutation_paths_blocked && !runtime.known_bypass {
         PlanningIsolationLevel::Guaranteed
@@ -336,6 +404,8 @@ mod tests {
     fn only_complete_runtime_enforcement_is_guaranteed() {
         let guaranteed = RuntimeEnforcementCapabilities {
             integration_mode: AgentIntegrationMode::NativeSandbox,
+            mandatory_gateway: true,
+            all_registered_tools_classified: true,
             filesystem_mutation_blocked: true,
             shell_mutation_blocked: true,
             git_mutation_blocked: true,
@@ -343,6 +413,8 @@ mod tests {
             external_network_blocked: true,
             delegated_tools_inherit_policy: true,
             unknown_tools_fail_closed: true,
+            mutation_hard_denied: true,
+            mcp_mediated: true,
             known_bypass: false,
         };
         assert_eq!(
@@ -371,6 +443,32 @@ mod tests {
             .level,
             PlanningIsolationLevel::Unsupported,
         );
+    }
+
+    #[test]
+    fn aion_registry_inventory_classifies_every_builtin_and_fails_unknown_closed() {
+        let registered = [
+            "Read",
+            "Write",
+            "Edit",
+            "ExecCommand",
+            "Grep",
+            "Glob",
+            "ViewImage",
+            "Skill",
+            "Spawn",
+            "EnterPlanMode",
+            "ExitPlanMode",
+            "ToolSearch",
+        ];
+        assert_eq!(
+            registered
+                .iter()
+                .filter(|name| classify_aion_registered_tool(name).is_some())
+                .count(),
+            registered.len()
+        );
+        assert_eq!(classify_aion_registered_tool("dynamic_mcp_tool"), None);
     }
 
     #[test]

@@ -181,12 +181,15 @@ pub(crate) async fn compose_injected_prefix_for(
 }
 
 async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> Result<AgentInstance, AgentError> {
+    let aionrs_tool_policy = options.runtime_capabilities.aionrs_tool_policy;
     let context = options.context;
     let ctx = FactoryContext::resolve(&context).await?;
     let model = context.model.clone();
     match context.kind {
         AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, model, ctx).await,
-        AgentSessionKind::Aionrs(aionrs_context) => aionrs::build(deps, *aionrs_context, model, ctx).await,
+        AgentSessionKind::Aionrs(aionrs_context) => {
+            aionrs::build(deps, *aionrs_context, model, ctx, aionrs_tool_policy).await
+        }
         AgentSessionKind::Antigravity(agy_context) => antigravity::build(deps, *agy_context, ctx).await,
     }
 }

@@ -109,17 +109,30 @@ pub const CONVERSATION_RUNTIME_CONTEXT_VERSION: u32 = 2;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeCapabilities {
     pub conversation_runtime_context_version: Option<u32>,
+    pub aionrs_tool_policy: AionrsRuntimeToolPolicy,
 }
 
 impl RuntimeCapabilities {
     pub fn satisfies(&self, requested: &Self) -> bool {
-        match requested.conversation_runtime_context_version {
+        let runtime_context_satisfied = match requested.conversation_runtime_context_version {
             Some(version) => self
                 .conversation_runtime_context_version
                 .is_some_and(|actual| actual >= version),
             None => true,
-        }
+        };
+        runtime_context_satisfied && self.aionrs_tool_policy == requested.aionrs_tool_policy
     }
+}
+
+/// Host-selected tool policy for the embedded Aion runtime.
+///
+/// This value is part of the task-manager cache identity so changing between
+/// planning and execution always rebuilds the engine with the requested gate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AionrsRuntimeToolPolicy {
+    #[default]
+    Unrestricted,
+    StrictPlanning,
 }
 
 /// Provider-specific compat overrides resolved in the factory.
@@ -169,6 +182,8 @@ pub struct AionrsResolvedConfig {
     pub runtime_env: Vec<(String, String)>,
     /// Prompt dump directory when development prompt dumps are enabled.
     pub prompt_dump_dir: Option<PathBuf>,
+    /// Mandatory host policy applied before any Aion tool approval path.
+    pub tool_policy: AionrsRuntimeToolPolicy,
 }
 
 #[cfg(test)]
@@ -176,6 +191,19 @@ mod tests {
     use super::*;
     use aionui_api_types::{AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, SlashCommandItem};
     use serde_json::json;
+
+    #[test]
+    fn runtime_capabilities_require_exact_aion_policy_identity() {
+        let unrestricted = RuntimeCapabilities::default();
+        let strict = RuntimeCapabilities {
+            aionrs_tool_policy: AionrsRuntimeToolPolicy::StrictPlanning,
+            ..RuntimeCapabilities::default()
+        };
+
+        assert!(!unrestricted.satisfies(&strict));
+        assert!(!strict.satisfies(&unrestricted));
+        assert!(strict.satisfies(&strict));
+    }
 
     #[test]
     fn acp_build_extra_accepts_payload_without_skills() {

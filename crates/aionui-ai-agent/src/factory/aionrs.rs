@@ -25,7 +25,7 @@ use crate::factory::context::FactoryContext;
 use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
 use crate::runtime_status::conversation_runtime_reporter;
 use crate::session_context::AionrsSessionBuildContext;
-use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig};
+use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig, AionrsRuntimeToolPolicy};
 
 /// Render this conversation's skills index, or `""` when there is nothing to add.
 async fn skill_index_text(deps: &AgentFactoryDeps, user_id: &str, skills: &[String]) -> String {
@@ -50,6 +50,7 @@ pub(super) async fn build(
     build_context: AionrsSessionBuildContext,
     model: ProviderWithModel,
     ctx: FactoryContext,
+    tool_policy: AionrsRuntimeToolPolicy,
 ) -> Result<AgentInstance, AgentError> {
     let mut overrides = build_context.config;
     let resolved_skills = overrides.skills.clone();
@@ -200,6 +201,7 @@ pub(super) async fn build(
         bedrock_config,
         runtime_env: ctx.runtime_env,
         prompt_dump_dir: crate::dev_prompt_dump::dump_dir_for_data_dir(&deps.data_dir, deps.dump_prompts),
+        tool_policy,
     };
 
     if let Some(system_prompt) = config.system_prompt.as_deref()

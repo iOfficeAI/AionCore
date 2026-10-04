@@ -10,6 +10,7 @@ use aion_agent::engine::AgentEngine;
 use aion_agent::injection::InjectionHandle;
 use aion_agent::output::OutputSink;
 use aion_agent::session::Session;
+use aion_agent::tool_policy::ToolPolicy;
 use aion_config::compat::ProviderCompat;
 use aion_config::config::{CliArgs, Config, McpServerConfig, ProviderType};
 use aion_mcp::manager::McpManager;
@@ -33,12 +34,13 @@ use crate::agent_task::IAgentTask;
 use crate::capability::backend_output_sink::BackendOutputSink;
 use crate::capability::backend_protocol_sink::BackendProtocolSink;
 use crate::capability::image_input::resolve_image_input_capability;
+use crate::capability::planning_policy::AION_STRICT_PLANNING_ALLOWED_TOOLS;
 use crate::dev_prompt_dump::{AgentFinalInputDump, dump_agent_final_input};
 use crate::error::AgentError;
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::events::FinishEventData;
 use crate::protocol::send_error::AgentSendError;
-use crate::types::{AionrsResolvedConfig, SendMessageData};
+use crate::types::{AionrsResolvedConfig, AionrsRuntimeToolPolicy, SendMessageData};
 
 use super::content::build_content_blocks;
 use super::error::{aionrs_engine_error_to_send_error, aionrs_runtime_error_summary};
@@ -59,6 +61,21 @@ fn resolve_aionui_config(cli_args: &CliArgs) -> Result<Config, AgentError> {
     config.compat.transport.model_max_tokens = default_transport.model_max_tokens;
 
     Ok(config)
+}
+
+fn apply_runtime_tool_policy(config: &mut Config, policy: AionrsRuntimeToolPolicy) -> ToolPolicy {
+    match policy {
+        AionrsRuntimeToolPolicy::Unrestricted => ToolPolicy::Unrestricted,
+        AionrsRuntimeToolPolicy::StrictPlanning => {
+            // Hooks and MCP processes execute outside individual built-in tool
+            // bodies. Disable them before bootstrap so they cannot become a
+            // side-effect path around the exact-name runtime gate.
+            config.hooks = Default::default();
+            config.mcp.servers.clear();
+            config.plan.enabled = false;
+            ToolPolicy::allow_only(AION_STRICT_PLANNING_ALLOWED_TOOLS)
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -219,9 +236,17 @@ impl AionrsAgentManager {
             config.compat.transport.api_path = Some(path);
         }
 
-        if !config_extra.extra_mcp_servers.is_empty() {
+        if config_extra.tool_policy == AionrsRuntimeToolPolicy::Unrestricted
+            && !config_extra.extra_mcp_servers.is_empty()
+        {
             config.mcp.servers.extend(config_extra.extra_mcp_servers.clone());
         }
+        let tool_policy = apply_runtime_tool_policy(&mut config, config_extra.tool_policy);
+        info!(
+            conversation_id = %conversation_id,
+            policy = ?config_extra.tool_policy,
+            "Applied Aion runtime tool policy"
+        );
 
         let is_resume = resume_session.is_some();
         let last_total_usage = resume_session
@@ -230,7 +255,9 @@ impl AionrsAgentManager {
             .unwrap_or_default();
         let provider_label = config.provider_label.clone();
 
-        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
+        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink)
+            .runtime_env(runtime_env)
+            .tool_policy(tool_policy);
         if let Some(session) = resume_session {
             info!(
                 conversation_id = %conversation_id,

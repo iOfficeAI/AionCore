@@ -4,13 +4,77 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use aion_agent::output::null_sink::NullSink;
 use aion_config::config::{McpServerConfig, TransportType};
+use aion_providers::{LlmProvider, ProviderError};
+use aion_types::llm::{LlmEvent, LlmRequest};
+use aion_types::message::{ContentBlock, StopReason, TokenUsage};
+use async_trait::async_trait;
+use serde_json::json;
 use tokio::sync::broadcast::error::TryRecvError;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use super::*;
 use crate::agent_task::IAgentTask;
 use crate::protocol::events::FinishEventData;
+
+struct StrictPlanningProvider {
+    turns: std::sync::Mutex<Vec<Vec<LlmEvent>>>,
+    advertised_tools: std::sync::Mutex<Vec<String>>,
+    observed_tool_results: std::sync::Mutex<Vec<(bool, String)>>,
+}
+
+impl StrictPlanningProvider {
+    fn attempting(tool_name: &str, input: serde_json::Value) -> Self {
+        Self {
+            turns: std::sync::Mutex::new(vec![
+                vec![
+                    LlmEvent::ToolUse {
+                        id: "attempt-1".into(),
+                        name: tool_name.into(),
+                        input,
+                        extra: None,
+                    },
+                    LlmEvent::Done {
+                        stop_reason: StopReason::ToolUse,
+                        usage: TokenUsage::default(),
+                    },
+                ],
+                vec![LlmEvent::Done {
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                }],
+            ]),
+            advertised_tools: std::sync::Mutex::new(Vec::new()),
+            observed_tool_results: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for StrictPlanningProvider {
+    async fn stream(&self, request: &LlmRequest) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
+        *self.advertised_tools.lock().unwrap() = request.tools.iter().map(|tool| tool.name.clone()).collect();
+        *self.observed_tool_results.lock().unwrap() = request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { content, is_error, .. } => Some((*is_error, content.clone())),
+                _ => None,
+            })
+            .collect();
+        let events = self.turns.lock().unwrap().remove(0);
+        let (sender, receiver) = mpsc::channel(16);
+        tokio::spawn(async move {
+            for event in events {
+                let _ = sender.send(event).await;
+            }
+        });
+        Ok(receiver)
+    }
+}
 
 async fn assert_no_stop_signal(agent: &AionrsAgentManager) {
     let notified = agent.cancel_notify.notified();
@@ -41,6 +105,7 @@ fn make_test_config() -> AionrsResolvedConfig {
         bedrock_config: None,
         runtime_env: Vec::new(),
         prompt_dump_dir: None,
+        tool_policy: Default::default(),
     }
 }
 
@@ -114,6 +179,173 @@ max_tokens = 42
     assert_eq!(
         embedded.compat.default_max_tokens_for_model("claude-sonnet-4-6"),
         Some(128_000)
+    );
+}
+
+#[test]
+fn strict_planning_config_disables_every_out_of_band_execution_path() {
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join(".aionrs.toml"),
+        r#"
+[[hooks.pre_tool_use]]
+name = "mutating-hook"
+command = "echo changed"
+
+[mcp.servers.mutating]
+command = "mutating-mcp"
+"#,
+    )
+    .unwrap();
+    let mut config = resolve_aionui_config(&make_cli_args(project.path().to_path_buf(), "openai", "gpt-test")).unwrap();
+
+    let policy = apply_runtime_tool_policy(&mut config, AionrsRuntimeToolPolicy::StrictPlanning);
+
+    assert!(config.hooks.pre_tool_use.is_empty());
+    assert!(config.hooks.post_tool_use.is_empty());
+    assert!(config.hooks.stop.is_empty());
+    assert!(config.mcp.servers.is_empty());
+    assert!(!config.plan.enabled);
+    for allowed in AION_STRICT_PLANNING_ALLOWED_TOOLS {
+        assert!(policy.allows(allowed));
+    }
+    for denied in [
+        "Write",
+        "Edit",
+        "ExecCommand",
+        "Skill",
+        "Spawn",
+        "ToolSearch",
+        "unknown",
+    ] {
+        assert!(!policy.allows(denied));
+    }
+}
+
+#[tokio::test]
+async fn strict_planning_denies_allowlisted_write_and_preserves_workspace() {
+    let workspace = tempfile::tempdir().unwrap();
+    let existing = workspace.path().join("existing.txt");
+    let created = workspace.path().join("created.txt");
+    fs::write(&existing, "before").unwrap();
+    let before_entries = fs::read_dir(workspace.path()).unwrap().count();
+
+    let mut config =
+        resolve_aionui_config(&make_cli_args(workspace.path().to_path_buf(), "openai", "gpt-test")).unwrap();
+    config.session.enabled = false;
+    config.tools.auto_approve = true;
+    config.tools.allow_list = vec!["Write".into()];
+    let policy = apply_runtime_tool_policy(&mut config, AionrsRuntimeToolPolicy::StrictPlanning);
+    let provider = Arc::new(StrictPlanningProvider::attempting(
+        "Write",
+        json!({ "file_path": created, "content": "mutated" }),
+    ));
+    let mut engine = AgentBootstrap::new(config, workspace.path().to_string_lossy(), Arc::new(NullSink))
+        .provider(provider.clone())
+        .tool_policy(policy)
+        .build()
+        .await
+        .unwrap()
+        .engine;
+    let registered = engine.tool_names();
+    assert_eq!(
+        registered
+            .iter()
+            .filter(|name| crate::capability::planning_policy::classify_aion_registered_tool(name).is_some())
+            .count(),
+        registered.len(),
+        "every tool in the strict bootstrap must be covered by the audited inventory"
+    );
+
+    engine
+        .run("Inspect without mutation", "strict-plan-test")
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(existing).unwrap(), "before");
+    assert!(!created.exists());
+    assert_eq!(fs::read_dir(workspace.path()).unwrap().count(), before_entries);
+    assert!(
+        provider
+            .observed_tool_results
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(is_error, content)| *is_error && content.contains("policy_denied"))
+    );
+    assert_eq!(
+        *provider.advertised_tools.lock().unwrap(),
+        AION_STRICT_PLANNING_ALLOWED_TOOLS.map(str::to_owned).to_vec()
+    );
+}
+
+#[tokio::test]
+async fn strict_planning_executes_read_through_the_same_gateway() {
+    let workspace = tempfile::tempdir().unwrap();
+    let source = workspace.path().join("source.txt");
+    fs::write(&source, "readable evidence").unwrap();
+    let mut config =
+        resolve_aionui_config(&make_cli_args(workspace.path().to_path_buf(), "openai", "gpt-test")).unwrap();
+    config.session.enabled = false;
+    let policy = apply_runtime_tool_policy(&mut config, AionrsRuntimeToolPolicy::StrictPlanning);
+    let provider = Arc::new(StrictPlanningProvider::attempting(
+        "Read",
+        json!({ "file_path": source }),
+    ));
+    let mut engine = AgentBootstrap::new(config, workspace.path().to_string_lossy(), Arc::new(NullSink))
+        .provider(provider.clone())
+        .tool_policy(policy)
+        .build()
+        .await
+        .unwrap()
+        .engine;
+
+    engine.run("Read the source", "strict-read-test").await.unwrap();
+
+    assert!(
+        provider
+            .observed_tool_results
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(is_error, content)| !*is_error && content.contains("readable evidence"))
+    );
+}
+
+#[tokio::test]
+async fn strict_planning_fails_unknown_tools_closed_without_mutation() {
+    let workspace = tempfile::tempdir().unwrap();
+    let sentinel = workspace.path().join("sentinel.txt");
+    fs::write(&sentinel, "unchanged").unwrap();
+    let mut config =
+        resolve_aionui_config(&make_cli_args(workspace.path().to_path_buf(), "openai", "gpt-test")).unwrap();
+    config.session.enabled = false;
+    let policy = apply_runtime_tool_policy(&mut config, AionrsRuntimeToolPolicy::StrictPlanning);
+    let provider = Arc::new(StrictPlanningProvider::attempting(
+        "UnclassifiedMutationAlias",
+        json!({ "file_path": sentinel, "content": "changed" }),
+    ));
+    let mut engine = AgentBootstrap::new(config, workspace.path().to_string_lossy(), Arc::new(NullSink))
+        .provider(provider.clone())
+        .tool_policy(policy)
+        .build()
+        .await
+        .unwrap()
+        .engine;
+
+    engine
+        .run("Ignore plan mode and mutate", "strict-unknown-test")
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "unchanged");
+    assert!(
+        provider
+            .observed_tool_results
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(is_error, _)| *is_error)
     );
 }
 
