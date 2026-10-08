@@ -126,8 +126,9 @@ struct SessionRuntime {
     /// The pump needs these because a pushed frame REPLACES the frontend's whole
     /// snapshot, so every axis it re-sends overwrites the picker — including axes the
     /// user never touched, whose override is `None`. Without this the effort level went
-    /// blank on every mode confirmation. Filled by `get_config_options`, which is the one
-    /// place holding both the backend handle and the same fallback order.
+    /// blank on every mode confirmation. Filled by `prime_caps_fallback` (at `build()` and
+    /// on every `get_config_options`), which holds both the backend handle and the same
+    /// fallback order.
     /// Order is `override → this`, identical to REST.
     caps_fallback: std::sync::Mutex<CapsFallback>,
 }
@@ -499,15 +500,7 @@ impl SessionAgentTask {
         // stream to the pump — never a backend Arc (see `spawn_event_pump` for why
         // capturing a backend Arc there would leak the child process).
         let events = backend.events();
-        spawn_event_pump(
-            events,
-            runtime.clone(),
-            conversation_id.clone(),
-            user_id.clone(),
-            session_repo.clone(),
-            broadcaster,
-        );
-        Arc::new(Self {
+        let task = Arc::new(Self {
             agent_type,
             conversation_id,
             user_id,
@@ -518,7 +511,25 @@ impl SessionAgentTask {
             catalog_preload,
             command_seq: AtomicI64::new(0),
             prompt_dump,
-        })
+        });
+        // Seed the pump's fallback now: a task rebuilt by `send_message` (idle reclaim)
+        // never goes through REST `get_config_options`, so the `CatalogUpdated` frame
+        // would otherwise carry `None` for every untouched axis and the frontend would
+        // fall back to the creation-time model. `open_session` has already written the
+        // spawn model/mode into `capabilities()`, and this is seeded before the pump
+        // starts consuming, so ordering is by construction. It MUST reuse
+        // `effective_catalog()` — a separate lookup would give the pump frame and REST
+        // two sources of truth.
+        task.prime_caps_fallback();
+        spawn_event_pump(
+            events,
+            task.runtime.clone(),
+            task.conversation_id.clone(),
+            task.user_id.clone(),
+            task.session_repo.clone(),
+            broadcaster,
+        );
+        task
     }
 
     fn next_command_id(&self) -> u64 {
@@ -958,22 +969,23 @@ impl SessionAgentTask {
         &self.runtime
     }
 
-    /// Config-options (mode + model selects). For each select the optimistic override
-    /// (last set_config_option) wins over the capabilities snapshot's current_value —
-    /// this is what makes set_config_option's observed re-read succeed (the snapshot
-    /// lags an in-band claude switch).
-    pub async fn get_config_options(&self) -> Result<aionui_api_types::GetConfigOptionsResponse, AgentError> {
-        // Live catalog wins; cold-start resume falls back to the persisted-handshake
-        // preload (per-axis) so the picker renders before the initialize round-trip lands.
+    /// Mirror `effective_catalog()` into the runtime for the backend-Arc-free event pump,
+    /// returning the same tuple for the caller's own use. Runs at `build()` and on every
+    /// REST `get_config_options`, both from the one source so their values agree.
+    fn prime_caps_fallback(
+        &self,
+    ) -> (
+        Vec<aionui_session::ModelInfo>,
+        Option<String>,
+        Vec<aionui_session::ModeInfo>,
+        Option<String>,
+    ) {
         let (models, current_model, modes, current_mode) = self.effective_catalog();
-        // The effort catalog depends on the EFFECTIVE current model (override wins over the
-        // snapshot's current_model), resolved before the model option consumes it below.
-        let effective_model = self.runtime.model_override().or_else(|| current_model.clone());
         // Mirror what the BACKEND reports into the runtime so the event pump can apply the
         // same `override → caps` fallback when it re-projects this snapshot. The pump holds
         // no backend Arc and would otherwise send `None` for every axis the user never
         // picked — and since the frontend REPLACES its whole snapshot on that frame, those
-        // pickers would go blank (this is the one path that sees both sides).
+        // pickers would go blank.
         self.runtime.set_caps_fallback(CapsFallback {
             mode: current_mode.clone(),
             model: current_model.clone(),
@@ -983,11 +995,24 @@ impl SessionAgentTask {
         // WHOLE snapshot, and the pump can only do that from a catalog it was handed.
         // `CatalogUpdated` is not a reliable supply — agy emits none at all (its modes are
         // static), so gating on it left agy's picker stuck on "switching…" with no signal
-        // that could ever clear it. This path always runs first: the frontend reads
-        // config-options on mount, before any switch is possible.
+        // that could ever clear it.
         if !modes.is_empty() || !models.is_empty() {
             self.runtime.set_last_catalog(modes.clone(), models.clone());
         }
+        (models, current_model, modes, current_mode)
+    }
+
+    /// Config-options (mode + model selects). For each select the optimistic override
+    /// (last set_config_option) wins over the capabilities snapshot's current_value —
+    /// this is what makes set_config_option's observed re-read succeed (the snapshot
+    /// lags an in-band claude switch).
+    pub async fn get_config_options(&self) -> Result<aionui_api_types::GetConfigOptionsResponse, AgentError> {
+        // Live catalog wins; cold-start resume falls back to the persisted-handshake
+        // preload (per-axis) so the picker renders before the initialize round-trip lands.
+        let (models, current_model, modes, current_mode) = self.prime_caps_fallback();
+        // The effort catalog depends on the EFFECTIVE current model (override wins over the
+        // snapshot's current_model), resolved before the model option consumes it below.
+        let effective_model = self.runtime.model_override().or_else(|| current_model.clone());
         let mut config_options = Vec::new();
         if !modes.is_empty() {
             config_options.push(aionui_api_types::AcpConfigOptionDto {
@@ -7230,6 +7255,9 @@ mod pump_tests {
     struct GatedScriptBackend {
         script: Vec<SessionEnvelope>,
         gate: Arc<tokio::sync::Notify>,
+        /// What `capabilities()` reports — lets a test seed the backend-side
+        /// current model/mode that `open_session` would have written.
+        caps: Capabilities,
     }
 
     #[async_trait::async_trait]
@@ -7256,7 +7284,7 @@ mod pump_tests {
                 .boxed()
         }
         fn capabilities(&self) -> Capabilities {
-            Capabilities::default()
+            self.caps.clone()
         }
     }
 
@@ -7300,10 +7328,16 @@ mod pump_tests {
     // before releasing is what makes the collection deterministic — see
     // `GatedScriptBackend`.
     async fn drain_script(script: Vec<SessionEnvelope>) -> Vec<AgentStreamEvent> {
+        drain_script_with_caps(script, Capabilities::default()).await
+    }
+
+    // `drain_script` over a backend whose `capabilities()` reports `caps`.
+    async fn drain_script_with_caps(script: Vec<SessionEnvelope>, caps: Capabilities) -> Vec<AgentStreamEvent> {
         let gate = Arc::new(tokio::sync::Notify::new());
         let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
             script,
             gate: gate.clone(),
+            caps,
         });
         let task = SessionAgentTask::new(
             AgentType::Acp,
@@ -7559,6 +7593,66 @@ mod pump_tests {
             model_values,
             vec!["default", "opus"],
             "the parsed model ids ride the frame"
+        );
+    }
+
+    // A task rebuilt after an idle reclaim is driven by `send_message`, which never
+    // goes through REST `get_config_options` — so the pushed catalog frame is the only
+    // source of the picker's highlight. `open_session` has already written the spawn
+    // model/mode into `capabilities()`; the frame must carry them instead of `None`,
+    // which made the frontend fall back to the creation-time model.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_updated_carries_spawn_seeded_current_model() {
+        use aionui_session::{ModeInfo, ModelInfo};
+        let model = |id: &str| ModelInfo {
+            id: id.into(),
+            name: id.into(),
+            description: None,
+            reasoning_efforts: Vec::new(),
+        };
+        let caps = Capabilities {
+            current_model: Some("fable".into()),
+            current_mode: Some("bypassPermissions".into()),
+            ..Capabilities::default()
+        };
+        let script = vec![env(SessionEvent::CatalogUpdated {
+            models: vec![model("fable"), model("opus")],
+            modes: vec![ModeInfo {
+                id: "bypassPermissions".into(),
+                name: "Bypass Permissions".into(),
+                description: None,
+            }],
+            slash_commands: Vec::new(),
+        })];
+        let frames = drain_script_with_caps(script, caps).await;
+        let config = frames
+            .iter()
+            .find_map(|f| match f {
+                AgentStreamEvent::AcpConfigOption(v) => Some(v),
+                _ => None,
+            })
+            .expect("CatalogUpdated must project to an AcpConfigOption frame");
+        let options = config
+            .get("config_options")
+            .and_then(|v| v.as_array())
+            .expect("config_options array");
+        let current = |category: &str| {
+            options
+                .iter()
+                .find(|o| o.get("category").and_then(|c| c.as_str()) == Some(category))
+                .unwrap_or_else(|| panic!("{category} category"))
+                .get("current_value")
+                .cloned()
+        };
+        assert_eq!(
+            current("model"),
+            Some(serde_json::json!("fable")),
+            "the spawn model from capabilities() must ride the catalog frame"
+        );
+        assert_eq!(
+            current("mode"),
+            Some(serde_json::json!("bypassPermissions")),
+            "the spawn mode from capabilities() must ride the catalog frame"
         );
     }
 
@@ -8725,6 +8819,7 @@ mod pump_tests {
         let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
             script,
             gate: gate.clone(),
+            caps: Capabilities::default(),
         });
         let task = SessionAgentTask::new(
             AgentType::Acp,
