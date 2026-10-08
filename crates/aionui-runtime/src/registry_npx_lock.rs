@@ -120,7 +120,7 @@ mod tests {
             [
                 "-y",
                 "--package",
-                "@tencent-ai/codebuddy-code@2.160.0",
+                "@tencent-ai/codebuddy-code@2.162.0",
                 "codebuddy",
                 "--acp"
             ]
