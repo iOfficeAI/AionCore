@@ -9,7 +9,7 @@
     "codebuddy": {
       "registry_json_id": "codebuddy-code",
       "package": "@tencent-ai/codebuddy-code",
-      "version": "2.160.0"
+      "version": "2.162.0"
     },
     "deepagents": {
       "registry_json_id": "deepagents",
@@ -19,27 +19,27 @@
     "dimcode": {
       "registry_json_id": "dimcode",
       "package": "dimcode",
-      "version": "0.5.15"
+      "version": "0.5.16"
     },
     "dirac": {
       "registry_json_id": "dirac",
       "package": "dirac-cli",
-      "version": "0.5.17"
+      "version": "0.5.18"
     },
     "glm-acp-agent": {
       "registry_json_id": "glm-acp-agent",
       "package": "glm-acp-agent",
-      "version": "1.13.0"
+      "version": "1.14.0"
     },
     "grok": {
       "registry_json_id": "grok-build",
       "package": "@xai-official/grok",
-      "version": "1.0.45"
+      "version": "1.0.50"
     },
     "kilo": {
       "registry_json_id": "kilo",
       "package": "@kilocode/cli",
-      "version": "7.8.1"
+      "version": "7.8.8"
     },
     "mimo-code": {
       "package": "@mimo-ai/cli",
@@ -53,7 +53,7 @@
     "nova": {
       "registry_json_id": "nova",
       "package": "@compass-ai/nova",
-      "version": "1.1.48"
+      "version": "1.1.50"
     },
     "pi": {
       "registry_json_id": "pi-acp",
@@ -63,7 +63,7 @@
     "sigit": {
       "registry_json_id": "sigit",
       "package": "@smbcloud/sigit",
-      "version": "1.5.11",
+      "version": "1.6.4",
       "skip_version_probe": true
     }
   }
