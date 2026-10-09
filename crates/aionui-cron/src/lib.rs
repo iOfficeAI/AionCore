@@ -9,6 +9,7 @@ pub mod prompt;
 pub mod routes;
 pub mod scheduler;
 pub mod service;
+pub mod shell;
 pub mod skill_file;
 pub mod skill_suggest;
 pub mod state;
