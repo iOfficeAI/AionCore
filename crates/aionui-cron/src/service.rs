@@ -3,8 +3,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use aionui_api_types::{
-    CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronJobResponse,
-    CronScheduleDto, HasSkillResponse, ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest,
+    CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronJobPayloadDto,
+    CronJobResponse, CronScheduleDto, HasSkillResponse, ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest,
     UpdateConversationCronRequest, UpdateCronJobRequest,
 };
 use aionui_common::{
@@ -121,9 +121,11 @@ impl CronService {
             schedule: schedule_dto,
             prompt: None,
             message: Some(req.message),
-            conversation_id: conversation_id.to_owned(),
+            target: None,
+            enabled: None,
+            conversation_id: Some(conversation_id.to_owned()),
             conversation_title,
-            created_by: "agent".to_owned(),
+            created_by: Some("agent".to_owned()),
             execution_mode: Some("existing".to_owned()),
             queue_enabled: false,
             agent_config,
@@ -268,10 +270,21 @@ impl CronService {
         };
         validate_aionrs_agent_config(&resolved_agent_type, req.agent_config.as_ref())?;
 
-        let execution_mode = parse_execution_mode(req.execution_mode.as_deref())?;
-        let created_by = CreatedBy::from_str(&req.created_by)?;
-        let message = req.message.or(req.prompt).unwrap_or_default();
-        let conversation_id = req.conversation_id.trim();
+        // Normalize the nested create shape (mirrors the GET response) onto the
+        // flat internal fields. Flat fields take precedence when both are set;
+        // see issue iOfficeAI/AionUi#4042.
+        let target = req.target;
+        let execution_mode_raw = req
+            .execution_mode
+            .or_else(|| target.as_ref().and_then(|t| t.execution_mode.clone()));
+        let execution_mode = parse_execution_mode(execution_mode_raw.as_deref())?;
+        let created_by = CreatedBy::from_str(req.created_by.as_deref().unwrap_or("agent"))?;
+        let target_text = target.map(|t| match t.payload {
+            CronJobPayloadDto::Message { text } => text,
+        });
+        let message = req.message.or(req.prompt).or(target_text).unwrap_or_default();
+        let conversation_id = req.conversation_id.unwrap_or_default();
+        let conversation_id = conversation_id.trim();
         if matches!(execution_mode, ExecutionMode::Existing) {
             self.require_existing_conversation_scope(user_id, conversation_id)
                 .await?;
@@ -297,7 +310,7 @@ impl CronService {
             id: generate_prefixed_id("cron"),
             user_id: user_id.to_owned(),
             name: req.name,
-            enabled: true,
+            enabled: req.enabled.unwrap_or(true),
             schedule,
             message,
             execution_mode,
