@@ -160,14 +160,19 @@ async fn fake_cron_jobs() -> axum::Json<serde_json::Value> {
                 "id": "cron-failing",
                 "name": "Failing cron",
                 "enabled": true,
-                "last_status": "error",
-                "last_error": "boom"
+                "state": {
+                    "last_status": "error",
+                    "last_error": "boom"
+                }
             },
             {
                 "id": "cron-ok",
                 "name": "OK cron",
                 "enabled": true,
-                "last_status": "success"
+                "state": {
+                    "last_status": "success",
+                    "last_error": null
+                }
             }
         ]
     }))
@@ -408,6 +413,34 @@ async fn diagnose_http_get_rejects_paths_outside_health_and_api() {
 }
 
 #[tokio::test]
+async fn diagnose_cron_summary_preserves_nested_job_state_and_failing_jobs() {
+    let capture = Arc::new(Mutex::new(Capture::default()));
+    let (base_url, handle) = spawn_diagnose_probe_server(capture).await;
+
+    let output = diagnose_command()
+        .args(["cron", "summary"])
+        .env("AIONUI_BASE_URL", &base_url)
+        .env("AIONUI_CONVERSATION_ID", "conv-cron")
+        .env("AIONUI_USER_ID", "user-cron")
+        .output()
+        .await
+        .unwrap();
+
+    handle.abort();
+    assert!(
+        output.status.success(),
+        "diagnose cron summary failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(stdout["data"]["total"], 2);
+    assert_eq!(stdout["data"]["failing"][0]["state"]["last_status"], "error");
+    assert_eq!(stdout["data"]["failing"][0]["state"]["last_error"], "boom");
+    assert_eq!(stdout["data"]["all"][1]["state"]["last_status"], "success");
+}
+
+#[tokio::test]
 async fn diagnose_overview_aggregates_common_failure_signals() {
     let capture = Arc::new(Mutex::new(Capture::default()));
     let (base_url, handle) = spawn_diagnose_probe_server(capture).await;
@@ -434,6 +467,8 @@ async fn diagnose_overview_aggregates_common_failure_signals() {
     assert_eq!(stdout["data"]["providers"]["unhealthy"][0]["model"], "gpt-5");
     assert_eq!(stdout["data"]["mcp"]["enabled_but_no_tools"][0]["id"], "mcp-empty");
     assert_eq!(stdout["data"]["cron"]["failing"][0]["id"], "cron-failing");
+    assert_eq!(stdout["data"]["cron"]["failing"][0]["last_status"], "error");
+    assert_eq!(stdout["data"]["cron"]["failing"][0]["last_error"], "boom");
     assert_eq!(stdout["data"]["running_conversations"][0]["id"], "conv-running");
 }
 
