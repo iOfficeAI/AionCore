@@ -52,6 +52,10 @@ impl OutputSink for BackendOutputSink {
         }
 
         let parsed_input = serde_json::from_str(input).unwrap_or(serde_json::Value::String(input.to_owned()));
+        let description = parsed_input
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
 
         tracing::debug!(
             tool_use_id = %tool_use_id,
@@ -75,7 +79,7 @@ impl OutputSink for BackendOutputSink {
             status: ToolCallStatus::Running,
             input: Some(parsed_input),
             output: None,
-            description: None,
+            description,
             parent_call_id: None,
         }));
     }
@@ -329,6 +333,36 @@ mod tests {
                 assert_eq!(data.status, ToolCallStatus::Running);
                 assert!(data.input.is_some());
                 assert_eq!(data.input.unwrap()["pattern"], "**/*.rs");
+            }
+            other => panic!("Expected ToolCall, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn emit_tool_call_extracts_description_from_input() {
+        let (sink, mut rx) = make_sink();
+        sink.emit_tool_call(
+            "call_bash_1",
+            "ExecCommand",
+            r#"{"cmd":"cargo build","description":"Build the project"}"#,
+        );
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentStreamEvent::ToolCall(data) => {
+                assert_eq!(data.description.as_deref(), Some("Build the project"));
+            }
+            other => panic!("Expected ToolCall, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn emit_tool_call_without_description_keeps_none() {
+        let (sink, mut rx) = make_sink();
+        sink.emit_tool_call("call_bash_1", "ExecCommand", r#"{"cmd":"cargo build"}"#);
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentStreamEvent::ToolCall(data) => {
+                assert_eq!(data.description, None);
             }
             other => panic!("Expected ToolCall, got {:?}", other),
         }
