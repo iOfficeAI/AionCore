@@ -33,6 +33,13 @@ impl From<McpError> for ApiError {
             McpError::AgentOperationFailed(msg) => ApiError::Internal(msg),
             McpError::ConnectionFailed(msg) => ApiError::BadGateway(msg),
             McpError::OAuth(msg) => ApiError::Internal(format!("OAuth error: {msg}")),
+            // Discovery failures are caused by the remote server or the
+            // configured URL, not by an internal fault. Use a coded error so
+            // the actionable reason reaches the user instead of the generic
+            // "Internal server error." / "Upstream service unavailable."
+            McpError::OAuthDiscovery(msg) => {
+                ApiError::coded(StatusCode::BAD_GATEWAY, "MCP_OAUTH_DISCOVERY_FAILED", msg, None)
+            }
             McpError::Database(db_err) => ApiError::Internal(db_err.to_string()),
             McpError::Json(e) => ApiError::Internal(format!("JSON error: {e}")),
         }
@@ -368,6 +375,16 @@ mod error_mapping_tests {
     fn agent_not_installed_maps_to_bad_request() {
         let err = ApiError::from(McpError::AgentNotInstalled("claude".into()));
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    /// Discovery failures must not be laundered into an opaque 500 — the user
+    /// needs to see which server/URL failed to publish OAuth metadata.
+    #[test]
+    fn oauth_discovery_maps_to_bad_gateway_and_keeps_message() {
+        let err = ApiError::from(McpError::OAuthDiscovery("no metadata at example.com".into()));
+        assert_eq!(err.status_code(), StatusCode::BAD_GATEWAY);
+        assert_eq!(err.error_code(), "MCP_OAUTH_DISCOVERY_FAILED");
+        assert!(err.public_message().contains("no metadata at example.com"));
     }
 
     #[test]
