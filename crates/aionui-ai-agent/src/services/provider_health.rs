@@ -8,6 +8,7 @@ use aion_agent::bootstrap::AgentBootstrap;
 use aion_agent::engine::AgentEngine;
 use aion_agent::output::OutputSink;
 use aion_agent::output::null_sink::NullSink;
+use aion_agent::tool_policy::ToolPolicy;
 use aion_config::config::{CliArgs, Config};
 use aionui_api_types::{
     HealthStatus, ProviderHealthCheckErrorKind, ProviderHealthCheckRequest, ProviderHealthCheckResponse,
@@ -205,24 +206,7 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_default();
     let sink: Arc<dyn OutputSink> = Arc::new(NullSink);
-    let cli_args = CliArgs {
-        provider: Some(config_extra.provider),
-        api_key: Some(config_extra.api_key),
-        base_url: config_extra.base_url,
-        model: Some(config_extra.model),
-        max_tokens: config_extra.max_tokens,
-        max_turns: config_extra.max_turns,
-        max_tool_call_malformed_turns: config_extra.max_tool_call_malformed_turns,
-        max_tool_call_failure_turns: config_extra.max_tool_call_failure_turns,
-        system_prompt: config_extra.system_prompt,
-        profile: None,
-        auto_approve: false,
-        thinking: None,
-        thinking_budget: None,
-        project_dir: Some(PathBuf::from(&workspace)),
-    };
-    let mut config =
-        Config::resolve(&cli_args).map_err(|error| AgentError::internal(format!("Config resolve failed: {error}")))?;
+    let mut config = resolve_probe_engine_config(&config_extra, &workspace)?;
 
     config.bedrock = config_extra.bedrock_config;
     config.session.enabled = false;
@@ -243,10 +227,31 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
 
     AgentBootstrap::new(config, workspace, sink)
         .runtime_env(config_extra.runtime_env)
+        .tool_policy(ToolPolicy::allow_only(std::iter::empty::<String>()))
         .build()
         .await
         .map(|result| result.engine)
         .map_err(|error| AgentError::internal(error.to_string()))
+}
+
+fn resolve_probe_engine_config(config_extra: &AionrsResolvedConfig, workspace: &str) -> Result<Config, AgentError> {
+    let cli_args = CliArgs {
+        provider: Some(config_extra.provider.clone()),
+        api_key: Some(config_extra.api_key.clone()),
+        base_url: config_extra.base_url.clone(),
+        model: Some(config_extra.model.clone()),
+        max_tokens: config_extra.max_tokens,
+        max_turns: config_extra.max_turns,
+        max_tool_call_malformed_turns: config_extra.max_tool_call_malformed_turns,
+        max_tool_call_failure_turns: config_extra.max_tool_call_failure_turns,
+        system_prompt: config_extra.system_prompt.clone(),
+        profile: None,
+        auto_approve: false,
+        thinking: Some("disabled".into()),
+        thinking_budget: None,
+        project_dir: Some(PathBuf::from(workspace)),
+    };
+    Config::resolve(&cli_args).map_err(|error| AgentError::internal(format!("Config resolve failed: {error}")))
 }
 
 fn unhealthy_response(
@@ -335,6 +340,7 @@ pub(crate) fn extract_http_status(message: &str) -> Option<u16> {
 mod tests {
     use super::*;
     use aion_config::compat::OpenAiApiMode;
+    use aion_types::llm::ThinkingConfig;
     use aionui_common::encrypt_string;
     use aionui_db::{CreateProviderParams, DbError, UpdateProviderParams};
 
@@ -410,6 +416,16 @@ mod tests {
 
         assert_eq!(config.max_tokens, Some(HEALTH_CHECK_MAX_TOKENS));
         assert_eq!(config.max_turns, Some(1));
+    }
+
+    #[test]
+    fn probe_engine_disables_thinking() {
+        let config_extra = test_service()
+            .resolve_probe_config(&test_provider(), "claude-sonnet-4-20250514")
+            .unwrap();
+        let config = resolve_probe_engine_config(&config_extra, "/tmp").unwrap();
+
+        assert!(matches!(config.thinking, Some(ThinkingConfig::Disabled)));
     }
 
     #[test]
