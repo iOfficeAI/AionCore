@@ -178,6 +178,27 @@ pub(crate) struct SendTextItem {
 // SSE event payloads (frontend-facing — DO NOT CHANGE field names)
 // ---------------------------------------------------------------------------
 
+// --- typing ticket ---
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct GetConfigRequest {
+    pub ilink_user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_token: Option<String>,
+}
+
+// --- sendtyping ---
+pub(crate) const TYPING_START: i32 = 1;
+pub(crate) const TYPING_STOP: i32 = 2;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct SendTypingRequest {
+    pub ilink_user_id: String,
+    pub typing_ticket: String,
+    pub status: i32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SseQrEvent {
