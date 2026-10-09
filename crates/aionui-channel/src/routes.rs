@@ -147,10 +147,11 @@ async fn get_plugin_status(
         .map(|plugin| (plugin.id.clone(), plugin))
         .collect();
 
-    let builtin_names: [(&str, &str); 7] = [
+    let builtin_names: [(&str, &str); 8] = [
         ("telegram", "Telegram"),
         ("lark", "Lark"),
         ("dingtalk", "DingTalk"),
+        ("mattermost", "Mattermost"),
         ("slack", "Slack"),
         ("discord", "Discord"),
         ("weixin", "WeChat"),
@@ -752,6 +753,27 @@ fn build_test_config(req: &TestPluginRequest) -> PluginConfig {
                 credentials.account_id = extra.app_id.clone();
             }
         }
+        "mattermost" => {
+            credentials
+                .extra
+                .insert("accessToken".to_string(), serde_json::Value::String(req.token.clone()));
+            let mut extra_map = HashMap::new();
+            if let Some(ref extra) = req.extra_config {
+                for (key, value) in &extra.extra {
+                    extra_map.insert(key.clone(), value.clone());
+                }
+            }
+            return PluginConfig {
+                credentials,
+                config: Some(PluginConfigOptions {
+                    mode: None,
+                    webhook_url: None,
+                    rate_limit: None,
+                    require_mention: None,
+                    extra: extra_map,
+                }),
+            };
+        }
         _ => {
             // Default: use token field (Telegram)
             credentials.token = Some(req.token.clone());
@@ -791,6 +813,9 @@ fn build_extension_test_config(
         }
         if let Some(app_secret) = &extra.app_secret {
             map.insert("appSecret".to_string(), serde_json::Value::String(app_secret.clone()));
+        }
+        for (key, value) in &extra.extra {
+            map.insert(key.clone(), value.clone());
         }
     }
     build_extension_config(plugin, &serde_json::Value::Object(map))
@@ -1000,6 +1025,7 @@ mod tests {
             extra_config: Some(TestPluginExtraConfig {
                 app_id: Some("cli_abc".into()),
                 app_secret: Some("secret".into()),
+                extra: HashMap::new(),
             }),
         };
         let config = build_test_config(&req);
@@ -1016,6 +1042,7 @@ mod tests {
             extra_config: Some(TestPluginExtraConfig {
                 app_id: None,
                 app_secret: Some("client_secret_456".into()),
+                extra: HashMap::new(),
             }),
         };
         let config = build_test_config(&req);
@@ -1031,10 +1058,40 @@ mod tests {
             extra_config: Some(TestPluginExtraConfig {
                 app_id: Some("account_abc".into()),
                 app_secret: None,
+                extra: HashMap::new(),
             }),
         };
         let config = build_test_config(&req);
         assert_eq!(config.credentials.bot_token.as_deref(), Some("bot_token_xyz"));
         assert_eq!(config.credentials.account_id.as_deref(), Some("account_abc"));
+    }
+
+    #[test]
+    fn build_test_config_mattermost() {
+        let req = TestPluginRequest {
+            plugin_id: "mattermost".into(),
+            token: "token".into(),
+            extra_config: Some(TestPluginExtraConfig {
+                app_id: None,
+                app_secret: None,
+                extra: HashMap::from([(
+                    "serverUrl".into(),
+                    serde_json::Value::String("https://mm.example".into()),
+                )]),
+            }),
+        };
+        let config = build_test_config(&req);
+        assert_eq!(
+            config.credentials.extra.get("accessToken").and_then(|v| v.as_str()),
+            Some("token")
+        );
+        assert_eq!(
+            config
+                .config
+                .as_ref()
+                .and_then(|c| c.extra.get("serverUrl"))
+                .and_then(|v| v.as_str()),
+            Some("https://mm.example")
+        );
     }
 }
