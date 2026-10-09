@@ -65,6 +65,7 @@ impl CloseReason {
                 Some(AgentKillReason::RuntimeCapabilityChanged) => {
                     "Agent killed: runtime capability changed".to_owned()
                 }
+                Some(AgentKillReason::WorkspaceChanged) => "Agent killed: workspace changed".to_owned(),
                 Some(AgentKillReason::SessionRevoked) => "Agent killed: session revoked".to_owned(),
                 Some(AgentKillReason::Archived) => "Agent killed: archived".to_owned(),
                 None => "Agent killed".to_owned(),
@@ -426,6 +427,13 @@ mod tests {
             }
             .user_facing_message(),
             "Agent killed: conversation deleted"
+        );
+        assert_eq!(
+            CloseReason::Killed {
+                reason: Some(AgentKillReason::WorkspaceChanged)
+            }
+            .user_facing_message(),
+            "Agent killed: workspace changed"
         );
         assert_eq!(
             CloseReason::Killed { reason: None }.user_facing_message(),

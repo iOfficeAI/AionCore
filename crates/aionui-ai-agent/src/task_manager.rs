@@ -124,8 +124,10 @@ impl WorkerTaskManagerImpl {
             .and_then(|slot| slot.get().map(|managed| managed.agent.clone()))
     }
 
-    fn initialised_managed_task(&self, conversation_id: &str) -> Option<ManagedAgentTask> {
-        self.tasks.get(conversation_id).and_then(|slot| slot.get().cloned())
+    fn initialised_managed_task(&self, conversation_id: &str) -> Option<(TaskSlot, ManagedAgentTask)> {
+        let slot = self.tasks.get(conversation_id).map(|entry| Arc::clone(entry.value()))?;
+        let managed = slot.get()?.clone();
+        Some((slot, managed))
     }
 
     fn invalidate_runtime_tokens(&self, conversation_id: &str) {
@@ -171,14 +173,40 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         conversation_id: &str,
         mut options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError> {
-        if let Some(existing) = self.initialised_managed_task(conversation_id)
-            && !existing.runtime_capabilities.satisfies(&options.runtime_capabilities)
-        {
-            info!(
-                conversation_id,
-                "Rebuilding agent task because runtime capabilities changed"
-            );
-            self.kill(conversation_id, Some(AgentKillReason::RuntimeCapabilityChanged))?;
+        let rebuild = self
+            .initialised_managed_task(conversation_id)
+            .and_then(|(slot, existing)| {
+                let reason = if !existing.runtime_capabilities.satisfies(&options.runtime_capabilities) {
+                    Some(AgentKillReason::RuntimeCapabilityChanged)
+                } else if existing.agent.workspace() != options.context.workspace.path.as_str() {
+                    Some(AgentKillReason::WorkspaceChanged)
+                } else {
+                    None
+                }?;
+                Some((slot, reason))
+            });
+
+        if let Some((stale_slot, reason)) = rebuild {
+            // Remove only the slot that was inspected. Another concurrent
+            // caller may already have replaced it with the correct task.
+            if let Some((id, removed_slot)) = self
+                .tasks
+                .remove_if(conversation_id, |_, current| Arc::ptr_eq(current, &stale_slot))
+            {
+                self.invalidate_runtime_tokens(&id);
+                info!(
+                    conversation_id = %id,
+                    ?reason,
+                    "Rebuilding agent task because runtime context changed"
+                );
+                if let Some(managed) = removed_slot.get() {
+                    managed.agent.kill(Some(reason))?;
+                }
+            }
+
+            // A workspace rebuild is also a new task generation. Refresh even
+            // if a concurrent caller removed the stale slot first; the options
+            // are used only if this caller wins initialization of the new slot.
             self.refresh_runtime_token_for_new_task(&mut options);
         }
 
@@ -437,6 +465,11 @@ mod tests {
             self
         }
 
+        fn with_workspace(mut self, workspace: impl Into<String>) -> Self {
+            self.workspace = workspace.into();
+            self
+        }
+
         fn with_last_activity(mut self, ts: TimestampMs) -> Self {
             self.last_activity = AtomicI64::new(ts);
             self
@@ -541,6 +574,12 @@ mod tests {
         options
     }
 
+    fn with_workspace(mut options: BuildTaskOptions, workspace: &str) -> BuildTaskOptions {
+        options.context.workspace.path = workspace.to_owned();
+        options.context.workspace.stored_path = workspace.to_owned();
+        options
+    }
+
     fn mock_instance(agent: MockAgent) -> AgentInstance {
         AgentInstance::Mock(Arc::new(agent))
     }
@@ -554,7 +593,13 @@ mod tests {
 
     fn make_manager() -> WorkerTaskManagerImpl {
         let factory: AgentFactory = Arc::new(|opts: BuildTaskOptions| {
-            async move { Ok(mock_instance(MockAgent::new(opts.conversation_id(), None))) }.boxed()
+            async move {
+                let workspace = opts.context.workspace.path.clone();
+                Ok(mock_instance(
+                    MockAgent::new(opts.conversation_id(), None).with_workspace(workspace),
+                ))
+            }
+            .boxed()
         });
         WorkerTaskManagerImpl::new(factory)
     }
@@ -640,6 +685,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_or_build_rebuilds_when_requested_workspace_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_factory = Arc::clone(&calls);
+        let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
+            let calls = Arc::clone(&calls_for_factory);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let workspace = opts.context.workspace.path.clone();
+                Ok(mock_instance(
+                    MockAgent::new(opts.conversation_id(), None).with_workspace(workspace),
+                ))
+            }
+            .boxed()
+        });
+        let mgr = WorkerTaskManagerImpl::new(factory);
+
+        let old = mgr
+            .get_or_build_task("conv-1", with_workspace(make_options("conv-1"), "/tmp/workspace-a"))
+            .await
+            .unwrap();
+        let new = mgr
+            .get_or_build_task("conv-1", with_workspace(make_options("conv-1"), "/tmp/workspace-b"))
+            .await
+            .unwrap();
+
+        assert!(!same_mock(&old, &new));
+        assert_eq!(new.workspace(), "/tmp/workspace-b");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_or_build_reuses_task_when_requested_workspace_is_unchanged() {
+        let mgr = make_manager();
+        let options = with_workspace(make_options("conv-1"), "/tmp/workspace-a");
+        let old = mgr.get_or_build_task("conv-1", options.clone()).await.unwrap();
+        let reused = mgr.get_or_build_task("conv-1", options).await.unwrap();
+
+        assert!(same_mock(&old, &reused));
+        assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn workspace_and_capability_change_rebuilds_only_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let killed = Arc::new(AtomicUsize::new(0));
+        let factory: AgentFactory = Arc::new({
+            let calls = Arc::clone(&calls);
+            let killed = Arc::clone(&killed);
+            move |opts: BuildTaskOptions| {
+                let calls = Arc::clone(&calls);
+                let killed = Arc::clone(&killed);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let workspace = opts.context.workspace.path.clone();
+                    Ok(mock_instance(
+                        MockAgent::new(opts.conversation_id(), None)
+                            .with_workspace(workspace)
+                            .with_kill_counter(killed),
+                    ))
+                }
+                .boxed()
+            }
+        });
+        let mgr = WorkerTaskManagerImpl::new(factory);
+        mgr.get_or_build_task("conv-1", with_workspace(make_options("conv-1"), "/tmp/workspace-a"))
+            .await
+            .unwrap();
+
+        let mut changed = with_workspace(make_options("conv-1"), "/tmp/workspace-b");
+        changed.runtime_capabilities.conversation_runtime_context_version = Some(CONVERSATION_RUNTIME_CONTEXT_VERSION);
+        let rebuilt = mgr.get_or_build_task("conv-1", changed).await.unwrap();
+
+        assert_eq!(rebuilt.workspace(), "/tmp/workspace-b");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(killed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn get_or_build_rebuilds_when_existing_task_lacks_requested_runtime_context_capability() {
         let mgr = make_manager();
         let h1 = mgr.get_or_build_task("conv-1", make_options("conv-1")).await.unwrap();
@@ -717,6 +845,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_rebuild_refreshes_runtime_token_after_killing_existing_task() {
+        let runtime_tokens = Arc::new(RuntimeTokenService::new());
+        let old_issue = runtime_tokens.issue(
+            "user-1",
+            "conv-1",
+            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
+        );
+        let observed_tokens = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let factory: AgentFactory = Arc::new({
+            let observed_tokens = Arc::clone(&observed_tokens);
+            move |opts: BuildTaskOptions| {
+                let observed_tokens = Arc::clone(&observed_tokens);
+                async move {
+                    if let Some((_, token)) = opts
+                        .context
+                        .runtime_env
+                        .iter()
+                        .find(|(key, _)| key == AIONUI_RUNTIME_TOKEN_ENV)
+                    {
+                        observed_tokens.lock().unwrap().push(token.clone());
+                    }
+                    let workspace = opts.context.workspace.path.clone();
+                    Ok(mock_instance(
+                        MockAgent::new(opts.conversation_id(), None).with_workspace(workspace),
+                    ))
+                }
+                .boxed()
+            }
+        });
+        let mgr = WorkerTaskManagerImpl::new(factory).with_runtime_token_service(Arc::clone(&runtime_tokens));
+        let old = mgr
+            .get_or_build_task(
+                "conv-1",
+                with_workspace(
+                    make_team_options_with_runtime_token("conv-1", &old_issue.token),
+                    "/tmp/workspace-a",
+                ),
+            )
+            .await
+            .unwrap();
+
+        let new = mgr
+            .get_or_build_task(
+                "conv-1",
+                with_workspace(
+                    make_team_options_with_runtime_token("conv-1", &old_issue.token),
+                    "/tmp/workspace-b",
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(!same_mock(&old, &new));
+        assert_eq!(new.workspace(), "/tmp/workspace-b");
+        let tokens = observed_tokens.lock().unwrap().clone();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], old_issue.token);
+        assert_ne!(tokens[1], old_issue.token);
+        assert_eq!(
+            runtime_tokens.validate(
+                Some(&old_issue.token),
+                "user-1",
+                "conv-1",
+                RuntimeTokenScope::TeamCall,
+                TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            ),
+            Err(RuntimeTokenError::Unknown)
+        );
+        runtime_tokens
+            .validate(
+                Some(&tokens[1]),
+                "user-1",
+                "conv-1",
+                RuntimeTokenScope::TeamCall,
+                TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn get_or_build_is_single_flight_under_concurrency() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -752,6 +961,57 @@ mod tests {
         assert_eq!(mgr.active_count(), 1);
         for h in handles.iter().skip(1) {
             assert!(same_mock(&handles[0], h), "all callers see the same handle");
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_rebuild_is_single_flight_under_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_factory = Arc::clone(&calls);
+        let factory: AgentFactory = Arc::new(move |opts: BuildTaskOptions| {
+            let calls = Arc::clone(&calls_for_factory);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                let workspace = opts.context.workspace.path.clone();
+                Ok(mock_instance(
+                    MockAgent::new(opts.conversation_id(), None).with_workspace(workspace),
+                ))
+            }
+            .boxed()
+        });
+        let mgr = Arc::new(WorkerTaskManagerImpl::new(factory));
+        mgr.get_or_build_task(
+            "conv-race",
+            with_workspace(make_options("conv-race"), "/tmp/workspace-a"),
+        )
+        .await
+        .unwrap();
+
+        let mut joins = Vec::new();
+        for _ in 0..10 {
+            let mgr = Arc::clone(&mgr);
+            joins.push(tokio::spawn(async move {
+                mgr.get_or_build_task(
+                    "conv-race",
+                    with_workspace(make_options("conv-race"), "/tmp/workspace-b"),
+                )
+                .await
+            }));
+        }
+        let handles: Vec<_> = futures_util::future::join_all(joins)
+            .await
+            .into_iter()
+            .map(|result| result.unwrap().unwrap())
+            .collect();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "only one replacement may be built");
+        assert_eq!(mgr.active_count(), 1);
+        assert_eq!(handles[0].workspace(), "/tmp/workspace-b");
+        for handle in handles.iter().skip(1) {
+            assert!(same_mock(&handles[0], handle), "all callers must share the replacement");
         }
     }
 

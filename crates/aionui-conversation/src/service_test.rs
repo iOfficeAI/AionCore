@@ -2610,6 +2610,115 @@ async fn update_extra_merge() {
 }
 
 #[tokio::test]
+async fn update_workspace_recycles_agent_once_with_workspace_changed_reason() {
+    let task = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(Arc::clone(&task));
+    let task_manager: Arc<dyn IWorkerTaskManager> = task.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let old_workspace = dir.path().join("workspace-a");
+    let new_workspace = dir.path().join("workspace-b");
+    std::fs::create_dir_all(&old_workspace).unwrap();
+    std::fs::create_dir_all(&new_workspace).unwrap();
+    let create_req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": old_workspace.to_string_lossy() }
+    }))
+    .unwrap();
+    let conversation = svc.create("user_1", create_req).await.unwrap();
+
+    let update_req: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "workspace": new_workspace.to_string_lossy() }
+    }))
+    .unwrap();
+    svc.update("user_1", &conversation.id, update_req, &task_manager)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        task.kill_records(),
+        vec![(conversation.id, Some(AgentKillReason::WorkspaceChanged))]
+    );
+}
+
+#[tokio::test]
+async fn update_same_workspace_does_not_recycle_agent() {
+    let task = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(Arc::clone(&task));
+    let task_manager: Arc<dyn IWorkerTaskManager> = task.clone();
+    let workspace = ensure_test_workspace_path();
+    let create_req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace }
+    }))
+    .unwrap();
+    let conversation = svc.create("user_1", create_req).await.unwrap();
+
+    let update_req: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "workspace": workspace }
+    }))
+    .unwrap();
+    svc.update("user_1", &conversation.id, update_req, &task_manager)
+        .await
+        .unwrap();
+
+    assert!(task.kill_records().is_empty());
+}
+
+#[tokio::test]
+async fn update_without_workspace_or_model_does_not_recycle_agent() {
+    let task = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(Arc::clone(&task));
+    let task_manager: Arc<dyn IWorkerTaskManager> = task.clone();
+    let conversation = svc.create("user_1", make_create_req()).await.unwrap();
+
+    for update in [
+        json!({ "name": "renamed" }),
+        json!({ "pinned": true }),
+        json!({ "extra": { "contextFileName": "context.md" } }),
+    ] {
+        let request: UpdateConversationRequest = serde_json::from_value(update).unwrap();
+        svc.update("user_1", &conversation.id, request, &task_manager)
+            .await
+            .unwrap();
+    }
+
+    assert!(task.kill_records().is_empty());
+}
+
+#[tokio::test]
+async fn update_workspace_and_model_recycles_agent_only_once() {
+    let task = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(Arc::clone(&task));
+    let task_manager: Arc<dyn IWorkerTaskManager> = task.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let old_workspace = dir.path().join("workspace-a");
+    let new_workspace = dir.path().join("workspace-b");
+    std::fs::create_dir_all(&old_workspace).unwrap();
+    std::fs::create_dir_all(&new_workspace).unwrap();
+    let create_req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "aionrs",
+        "model": { "provider_id": "provider-1", "model": "model-a" },
+        "extra": { "workspace": old_workspace.to_string_lossy() }
+    }))
+    .unwrap();
+    let conversation = svc.create("user_1", create_req).await.unwrap();
+
+    let update_req: UpdateConversationRequest = serde_json::from_value(json!({
+        "model": { "provider_id": "provider-1", "model": "model-b" },
+        "extra": { "workspace": new_workspace.to_string_lossy() }
+    }))
+    .unwrap();
+    svc.update("user_1", &conversation.id, update_req, &task_manager)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        task.kill_records(),
+        vec![(conversation.id, Some(AgentKillReason::WorkspaceChanged))]
+    );
+}
+
+#[tokio::test]
 async fn update_model() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let workspace = ensure_test_workspace_path();
@@ -6302,6 +6411,80 @@ async fn send_message_persists_factory_resolved_workspace() {
     .await
     .expect("factory-resolved workspace should be persisted in the background");
     assert_eq!(updated.extra["workspace"], auto_workspace);
+}
+
+#[tokio::test]
+async fn maybe_persist_workspace_does_not_replace_non_empty_snapshot() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conversation = svc.create("user_1", make_create_req()).await.unwrap();
+    let saved_workspace = "saved-workspace-b";
+    repo.update(
+        "user_1",
+        &conversation.id,
+        &ConversationRowUpdate {
+            extra: Some(json!({ "workspace": saved_workspace }).to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    svc.maybe_persist_workspace("user_1", &conversation.id, saved_workspace, "cached-workspace-a")
+        .await
+        .unwrap();
+
+    let row = repo.get("user_1", &conversation.id).await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    assert_eq!(extra["workspace"], saved_workspace);
+}
+
+#[tokio::test]
+async fn maybe_persist_workspace_rechecks_latest_database_value() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conversation = svc.create("user_1", make_create_req()).await.unwrap();
+    let saved_workspace = "saved-workspace-b";
+    repo.update(
+        "user_1",
+        &conversation.id,
+        &ConversationRowUpdate {
+            extra: Some(json!({ "workspace": saved_workspace }).to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    svc.maybe_persist_workspace("user_1", &conversation.id, "", "cached-workspace-a")
+        .await
+        .unwrap();
+
+    let row = repo.get("user_1", &conversation.id).await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    assert_eq!(extra["workspace"], saved_workspace);
+}
+
+#[tokio::test]
+async fn maybe_persist_workspace_fills_empty_legacy_value() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conversation = svc.create("user_1", make_create_req()).await.unwrap();
+    repo.update(
+        "user_1",
+        &conversation.id,
+        &ConversationRowUpdate {
+            extra: Some(json!({ "workspace": "" }).to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    svc.maybe_persist_workspace("user_1", &conversation.id, "", "factory-workspace")
+        .await
+        .unwrap();
+
+    let row = repo.get("user_1", &conversation.id).await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    assert_eq!(extra["workspace"], "factory-workspace");
 }
 
 #[tokio::test]

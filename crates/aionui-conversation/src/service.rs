@@ -2332,24 +2332,37 @@ impl ConversationService {
 
         let now = now_ms();
 
+        let existing_extra_value: serde_json::Value =
+            serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
+        let old_workspace = existing_extra_value
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let mut workspace_changed = false;
+
         // Merge extra if provided. For aionrs, strip `extra.model` post-merge
         // so the row keeps a single canonical model source (top-level column).
         let merged_extra = if let Some(new_extra) = &req.extra {
-            let mut existing_extra: serde_json::Value =
-                serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
-            merge_json(&mut existing_extra, new_extra);
-            strip_request_owner_user_id(&mut existing_extra);
+            let mut merged = existing_extra_value;
+            merge_json(&mut merged, new_extra);
+            strip_request_owner_user_id(&mut merged);
             if existing_type == AgentType::Aionrs
-                && let Some(obj) = existing_extra.as_object_mut()
+                && let Some(obj) = merged.as_object_mut()
                 && obj.remove("model").is_some()
             {
                 warn!("aionrs update: stripped legacy `extra.model` from merged extra");
             }
             if new_extra.get("workspace").is_some() {
-                normalize_workspace_extra(&mut existing_extra)?;
+                normalize_workspace_extra(&mut merged)?;
+                let new_workspace = merged
+                    .get("workspace")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                workspace_changed = old_workspace != new_workspace;
             }
             Some(
-                serde_json::to_string(&existing_extra)
+                serde_json::to_string(&merged)
                     .map_err(|e| ConversationError::internal(format!("Failed to serialize merged extra: {e}")))?,
             )
         } else {
@@ -2421,13 +2434,22 @@ impl ConversationService {
             .await?;
         }
 
-        if model_changed {
+        let should_rebuild_task = workspace_changed || model_changed;
+        let kill_reason = workspace_changed.then_some(AgentKillReason::WorkspaceChanged);
+        if should_rebuild_task {
             info!(
-                model_changed = true,
-                "Conversation updated, killing agent task due to model change"
+                conversation_id = %id,
+                model_changed,
+                workspace_changed,
+                ?kill_reason,
+                "Conversation runtime context changed; recycling agent task"
             );
-            if let Err(e) = task_manager.kill(id, None) {
-                warn!(error = %ErrorChain(&e), "Failed to kill agent after model change");
+            if let Err(e) = task_manager.kill(id, kill_reason) {
+                warn!(
+                    conversation_id = %id,
+                    error = %ErrorChain(&e),
+                    "Failed to recycle agent after conversation update"
+                );
             }
         }
 
@@ -4911,7 +4933,10 @@ impl ConversationService {
         stored_workspace: &str,
         resolved_workspace: &str,
     ) -> Result<(), ConversationError> {
-        if resolved_workspace.is_empty() || resolved_workspace == stored_workspace {
+        // Only a strictly empty legacy workspace may be filled automatically.
+        // A non-empty value is user-owned even when it is malformed or differs
+        // from the path reported by a cached agent.
+        if !stored_workspace.is_empty() || resolved_workspace.is_empty() {
             return Ok(());
         }
         if !self
@@ -4921,7 +4946,8 @@ impl ConversationService {
             return Ok(());
         }
 
-        // Fetch latest extra, merge the resolved workspace path in, and persist.
+        // The user may have selected a workspace after the caller captured its
+        // snapshot, so re-read the row immediately before persisting.
         let row = self
             .conversation_repo
             .get(user_id, conversation_id)
@@ -4929,6 +4955,14 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::internal("Conversation vanished during workspace sync"))?;
 
         let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+        let latest_workspace = extra
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !latest_workspace.is_empty() {
+            return Ok(());
+        }
+
         extra["workspace"] = serde_json::Value::String(resolved_workspace.to_owned());
 
         let extra_json = serde_json::to_string(&extra)
@@ -4941,11 +4975,7 @@ impl ConversationService {
         };
         self.conversation_repo.update(user_id, conversation_id, &update).await?;
 
-        debug!(
-            conversation_id,
-            workspace = resolved_workspace,
-            "Persisted auto-resolved workspace to conversation.extra"
-        );
+        debug!(conversation_id, "Persisted legacy auto-resolved workspace");
         Ok(())
     }
 
