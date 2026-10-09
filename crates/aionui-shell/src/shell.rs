@@ -138,8 +138,7 @@ impl ShellService {
 
 fn validate_file_exists(file_path: &str) -> Result<std::path::PathBuf, ShellError> {
     let path = Path::new(file_path);
-    let canonical = path
-        .canonicalize()
+    let canonical = dunce::canonicalize(path)
         .map_err(|_| ShellError::FileNotFound(file_path.to_owned()))?;
     if !canonical.is_file() {
         return Err(ShellError::FileNotFound(file_path.to_owned()));
@@ -149,8 +148,7 @@ fn validate_file_exists(file_path: &str) -> Result<std::path::PathBuf, ShellErro
 
 fn validate_path_exists(file_path: &str) -> Result<std::path::PathBuf, ShellError> {
     let path = Path::new(file_path);
-    let canonical = path
-        .canonicalize()
+    let canonical = dunce::canonicalize(path)
         .map_err(|_| ShellError::FileNotFound(file_path.to_owned()))?;
     if !canonical.exists() {
         return Err(ShellError::FileNotFound(file_path.to_owned()));
@@ -160,8 +158,7 @@ fn validate_path_exists(file_path: &str) -> Result<std::path::PathBuf, ShellErro
 
 fn validate_directory_exists(dir_path: &str) -> Result<std::path::PathBuf, ShellError> {
     let path = Path::new(dir_path);
-    let canonical = path
-        .canonicalize()
+    let canonical = dunce::canonicalize(path)
         .map_err(|_| ShellError::DirectoryNotFound(dir_path.to_owned()))?;
     if !canonical.is_dir() {
         return Err(ShellError::DirectoryNotFound(dir_path.to_owned()));
@@ -170,7 +167,14 @@ fn validate_directory_exists(dir_path: &str) -> Result<std::path::PathBuf, Shell
 }
 
 fn build_windows_terminal_command(path: &str) -> String {
-    format!(r#"pushd "{path}""#)
+    let sanitized = if let Some(stripped) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{stripped}")
+    } else if let Some(stripped) = path.strip_prefix(r"\\?\") {
+        stripped.to_string()
+    } else {
+        path.to_string()
+    };
+    format!(r#"pushd "{sanitized}""#)
 }
 
 /// Build the `(program, args)` used to reveal `path` in the Linux file manager.
@@ -447,5 +451,14 @@ mod tests {
     fn build_windows_terminal_command_supports_unc_paths() {
         let command = build_windows_terminal_command(r#"\\server\share\My Project"#);
         assert_eq!(command, r#"pushd "\\server\share\My Project""#);
+    }
+
+    #[test]
+    fn build_windows_terminal_command_strips_verbatim_unc_prefix() {
+        let command = build_windows_terminal_command(r#"\\?\D:\My Project"#);
+        assert_eq!(command, r#"pushd "D:\My Project""#);
+
+        let unc_command = build_windows_terminal_command(r#"\\?\UNC\server\share\My Project"#);
+        assert_eq!(unc_command, r#"pushd "\\server\share\My Project""#);
     }
 }
