@@ -164,11 +164,11 @@ pub(crate) struct Mention {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct MentionId {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub open_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub user_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub union_id: String,
 }
 
@@ -555,6 +555,37 @@ mod tests {
         let mentions = evt.message.mentions.unwrap();
         assert_eq!(mentions.len(), 1);
         assert_eq!(mentions[0].key, "@_user_1");
+        assert_eq!(mentions[0].name, "MyBot");
+    }
+
+    #[test]
+    fn message_event_with_null_mention_user_id_parses() {
+        let raw = json!({
+            "sender": {
+                "sender_id": { "open_id": "ou_user2", "user_id": "", "union_id": "" },
+                "sender_type": "user",
+                "tenant_key": "tk_1"
+            },
+            "message": {
+                "message_id": "om_msg3",
+                "chat_id": "oc_chat3",
+                "chat_type": "group",
+                "message_type": "text",
+                "content": "{\"text\":\"@_user_1 Hello\"}",
+                "mentions": [
+                    {
+                        "key": "@_user_1",
+                        "id": { "open_id": "ou_bot", "user_id": null, "union_id": "" },
+                        "name": "MyBot"
+                    }
+                ]
+            }
+        });
+        let evt: MessageEvent = serde_json::from_value(raw).unwrap();
+        let mentions = evt.message.mentions.unwrap();
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].key, "@_user_1");
+        assert_eq!(mentions[0].id.user_id, ""); // null 被归一化为空字符串
         assert_eq!(mentions[0].name, "MyBot");
     }
 
