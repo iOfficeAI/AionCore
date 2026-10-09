@@ -211,6 +211,13 @@ impl AionrsAgentManager {
         if let Some(path) = config_extra.compat_overrides.api_path {
             config.compat.transport.api_path = Some(path);
         }
+        // Attribution headers resolved in `factory::aionrs`. Extend rather than
+        // assign so a preset that already carries headers keeps them.
+        config
+            .compat
+            .transport
+            .extra_headers
+            .extend(config_extra.compat_overrides.extra_headers.clone());
 
         if !config_extra.extra_mcp_servers.is_empty() {
             config.mcp.servers.extend(config_extra.extra_mcp_servers.clone());

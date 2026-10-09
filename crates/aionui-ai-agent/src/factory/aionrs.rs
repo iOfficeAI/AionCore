@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -345,6 +345,44 @@ fn resolve_build_session(
     Ok(None)
 }
 
+/// AI/ML API attributes traffic by header. Without them a request is served
+/// normally and simply counts for nobody, so a missing or misspelled value
+/// fails silently — which is why the host match below is exact and why there
+/// are tests for the near-misses rather than only the hit.
+///
+/// `X-AIMLAPI-Partner-ID` must match `^part_[A-Za-z0-9]{1,64}$` — alphanumerics
+/// only after the prefix. `HTTP-Referer` and `X-Title` are the OpenRouter
+/// convention, and mirror what the desktop client already sends on the paths
+/// it owns; conversations do not go through those, which is the gap this fills.
+const AIMLAPI_HOST: &str = "api.aimlapi.com";
+const AIMLAPI_PARTNER_ID: &str = "part_UJK4IAHBjvT9g4cPDrb7B7KT";
+const AIMLAPI_SOURCE: &str = "agent/aionui";
+const AIMLAPI_REFERER: &str = "https://aionui.com";
+const AIMLAPI_TITLE: &str = "AionUi";
+
+/// Exact host match, mirroring [`is_openai_host`].
+///
+/// Substring matching would be wrong in the direction that matters: a URL such
+/// as `https://api.aimlapi.com.example.test/v1` is a different origin, and
+/// sending a partner id there hands our attribution to whoever owns it.
+fn is_aimlapi_host(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .map(|rest| rest == AIMLAPI_HOST || rest.starts_with(&format!("{AIMLAPI_HOST}/")))
+        .unwrap_or(false)
+}
+
+fn aimlapi_attribution_headers() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("X-AIMLAPI-Partner-ID".to_owned(), AIMLAPI_PARTNER_ID.to_owned()),
+        ("X-AIMLAPI-Source".to_owned(), AIMLAPI_SOURCE.to_owned()),
+        ("HTTP-Referer".to_owned(), AIMLAPI_REFERER.to_owned()),
+        ("X-Title".to_owned(), AIMLAPI_TITLE.to_owned()),
+    ])
+}
+
 /// Map AionUi DB platform/protocol settings to the aionrs provider identifier.
 pub(crate) fn map_aionrs_provider(
     platform: &str,
@@ -395,6 +433,11 @@ pub(crate) fn resolve_aionrs_url_and_compat_with_mode(
     openai_api_mode_override: Option<OpenAiApiMode>,
 ) -> (Option<String>, AionrsCompatOverrides) {
     let mut compat = AionrsCompatOverrides::default();
+    // Set before every return below, including the `is_full_url` early exit:
+    // a user who pasted a complete endpoint is still talking to the same host.
+    if is_aimlapi_host(raw_base_url) {
+        compat.extra_headers = aimlapi_attribution_headers();
+    }
     let openai_api_mode = resolve_openai_api_mode(platform, mapped_provider, model_id, openai_api_mode_override);
     let use_responses = openai_api_mode == Some(OpenAiApiMode::Responses);
 
@@ -892,6 +935,82 @@ mod tests {
     };
 
     const TEST_USER_ID: &str = "user-1";
+
+    fn headers_for(base_url: &str, is_full_url: bool) -> BTreeMap<String, String> {
+        let (_url, compat) = resolve_aionrs_url_and_compat("custom", base_url, "openai", "some-model", is_full_url);
+        compat.extra_headers
+    }
+
+    #[test]
+    fn aimlapi_base_url_resolves_attribution_headers() {
+        let headers = headers_for("https://api.aimlapi.com/v1", false);
+
+        assert_eq!(
+            headers.get("X-AIMLAPI-Partner-ID").map(String::as_str),
+            Some(AIMLAPI_PARTNER_ID)
+        );
+        assert_eq!(
+            headers.get("X-AIMLAPI-Source").map(String::as_str),
+            Some("agent/aionui")
+        );
+        assert_eq!(
+            headers.get("HTTP-Referer").map(String::as_str),
+            Some("https://aionui.com")
+        );
+        assert_eq!(headers.get("X-Title").map(String::as_str), Some("AionUi"));
+    }
+
+    #[test]
+    fn attribution_survives_a_user_supplied_complete_endpoint() {
+        // `is_full_url` returns early, before the rest of the compat work. A
+        // user who pasted the whole endpoint is still talking to the same host.
+        let headers = headers_for("https://api.aimlapi.com/v1/chat/completions", true);
+
+        assert_eq!(
+            headers.get("X-AIMLAPI-Partner-ID").map(String::as_str),
+            Some(AIMLAPI_PARTNER_ID)
+        );
+    }
+
+    #[test]
+    fn other_providers_get_no_headers() {
+        for base_url in ["https://api.openai.com/v1", "https://openrouter.ai/api/v1", ""] {
+            assert!(
+                headers_for(base_url, false).is_empty(),
+                "attribution must not leak to {base_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lookalike_domain_gets_no_headers() {
+        // The failure this guards against is silent and expensive: a substring
+        // match would hand the partner id to whoever owns the lookalike.
+        for base_url in [
+            "https://api.aimlapi.com.example.test/v1",
+            "https://not-api.aimlapi.com/v1",
+            "https://evil.test/?u=https://api.aimlapi.com/v1",
+        ] {
+            assert!(
+                headers_for(base_url, false).is_empty(),
+                "attribution must not be sent to {base_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_partner_id_matches_the_gateway_contract() {
+        // `^part_[A-Za-z0-9]{1,64}$` — a malformed id is accepted by the API and
+        // simply attributed to nobody, so nothing at runtime would report this.
+        let rest = AIMLAPI_PARTNER_ID
+            .strip_prefix("part_")
+            .expect("partner id must carry the part_ prefix");
+        assert!((1..=64).contains(&rest.len()), "length out of range: {}", rest.len());
+        assert!(
+            rest.chars().all(|c| c.is_ascii_alphanumeric()),
+            "only alphanumerics are allowed after the prefix: {AIMLAPI_PARTNER_ID}"
+        );
+    }
 
     fn path_test_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
