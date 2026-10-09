@@ -719,66 +719,116 @@ async fn run_backend_set_model(backend: &str) {
         .and_then(|o| o["current_value"].as_str())
         .unwrap_or_default()
         .to_owned();
-    let target = models
+    // Every alternative, not just the first. The catalog lists models this
+    // account may not be entitled to — codex 0.153.4 leads with `gpt-6-astra`,
+    // which answers 403 `USER_LLM_PROVIDER_PERMISSION_DENIED` here while
+    // 0.151.0 led with `gpt-5.6-sol`, which works. Taking the first made the
+    // test fail on an entitlement gap and read like a release regression.
+    let candidates: Vec<String> = models
         .iter()
         .filter_map(|m| m["value"].as_str())
-        .find(|v| *v != current)
-        .unwrap_or_else(|| panic!("[{backend}] no model to switch to besides {current:?}"))
-        .to_owned();
-    println!("[{backend}] switching model {current:?} -> {target:?}");
-
-    let resp = http_json(
-        &app,
-        "PUT",
-        &format!("/api/conversations/{conv_id}/config-options/model"),
-        json!({"value": target}),
-    )
-    .await;
-    assert_eq!(
-        resp["success"],
-        json!(true),
-        "[{backend}] model switch rejected: {resp}"
-    );
-
-    let confirmed = resp["data"]["config_options"]
-        .as_array()
-        .and_then(|opts| opts.iter().find(|o| o["id"] == "model"))
-        .and_then(|o| o["current_value"].as_str())
-        .unwrap_or_default();
-    assert_eq!(
-        confirmed, target,
-        "[{backend}] the CLI did not confirm the switch — the picker would report a change that did not happen: {resp}"
-    );
-
-    // A switched session must still be able to run a turn. Confirming the value
-    // and then failing to answer would be a worse outcome than refusing it.
-    let frames = connect_ws_recorder(app.addr, &app.token).await;
-    http_json(
-        &app,
-        "POST",
-        &format!("/api/conversations/{conv_id}/messages"),
-        json!({"content": "Reply with exactly: PONG"}),
-    )
-    .await;
-    let started = Instant::now();
-    let mut finished = false;
-    while started.elapsed() < Duration::from_secs(300) {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let snapshot = frames.lock().unwrap().clone();
-        if stream_frames_for(&snapshot, &conv_id)
-            .iter()
-            .any(|f| f["data"]["type"] == "finish")
-        {
-            finished = true;
-            break;
-        }
-    }
+        .filter(|v| *v != current)
+        .map(str::to_owned)
+        .collect();
     assert!(
-        finished,
-        "[{backend}] the turn did not finish after switching model to {target}"
+        !candidates.is_empty(),
+        "[{backend}] no model to switch to besides {current:?}"
     );
+    let mut refused: Vec<String> = Vec::new();
+    for target in &candidates {
+        let target = target.clone();
+        // A turn that ends in `error` leaves the conversation with no active
+        // agent, so the next switch would 404 with NOT_FOUND. Bring the runtime
+        // back up first — the same endpoint that started it above.
+        if !refused.is_empty() {
+            http_json(
+                &app,
+                "POST",
+                &format!("/api/conversations/{conv_id}/runtime/ensure"),
+                json!({}),
+            )
+            .await;
+        }
+        println!("[{backend}] switching model {current:?} -> {target:?}");
 
-    record_frame_types(backend, &frames.lock().unwrap().clone());
+        let resp = http_json(
+            &app,
+            "PUT",
+            &format!("/api/conversations/{conv_id}/config-options/model"),
+            json!({"value": target}),
+        )
+        .await;
+        assert_eq!(
+            resp["success"],
+            json!(true),
+            "[{backend}] model switch rejected: {resp}"
+        );
+
+        let confirmed = resp["data"]["config_options"]
+            .as_array()
+            .and_then(|opts| opts.iter().find(|o| o["id"] == "model"))
+            .and_then(|o| o["current_value"].as_str())
+            .unwrap_or_default();
+        assert_eq!(
+            confirmed, target,
+            "[{backend}] the CLI did not confirm the switch — the picker would report a change that did not happen: {resp}"
+        );
+
+        // A switched session must still be able to run a turn. Confirming the value
+        // and then failing to answer would be a worse outcome than refusing it.
+        let frames = connect_ws_recorder(app.addr, &app.token).await;
+        http_json(
+            &app,
+            "POST",
+            &format!("/api/conversations/{conv_id}/messages"),
+            json!({"content": "Reply with exactly: PONG"}),
+        )
+        .await;
+        // `error` is a terminal too. Waiting only for `finish` turned a turn that
+        // ended in seconds-to-minutes with a clear reason into a 300s timeout whose
+        // message named the wrong problem: on 2026-09-10 a switch to a model this
+        // account cannot use produced
+        //   tips x5: "Reconnecting... n/5 — unexpected status 403 Forbidden: user not
+        //             allowed to access model … Tried to access gpt-6-astra"
+        //   error
+        // and the test still reported "the turn did not finish", which reads like a
+        // release regression rather than an entitlement problem.
+        let started = Instant::now();
+        let mut outcome = None;
+        while started.elapsed() < Duration::from_secs(300) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let snapshot = frames.lock().unwrap().clone();
+            let terminal = stream_frames_for(&snapshot, &conv_id)
+                .into_iter()
+                .find(|f| f["data"]["type"] == "finish" || f["data"]["type"] == "error");
+            if let Some(frame) = terminal {
+                outcome = Some(frame.clone());
+                break;
+            }
+        }
+
+        let Some(terminal) = outcome else {
+            panic!("[{backend}] no terminal frame within 300s after switching model to {target}");
+        };
+        if terminal["data"]["type"] == "error" {
+            // An entitlement gap is the account's, not the release's. Record
+            // what the backend said and try the next model rather than calling
+            // the CLI broken.
+            let detail = terminal["data"]["data"]["detail"]
+                .as_str()
+                .or_else(|| terminal["data"]["data"]["message"].as_str())
+                .unwrap_or("(no detail)")
+                .to_owned();
+            println!("[{backend}] model {target:?} ended in an error, trying the next: {detail}");
+            refused.push(format!("{target}: {detail}"));
+            continue;
+        }
+
+        record_frame_types(backend, &frames.lock().unwrap().clone());
+        return;
+    }
+
+    panic!("[{backend}] no model completed a turn after switching. Tried: {refused:#?}");
 }
 
 /// The agent names the conversation. A backend that stops sending a title
