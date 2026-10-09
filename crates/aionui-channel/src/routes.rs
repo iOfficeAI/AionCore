@@ -11,9 +11,9 @@ use tracing::warn;
 
 use aionui_api_types::{
     ApiResponse, ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelDefaultModelSetting,
-    ChannelPlatformSettingsResponse, ChannelSessionResponse, ChannelUserResponse, DisablePluginRequest,
-    EnablePluginRequest, PairingRequestResponse, PluginStatusResponse, RejectPairingRequest, RevokeUserRequest,
-    SyncChannelSettingsRequest, TestPluginRequest, TestPluginResponse,
+    ChannelPlatformSettingsResponse, ChannelSessionResponse, ChannelUserResponse, ChannelWorkspaceSetting,
+    DisablePluginRequest, EnablePluginRequest, PairingRequestResponse, PluginStatusResponse, RejectPairingRequest,
+    RevokeUserRequest, SyncChannelSettingsRequest, TestPluginRequest, TestPluginResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -115,6 +115,10 @@ pub fn channel_routes(state: ChannelRouterState) -> Router {
         .route(
             "/api/channel/settings/{platform}/default-model",
             put(set_channel_default_model_setting),
+        )
+        .route(
+            "/api/channel/settings/{platform}/workspace",
+            put(set_channel_workspace_setting),
         )
         .route("/api/channel/settings/sync", post(sync_channel_settings))
         .with_state(state)
@@ -646,6 +650,32 @@ async fn set_channel_default_model_setting(
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
         message: Some("Default model setting updated".into()),
+        error: None,
+    })))
+}
+
+/// `PUT /api/channel/settings/:platform/workspace` — persist default workspace for a platform.
+///
+/// Empty `path` clears the preference so new channel conversations use a temporary workspace.
+async fn set_channel_workspace_setting(
+    State(state): State<ChannelRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(platform): Path<String>,
+    body: Result<Json<ChannelWorkspaceSetting>, JsonRejection>,
+) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
+    let platform = PluginType::from_str_opt(&platform)
+        .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", platform)))?;
+    let Json(req) = body.map_err(ApiError::from)?;
+
+    state
+        .settings_service
+        .set_workspace_setting(&user.id, platform, &req)
+        .await?;
+    state.session_manager.clear_all_sessions(&user.id).await?;
+
+    Ok(Json(ApiResponse::ok(BridgeResponse {
+        success: true,
+        message: Some("Workspace setting updated".into()),
         error: None,
     })))
 }
