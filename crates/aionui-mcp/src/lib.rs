@@ -6,6 +6,8 @@ pub mod adapters;
 pub mod connection_test;
 pub mod error;
 pub mod oauth_service;
+pub mod permission;
+pub mod permission_routes;
 pub mod routes;
 pub mod service;
 pub mod session_injection;
@@ -14,12 +16,14 @@ pub mod types;
 
 pub use adapter::{DetectedServer, McpAgentAdapter};
 pub use adapters::{
-    AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, OpencodeAdapter,
-    QwenAdapter,
+    AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter,
+    OpenCodePermissionAdapter, OpencodeAdapter, QwenAdapter,
 };
 pub use connection_test::McpConnectionTestService;
 pub use error::McpError;
 pub use oauth_service::McpOAuthService;
+pub use permission::{PermissionLevel, PermissionPolicyAdapter, PermissionPolicyView, policy_view};
+pub use permission_routes::{PermissionRouterState, permission_policy_routes};
 pub use routes::{McpRouterState, mcp_routes};
 pub use service::McpConfigService;
 pub use session_injection::{
