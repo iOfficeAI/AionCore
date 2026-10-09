@@ -182,11 +182,14 @@ impl AcpProtocol {
         notification_tx: mpsc::Sender<SessionNotification>,
         terminal_label: &str,
         terminal_cwd: Option<std::path::PathBuf>,
+        terminal_base_env: Vec<(String, String)>,
         init_budget: InitBudget,
     ) -> Result<Self, AcpError> {
         let alive = Arc::new(AtomicBool::new(true));
         let replay_suppression = Arc::new(AtomicBool::new(false));
-        let terminal_registry = Arc::new(crate::terminal::TerminalRegistry::new(terminal_label, terminal_cwd));
+        let terminal_registry = Arc::new(
+            crate::terminal::TerminalRegistry::new(terminal_label, terminal_cwd).with_base_env(terminal_base_env),
+        );
         let started_at = std::time::Instant::now();
         log_acp_initialize_start(init_budget);
 
