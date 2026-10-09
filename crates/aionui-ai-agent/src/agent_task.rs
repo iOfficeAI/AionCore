@@ -695,6 +695,14 @@ mod aionrs_config_option_tests {
                 .collect::<Vec<_>>(),
             vec!["default", "auto_edit", "yolo"]
         );
+
+        let model = response
+            .config_options
+            .iter()
+            .find(|option| option.id == "model")
+            .expect("aionrs should expose a model config option for hot-swap");
+        assert_eq!(model.category.as_deref(), Some("model"));
+        assert_eq!(model.current_value.as_deref(), Some("claude-sonnet-4-20250514"));
     }
 
     #[tokio::test]
@@ -737,6 +745,24 @@ mod aionrs_config_option_tests {
             matches!(&error, AgentError::BadRequest(message) if message == "Config option 'thought_level' is not available"),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn aionrs_set_config_option_model_hot_swaps_without_error() {
+        let instance = aionrs_instance().await;
+
+        let response = instance
+            .set_config_option("model", "claude-haiku-4-20250514")
+            .await
+            .unwrap();
+
+        assert_eq!(response.confirmation, ConfigOptionConfirmation::Observed);
+        let options = response.config_options.expect("snapshot");
+        let model = options
+            .iter()
+            .find(|option| option.id == "model")
+            .expect("model option");
+        assert_eq!(model.current_value.as_deref(), Some("claude-haiku-4-20250514"));
     }
 }
 
