@@ -865,8 +865,8 @@ mod tests {
         // 39 ACP vendors + 2 non-ACP builtins + 1 internal = 42.
         assert_eq!(
             rows.len(),
-            44,
-            "seed rows: 42 pre-existing + antigravity + minimax-code"
+            45,
+            "seed rows: 42 pre-existing + antigravity + minimax-code + dsh"
         );
         assert!(
             rows.iter()

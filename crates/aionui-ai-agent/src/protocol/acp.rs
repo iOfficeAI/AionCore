@@ -318,6 +318,7 @@ impl AcpProtocol {
 
     /// Resume an existing ACP session.
     pub async fn resume_session(&self, req: ResumeSessionRequest) -> Result<ResumeSessionResponse, AcpError> {
+        let _guard = ReplaySuppressionGuard::new(&self.replay_suppression);
         self.send_request(req, AGENT_METHOD_NAMES.session_resume).await
     }
 
