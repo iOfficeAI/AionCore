@@ -81,15 +81,43 @@ pub fn remove_hooks_json(workspace: &Path) {
 /// The `matcher: "*"` is deliberate — AionUi decides per call, so agy must ask
 /// about all of them.
 ///
-/// `command` is a COMMAND LINE, not a bare path: agy word-splits it and honours
-/// double quotes (verified against agy 1.1.8, including a path containing
-/// spaces). Both details are load-bearing — without the subcommand agy would
-/// launch the whole backend instead of the hook, and without the quotes any
-/// install path containing a space would break word splitting.
+/// `command` is a COMMAND LINE, not a bare path. Unix/agy word-splits it and
+/// honours double quotes (verified against agy 1.1.8, including a path
+/// containing spaces). On Windows the same quoted-exe form is executed through
+/// `cmd.exe` by the JSON-hook runner (`jsonhook__aionui-permission-bridge_*`),
+/// which treats a command that *starts* with `"` as the program name *including
+/// the quote characters* — `'\"C:\\...\\aioncore.exe\"' is not recognized as
+/// an internal or external command` (AionUi#4095 follow-up; Program Files
+/// install: `"C:/Program Files/.../aioncore.exe"` with forward slashes).
+///
+/// Both the subcommand and platform-correct quoting are load-bearing — without
+/// the subcommand the agent would launch the whole backend instead of the hook.
 pub fn write_hooks_json(workspace: &Path, hook_binary: &Path) -> std::io::Result<()> {
     let dir = workspace.join(AGENTS_DIR);
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("hooks.json"), hooks_json_body(hook_binary).as_bytes())
+}
+
+/// Build the `hooks.json` `command` value for `hook_binary`.
+///
+/// `windows` is injected so tests can lock both encodings without being compiled
+/// on that OS. Production always passes `cfg!(windows)`.
+pub(crate) fn hook_command_line_for(hook_binary: &Path, windows: bool) -> String {
+    let mut path = hook_binary.to_string_lossy().into_owned();
+    if windows {
+        // current_exe() / Electron can yield forward slashes; cmd.exe then
+        // treats `/win32-x64` as a switch. Always use backslashes on Windows.
+        path = path.replace('/', "\\");
+        if path.len() >= 2 && path.starts_with('"') && path.ends_with('"') {
+            path = path[1..path.len() - 1].to_string();
+        }
+        // `call` is a cmd builtin, so the subsequent quoted path is an argument
+        // to `call`, not argv[0]. A line that starts with `"` is the #4095
+        // follow-up failure mode.
+        format!("call \"{path}\" {HOOK_SUBCOMMAND}")
+    } else {
+        format!("\"{path}\" {HOOK_SUBCOMMAND}")
+    }
 }
 
 /// The `hooks.json` contents, without writing them.
@@ -99,11 +127,7 @@ pub fn write_hooks_json(workspace: &Path, hook_binary: &Path) -> std::io::Result
 /// (it knows the workspace, not where AionUi's binary lives). Handing it the
 /// prepared body lets it restore the gate when the user asks for it back.
 pub fn hooks_json_body(hook_binary: &Path) -> String {
-    // A COMMAND LINE, not a bare path: agy word-splits it and honours double
-    // quotes (verified against 1.1.8, including a path containing spaces).
-    // Without the subcommand agy would launch the whole backend; without the
-    // quotes any install path with a space would break word splitting.
-    let command = format!("\"{}\" {HOOK_SUBCOMMAND}", hook_binary.to_string_lossy());
+    let command = hook_command_line_for(hook_binary, cfg!(windows));
     let body = serde_json::json!({
         AntigravityHookConfig::HOOK_NAME: {
             "enabled": true,
@@ -175,7 +199,7 @@ mod tests {
         // launch the whole backend instead of the hook.
         assert_eq!(
             entry["PreToolUse"][0]["hooks"][0]["command"],
-            "\"/opt/aionui/backend\" antigravity-hook"
+            hook_command_line_for(Path::new("/opt/aionui/backend"), cfg!(windows))
         );
 
         // The decision must never be baked into the file: AionUi owns it at
@@ -195,7 +219,69 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(
             v[AntigravityHookConfig::HOOK_NAME]["PreToolUse"][0]["hooks"][0]["command"],
+            hook_command_line_for(Path::new("/Apps/Aion UI/backend"), cfg!(windows))
+        );
+    }
+
+    #[test]
+    fn unix_command_line_quotes_the_path_and_keeps_the_subcommand() {
+        assert_eq!(
+            hook_command_line_for(Path::new("/opt/aionui/backend"), false),
+            "\"/opt/aionui/backend\" antigravity-hook"
+        );
+        assert_eq!(
+            hook_command_line_for(Path::new("/Apps/Aion UI/backend"), false),
             "\"/Apps/Aion UI/backend\" antigravity-hook"
+        );
+    }
+
+    #[test]
+    fn windows_command_line_does_not_start_with_a_quote() {
+        // cmd.exe / jsonhook: a command that starts with `"` is looked up as a
+        // file whose name includes the quote characters.
+        let command = hook_command_line_for(
+            Path::new(r"C:\Program Files\AionUi\resources\bundled-aioncore\win32-x64\aioncore.exe"),
+            true,
+        );
+        assert!(
+            !command.starts_with('"'),
+            "Windows hook command must not start with a quote, got {command}"
+        );
+        assert_eq!(
+            command,
+            r#"call "C:\Program Files\AionUi\resources\bundled-aioncore\win32-x64\aioncore.exe" antigravity-hook"#
+        );
+        assert!(command.contains("antigravity-hook"));
+        assert!(
+            !command.contains(r#"\\?\"#),
+            "verbatim prefix must not leak into the hook command"
+        );
+    }
+
+    #[test]
+    fn windows_command_line_normalizes_forward_slashes() {
+        // Electron / current_exe() can yield C:/Program Files/...; cmd.exe then
+        // treats /win32-x64 as a switch. Reproduce the reported stderr path.
+        let command = hook_command_line_for(
+            Path::new("C:/Program Files/AionUi/resources/bundled-aioncore/win32-x64/aioncore.exe"),
+            true,
+        );
+        assert_eq!(
+            command,
+            r#"call "C:\Program Files\AionUi\resources\bundled-aioncore\win32-x64\aioncore.exe" antigravity-hook"#
+        );
+        assert!(!command.contains('/'), "Windows hook command must not keep forward slashes: {command}");
+    }
+
+    #[test]
+    fn windows_command_line_strips_already_quoted_paths() {
+        let command = hook_command_line_for(
+            Path::new(r#""C:\Program Files\AionUi\aioncore.exe""#),
+            true,
+        );
+        assert_eq!(
+            command,
+            r#"call "C:\Program Files\AionUi\aioncore.exe" antigravity-hook"#
         );
     }
 
