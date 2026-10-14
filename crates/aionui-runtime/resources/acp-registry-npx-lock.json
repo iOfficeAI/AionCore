@@ -19,7 +19,7 @@
     "dimcode": {
       "registry_json_id": "dimcode",
       "package": "dimcode",
-      "version": "0.5.17"
+      "version": "0.5.18"
     },
     "dirac": {
       "registry_json_id": "dirac",
@@ -34,7 +34,7 @@
     "grok": {
       "registry_json_id": "grok-build",
       "package": "@xai-official/grok",
-      "version": "1.0.57"
+      "version": "1.0.58"
     },
     "kilo": {
       "registry_json_id": "kilo",
