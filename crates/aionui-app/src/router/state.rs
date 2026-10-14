@@ -676,16 +676,15 @@ pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
         Arc::new(AionuiAdapter::new(repo.clone())),
     ];
 
-    let oauth_token_repo: Arc<dyn aionui_db::IOAuthTokenRepository> = Arc::new(
-        aionui_db::SqliteOAuthTokenRepository::new(services.database.pool().clone()),
-    );
     let http_client = reqwest::Client::new();
 
     McpRouterState {
         config_service: McpConfigService::new(repo.clone()),
         sync_service: McpSyncService::new(repo, adapters),
-        connection_test_service: McpConnectionTestService::new(http_client.clone(), services.event_bus.clone()),
-        oauth_service: aionui_mcp::McpOAuthService::new(oauth_token_repo, http_client),
+        connection_test_service: McpConnectionTestService::new(http_client, services.event_bus.clone()),
+        // The same instance the agent factory injects tokens with, so a login
+        // completed through the API is immediately visible to session builds.
+        oauth_service: services.mcp_oauth_service.clone(),
     }
 }
 

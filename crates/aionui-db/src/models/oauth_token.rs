@@ -19,6 +19,15 @@ pub struct OAuthTokenRow {
     pub token_type: String,
     /// Token expiration timestamp (milliseconds).
     pub expires_at: Option<TimestampMs>,
+    /// OAuth client id used for this server. `Some` when obtained through
+    /// Dynamic Client Registration (RFC 7591); `None` when the static
+    /// fallback client id was used. The refresh grant must present the same
+    /// client that obtained the token, hence the persistence.
+    pub client_id: Option<String>,
+    /// Client secret issued by the authorization server at registration time.
+    /// `None` for a public client (`token_endpoint_auth_method: "none"`),
+    /// which is the normal case for a native app.
+    pub client_secret: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }

@@ -50,6 +50,8 @@ async fn check_status_authenticated_returns_true() {
         access_token: "access_123",
         refresh_token: Some("refresh_456"),
         token_type: "bearer",
+        client_id: None,
+        client_secret: None,
         // Expires in the far future.
         expires_at: Some(aionui_common::now_ms() + 3_600_000),
     })
@@ -77,6 +79,8 @@ async fn check_status_expired_token_returns_false() {
         access_token: "old_token",
         refresh_token: None,
         token_type: "bearer",
+        client_id: None,
+        client_secret: None,
         // Already expired.
         expires_at: Some(1000),
     })
@@ -104,6 +108,8 @@ async fn check_status_no_expiry_treated_as_valid() {
         access_token: "no_exp_token",
         refresh_token: None,
         token_type: "bearer",
+        client_id: None,
+        client_secret: None,
         expires_at: None,
     })
     .await
@@ -130,6 +136,8 @@ async fn get_authenticated_servers_returns_all_urls() {
         access_token: "tok_a",
         refresh_token: None,
         token_type: "bearer",
+        client_id: None,
+        client_secret: None,
         expires_at: None,
     })
     .await
@@ -141,6 +149,8 @@ async fn get_authenticated_servers_returns_all_urls() {
         access_token: "tok_b",
         refresh_token: None,
         token_type: "bearer",
+        client_id: None,
+        client_secret: None,
         expires_at: None,
     })
     .await
@@ -186,6 +196,8 @@ async fn logout_deletes_stored_token() {
         access_token: "to_delete",
         refresh_token: None,
         token_type: "bearer",
+        client_id: None,
+        client_secret: None,
         expires_at: None,
     })
     .await
@@ -246,6 +258,8 @@ async fn get_token_returns_access_token_when_valid() {
         access_token: "my_access_token",
         refresh_token: None,
         token_type: "bearer",
+        client_id: None,
+        client_secret: None,
         expires_at: Some(aionui_common::now_ms() + 3_600_000),
     })
     .await
@@ -265,6 +279,8 @@ async fn get_token_returns_expired_token_when_no_refresh_token() {
         access_token: "old_access",
         refresh_token: None,
         token_type: "bearer",
+        client_id: None,
+        client_secret: None,
         expires_at: Some(1000),
     })
     .await
@@ -288,6 +304,8 @@ async fn get_token_returns_no_expiry_token() {
         access_token: "forever_token",
         refresh_token: None,
         token_type: "bearer",
+        client_id: None,
+        client_secret: None,
         expires_at: None,
     })
     .await

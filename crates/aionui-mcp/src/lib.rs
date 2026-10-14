@@ -5,6 +5,9 @@ pub mod adapter;
 pub mod adapters;
 pub mod connection_test;
 pub mod error;
+pub mod oauth_discovery;
+pub mod oauth_injection;
+pub mod oauth_registration;
 pub mod oauth_service;
 pub mod routes;
 pub mod service;
@@ -19,6 +22,10 @@ pub use adapters::{
 };
 pub use connection_test::McpConnectionTestService;
 pub use error::McpError;
+pub use oauth_discovery::{AuthorizationServerMetadata, ProtectedResourceMetadata};
+pub use oauth_injection::{
+    AUTHORIZATION_HEADER, IMcpAccessTokenProvider, apply_bearer_header, inject_oauth_bearer_headers,
+};
 pub use oauth_service::McpOAuthService;
 pub use routes::{McpRouterState, mcp_routes};
 pub use service::McpConfigService;

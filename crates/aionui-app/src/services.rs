@@ -85,6 +85,11 @@ pub struct AppServices {
     backend_binary_path: Arc<PathBuf>,
     runtime_helper_bin: String,
     runtime_base_url: String,
+    /// MCP OAuth service. Built here (the sole construction centre) because it
+    /// is shared by two consumers: the MCP router state (login/logout/status)
+    /// and the agent factory, which injects the stored access tokens into the
+    /// MCP servers handed to a backend.
+    pub mcp_oauth_service: aionui_mcp::McpOAuthService,
     /// Shared with the Antigravity hook endpoint so it can authenticate callbacks.
     pub(crate) antigravity_hook_tokens: Arc<aionui_ai_agent::antigravity_hook::HookTokenRegistry>,
 }
@@ -358,6 +363,10 @@ impl AppServices {
             machine_id,
         ));
 
+        let oauth_token_repo: Arc<dyn aionui_db::IOAuthTokenRepository> =
+            Arc::new(aionui_db::SqliteOAuthTokenRepository::new(database.pool().clone()));
+        let mcp_oauth_service = aionui_mcp::McpOAuthService::new(oauth_token_repo, reqwest::Client::new());
+
         let factory = build_agent_factory(AgentFactoryDeps {
             skill_manager: AcpSkillManager::new_with_repo(skill_paths.clone(), skill_repo.clone()),
             provider_repo,
@@ -369,6 +378,7 @@ impl AppServices {
             broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),
+            mcp_token_provider: Some(Arc::new(mcp_oauth_service.clone())),
             session_spawner,
             // agy cannot prompt for tool permission in headless mode, so AionUi
             // registers itself as its PreToolUse hook; the hook process calls
@@ -427,6 +437,7 @@ impl AppServices {
         Ok(Self {
             database,
             jwt_service: Arc::new(JwtService::new(secret.clone())),
+            mcp_oauth_service,
             antigravity_hook_tokens,
             user_repo,
             cookie_config: Arc::new(CookieConfig::from_env()),

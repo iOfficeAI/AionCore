@@ -114,6 +114,12 @@ pub(super) async fn build(
     )
     .await;
 
+    // OAuth: a remote MCP server the user authenticated against travels with
+    // its bearer token, resolved (and refreshed) per session build.
+    if let Some(provider) = deps.mcp_token_provider.as_ref() {
+        inject_oauth_headers_into_configs(&mut extra_mcp_servers, &ctx.user_id, provider.as_ref()).await;
+    }
+
     if !extra_mcp_servers.is_empty() {
         info!(
             conversation_id = %ctx.conversation_id,
@@ -604,6 +610,31 @@ async fn load_user_mcp_servers(
     servers
 }
 
+/// Add the stored OAuth bearer token to every URL-based MCP server config.
+///
+/// The aionrs lane carries its own `McpServerConfig` shape, so this mirrors
+/// [`aionui_mcp::inject_oauth_bearer_headers`] on it. Best effort: a server
+/// with no stored token is left untouched, and a header the user configured by
+/// hand is never replaced.
+async fn inject_oauth_headers_into_configs(
+    servers: &mut HashMap<String, McpServerConfig>,
+    user_id: &str,
+    provider: &dyn aionui_mcp::IMcpAccessTokenProvider,
+) {
+    for config in servers.values_mut() {
+        let Some(url) = config.url.clone() else {
+            continue;
+        };
+        let Some(token) = provider.access_token(user_id, &url).await else {
+            continue;
+        };
+        let headers = config.headers.get_or_insert_with(HashMap::new);
+        if aionui_mcp::apply_bearer_header(headers, &token) {
+            info!(mcp_url = %url, "mcp_oauth: injected bearer token into aionrs MCP server headers");
+        }
+    }
+}
+
 async fn row_to_mcp_server_config(
     row: &McpServerRow,
     user_id: &str,
@@ -981,6 +1012,84 @@ mod tests {
             unsafe { std::env::remove_var("AIONUI_BUNDLED_MANAGED_RESOURCES") };
             set_managed_resources_mode(ManagedResourcesMode::Download);
         }
+    }
+
+    struct StaticTokenProvider;
+
+    #[async_trait::async_trait]
+    impl aionui_mcp::IMcpAccessTokenProvider for StaticTokenProvider {
+        async fn access_token(&self, _user_id: &str, _server_url: &str) -> Option<String> {
+            Some("oauth-access-token".to_owned())
+        }
+    }
+
+    fn http_config(headers: Option<HashMap<String, String>>) -> McpServerConfig {
+        McpServerConfig {
+            transport: TransportType::StreamableHttp,
+            command: None,
+            args: None,
+            env: None,
+            url: Some("https://mcp.example.com/mcp".into()),
+            headers,
+            deferred: Some(false),
+            startup_timeout_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_injection_adds_bearer_to_url_servers() {
+        let mut servers = HashMap::from([("remote".to_owned(), http_config(None))]);
+
+        inject_oauth_headers_into_configs(&mut servers, TEST_USER_ID, &StaticTokenProvider).await;
+
+        assert_eq!(
+            servers["remote"]
+                .headers
+                .as_ref()
+                .unwrap()
+                .get("Authorization")
+                .unwrap(),
+            "Bearer oauth-access-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_injection_keeps_user_configured_header_and_skips_stdio() {
+        let mut servers = HashMap::from([
+            (
+                "remote".to_owned(),
+                http_config(Some(HashMap::from([(
+                    "Authorization".to_owned(),
+                    "Bearer manual".to_owned(),
+                )]))),
+            ),
+            (
+                "local".to_owned(),
+                McpServerConfig {
+                    transport: TransportType::Stdio,
+                    command: Some("npx".into()),
+                    args: Some(vec![]),
+                    env: Some(HashMap::new()),
+                    url: None,
+                    headers: None,
+                    deferred: Some(false),
+                    startup_timeout_ms: None,
+                },
+            ),
+        ]);
+
+        inject_oauth_headers_into_configs(&mut servers, TEST_USER_ID, &StaticTokenProvider).await;
+
+        assert_eq!(
+            servers["remote"]
+                .headers
+                .as_ref()
+                .unwrap()
+                .get("Authorization")
+                .unwrap(),
+            "Bearer manual"
+        );
+        assert!(servers["local"].headers.is_none());
     }
 
     fn make_row(
