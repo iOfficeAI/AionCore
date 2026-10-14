@@ -32,4 +32,8 @@ pub struct UpsertOAuthTokenParams<'a> {
     pub refresh_token: Option<&'a str>,
     pub token_type: &'a str,
     pub expires_at: Option<aionui_common::TimestampMs>,
+    /// Dynamically registered client id (RFC 7591), when one was obtained.
+    pub client_id: Option<&'a str>,
+    /// Client secret issued at registration, when the server issued one.
+    pub client_secret: Option<&'a str>,
 }

@@ -1543,6 +1543,10 @@ pub struct SessionBuildInputs<'a> {
     /// User-configured MCP server repository (feature ELECTRON-1JG). `None` on
     /// paths that never inject MCP (tests) ⇒ no injection.
     pub mcp_server_repo: Option<&'a Arc<dyn IMcpServerRepository>>,
+    /// OAuth access token source for URL-based MCP servers. When present, every
+    /// http/sse MCP server the user authenticated against is handed to the
+    /// backend with an `Authorization: Bearer` header. `None` ⇒ no injection.
+    pub mcp_token_provider: Option<&'a Arc<dyn aionui_mcp::IMcpAccessTokenProvider>>,
     /// The conversation runtime context env (`AIONUI_USER_ID` /
     /// `AIONUI_CONVERSATION_ID` / `AIONUI_HELPER_BIN` / `AIONUI_BASE_URL` /
     /// `AIONUI_RUNTIME_TOKEN`, filled by `apply_conversation_runtime_context`).
@@ -1767,6 +1771,7 @@ pub async fn build_antigravity_instance(
         session_snapshot,
         backend_session_id,
         mcp_server_repo,
+        mcp_token_provider,
         runtime_env,
         broadcaster,
         catalog_writeback,
@@ -1796,6 +1801,12 @@ pub async fn build_antigravity_instance(
         None => Vec::new(),
     };
     neutral.extend(config.session_mcp_servers.iter().cloned());
+    // Authenticated remote MCP servers travel with their bearer token (the
+    // same injection the claude/codex lane does), never persisted — the token
+    // is resolved (and refreshed) per session build.
+    if let Some(provider) = mcp_token_provider {
+        aionui_mcp::inject_oauth_bearer_headers(&mut neutral, &user_id, provider.as_ref()).await;
+    }
     let mut mcp_servers: Vec<McpServerSpec> = neutral.iter().map(session_server_to_spec).collect();
     if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
         let mut coordination = vec![team_mcp_server_spec(cfg)];
@@ -1895,6 +1906,7 @@ pub async fn build_session_instance(
         session_snapshot,
         backend_session_id,
         mcp_server_repo,
+        mcp_token_provider,
         runtime_env,
         broadcaster,
         catalog_writeback,
@@ -1935,6 +1947,13 @@ pub async fn build_session_instance(
             .filter(|server| server.name != TEAM_MCP_SERVER_NAME)
             .cloned(),
     );
+    // GAP #3b — OAuth: a remote MCP server the user logged into is useless to
+    // the CLI without the credential, so the stored access token is injected as
+    // an `Authorization: Bearer` header here. A header the user configured by
+    // hand always wins.
+    if let Some(provider) = mcp_token_provider {
+        aionui_mcp::inject_oauth_bearer_headers(&mut neutral, &user_id, provider.as_ref()).await;
+    }
     let mut mcp_servers: Vec<McpServerSpec> = neutral.iter().map(session_server_to_spec).collect();
     if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
         // Team-MCP is PREPENDED before the user's servers (clean-slate + legacy
@@ -4976,6 +4995,111 @@ mod build_mapping_tests {
         }
     }
 
+    /// Token provider that hands out one token for any MCP server URL.
+    struct StaticTokenProvider;
+
+    #[async_trait::async_trait]
+    impl aionui_mcp::IMcpAccessTokenProvider for StaticTokenProvider {
+        async fn access_token(&self, _user_id: &str, _server_url: &str) -> Option<String> {
+            Some("oauth-access-token".to_owned())
+        }
+    }
+
+    /// Build a claude spawn with one http MCP row and return its inline
+    /// `--mcp-config` entry, so OAuth header injection can be asserted on what
+    /// the CLI actually receives.
+    async fn direct_claude_http_mcp_entry(
+        transport_config: &str,
+        provider: Option<Arc<dyn aionui_mcp::IMcpAccessTokenProvider>>,
+    ) -> serde_json::Value {
+        let config = AcpBuildExtra {
+            backend: Some("claude".into()),
+            mcp_server_ids: Some(vec!["mcp-remote".into()]),
+            ..Default::default()
+        };
+        let mut row = direct_mcp_row("mcp-remote", "mcp-remote");
+        row.transport_config = transport_config.into();
+        let repo: Arc<dyn IMcpServerRepository> = Arc::new(DirectMcpRepo { rows: vec![row] });
+        let metadata = test_metadata(Some("claude"), None);
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(16));
+        let spawner = Arc::new(RecordingFailSpawner::default());
+
+        let _ = build_session_instance(
+            "claude",
+            SessionBuildInputs {
+                conversation_id: "conv-direct-oauth".into(),
+                user_id: "user-1".into(),
+                workspace: std::env::current_dir()
+                    .expect("current directory")
+                    .to_string_lossy()
+                    .into_owned(),
+                config: &config,
+                metadata: &metadata,
+                skill_delivery: Default::default(),
+                session_snapshot: None,
+                backend_session_id: None,
+                mcp_server_repo: Some(&repo),
+                mcp_token_provider: provider.as_ref(),
+                runtime_env: &[],
+                broadcaster,
+                catalog_writeback: None,
+                acp_session_repo: None,
+                prompt_dump_dir: None,
+                permission_hook_body: None,
+            },
+            spawner.clone(),
+        )
+        .await;
+
+        let command = spawner.last_command().expect("direct backend must reach spawn");
+        let mcp_flag = command
+            .args
+            .iter()
+            .position(|arg| arg == "--mcp-config")
+            .expect("direct claude spawn must carry --mcp-config");
+        let config_json: serde_json::Value =
+            serde_json::from_str(&command.args[mcp_flag + 1]).expect("valid inline MCP config");
+        config_json["mcpServers"]["mcp-remote"].clone()
+    }
+
+    #[tokio::test]
+    async fn direct_claude_spawn_injects_oauth_bearer_into_http_mcp_server() {
+        let provider: Arc<dyn aionui_mcp::IMcpAccessTokenProvider> = Arc::new(StaticTokenProvider);
+        let entry = direct_claude_http_mcp_entry(r#"{"url":"http://127.0.0.1:9999/mcp"}"#, Some(provider)).await;
+
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            serde_json::json!("Bearer oauth-access-token"),
+            "an authenticated remote MCP server must reach the CLI with its bearer token"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_claude_spawn_without_provider_sends_no_authorization_header() {
+        let entry = direct_claude_http_mcp_entry(r#"{"url":"http://127.0.0.1:9999/mcp"}"#, None).await;
+
+        assert!(
+            entry["headers"].get("Authorization").is_none(),
+            "no OAuth service ⇒ no header invented: {entry}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_claude_spawn_keeps_user_configured_authorization_header() {
+        let provider: Arc<dyn aionui_mcp::IMcpAccessTokenProvider> = Arc::new(StaticTokenProvider);
+        let entry = direct_claude_http_mcp_entry(
+            r#"{"url":"http://127.0.0.1:9999/mcp","headers":{"Authorization":"Bearer manual-token"}}"#,
+            Some(provider),
+        )
+        .await;
+
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            serde_json::json!("Bearer manual-token"),
+            "a header the user configured by hand must never be replaced"
+        );
+    }
+
     #[tokio::test]
     async fn direct_claude_spawn_contains_team_nonbuiltin_and_builtin_without_reserved_override() {
         use aionui_api_types::{SessionMcpServer, SessionMcpTransport, TeamMcpStdioConfig};
@@ -5043,6 +5167,7 @@ mod build_mapping_tests {
                 session_snapshot: None,
                 backend_session_id: None,
                 mcp_server_repo: Some(&repo),
+                mcp_token_provider: None,
                 runtime_env: &[],
                 broadcaster,
                 catalog_writeback: None,

@@ -132,6 +132,7 @@ pub(super) async fn build(
                 session_snapshot: build_context.session_snapshot.as_ref(),
                 backend_session_id: build_context.session_id.clone(),
                 mcp_server_repo: deps.mcp_server_repo.as_ref(),
+                mcp_token_provider: deps.mcp_token_provider.as_ref(),
                 // The AIONUI_* conversation runtime context the legacy path
                 // injects via apply_acp_launch_policy — forwarded into
                 // SessionConfig.spawn_env so direct-CLI spawns get it too.
@@ -263,6 +264,12 @@ pub(super) async fn build(
                 );
             }
         }
+    }
+
+    // OAuth: hand the ACP agent the credential for every remote MCP server the
+    // user authenticated against, so it is not left with an anonymous 401.
+    if let Some(provider) = deps.mcp_token_provider.as_ref() {
+        inject_oauth_headers_into_sdk_servers(&mut session_mcp_servers, &ctx.user_id, provider.as_ref()).await;
     }
 
     let params = Arc::new(
@@ -536,6 +543,45 @@ async fn row_to_sdk_mcp_server(row: &McpServerRow) -> Result<McpServer, String> 
             ))
         }
         other => Err(format!("unknown transport type: {other}")),
+    }
+}
+
+/// Add the stored OAuth bearer token to every URL-based MCP server in the ACP
+/// `session/new` payload.
+///
+/// The SDK carries headers as a `Vec<HttpHeader>` rather than a map, so this
+/// mirrors [`aionui_mcp::inject_oauth_bearer_headers`] on the SDK shape. Best
+/// effort: a server with no stored token is left untouched, and a header the
+/// user configured by hand is never replaced.
+async fn inject_oauth_headers_into_sdk_servers(
+    servers: &mut [McpServer],
+    user_id: &str,
+    provider: &dyn aionui_mcp::IMcpAccessTokenProvider,
+) {
+    for server in servers.iter_mut() {
+        let url = match server {
+            McpServer::Http(http) => http.url.clone(),
+            McpServer::Sse(sse) => sse.url.clone(),
+            _ => continue,
+        };
+        let Some(token) = provider.access_token(user_id, &url).await else {
+            continue;
+        };
+        let headers = match server {
+            McpServer::Http(http) => &mut http.headers,
+            McpServer::Sse(sse) => &mut sse.headers,
+            _ => continue,
+        };
+        if headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case(aionui_mcp::AUTHORIZATION_HEADER))
+        {
+            continue;
+        }
+        headers.push(HttpHeader::new(
+            aionui_mcp::AUTHORIZATION_HEADER,
+            format!("Bearer {token}"),
+        ));
     }
 }
 

@@ -24,6 +24,8 @@ fn sample_params() -> UpsertOAuthTokenParams<'static> {
         access_token: "enc_access_token_123",
         refresh_token: Some("enc_refresh_token_456"),
         token_type: "bearer",
+        client_id: None,
+        client_secret: None,
         expires_at: Some(1700000000000),
     }
 }
@@ -68,6 +70,8 @@ async fn upsert_updates_existing_token() {
             access_token: "new_access_token",
             refresh_token: None,
             token_type: "bearer",
+            client_id: None,
+            client_secret: None,
             expires_at: Some(1800000000000),
         })
         .await
@@ -93,6 +97,8 @@ async fn upsert_without_refresh_token_or_expires_at() {
             access_token: "simple_token",
             refresh_token: None,
             token_type: "bearer",
+            client_id: None,
+            client_secret: None,
             expires_at: None,
         })
         .await
@@ -146,6 +152,8 @@ async fn list_authenticated_urls_returns_all() {
         access_token: "token2",
         refresh_token: None,
         token_type: "bearer",
+        client_id: None,
+        client_secret: None,
         expires_at: None,
     })
     .await
@@ -169,6 +177,8 @@ async fn delete_one_does_not_affect_others() {
         access_token: "token2",
         refresh_token: None,
         token_type: "bearer",
+        client_id: None,
+        client_secret: None,
         expires_at: None,
     })
     .await
@@ -212,6 +222,8 @@ async fn full_oauth_lifecycle() {
             access_token: "refreshed_token",
             refresh_token: Some("new_refresh"),
             token_type: "bearer",
+            client_id: None,
+            client_secret: None,
             expires_at: Some(1900000000000),
         })
         .await

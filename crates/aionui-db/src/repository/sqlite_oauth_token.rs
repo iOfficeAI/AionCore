@@ -34,13 +34,15 @@ impl IOAuthTokenRepository for SqliteOAuthTokenRepository {
         sqlx::query(
             "INSERT INTO oauth_tokens \
                 (user_id, server_url, access_token, refresh_token, token_type, \
-                 expires_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+                 expires_at, client_id, client_secret, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(user_id, server_url) DO UPDATE SET \
                 access_token = excluded.access_token, \
                 refresh_token = excluded.refresh_token, \
                 token_type = excluded.token_type, \
                 expires_at = excluded.expires_at, \
+                client_id = excluded.client_id, \
+                client_secret = excluded.client_secret, \
                 updated_at = excluded.updated_at",
         )
         .bind(params.user_id)
@@ -49,6 +51,8 @@ impl IOAuthTokenRepository for SqliteOAuthTokenRepository {
         .bind(params.refresh_token)
         .bind(params.token_type)
         .bind(params.expires_at)
+        .bind(params.client_id)
+        .bind(params.client_secret)
         .bind(now)
         .bind(now)
         .execute(&self.pool)
@@ -119,6 +123,8 @@ mod tests {
             refresh_token: Some("enc_refresh_token_456"),
             token_type: "bearer",
             expires_at: Some(1700000000000),
+            client_id: None,
+            client_secret: None,
         }
     }
 
@@ -155,6 +161,8 @@ mod tests {
                 refresh_token: None,
                 token_type: "bearer",
                 expires_at: Some(1800000000000),
+                client_id: None,
+                client_secret: None,
             })
             .await
             .unwrap();
@@ -165,6 +173,44 @@ mod tests {
         assert_eq!(updated.expires_at, Some(1800000000000));
         // created_at preserved from original insert
         assert_eq!(updated.created_at, original.created_at);
+    }
+
+    #[tokio::test]
+    async fn upsert_persists_dynamically_registered_client() {
+        let (repo, _db) = setup().await;
+        repo.upsert(UpsertOAuthTokenParams {
+            client_id: Some("dcr_client_123"),
+            client_secret: Some("dcr_secret_456"),
+            ..sample_params()
+        })
+        .await
+        .unwrap();
+
+        let found = repo
+            .get_by_url(USER_A, "https://mcp.example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.client_id.as_deref(), Some("dcr_client_123"));
+        assert_eq!(found.client_secret.as_deref(), Some("dcr_secret_456"));
+    }
+
+    #[tokio::test]
+    async fn upsert_without_client_clears_previous_registration() {
+        let (repo, _db) = setup().await;
+        repo.upsert(UpsertOAuthTokenParams {
+            client_id: Some("dcr_client_123"),
+            client_secret: None,
+            ..sample_params()
+        })
+        .await
+        .unwrap();
+
+        // A later login against a server that dropped its registration endpoint
+        // must not keep presenting a stale client id.
+        let updated = repo.upsert(sample_params()).await.unwrap();
+        assert!(updated.client_id.is_none());
+        assert!(updated.client_secret.is_none());
     }
 
     #[tokio::test]
@@ -219,6 +265,8 @@ mod tests {
             refresh_token: None,
             token_type: "bearer",
             expires_at: None,
+            client_id: None,
+            client_secret: None,
         })
         .await
         .unwrap();
