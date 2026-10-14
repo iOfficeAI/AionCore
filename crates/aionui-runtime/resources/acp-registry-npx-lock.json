@@ -6,6 +6,11 @@
       "package": "@autohandai/autohand-acp",
       "version": "0.2.1"
     },
+    "bob": {
+      "registry_json_id": "bob",
+      "package": "@ibm/bob",
+      "version": "2.0.7"
+    },
     "codebuddy": {
       "registry_json_id": "codebuddy-code",
       "package": "@tencent-ai/codebuddy-code",

@@ -76,6 +76,7 @@ async fn probed_registry_agents_carry_seeded_auth_methods() {
 
     let seeded = [
         "autohand",
+        "bob",
         "deepagents",
         "dirac",
         "glm-acp-agent",
@@ -137,7 +138,7 @@ async fn probed_registry_agents_carry_seeded_mcp_capabilities() {
     // (backend, http, sse) — `None` means the agent advertises no usable
     // mcp_capabilities (absent or empty object), which keeps Team on the CLI
     // transport for it. Covers EVERY agent added by migrations 025/029/031.
-    let cases: [(&str, Option<(bool, bool)>); 21] = [
+    let cases: [(&str, Option<(bool, bool)>); 22] = [
         // npx distributions (025 + 029 + 031)
         ("autohand", Some((true, true))),
         ("deepagents", Some((false, false))),
@@ -149,6 +150,8 @@ async fn probed_registry_agents_carry_seeded_mcp_capabilities() {
         ("mimo-code", Some((true, true))),
         // 044 (Registry npx, probed 2026-09-14 at @minimax-ai/code@0.2.7)
         ("minimax-code", Some((true, true))),
+        // 045 (Registry npx, probed 2026-10-15 at @ibm/bob@2.0.7; advertises http only)
+        ("bob", Some((true, false))),
         ("nova", Some((true, true))),
         ("sigit", Some((false, false))),
         // direct CLI launch (031 seeded it on npx; 039 moved it off the bridge)

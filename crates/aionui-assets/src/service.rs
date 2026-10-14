@@ -121,6 +121,7 @@ mod tests {
         let service = AssetService;
         for name in [
             "autohand",
+            "bob",
             "deepagents",
             "dimcode",
             "dirac",
