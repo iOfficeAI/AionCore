@@ -101,6 +101,60 @@ pub fn classify(reported: &str, verified: &str) -> VersionVerdict {
 /// direct-CLI backend instead of one pair per CLI.
 pub const CODE_CLI_VERSION_OLDER: &str = "CLI_VERSION_OLDER";
 pub const CODE_CLI_VERSION_NEWER: &str = "CLI_VERSION_NEWER";
+pub const CODE_CODEX_PLAN_OPT_IN: &str = "CODEX_PLAN_OPT_IN";
+
+/// First codex release where the `update_plan` tool became opt-in.
+///
+/// `UpdatePlanToolConfig` lost its `default = "default_true"` in openai/codex
+/// `a9519cbc` ("Make the update_plan tool opt-in", #41744); the same commit
+/// flips `"default": true` to `"default": false` under that key in the
+/// machine-generated `codex-rs/core/config.schema.json`. Re-checked against
+/// `rust-v0.153.4` on 2026-09-09: still `false`.
+const CODEX_PLAN_OPT_IN_SINCE: [u32; 3] = [0, 152, 0];
+
+/// Tell the user that codex stopped offering the plan tool by default.
+///
+/// AionUi renders the running turn's to-do list in `ConversationPlanBar`, which
+/// is fed by `SessionEvent::Plan`. From 0.152.0 the model is not offered
+/// `update_plan` unless the user enables it, so no plan frame is ever emitted
+/// and the bar simply does not appear — no error, nothing to notice.
+///
+/// AionUi deliberately does NOT force the setting on. `-c` overrides whatever
+/// the user put in their own `~/.codex/config.toml` (`codex --help`: "Override
+/// a configuration value that would otherwise be loaded from
+/// `~/.codex/config.toml`"), and this is a preference upstream made opt-in on
+/// purpose — unlike the shell-environment overrides next to it, which are
+/// compatibility requirements the host must control. Losing the bar costs a
+/// live progress view, not correctness: the turn still runs and still answers.
+///
+/// So we say so once, and leave the choice where it belongs.
+///
+/// Version-gated rather than config-gated on purpose: reading the effective
+/// value would mean an extra app-server `config/read` round-trip
+/// (`AppToolsConfig` is an untyped object in the v2 schema, so the value does
+/// come back — it is reachable, just not free). The cost of not doing it is one
+/// Info line for a user who already enabled it; the cost of doing it is a
+/// handshake on every session open.
+pub fn plan_opt_in_notice(cli: &str, reported: &str) -> Option<(NoticeLevel, String, LocalizedText)> {
+    if cli != "codex" {
+        return None;
+    }
+    let parsed = parse_version(reported)?;
+    let mut padded = parsed;
+    padded.resize(3, 0);
+    if padded[..3] < CODEX_PLAN_OPT_IN_SINCE[..] {
+        return None;
+    }
+    Some((
+        NoticeLevel::Info,
+        format!(
+            "codex {reported} no longer offers the plan tool by default, so the plan progress              bar will not appear. To bring it back, add `[tools.update_plan]` with              `enabled = true` to your codex config (~/.codex/config.toml). AionUi does not              change that file for you."
+        ),
+        LocalizedText::new(CODE_CODEX_PLAN_OPT_IN)
+            .with("cli", cli)
+            .with("reported", reported),
+    ))
+}
 
 /// The user-facing warning for a drifting install, or `None` when there is
 /// nothing worth saying.
@@ -259,33 +313,47 @@ pub fn already_reported(cli: &str, session_id: &str) -> bool {
         .insert((cli.to_owned(), session_id.to_owned()))
 }
 
-/// Probe `<cli> --version` and return the drift notice to emit, if any.
+/// Probe `<cli> --version` once and return every notice that probe justifies.
 ///
-/// Returns `None` when this session already reported, when the CLI is not
-/// version-gated, when the probe failed, or when the install matches — i.e.
-/// the caller emits whatever comes back and needs no further conditions.
+/// A list rather than an option because one version probe can now answer two
+/// questions: has the install drifted from the verified release, and does this
+/// release need the user to opt into something AionUi will not opt into for
+/// them. Both are one-shot per session and both need the same version string,
+/// so probing twice would be waste and a second `already_reported` key.
+///
+/// Empty when this session already reported, when the CLI is not version-gated,
+/// when the probe failed, or when there is simply nothing to say — i.e. the
+/// caller emits whatever comes back and needs no further conditions.
 pub async fn session_drift_notice(
     spawner: &Arc<dyn Spawner>,
     cli: &str,
     program: &std::path::Path,
     session_id: &str,
-) -> Option<(NoticeLevel, String, LocalizedText)> {
+) -> Vec<(NoticeLevel, String, LocalizedText)> {
     let Some(verified) = verified_version(cli) else {
         tracing::debug!(cli = %cli, "version check skipped: CLI is not version-gated");
-        return None;
+        return Vec::new();
     };
     if already_reported(cli, session_id) {
         tracing::debug!(session_id = %session_id, cli = %cli, "version check skipped: already reported for this session");
-        return None;
+        return Vec::new();
     }
     let Some(reported) = probe_cli_version(spawner, program, session_id).await else {
         tracing::warn!(session_id = %session_id, cli = %cli, program = %program.display(), "version probe produced no output");
-        return None;
+        return Vec::new();
     };
     tracing::info!(session_id = %session_id, cli = %cli, version = %reported, "direct CLI version detected");
-    let notice = drift_notice(cli, &reported, verified)?;
-    tracing::warn!(session_id = %session_id, cli = %cli, version = %reported, "direct CLI version drift");
-    Some(notice)
+
+    let mut notices = Vec::new();
+    if let Some(notice) = drift_notice(cli, &reported, verified) {
+        tracing::warn!(session_id = %session_id, cli = %cli, version = %reported, "direct CLI version drift");
+        notices.push(notice);
+    }
+    if let Some(notice) = plan_opt_in_notice(cli, &reported) {
+        tracing::info!(session_id = %session_id, cli = %cli, version = %reported, "codex plan tool is opt-in on this release");
+        notices.push(notice);
+    }
+    notices
 }
 
 /// How long to keep trying to hand the notice to a subscriber.
@@ -468,6 +536,39 @@ mod tests {
         assert_eq!(parse_version("2.1.220 (Claude Code)"), Some(vec![2, 1, 220]));
         assert_eq!(parse_version("codex-cli 0.144.6"), Some(vec![0, 144, 6]));
         assert_eq!(parse_version("1.1.10"), Some(vec![1, 1, 10]));
+    }
+
+    #[test]
+    fn the_plan_notice_starts_at_the_release_that_made_the_tool_opt_in() {
+        // 0.152.0 is the boundary, not an arbitrary floor: openai/codex a9519cbc
+        // ("Make the update_plan tool opt-in", #41744) is what flipped the
+        // default, and it shipped in 0.152.0.
+        assert!(plan_opt_in_notice("codex", "codex-cli 0.151.0").is_none());
+        assert!(plan_opt_in_notice("codex", "codex-cli 0.152.0").is_some());
+        assert!(plan_opt_in_notice("codex", "codex-cli 0.153.4").is_some());
+        // A future major must not fall back through the comparison.
+        assert!(plan_opt_in_notice("codex", "codex-cli 1.0.0").is_some());
+    }
+
+    #[test]
+    fn the_plan_notice_is_codex_only_and_says_what_to_do() {
+        // The other two CLIs have no such setting; a notice naming a codex
+        // config file would be nonsense in an agy or claude conversation.
+        assert!(plan_opt_in_notice("claude", "2.1.236").is_none());
+        assert!(plan_opt_in_notice("agy", "1.1.28").is_none());
+        // Unparseable output claims nothing, like every other verdict here.
+        assert!(plan_opt_in_notice("codex", "not a version").is_none());
+
+        let (level, message, localized) =
+            plan_opt_in_notice("codex", "codex-cli 0.153.4").expect("0.153.4 needs the opt-in");
+        // Info: nothing has failed, and the user may have disabled it on
+        // purpose. Same tier as the drift notices for the same reason.
+        assert_eq!(level, NoticeLevel::Info);
+        assert_eq!(localized.code, CODE_CODEX_PLAN_OPT_IN);
+        // The message must carry the fix, not just the diagnosis — this is the
+        // only place the user is told, because AionUi will not set it for them.
+        assert!(message.contains("tools.update_plan"), "{message}");
+        assert!(message.contains("config.toml"), "{message}");
     }
 
     #[test]

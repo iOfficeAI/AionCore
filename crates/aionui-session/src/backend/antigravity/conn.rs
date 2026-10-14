@@ -460,29 +460,31 @@ impl AntigravitySessionBackend {
             .unwrap_or_else(|| std::path::PathBuf::from("agy"));
         let weak = self.weak_self.get().cloned();
         tokio::spawn(async move {
-            let Some((level, message, localized)) = session_drift_notice(&spawner, "agy", &program, &session_id).await
-            else {
+            let notices = session_drift_notice(&spawner, "agy", &program, &session_id).await;
+            if notices.is_empty() {
                 return;
-            };
+            }
             if let Some(backend) = weak.and_then(|w| w.upgrade()) {
-                // Not `emit`: that drops the value when nobody is subscribed
-                // yet, which is fine for a turn frame (another one follows) but
-                // loses this notice outright — the check runs once per session.
-                crate::backend::cli_version::broadcast_notice(
-                    &backend.event_tx,
-                    SessionEnvelope {
-                        session_id: backend.session_id.clone(),
-                        turn_gen: backend.turn_gen.load(Ordering::SeqCst),
-                        event: SessionEvent::Notice {
-                            level,
-                            message,
-                            localized: Some(localized),
-                            supersedes_key: None,
+                for (level, message, localized) in notices {
+                    // Not `emit`: that drops the value when nobody is subscribed
+                    // yet, which is fine for a turn frame (another one follows) but
+                    // loses this notice outright — the check runs once per session.
+                    crate::backend::cli_version::broadcast_notice(
+                        &backend.event_tx,
+                        SessionEnvelope {
+                            session_id: backend.session_id.clone(),
+                            turn_gen: backend.turn_gen.load(Ordering::SeqCst),
+                            event: SessionEvent::Notice {
+                                level,
+                                message,
+                                localized: Some(localized),
+                                supersedes_key: None,
+                            },
                         },
-                    },
-                    "agy",
-                )
-                .await;
+                        "agy",
+                    )
+                    .await;
+                }
             }
         });
     }
