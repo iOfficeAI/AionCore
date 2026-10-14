@@ -7,16 +7,16 @@ use aionui_common::{TimestampMs, now_ms};
 use aionui_db::{IOAuthTokenRepository, UpsertOAuthTokenParams};
 use oauth2::basic::BasicClient;
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken,
-    TokenResponse, TokenUrl,
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl,
+    RefreshToken, TokenResponse, TokenUrl,
 };
-use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use crate::error::McpError;
+use crate::oauth_discovery::{ClientCredentials, OAuthDiscovery, OAuthServerMetadata};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -32,17 +32,6 @@ const DEFAULT_CLIENT_ID: &str = "aionui";
 const EXPIRY_MARGIN_MS: i64 = 5 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
-// Discovery response
-// ---------------------------------------------------------------------------
-
-/// OAuth Authorization Server Metadata (RFC 8414) — subset of fields we need.
-#[derive(Debug, Deserialize)]
-struct OAuthServerMetadata {
-    authorization_endpoint: String,
-    token_endpoint: String,
-}
-
-// ---------------------------------------------------------------------------
 // Pending login state
 // ---------------------------------------------------------------------------
 
@@ -56,6 +45,10 @@ struct PendingLogin {
     auth_url: String,
     token_url: String,
     redirect_url: String,
+    /// Credentials the authorize request was made with. The token exchange must
+    /// reuse exactly these — a dynamically registered client_id differs per
+    /// server and per registration.
+    credentials: ClientCredentials,
 }
 
 // ---------------------------------------------------------------------------
@@ -72,6 +65,16 @@ pub struct McpOAuthService {
     http_client: reqwest::Client,
     /// Mutex protecting pending login state by (user_id, oauth_state).
     pending: Arc<Mutex<HashMap<(String, String), PendingLogin>>>,
+    /// Dynamically registered client credentials, keyed by server URL.
+    ///
+    /// Cached in-process so the authorize/exchange/refresh legs of one login
+    /// share a client_id without re-registering on every call.
+    ///
+    /// Not persisted: after a restart the cache is empty, so a refresh against
+    /// a registration-only server falls back to the static client ID and fails,
+    /// requiring a fresh login. Persisting the registration alongside the token
+    /// row would remove that re-login and is the natural follow-up.
+    registered_clients: Arc<Mutex<HashMap<String, ClientCredentials>>>,
 }
 
 impl McpOAuthService {
@@ -80,6 +83,7 @@ impl McpOAuthService {
             token_repo,
             http_client,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            registered_clients: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -206,10 +210,10 @@ impl McpOAuthService {
         let auth_url_str = metadata.authorization_endpoint.clone();
         let token_url_str = metadata.token_endpoint.clone();
 
-        let auth_url = AuthUrl::new(metadata.authorization_endpoint)
+        let auth_url = AuthUrl::new(metadata.authorization_endpoint.clone())
             .map_err(|e| McpError::OAuth(format!("Invalid auth URL: {e}")))?;
-        let token_url =
-            TokenUrl::new(metadata.token_endpoint).map_err(|e| McpError::OAuth(format!("Invalid token URL: {e}")))?;
+        let token_url = TokenUrl::new(metadata.token_endpoint.clone())
+            .map_err(|e| McpError::OAuth(format!("Invalid token URL: {e}")))?;
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -223,10 +227,17 @@ impl McpOAuthService {
         let redirect = RedirectUrl::new(redirect_url_str.clone())
             .map_err(|e| McpError::OAuth(format!("Invalid redirect URL: {e}")))?;
 
-        let client = BasicClient::new(ClientId::new(DEFAULT_CLIENT_ID.to_string()))
+        let credentials = self
+            .resolve_client_credentials(server_url, &metadata, &redirect_url_str)
+            .await?;
+
+        let mut client = BasicClient::new(ClientId::new(credentials.client_id.clone()))
             .set_auth_uri(auth_url)
             .set_token_uri(token_url)
             .set_redirect_uri(redirect);
+        if let Some(ref secret) = credentials.client_secret {
+            client = client.set_client_secret(ClientSecret::new(secret.clone()));
+        }
 
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
@@ -246,6 +257,7 @@ impl McpOAuthService {
                     auth_url: auth_url_str,
                     token_url: token_url_str,
                     redirect_url: redirect_url_str,
+                    credentials,
                 },
             );
         }
@@ -269,48 +281,66 @@ impl McpOAuthService {
         Ok(true)
     }
 
-    /// Discover OAuth authorization server metadata.
+    /// Discover OAuth authorization server metadata for an MCP server URL.
     ///
-    /// Tries `.well-known/oauth-authorization-server` first,
-    /// falls back to `.well-known/openid-configuration`.
+    /// See [`crate::oauth_discovery`] for the probe order; the important part
+    /// is that `.well-known` paths are resolved against the server's *origin*
+    /// with the resource path as a suffix (RFC 8414), not appended to the full
+    /// URL — appending is rejected by many public MCP servers.
     async fn discover_endpoints(&self, server_url: &str) -> Result<OAuthServerMetadata, McpError> {
-        let base = server_url.trim_end_matches('/');
-
-        let well_known_url = format!("{base}/.well-known/oauth-authorization-server");
-        if let Ok(metadata) = self.fetch_metadata(&well_known_url).await {
-            debug!(server_url, "Discovered OAuth metadata via RFC 8414");
-            return Ok(metadata);
-        }
-
-        let oidc_url = format!("{base}/.well-known/openid-configuration");
-        if let Ok(metadata) = self.fetch_metadata(&oidc_url).await {
-            debug!(server_url, "Discovered OAuth metadata via OIDC");
-            return Ok(metadata);
-        }
-
-        Err(McpError::OAuth(format!(
-            "Failed to discover OAuth endpoints for '{server_url}': \
-             no .well-known/oauth-authorization-server or \
-             .well-known/openid-configuration found"
-        )))
+        OAuthDiscovery::new(&self.http_client).discover(server_url).await
     }
 
-    /// Fetch and parse OAuth server metadata from a URL.
-    async fn fetch_metadata(&self, url: &str) -> Result<OAuthServerMetadata, McpError> {
-        let resp = self
-            .http_client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| McpError::OAuth(format!("HTTP request failed: {e}")))?;
-
-        if !resp.status().is_success() {
-            return Err(McpError::OAuth(format!("Metadata endpoint returned {}", resp.status())));
+    /// Resolve the OAuth client to use for a server.
+    ///
+    /// Prefers a previously registered client, then RFC 7591 dynamic client
+    /// registration when the server advertises a registration endpoint, and
+    /// finally the static fallback client ID for servers that pre-provision it.
+    async fn resolve_client_credentials(
+        &self,
+        server_url: &str,
+        metadata: &OAuthServerMetadata,
+        redirect_uri: &str,
+    ) -> Result<ClientCredentials, McpError> {
+        if let Some(existing) = self.registered_clients.lock().await.get(server_url) {
+            return Ok(existing.clone());
         }
 
-        resp.json()
+        let Some(registration_endpoint) = metadata.registration_endpoint.as_deref() else {
+            debug!(
+                server_url,
+                "No registration endpoint advertised; using static client ID"
+            );
+            return Ok(ClientCredentials {
+                client_id: DEFAULT_CLIENT_ID.to_string(),
+                client_secret: None,
+            });
+        };
+
+        let credentials = OAuthDiscovery::new(&self.http_client)
+            .register_client(registration_endpoint, redirect_uri)
+            .await?;
+        debug!(server_url, "Registered OAuth client via dynamic client registration");
+
+        self.registered_clients
+            .lock()
             .await
-            .map_err(|e| McpError::OAuth(format!("Failed to parse metadata: {e}")))
+            .insert(server_url.to_string(), credentials.clone());
+
+        Ok(credentials)
+    }
+
+    /// Return the registered client for a server, or the static fallback.
+    async fn cached_client_credentials(&self, server_url: &str) -> ClientCredentials {
+        self.registered_clients
+            .lock()
+            .await
+            .get(server_url)
+            .cloned()
+            .unwrap_or_else(|| ClientCredentials {
+                client_id: DEFAULT_CLIENT_ID.to_string(),
+                client_secret: None,
+            })
     }
 
     /// Wait for the OAuth callback redirect on the given listener.
@@ -392,7 +422,7 @@ impl McpOAuthService {
         code: String,
         state: String,
     ) -> Result<(), McpError> {
-        let (auth_url_str, token_url_str, redirect_url_str, pkce_verifier) = {
+        let (auth_url_str, token_url_str, redirect_url_str, pkce_verifier, credentials) = {
             let mut guard = self.pending.lock().await;
             let pending = guard
                 .remove(&(user_id.to_string(), state))
@@ -402,6 +432,7 @@ impl McpOAuthService {
                 pending.token_url,
                 pending.redirect_url,
                 pending.pkce_verifier,
+                pending.credentials,
             )
         };
 
@@ -410,10 +441,13 @@ impl McpOAuthService {
         let redirect =
             RedirectUrl::new(redirect_url_str).map_err(|e| McpError::OAuth(format!("Invalid redirect URL: {e}")))?;
 
-        let client = BasicClient::new(ClientId::new(DEFAULT_CLIENT_ID.to_string()))
+        let mut client = BasicClient::new(ClientId::new(credentials.client_id))
             .set_auth_uri(auth_url)
             .set_token_uri(token_url)
             .set_redirect_uri(redirect);
+        if let Some(secret) = credentials.client_secret {
+            client = client.set_client_secret(ClientSecret::new(secret));
+        }
 
         let http_client = Self::build_no_redirect_client()?;
 
@@ -440,7 +474,11 @@ impl McpOAuthService {
         let token_url =
             TokenUrl::new(metadata.token_endpoint).map_err(|e| McpError::OAuth(format!("Invalid token URL: {e}")))?;
 
-        let client = BasicClient::new(ClientId::new(DEFAULT_CLIENT_ID.to_string())).set_token_uri(token_url);
+        let credentials = self.cached_client_credentials(server_url).await;
+        let mut client = BasicClient::new(ClientId::new(credentials.client_id)).set_token_uri(token_url);
+        if let Some(secret) = credentials.client_secret {
+            client = client.set_client_secret(ClientSecret::new(secret));
+        }
 
         let http_client = Self::build_no_redirect_client()?;
 
@@ -706,6 +744,10 @@ mod tests {
                 auth_url: "https://auth.example.com/authorize".to_string(),
                 token_url: "https://auth.example.com/token".to_string(),
                 redirect_url: "http://127.0.0.1/callback".to_string(),
+                credentials: ClientCredentials {
+                    client_id: DEFAULT_CLIENT_ID.to_string(),
+                    client_secret: None,
+                },
             },
         );
     }
