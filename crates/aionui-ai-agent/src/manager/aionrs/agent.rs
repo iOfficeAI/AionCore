@@ -119,6 +119,15 @@ pub struct AionrsAgentManager {
     approval_manager: Arc<ToolApprovalManager>,
     confirmations: Arc<RwLock<Vec<Confirmation>>>,
     final_input_dump: Option<AionrsFinalInputDumpContext>,
+    /// Provider type label used when resolving image-input capability after a
+    /// same-provider model hot-swap (openai / anthropic / …).
+    provider: String,
+    base_url: Option<String>,
+    /// Model id currently applied to the engine (or queued for the next turn).
+    current_model: Mutex<String>,
+    /// When a model switch arrives mid-turn, apply it before the next
+    /// `engine.run_with_blocks` instead of tearing down the agent.
+    pending_model: Mutex<Option<String>>,
     /// Signalled by `cancel()` to abort an in-flight `engine.run()` via
     /// `tokio::select!` in `send_message()`.
     cancel_notify: Arc<Notify>,
@@ -282,6 +291,10 @@ impl AionrsAgentManager {
             approval_manager,
             confirmations,
             final_input_dump,
+            provider: config_extra.provider.clone(),
+            base_url: config_extra.base_url.clone(),
+            current_model: Mutex::new(config_extra.model.clone()),
+            pending_model: Mutex::new(None),
             cancel_notify: Arc::new(Notify::new()),
             turn_finished_notify: Arc::new(Notify::new()),
         })
@@ -421,6 +434,7 @@ impl IAgentTask for AionrsAgentManager {
             .send(AgentStreamEvent::BackendTurnBound(turn_anchor.clone()));
 
         let mut engine = self.engine.lock().await;
+        self.apply_pending_model_locked(&mut engine).await;
         engine.set_next_turn_id(Some(turn_anchor));
 
         let result = tokio::select! {
@@ -586,8 +600,12 @@ impl AionrsAgentManager {
     }
 
     pub async fn config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
+        let current_model = self.current_model.lock().await.clone();
         Ok(GetConfigOptionsResponse {
-            config_options: vec![aionrs_mode_config_option(self.approval_manager.current_mode())],
+            config_options: vec![
+                aionrs_mode_config_option(self.approval_manager.current_mode()),
+                aionrs_model_config_option(&current_model),
+            ],
         })
     }
 
@@ -595,30 +613,82 @@ impl AionrsAgentManager {
         let option_id = option_id.trim();
         let value = value.trim();
 
-        if option_id != AIONRS_MODE_OPTION_ID {
-            return Err(AgentError::bad_request(format!(
+        match option_id {
+            AIONRS_MODE_OPTION_ID => {
+                if !is_aionrs_session_mode(value) {
+                    return Err(AgentError::bad_request(format!(
+                        "Value '{value}' is not selectable for config option '{option_id}'"
+                    )));
+                }
+                self.set_mode(value).await?;
+                Ok(SetConfigOptionResponse {
+                    confirmation: ConfigOptionConfirmation::Observed,
+                    config_options: Some(self.config_options().await?.config_options),
+                })
+            }
+            AIONRS_MODEL_OPTION_ID => {
+                if value.is_empty() {
+                    return Err(AgentError::bad_request(format!(
+                        "Value '{value}' is not selectable for config option '{option_id}'"
+                    )));
+                }
+                let confirmation = self.queue_or_apply_model(value).await?;
+                Ok(SetConfigOptionResponse {
+                    confirmation,
+                    config_options: Some(self.config_options().await?.config_options),
+                })
+            }
+            _ => Err(AgentError::bad_request(format!(
                 "Config option '{option_id}' is not available"
-            )));
+            ))),
         }
-        if !is_aionrs_session_mode(value) {
-            return Err(AgentError::bad_request(format!(
-                "Value '{value}' is not selectable for config option '{option_id}'"
-            )));
-        }
-
-        self.set_mode(value).await?;
-        Ok(SetConfigOptionResponse {
-            confirmation: ConfigOptionConfirmation::Observed,
-            config_options: Some(self.config_options().await?.config_options),
-        })
     }
 
     pub async fn get_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AgentError> {
         Ok(self.slash_commands.clone())
     }
+
+    /// Same-provider hot-swap: updates `AgentEngine.model` without rebuild.
+    /// Mid-turn requests are queued and applied before the next send.
+    async fn queue_or_apply_model(&self, model: &str) -> Result<ConfigOptionConfirmation, AgentError> {
+        if self.runtime.status() == Some(ConversationStatus::Running) {
+            *self.pending_model.lock().await = Some(model.to_owned());
+            *self.current_model.lock().await = model.to_owned();
+            info!(
+                conversation_id = %self.runtime.conversation_id(),
+                model,
+                "Aionrs model switch queued for next turn"
+            );
+            return Ok(ConfigOptionConfirmation::PendingNextTurn);
+        }
+
+        let mut engine = self.engine.lock().await;
+        self.apply_model_locked(&mut engine, model).await;
+        Ok(ConfigOptionConfirmation::Observed)
+    }
+
+    async fn apply_pending_model_locked(&self, engine: &mut AgentEngine) {
+        let pending = self.pending_model.lock().await.take();
+        if let Some(model) = pending {
+            self.apply_model_locked(engine, &model).await;
+        }
+    }
+
+    async fn apply_model_locked(&self, engine: &mut AgentEngine, model: &str) {
+        let image_input = resolve_image_input_capability(&self.provider, self.base_url.as_deref(), model);
+        let changes = engine.apply_config_update(Some(model.to_owned()), Some(image_input), None, None, None, None);
+        *self.current_model.lock().await = model.to_owned();
+        info!(
+            conversation_id = %self.runtime.conversation_id(),
+            model,
+            ?changes,
+            "Aionrs model hot-swapped without rebuild"
+        );
+    }
 }
 
 const AIONRS_MODE_OPTION_ID: &str = "mode";
+const AIONRS_MODEL_OPTION_ID: &str = "model";
 
 fn is_aionrs_session_mode(s: &str) -> bool {
     matches!(s, "default" | "auto_edit" | "yolo")
@@ -638,6 +708,23 @@ fn aionrs_mode_config_option(current_value: String) -> AcpConfigOptionDto {
             aionrs_mode_select_option("auto_edit", "Auto Edit"),
             aionrs_mode_select_option("yolo", "YOLO"),
         ],
+    }
+}
+
+fn aionrs_model_config_option(current_value: &str) -> AcpConfigOptionDto {
+    AcpConfigOptionDto {
+        id: AIONRS_MODEL_OPTION_ID.to_owned(),
+        name: Some("Model".to_owned()),
+        label: None,
+        description: Some(
+            "Hot-swap the upstream model on the same aionrs agent (same provider). Used by Auto planner/worker routing."
+                .to_owned(),
+        ),
+        category: Some("model".to_owned()),
+        option_type: "select".to_owned(),
+        current_value: Some(current_value.to_owned()),
+        // Catalog lives in AionUi; Core accepts any non-empty id for BYOK.
+        options: vec![aionrs_mode_select_option(current_value, current_value)],
     }
 }
 
