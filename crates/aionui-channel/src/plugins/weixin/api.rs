@@ -11,8 +11,9 @@ use crate::constants::{WEIXIN_API_TIMEOUT, WEIXIN_POLL_TIMEOUT};
 use crate::error::ChannelError;
 
 use super::types::{
-    GetUpdatesRequest, GetUpdatesResponse, ILinkResponse, ITEM_TYPE_TEXT, QrCodeData, QrCodeStatusData,
-    SendMessageItem, SendMessageMsg, SendMessageRequest, SendTextItem,
+    GetConfigRequest, GetUpdatesRequest, GetUpdatesResponse, ILinkResponse, ITEM_TYPE_TEXT,
+    QrCodeData, QrCodeStatusData, SendMessageItem, SendMessageMsg, SendMessageRequest,
+    SendTextItem, SendTypingRequest,
 };
 
 /// HTTP client for the WeChat iLink Bot API.
@@ -210,6 +211,79 @@ impl WeixinApi {
                 warn!(to_user_id, error = %e, "sendmessage failed");
                 ChannelError::MessageSendFailed(format!("sendmessage failed: {e}"))
             })?;
+
+        Ok(())
+    }
+
+    /// Fetch bot config including typing_ticket.
+    ///
+    /// `POST /ilink/bot/getconfig`
+    /// Requires `ilink_user_id` and optionally `context_token` (from incoming message).
+    pub async fn get_config(
+        &self,
+        ilink_user_id: &str,
+        context_token: Option<&str>,
+    ) -> Result<String, ChannelError> {
+        let body = GetConfigRequest {
+            ilink_user_id: ilink_user_id.to_string(),
+            context_token: context_token.map(String::from),
+        };
+        let resp: serde_json::Value = self
+            .authenticated_post("ilink/bot/getconfig", &body, WEIXIN_API_TIMEOUT)
+            .await
+            .map_err(|e| ChannelError::PlatformApi(format!("getconfig failed: {e}")))?;
+
+        // Check for API-level errors
+        let ret = resp.get("ret").and_then(|v| v.as_i64()).unwrap_or(0);
+        if ret != 0 {
+            let errcode = resp.get("errcode").and_then(|v| v.as_i64()).unwrap_or(0);
+            let errmsg = resp
+                .get("errmsg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(ChannelError::PlatformApi(format!(
+                "getconfig error: ret={ret}, errcode={errcode}, errmsg={errmsg}"
+            )));
+        }
+
+        resp.get("typing_ticket")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| ChannelError::PlatformApi("getconfig missing typing_ticket".into()))
+    }
+
+    /// Send or stop typing indicator.
+    ///
+    /// `POST /ilink/bot/sendtyping`
+    /// status: 1 = start, 2 = stop
+    pub async fn send_typing(
+        &self,
+        ilink_user_id: &str,
+        typing_ticket: &str,
+        status: i32,
+    ) -> Result<(), ChannelError> {
+        let body = SendTypingRequest {
+            ilink_user_id: ilink_user_id.to_string(),
+            typing_ticket: typing_ticket.to_string(),
+            status,
+        };
+        let resp: serde_json::Value = self
+            .authenticated_post("ilink/bot/sendtyping", &body, WEIXIN_API_TIMEOUT)
+            .await
+            .map_err(|e| ChannelError::PlatformApi(format!("sendtyping failed: {e}")))?;
+
+        // Check for API-level errors
+        let ret = resp.get("ret").and_then(|v| v.as_i64()).unwrap_or(0);
+        if ret != 0 {
+            let errcode = resp.get("errcode").and_then(|v| v.as_i64()).unwrap_or(0);
+            let errmsg = resp
+                .get("errmsg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(ChannelError::PlatformApi(format!(
+                "sendtyping error: ret={ret}, errcode={errcode}, errmsg={errmsg}"
+            )));
+        }
 
         Ok(())
     }
