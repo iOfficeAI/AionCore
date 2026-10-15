@@ -688,12 +688,15 @@ mod tests {
     // -- Test helper ----------------------------------------------------------
 
     fn make_test_job(id: &str, enabled: bool, next_run_at: Option<TimestampMs>) -> CronJob {
-        use crate::types::{CreatedBy, ExecutionMode};
+        use crate::types::{CreatedBy, CronAction, ExecutionMode};
         CronJob {
             id: id.to_owned(),
             user_id: "user1".into(),
             name: "Test".into(),
             enabled,
+            action: CronAction::AgentTurn,
+            shell_workspace: None,
+            shell_timeout_ms: None,
             schedule: CronSchedule::Every {
                 every_ms: 60000,
                 description: None,

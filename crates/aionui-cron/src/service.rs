@@ -26,13 +26,14 @@ use crate::executor::{ExecutionResult, JobExecutor, PreparedRunNow, RETRY_INTERV
 use crate::scheduler::{
     CronScheduler, compute_next_run, compute_next_run_after_occurrence, validate_schedule, validate_timezone,
 };
+use crate::shell;
 use crate::skill_file::{
     cron_skill_dir, cron_skill_name, delete_skill_file, has_skill_file, parse_skill_content, read_skill_content,
     write_raw_skill_file, write_skill_file,
 };
 use crate::types::{
-    CreatedBy, CronAgentConfig, CronJob, CronSchedule, ExecutionMode, cron_job_from_row, cron_job_to_response,
-    cron_job_to_row, schedule_from_dto,
+    CreatedBy, CronAction, CronAgentConfig, CronJob, CronSchedule, ExecutionMode, cron_job_from_row,
+    cron_job_to_response, cron_job_to_row, schedule_from_dto,
 };
 
 const PLACEHOLDER_PATTERNS: &[&str] = &[
@@ -127,6 +128,9 @@ impl CronService {
             execution_mode: Some("existing".to_owned()),
             queue_enabled: false,
             agent_config,
+            action: None,
+            shell_workspace: None,
+            shell_timeout_ms: None,
         };
 
         let job = self
@@ -214,6 +218,9 @@ impl CronService {
                     conversation_title: None,
                     max_retries: None,
                     queue_enabled: None,
+                    action: None,
+                    shell_workspace: None,
+                    shell_timeout_ms: None,
                 },
             )
             .await?;
@@ -259,19 +266,48 @@ impl CronService {
     ) -> Result<CronJob, CronError> {
         let schedule = schedule_from_dto(&req.schedule);
         validate_schedule(&schedule)?;
+        let execution_mode = parse_execution_mode(req.execution_mode.as_deref())?;
+        let action = parse_cron_action(req.action.as_deref())?;
+        let shell_workspace = req
+            .shell_workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let shell_timeout_ms = req.shell_timeout_ms;
+        let message = req.message.or(req.prompt).unwrap_or_default();
+        let conversation_id = req.conversation_id.trim();
+
+        if action == CronAction::Shell {
+            // Shell jobs run outside the agent pipeline: no assistant, no
+            // model tokens, and always bound to an existing conversation.
+            if req.agent_config.is_some() {
+                return Err(CronError::InvalidShellAction(
+                    "shell action jobs cannot carry agent_config".into(),
+                ));
+            }
+            if matches!(execution_mode, ExecutionMode::NewConversation) {
+                return Err(CronError::InvalidShellAction(
+                    "shell action jobs must use the 'existing' execution mode".into(),
+                ));
+            }
+            shell::validate_shell_command(&message)?;
+            shell::validate_shell_timeout(shell_timeout_ms)?;
+        }
+
         let resolved_agent_type = match runtime_agent_type {
             Some(agent_type) => agent_type,
+            None if action == CronAction::Shell => "shell".to_owned(),
             None => {
                 self.resolve_new_job_agent_type(user_id, req.agent_config.as_ref())
                     .await?
             }
         };
-        validate_aionrs_agent_config(&resolved_agent_type, req.agent_config.as_ref())?;
+        if action != CronAction::Shell {
+            validate_aionrs_agent_config(&resolved_agent_type, req.agent_config.as_ref())?;
+        }
 
-        let execution_mode = parse_execution_mode(req.execution_mode.as_deref())?;
         let created_by = CreatedBy::from_str(&req.created_by)?;
-        let message = req.message.or(req.prompt).unwrap_or_default();
-        let conversation_id = req.conversation_id.trim();
         if matches!(execution_mode, ExecutionMode::Existing) {
             self.require_existing_conversation_scope(user_id, conversation_id)
                 .await?;
@@ -301,6 +337,9 @@ impl CronService {
             schedule,
             message,
             execution_mode,
+            action,
+            shell_workspace,
+            shell_timeout_ms,
             agent_config,
             conversation_id: conversation_id.to_owned(),
             conversation_title: req.conversation_title,
@@ -344,11 +383,25 @@ impl CronService {
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
         let mut job = cron_job_from_row(existing_row)?;
-        job.agent_type = self.resolve_job_agent_type(&job).await?;
+        job.agent_type = self.resolve_job_agent_type_for_display(&job).await?;
         let original_execution_mode = job.execution_mode;
         let original_conversation_id = job.conversation_id.clone();
         let mut clear_conversation_binding = false;
         let mut agent_config_changed = false;
+
+        if let Some(action_str) = &req.action {
+            let requested = parse_cron_action(Some(action_str))?;
+            if requested != job.action {
+                return Err(CronError::InvalidShellAction(
+                    "action cannot be changed after creation".into(),
+                ));
+            }
+        }
+        if job.action != CronAction::Shell && (req.shell_workspace.is_some() || req.shell_timeout_ms.is_some()) {
+            return Err(CronError::InvalidShellAction(
+                "shell_workspace/shell_timeout_ms only apply to shell action jobs".into(),
+            ));
+        }
 
         if let Some(name) = &req.name {
             job.name = name.clone();
@@ -365,7 +418,22 @@ impl CronService {
             job.schedule = schedule;
         }
         if let Some(message) = &req.message {
+            if job.action == CronAction::Shell {
+                shell::validate_shell_command(message)?;
+            }
             job.message = message.clone();
+        }
+        if let Some(workspace) = &req.shell_workspace {
+            let trimmed = workspace.trim();
+            job.shell_workspace = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            };
+        }
+        if let Some(timeout_ms) = req.shell_timeout_ms {
+            shell::validate_shell_timeout(Some(timeout_ms))?;
+            job.shell_timeout_ms = Some(timeout_ms);
         }
         if let Some(mode_str) = &req.execution_mode {
             let requested_mode = parse_execution_mode(Some(mode_str))?;
@@ -472,7 +540,7 @@ impl CronService {
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
         let mut job = cron_job_from_row(row)?;
-        job.agent_type = self.resolve_job_agent_type(&job).await?;
+        job.agent_type = self.resolve_job_agent_type_for_display(&job).await?;
         Ok(job)
     }
 
@@ -486,7 +554,7 @@ impl CronService {
         let mut jobs = Vec::with_capacity(rows.len());
         for row in rows {
             let mut job = cron_job_from_row(row)?;
-            job.agent_type = self.resolve_job_agent_type(&job).await?;
+            job.agent_type = self.resolve_job_agent_type_for_display(&job).await?;
             jobs.push(job);
         }
         Ok(jobs)
@@ -636,7 +704,7 @@ impl CronService {
                 return;
             }
         };
-        match self.resolve_job_agent_type(&job).await {
+        match self.resolve_job_agent_type_for_display(&job).await {
             Ok(agent_type) => job.agent_type = agent_type,
             Err(e) => {
                 error!(job_id, error = %e, "Tick: failed to resolve cron assistant runtime");
@@ -794,7 +862,7 @@ impl CronService {
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
         let mut job = cron_job_from_row(row)?;
-        job.agent_type = self.resolve_job_agent_type(&job).await?;
+        job.agent_type = self.resolve_job_agent_type_for_display(&job).await?;
         let prepared = match self.executor.prepare_run_now(&job).await? {
             PreparedRunNow::Ready(prepared) => prepared,
             PreparedRunNow::AlreadyRunning { conversation_id } => {
@@ -966,6 +1034,16 @@ impl CronService {
 
         self.resolve_agent_type_for_assistant_id(&job.user_id, assistant_id)
             .await
+    }
+
+    /// Agent type shown in API responses. Shell-action jobs have no agent
+    /// runtime; they report the fixed `"shell"` discriminator instead of
+    /// failing assistant resolution.
+    async fn resolve_job_agent_type_for_display(&self, job: &CronJob) -> Result<String, CronError> {
+        if job.action == CronAction::Shell {
+            return Ok("shell".to_owned());
+        }
+        self.resolve_job_agent_type(job).await
     }
 
     async fn owner_user_id_for_job(&self, job: &CronJob) -> Option<String> {
@@ -2186,6 +2264,13 @@ fn parse_execution_mode(mode: Option<&str>) -> Result<ExecutionMode, CronError> 
     }
 }
 
+fn parse_cron_action(action: Option<&str>) -> Result<CronAction, CronError> {
+    match action {
+        None => Ok(CronAction::AgentTurn),
+        Some(value) => CronAction::from_str(value),
+    }
+}
+
 fn should_bind_success_conversation(
     execution_mode: &str,
     existing_conversation_id: &str,
@@ -2282,6 +2367,17 @@ fn build_update_params(job: &CronJob, req: &UpdateCronJobRequest) -> UpdateCronJ
         schedule_description,
         payload_message: req.message.clone(),
         execution_mode: req.execution_mode.clone(),
+        // Action is immutable after creation; never written through updates.
+        action: None,
+        shell_workspace: req.shell_workspace.as_ref().map(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        }),
+        shell_timeout_ms: req.shell_timeout_ms.map(Some),
         agent_config,
         conversation_id: None,
         conversation_title: req.conversation_title.as_ref().map(|t| Some(t.clone())),
@@ -2594,6 +2690,9 @@ mod tests {
 
     fn sample_job() -> CronJob {
         CronJob {
+            action: CronAction::AgentTurn,
+            shell_workspace: None,
+            shell_timeout_ms: None,
             id: "cron_test".into(),
             user_id: "user1".into(),
             name: "Test".into(),
@@ -2628,6 +2727,9 @@ mod tests {
     fn build_update_params_name_only() {
         let job = sample_job();
         let req = UpdateCronJobRequest {
+            action: None,
+            shell_workspace: None,
+            shell_timeout_ms: None,
             name: Some("New Name".into()),
             description: None,
             enabled: None,
@@ -2658,6 +2760,9 @@ mod tests {
             ..sample_job()
         };
         let req = UpdateCronJobRequest {
+            action: None,
+            shell_workspace: None,
+            shell_timeout_ms: None,
             name: None,
             description: None,
             enabled: None,
@@ -2695,6 +2800,9 @@ mod tests {
             workspace: None,
         });
         let req = UpdateCronJobRequest {
+            action: None,
+            shell_workspace: None,
+            shell_timeout_ms: None,
             name: None,
             description: None,
             enabled: None,
@@ -2767,6 +2875,9 @@ mod tests {
     fn build_update_params_enabled_change_triggers_next_run() {
         let job = sample_job();
         let req = UpdateCronJobRequest {
+            action: None,
+            shell_workspace: None,
+            shell_timeout_ms: None,
             name: None,
             description: None,
             enabled: Some(false),
@@ -2787,6 +2898,9 @@ mod tests {
     fn build_update_params_description_only() {
         let job = sample_job();
         let req = UpdateCronJobRequest {
+            action: None,
+            shell_workspace: None,
+            shell_timeout_ms: None,
             name: None,
             description: Some("Updated description".into()),
             enabled: None,

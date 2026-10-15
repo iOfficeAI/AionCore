@@ -88,6 +88,16 @@ pub struct CronAgentConfigWriteDto {
 pub enum CronJobPayloadDto {
     #[serde(rename = "message")]
     Message { text: String },
+    /// Native shell execution: `command` runs via the system shell with the
+    /// backend process as parent; no agent turn is started.
+    #[serde(rename = "shell")]
+    Shell {
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<i64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -164,6 +174,18 @@ pub struct CreateCronJobRequest {
     pub queue_enabled: bool,
     #[serde(default)]
     pub agent_config: Option<CronAgentConfigWriteDto>,
+    /// `"agent"` (default) starts an agent turn; `"shell"` runs
+    /// `message` as a native shell command without any model involvement.
+    #[serde(default)]
+    pub action: Option<String>,
+    /// Working directory for `action: "shell"`. Defaults to the bound
+    /// conversation's workspace when omitted.
+    #[serde(default)]
+    pub shell_workspace: Option<String>,
+    /// Timeout in ms for `action: "shell"`. Clamped to
+    /// `[1_000, 3_600_000]`; defaults to 600_000.
+    #[serde(default)]
+    pub shell_timeout_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,7 +214,7 @@ pub struct UpdateConversationCronRequest {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct UpdateCronJobRequest {
     #[serde(default)]
     pub name: Option<String>,
@@ -214,6 +236,15 @@ pub struct UpdateCronJobRequest {
     pub max_retries: Option<i64>,
     #[serde(default)]
     pub queue_enabled: Option<bool>,
+    /// Immutable after creation; requests carrying a different value are rejected.
+    #[serde(default)]
+    pub action: Option<String>,
+    /// Shell action only. `Some("")` clears the override.
+    #[serde(default)]
+    pub shell_workspace: Option<String>,
+    /// Shell action only.
+    #[serde(default)]
+    pub shell_timeout_ms: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -800,6 +831,60 @@ mod tests {
         assert!(serde_json::from_value::<CreateCronJobRequest>(raw).is_err());
     }
 
+    #[test]
+    fn create_request_shell_action() {
+        let raw = json!({
+            "name": "Mirror repos",
+            "schedule": {"kind": "cron", "expr": "0 0 9 * * *", "tz": "UTC"},
+            "message": "gh repo fork owner/repo --clone",
+            "conversation_id": "conv_1",
+            "created_by": "user",
+            "action": "shell",
+            "shell_workspace": "/tmp/forks",
+            "shell_timeout_ms": 300000,
+        });
+        let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.action.as_deref(), Some("shell"));
+        assert_eq!(req.shell_workspace.as_deref(), Some("/tmp/forks"));
+        assert_eq!(req.shell_timeout_ms, Some(300000));
+    }
+
+    #[test]
+    fn create_request_action_defaults_to_agent() {
+        let raw = json!({
+            "name": "X",
+            "schedule": {"kind": "every", "every_ms": 1000},
+            "conversation_id": "c1",
+            "created_by": "user"
+        });
+        let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
+        assert!(req.action.is_none());
+        assert!(req.shell_workspace.is_none());
+        assert!(req.shell_timeout_ms.is_none());
+    }
+
+    #[test]
+    fn create_request_rejects_unknown_action_field_neighbor() {
+        let raw = json!({
+            "name": "X",
+            "schedule": {"kind": "every", "every_ms": 1000},
+            "conversation_id": "c1",
+            "created_by": "user",
+            "shell_command": "echo hi",
+        });
+        let err = serde_json::from_value::<CreateCronJobRequest>(raw).expect_err("unknown fields must be rejected");
+        assert!(err.to_string().contains("shell_command"));
+    }
+
+    #[test]
+    fn update_request_shell_fields() {
+        let raw = json!({"shell_timeout_ms": 1000, "shell_workspace": ""});
+        let req: UpdateCronJobRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.shell_timeout_ms, Some(1000));
+        assert_eq!(req.shell_workspace.as_deref(), Some(""));
+        assert!(req.action.is_none());
+    }
+
     // -- E. UpdateCronJobRequest ----------------------------------------------
 
     #[test]
@@ -985,6 +1070,51 @@ mod tests {
     #[test]
     fn payload_message_roundtrip() {
         let p = CronJobPayloadDto::Message { text: "test".into() };
+        let json = serde_json::to_string(&p).unwrap();
+        let parsed: CronJobPayloadDto = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, p);
+    }
+
+    #[test]
+    fn payload_shell_serialize_minimal() {
+        let p = CronJobPayloadDto::Shell {
+            command: "gh repo fork owner/repo --clone".into(),
+            workspace: None,
+            timeout_ms: None,
+        };
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["kind"], "shell");
+        assert_eq!(json["command"], "gh repo fork owner/repo --clone");
+        assert!(json.get("workspace").is_none());
+        assert!(json.get("timeout_ms").is_none());
+    }
+
+    #[test]
+    fn payload_shell_deserialize_full() {
+        let raw = json!({
+            "kind": "shell",
+            "command": "git fetch --all",
+            "workspace": "/tmp/repos",
+            "timeout_ms": 30000,
+        });
+        let p: CronJobPayloadDto = serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            p,
+            CronJobPayloadDto::Shell {
+                command: "git fetch --all".into(),
+                workspace: Some("/tmp/repos".into()),
+                timeout_ms: Some(30000),
+            }
+        );
+    }
+
+    #[test]
+    fn payload_shell_roundtrip() {
+        let p = CronJobPayloadDto::Shell {
+            command: "echo hi".into(),
+            workspace: Some("/ws".into()),
+            timeout_ms: Some(5000),
+        };
         let json = serde_json::to_string(&p).unwrap();
         let parsed: CronJobPayloadDto = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, p);

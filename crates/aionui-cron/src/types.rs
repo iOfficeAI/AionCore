@@ -59,6 +59,36 @@ impl FromStr for ExecutionMode {
     }
 }
 
+/// What a triggered job does. `AgentTurn` injects a message into the bound
+/// conversation (model-backed); `Shell` runs `payload_message` via the system
+/// shell with no agent involvement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CronAction {
+    AgentTurn,
+    Shell,
+}
+
+impl CronAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AgentTurn => "agent",
+            Self::Shell => "shell",
+        }
+    }
+}
+
+impl FromStr for CronAction {
+    type Err = CronError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "agent" => Ok(Self::AgentTurn),
+            "shell" => Ok(Self::Shell),
+            other => Err(CronError::InvalidShellAction(other.to_owned())),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CreatedBy {
@@ -159,6 +189,12 @@ pub struct CronJob {
     pub schedule: CronSchedule,
     pub message: String,
     pub execution_mode: ExecutionMode,
+    /// Shell-action working directory override; `None` falls back to the
+    /// bound conversation's workspace, then an executor-managed scratch dir.
+    pub shell_workspace: Option<String>,
+    /// Shell-action timeout in ms; `None` = executor default.
+    pub shell_timeout_ms: Option<i64>,
+    pub action: CronAction,
     pub agent_config: Option<CronAgentConfig>,
     pub conversation_id: String,
     pub conversation_title: Option<String>,
@@ -191,6 +227,7 @@ pub fn cron_job_from_row(row: CronJobRow) -> Result<CronJob, CronError> {
     )?;
 
     let execution_mode = ExecutionMode::from_str(&row.execution_mode)?;
+    let action = CronAction::from_str(&row.action)?;
     let created_by = CreatedBy::from_str(&row.created_by)?;
 
     let agent_config = row
@@ -209,6 +246,9 @@ pub fn cron_job_from_row(row: CronJobRow) -> Result<CronJob, CronError> {
         schedule,
         message: row.payload_message,
         execution_mode,
+        action,
+        shell_workspace: row.shell_workspace,
+        shell_timeout_ms: row.shell_timeout_ms,
         agent_config,
         conversation_id: row.conversation_id,
         conversation_title: row.conversation_title,
@@ -283,6 +323,9 @@ pub fn cron_job_to_row(job: &CronJob) -> Result<CronJobRow, CronError> {
         schedule_description,
         payload_message: job.message.clone(),
         execution_mode: job.execution_mode.as_str().to_owned(),
+        action: job.action.as_str().to_owned(),
+        shell_workspace: job.shell_workspace.clone(),
+        shell_timeout_ms: job.shell_timeout_ms,
         agent_config: agent_config_json,
         conversation_id: job.conversation_id.clone(),
         conversation_title: job.conversation_title.clone(),
@@ -356,6 +399,17 @@ pub fn cron_job_to_response(job: &CronJob) -> CronJobResponse {
         }
     });
 
+    let payload = match job.action {
+        CronAction::AgentTurn => CronJobPayloadDto::Message {
+            text: job.message.clone(),
+        },
+        CronAction::Shell => CronJobPayloadDto::Shell {
+            command: job.message.clone(),
+            workspace: job.shell_workspace.clone(),
+            timeout_ms: job.shell_timeout_ms,
+        },
+    };
+
     CronJobResponse {
         id: job.id.clone(),
         name: job.name.clone(),
@@ -363,9 +417,7 @@ pub fn cron_job_to_response(job: &CronJob) -> CronJobResponse {
         enabled: job.enabled,
         schedule,
         target: CronJobTargetDto {
-            payload: CronJobPayloadDto::Message {
-                text: job.message.clone(),
-            },
+            payload,
             execution_mode: Some(job.execution_mode.as_str().to_owned()),
         },
         metadata: CronJobMetadataDto {
@@ -441,6 +493,25 @@ mod tests {
     fn execution_mode_as_str_roundtrip() {
         for mode in [ExecutionMode::Existing, ExecutionMode::NewConversation] {
             assert_eq!(ExecutionMode::from_str(mode.as_str()).unwrap(), mode);
+        }
+    }
+
+    #[test]
+    fn cron_action_from_str_valid() {
+        assert_eq!(CronAction::from_str("agent").unwrap(), CronAction::AgentTurn);
+        assert_eq!(CronAction::from_str("shell").unwrap(), CronAction::Shell);
+    }
+
+    #[test]
+    fn cron_action_from_str_invalid() {
+        let err = CronAction::from_str("script").unwrap_err();
+        assert!(matches!(err, CronError::InvalidShellAction(_)));
+    }
+
+    #[test]
+    fn cron_action_as_str_roundtrip() {
+        for action in [CronAction::AgentTurn, CronAction::Shell] {
+            assert_eq!(CronAction::from_str(action.as_str()).unwrap(), action);
         }
     }
 
@@ -568,6 +639,9 @@ mod tests {
             schedule_description: Some("every minute".into()),
             payload_message: "do something".into(),
             execution_mode: "existing".into(),
+            action: "agent".into(),
+            shell_workspace: None,
+            shell_timeout_ms: None,
             agent_config: Some(r#"{"backend":"acp","name":"Claude"}"#.into()),
             conversation_id: "conv_1".into(),
             conversation_title: Some("Test Conv".into()),
@@ -599,6 +673,9 @@ mod tests {
             },
             message: "do something".into(),
             execution_mode: ExecutionMode::Existing,
+            action: CronAction::AgentTurn,
+            shell_workspace: None,
+            shell_timeout_ms: None,
             agent_config: Some(CronAgentConfig {
                 name: "Claude".into(),
                 cli_path: None,
@@ -768,6 +845,52 @@ mod tests {
         assert!(matches!(err, CronError::Json(_)));
     }
 
+    #[test]
+    fn row_to_domain_shell_action() {
+        let row = CronJobRow {
+            action: "shell".into(),
+            shell_workspace: Some("/tmp/forks".into()),
+            shell_timeout_ms: Some(300_000),
+            ..sample_row()
+        };
+        let job = cron_job_from_row(row).unwrap();
+        assert_eq!(job.action, CronAction::Shell);
+        assert_eq!(job.shell_workspace.as_deref(), Some("/tmp/forks"));
+        assert_eq!(job.shell_timeout_ms, Some(300_000));
+    }
+
+    #[test]
+    fn row_to_domain_invalid_action() {
+        let row = CronJobRow {
+            action: "script".into(),
+            ..sample_row()
+        };
+        let err = cron_job_from_row(row).unwrap_err();
+        assert!(matches!(err, CronError::InvalidShellAction(_)));
+    }
+
+    #[test]
+    fn domain_to_row_shell_action_roundtrip() {
+        let job = CronJob {
+            action: CronAction::Shell,
+            message: "gh repo fork owner/repo --clone".into(),
+            shell_workspace: Some("/tmp/forks".into()),
+            shell_timeout_ms: Some(300_000),
+            ..sample_job()
+        };
+        let row = cron_job_to_row(&job).unwrap();
+        assert_eq!(row.action, "shell");
+        assert_eq!(row.shell_workspace.as_deref(), Some("/tmp/forks"));
+        assert_eq!(row.shell_timeout_ms, Some(300_000));
+        let restored = cron_job_from_row(row).unwrap();
+        assert_eq!(restored.action, job.action);
+        assert_eq!(restored.message, job.message);
+        assert_eq!(restored.shell_workspace, job.shell_workspace);
+        assert_eq!(restored.shell_timeout_ms, job.shell_timeout_ms);
+        assert_eq!(restored.schedule, job.schedule);
+        assert_eq!(restored.execution_mode, job.execution_mode);
+    }
+
     // -- Domain → DTO ---------------------------------------------------------
 
     #[test]
@@ -827,6 +950,38 @@ mod tests {
         };
         let resp = cron_job_to_response(&job);
         assert!(resp.metadata.agent_config.is_none());
+    }
+
+    #[test]
+    fn domain_to_dto_shell_payload() {
+        let job = CronJob {
+            action: CronAction::Shell,
+            message: "git fetch --all --prune".into(),
+            shell_workspace: Some("/tmp/forks".into()),
+            shell_timeout_ms: Some(120_000),
+            ..sample_job()
+        };
+        let resp = cron_job_to_response(&job);
+        assert_eq!(
+            resp.target.payload,
+            CronJobPayloadDto::Shell {
+                command: "git fetch --all --prune".into(),
+                workspace: Some("/tmp/forks".into()),
+                timeout_ms: Some(120_000),
+            }
+        );
+        assert_eq!(resp.target.execution_mode.as_deref(), Some("existing"));
+    }
+
+    #[test]
+    fn domain_to_dto_agent_payload_unchanged() {
+        let resp = cron_job_to_response(&sample_job());
+        assert_eq!(
+            resp.target.payload,
+            CronJobPayloadDto::Message {
+                text: "do something".into()
+            }
+        );
     }
 
     #[test]

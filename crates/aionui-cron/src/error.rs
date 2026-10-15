@@ -14,6 +14,9 @@ pub enum CronError {
     #[error("Invalid execution mode: {0}")]
     InvalidExecutionMode(String),
 
+    #[error("Invalid shell action: {0}")]
+    InvalidShellAction(String),
+
     #[error("Invalid created-by value: {0}")]
     InvalidCreatedBy(String),
 

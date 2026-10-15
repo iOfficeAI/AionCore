@@ -13,6 +13,13 @@ pub struct CronJobRow {
     pub schedule_description: Option<String>,
     pub payload_message: String,
     pub execution_mode: String,
+    /// `'agent'` (default) dispatches an agent turn; `'shell'` runs
+    /// `payload_message` as a native shell command.
+    pub action: String,
+    /// Working directory override for shell-action jobs.
+    pub shell_workspace: Option<String>,
+    /// Timeout in ms for shell-action jobs; `None` = executor default.
+    pub shell_timeout_ms: Option<i64>,
     /// JSON: serialized `CronAgentConfig`.
     pub agent_config: Option<String>,
     pub conversation_id: String,
@@ -49,6 +56,9 @@ mod tests {
             schedule_description: Some("Every day at 9am".into()),
             payload_message: "Generate daily report".into(),
             execution_mode: "new_conversation".into(),
+            action: "agent".into(),
+            shell_workspace: None,
+            shell_timeout_ms: None,
             agent_config: Some(r#"{"backend":"openai"}"#.into()),
             conversation_id: "conv_xyz".into(),
             conversation_title: Some("Reports".into()),
@@ -88,6 +98,9 @@ mod tests {
             schedule_description: None,
             payload_message: "ping".into(),
             execution_mode: "existing".into(),
+            action: "agent".into(),
+            shell_workspace: None,
+            shell_timeout_ms: None,
             agent_config: None,
             conversation_id: "conv_1".into(),
             conversation_title: None,
@@ -110,5 +123,57 @@ mod tests {
         assert!(row.skill_content.is_none());
         assert!(row.next_run_at.is_none());
         assert!(row.last_status.is_none());
+    }
+
+    #[test]
+    fn cron_job_row_shell_action_fields_roundtrip() {
+        let row = CronJobRow {
+            id: "cron_shell".into(),
+            payload_message: "gh repo fork owner/repo --clone".into(),
+            action: "shell".into(),
+            shell_workspace: Some("/tmp/forks".into()),
+            shell_timeout_ms: Some(300_000),
+            ..cron_job_row_serialization_row()
+        };
+        let json = serde_json::to_string(&row).expect("serialize");
+        let restored: CronJobRow = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.action, "shell");
+        assert_eq!(restored.shell_workspace.as_deref(), Some("/tmp/forks"));
+        assert_eq!(restored.shell_timeout_ms, Some(300_000));
+    }
+
+    /// Shared base row for `..Default`-style test construction.
+    fn cron_job_row_serialization_row() -> CronJobRow {
+        CronJobRow {
+            id: "cron_base".into(),
+            user_id: "user1".into(),
+            name: "Base".into(),
+            enabled: true,
+            schedule_kind: "every".into(),
+            schedule_value: "60000".into(),
+            schedule_tz: None,
+            schedule_description: None,
+            payload_message: "ping".into(),
+            execution_mode: "existing".into(),
+            action: "agent".into(),
+            shell_workspace: None,
+            shell_timeout_ms: None,
+            agent_config: None,
+            conversation_id: "conv_1".into(),
+            conversation_title: None,
+            created_by: "user".into(),
+            skill_content: None,
+            description: None,
+            created_at: 100,
+            updated_at: 100,
+            next_run_at: None,
+            last_run_at: None,
+            last_status: None,
+            last_error: None,
+            run_count: 0,
+            retry_count: 0,
+            max_retries: 3,
+            queue_enabled: false,
+        }
     }
 }

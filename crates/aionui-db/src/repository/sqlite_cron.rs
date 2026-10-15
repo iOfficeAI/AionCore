@@ -35,12 +35,13 @@ impl ICronRepository for SqliteCronRepository {
         sqlx::query(
             "INSERT INTO cron_jobs (\
                 id, user_id, name, enabled, schedule_kind, schedule_value, schedule_tz, \
-                schedule_description, payload_message, execution_mode, agent_config, \
+                schedule_description, payload_message, execution_mode, action, shell_workspace, \
+                shell_timeout_ms, agent_config, \
                 conversation_id, conversation_title, created_by, \
                 skill_content, description, created_at, updated_at, next_run_at, last_run_at, \
                 last_status, last_error, run_count, retry_count, max_retries, queue_enabled\
             ) VALUES (\
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
             )",
         )
         .bind(&row.id)
@@ -53,6 +54,9 @@ impl ICronRepository for SqliteCronRepository {
         .bind(&row.schedule_description)
         .bind(&row.payload_message)
         .bind(&row.execution_mode)
+        .bind(&row.action)
+        .bind(&row.shell_workspace)
+        .bind(row.shell_timeout_ms)
         .bind(&row.agent_config)
         .bind(&row.conversation_id)
         .bind(&row.conversation_title)
@@ -446,6 +450,12 @@ impl SqliteCronRepository {
         push_opt_str!(schedule_description);
         push_str!(payload_message);
         push_str!(execution_mode);
+        push_str!(action);
+        push_opt_str!(shell_workspace);
+        if let Some(ref v) = params.shell_timeout_ms {
+            set_parts.push("shell_timeout_ms = ?".to_string());
+            binds.push(BindValue::OptI64(*v));
+        }
         push_opt_str!(agent_config);
         push_str!(conversation_id);
         push_opt_str!(conversation_title);
@@ -562,6 +572,9 @@ mod tests {
             schedule_description: Some("Every minute".into()),
             payload_message: "ping".into(),
             execution_mode: "existing".into(),
+            action: "agent".into(),
+            shell_workspace: None,
+            shell_timeout_ms: None,
             agent_config: None,
             conversation_id: "conv_1".into(),
             conversation_title: Some("Test Conv".into()),

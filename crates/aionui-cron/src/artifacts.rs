@@ -98,7 +98,7 @@ fn parse_enum<T: DeserializeOwned>(value: &str) -> Result<T, CronError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CreatedBy, CronJob, CronSchedule, ExecutionMode};
+    use crate::types::{CreatedBy, CronAction, CronJob, CronSchedule, ExecutionMode};
 
     fn sample_job() -> CronJob {
         CronJob {
@@ -112,6 +112,9 @@ mod tests {
             },
             message: "Run".into(),
             execution_mode: ExecutionMode::NewConversation,
+            action: CronAction::AgentTurn,
+            shell_workspace: None,
+            shell_timeout_ms: None,
             agent_config: None,
             conversation_id: "conv_1".into(),
             conversation_title: None,
