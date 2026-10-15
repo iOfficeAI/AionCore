@@ -62,7 +62,13 @@ pub fn build_ping_frame(service_id: i32) -> PbFrame {
     }
 }
 
-pub fn build_ack_frame(original: &PbFrame) -> PbFrame {
+/// Build the ACK frame for a received DATA frame.
+///
+/// `response_payload` is the body echoed back to the platform. For plain
+/// events this is `{"code":200}`; for a `card.action.trigger` callback it must
+/// be the card-callback response (`{}` = keep card unchanged, or a `toast` /
+/// `card` object) so the platform does not report a callback timeout.
+pub fn build_ack_frame(original: &PbFrame, response_payload: &[u8]) -> PbFrame {
     let mut ack_headers = Vec::new();
     for h in &original.headers {
         if h.key == "type" || h.key == "message_id" || h.key == "trace_id" {
@@ -82,7 +88,7 @@ pub fn build_ack_frame(original: &PbFrame) -> PbFrame {
         headers: ack_headers,
         payload_encoding: String::new(),
         payload_type: String::new(),
-        payload: br#"{"code":200}"#.to_vec(),
+        payload: response_payload.to_vec(),
         log_id_new: original.log_id_new.clone(),
     }
 }
@@ -190,7 +196,7 @@ mod tests {
             payload: Vec::new(),
             log_id_new: String::new(),
         };
-        let ack = build_ack_frame(&original);
+        let ack = build_ack_frame(&original, br#"{"code":200}"#);
         assert_eq!(ack.method, METHOD_DATA);
         let payload_str = String::from_utf8(ack.payload.clone()).unwrap();
         assert!(payload_str.contains("200"));
@@ -247,7 +253,7 @@ mod tests {
             payload: Vec::new(),
             log_id_new: String::new(),
         };
-        let ack = build_ack_frame(&original);
+        let ack = build_ack_frame(&original, br#"{}"#);
         let keys: Vec<&str> = ack.headers.iter().map(|h| h.key.as_str()).collect();
         assert!(keys.contains(&"type"));
         assert!(keys.contains(&"message_id"));
@@ -270,7 +276,7 @@ mod tests {
             payload: Vec::new(),
             log_id_new: "new_log_xyz".into(),
         };
-        let ack = build_ack_frame(&original);
+        let ack = build_ack_frame(&original, br#"{}"#);
         assert_eq!(ack.seq_id, 77);
         assert_eq!(ack.log_id, 88);
         assert_eq!(ack.service, 3);
