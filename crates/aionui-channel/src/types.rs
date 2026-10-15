@@ -18,6 +18,7 @@ pub enum PluginType {
     Lark,
     Dingtalk,
     Weixin,
+    Mattermost,
     /// Reserved variant for future Slack integration.
     Slack,
     /// Reserved variant for future Discord integration.
@@ -31,6 +32,7 @@ impl fmt::Display for PluginType {
             Self::Lark => write!(f, "lark"),
             Self::Dingtalk => write!(f, "dingtalk"),
             Self::Weixin => write!(f, "weixin"),
+            Self::Mattermost => write!(f, "mattermost"),
             Self::Slack => write!(f, "slack"),
             Self::Discord => write!(f, "discord"),
         }
@@ -45,6 +47,7 @@ impl PluginType {
             "lark" => Some(Self::Lark),
             "dingtalk" => Some(Self::Dingtalk),
             "weixin" => Some(Self::Weixin),
+            "mattermost" => Some(Self::Mattermost),
             "slack" => Some(Self::Slack),
             "discord" => Some(Self::Discord),
             _ => None,
@@ -498,6 +501,7 @@ mod tests {
             (PluginType::Lark, "\"lark\""),
             (PluginType::Dingtalk, "\"dingtalk\""),
             (PluginType::Weixin, "\"weixin\""),
+            (PluginType::Mattermost, "\"mattermost\""),
             (PluginType::Slack, "\"slack\""),
             (PluginType::Discord, "\"discord\""),
         ];
@@ -515,6 +519,7 @@ mod tests {
         assert_eq!(PluginType::Lark.to_string(), "lark");
         assert_eq!(PluginType::Dingtalk.to_string(), "dingtalk");
         assert_eq!(PluginType::Weixin.to_string(), "weixin");
+        assert_eq!(PluginType::Mattermost.to_string(), "mattermost");
         assert_eq!(PluginType::Slack.to_string(), "slack");
         assert_eq!(PluginType::Discord.to_string(), "discord");
     }
@@ -523,6 +528,7 @@ mod tests {
     fn plugin_type_from_str_opt() {
         assert_eq!(PluginType::from_str_opt("telegram"), Some(PluginType::Telegram));
         assert_eq!(PluginType::from_str_opt("lark"), Some(PluginType::Lark));
+        assert_eq!(PluginType::from_str_opt("mattermost"), Some(PluginType::Mattermost));
         assert_eq!(PluginType::from_str_opt("unknown"), None);
     }
 

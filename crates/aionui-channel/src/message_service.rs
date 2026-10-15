@@ -382,7 +382,7 @@ fn platform_to_source(platform: PluginType) -> ConversationSource {
         PluginType::Dingtalk => ConversationSource::Dingtalk,
         PluginType::Weixin => ConversationSource::Weixin,
         // Reserved variants default to Aionui
-        PluginType::Slack | PluginType::Discord => ConversationSource::Aionui,
+        PluginType::Mattermost | PluginType::Slack | PluginType::Discord => ConversationSource::Aionui,
     }
 }
 
@@ -426,6 +426,7 @@ fn channel_conversation_name(
         PluginType::Lark => "lark",
         PluginType::Dingtalk => "ding",
         PluginType::Weixin => "wx",
+        PluginType::Mattermost => "mm",
         PluginType::Slack => "slack",
         PluginType::Discord => "discord",
     };
@@ -479,6 +480,7 @@ mod tests {
 
     #[test]
     fn platform_to_source_reserved_defaults_to_aionui() {
+        assert_eq!(platform_to_source(PluginType::Mattermost), ConversationSource::Aionui);
         assert_eq!(platform_to_source(PluginType::Slack), ConversationSource::Aionui);
         assert_eq!(platform_to_source(PluginType::Discord), ConversationSource::Aionui);
     }
