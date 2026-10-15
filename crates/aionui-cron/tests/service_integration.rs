@@ -1099,14 +1099,16 @@ async fn setup_with_assistant_repos() -> (
 
 fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobRequest {
     CreateCronJobRequest {
+        target: None,
+        enabled: None,
         name: name.into(),
         description: Some("test description".into()),
         schedule,
         prompt: None,
         message: Some("test message".into()),
-        conversation_id: "conv_1".into(),
+        conversation_id: Some("conv_1".to_string()),
         conversation_title: Some("Test Conv".into()),
-        created_by: "user".into(),
+        created_by: Some("user".to_string()),
         execution_mode: None,
         queue_enabled: false,
         agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
@@ -1150,9 +1152,9 @@ fn make_cron_row_with_workspace(id: &str, user_id: &str, conversation_id: &str, 
             })
             .unwrap(),
         ),
-        conversation_id: conversation_id.into(),
+        conversation_id: conversation_id.to_string(),
         conversation_title: Some("Test Conv".into()),
-        created_by: "user".into(),
+        created_by: "user".to_string(),
         skill_content: None,
         description: None,
         created_at: now,
@@ -1572,9 +1574,9 @@ async fn list_jobs_allows_legacy_custom_agent_id_without_assistant_id() {
                 })
                 .to_string(),
             ),
-            conversation_id: "conv_1".into(),
+            conversation_id: "conv_1".to_string(),
             conversation_title: None,
-            created_by: "user".into(),
+            created_by: "user".to_string(),
             skill_content: None,
             description: None,
             created_at: now_ms(),
@@ -1607,15 +1609,15 @@ async fn cj7_list_by_conversation() {
     let (svc, _, _) = setup().await;
 
     let mut req1 = make_create_req("Job A", every_60s());
-    req1.conversation_id = "conv_target".into();
+    req1.conversation_id = Some("conv_target".into());
     svc.add_job("u1", req1).await.unwrap();
 
     let mut req2 = make_create_req("Job B", every_60s());
-    req2.conversation_id = "conv_target".into();
+    req2.conversation_id = Some("conv_target".into());
     svc.add_job("u1", req2).await.unwrap();
 
     let mut req3 = make_create_req("Job C", every_60s());
-    req3.conversation_id = "conv_other".into();
+    req3.conversation_id = Some("conv_other".into());
     svc.add_job("u1", req3).await.unwrap();
 
     let query = ListCronJobsQuery {
@@ -1630,7 +1632,7 @@ async fn cj7b_add_job_binds_existing_conversation_to_job() {
     let (svc, _, _, conv_repo) = setup_with_conv_repo().await;
 
     let mut req = make_create_req("Bound Existing Conversation", every_60s());
-    req.conversation_id = "conv_existing_bind".into();
+    req.conversation_id = Some("conv_existing_bind".into());
 
     let job = svc.add_job("u1", req).await.unwrap();
 
@@ -1761,7 +1763,7 @@ async fn update_existing_conversation_job_rejects_agent_config_even_when_switchi
 async fn update_existing_job_to_new_conversation_keeps_owner_anchor() {
     let (svc, cron_repo, _, conv_repo) = setup_with_conv_repo().await;
     let mut create_req = make_create_req("Mode Switch Clears Binding", every_60s());
-    create_req.conversation_id = "conv_mode_switch".into();
+    create_req.conversation_id = Some("conv_mode_switch".into());
     create_req.execution_mode = Some("existing".into());
     let created = svc.add_job("u1", create_req).await.unwrap();
 
@@ -1819,7 +1821,7 @@ async fn update_existing_job_to_new_conversation_clears_previous_auto_workspace(
     );
 
     let mut create_req = make_create_req("Mode Switch Clears Workspace", every_60s());
-    create_req.conversation_id = conversation_id.clone();
+    create_req.conversation_id = Some(conversation_id.clone());
     create_req.execution_mode = Some("existing".into());
     create_req.agent_config.as_mut().unwrap().workspace = Some(auto_workspace);
     let created = svc.add_job("u1", create_req).await.unwrap();
@@ -1872,7 +1874,7 @@ async fn update_existing_job_to_new_conversation_preserves_custom_workspace() {
     );
 
     let mut create_req = make_create_req("Mode Switch Preserves Workspace", every_60s());
-    create_req.conversation_id = conversation_id.clone();
+    create_req.conversation_id = Some(conversation_id.clone());
     create_req.execution_mode = Some("existing".into());
     create_req.agent_config.as_mut().unwrap().workspace = Some(custom_workspace.clone());
     let created = svc.add_job("u1", create_req).await.unwrap();
@@ -1905,7 +1907,7 @@ async fn update_existing_job_to_new_conversation_preserves_custom_workspace() {
 async fn update_team_conversation_job_rejects_execution_mode_change() {
     let (svc, _, _, conv_repo) = setup_with_conv_repo().await;
     let mut create_req = make_create_req("Team Cron Mode Lock", every_60s());
-    create_req.conversation_id = "conv_team_cron".into();
+    create_req.conversation_id = Some("conv_team_cron".into());
     conv_repo.set_conversation_extra(
         "conv_team_cron",
         serde_json::json!({
@@ -2122,7 +2124,7 @@ async fn sk1_1_save_skill_marks_related_skill_suggest_artifacts_saved() {
 
     conv_repo.upsert_artifact_row(aionui_db::ConversationArtifactRow {
         id: format!("conv_1:skill_suggest:{}", job.id),
-        conversation_id: "conv_1".into(),
+        conversation_id: "conv_1".to_string(),
         cron_job_id: Some(job.id.clone()),
         kind: "skill_suggest".into(),
         status: "active".into(),
@@ -2524,7 +2526,7 @@ async fn oc1_rejects_lazy_existing_jobs() {
     let (svc, _repo, _) = setup().await;
 
     let mut req = make_create_req("Lazy Existing", every_60s());
-    req.conversation_id = "".into();
+    req.conversation_id = Some("".into());
     req.execution_mode = Some("existing".into());
     let err = svc.add_job("u1", req).await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::Conversation(_)));
@@ -2535,14 +2537,14 @@ async fn oc1b_allows_new_conversation_jobs_without_owner_anchor() {
     let (svc, _repo, _) = setup().await;
 
     let mut empty_req = make_create_req("New-conv empty", every_60s());
-    empty_req.conversation_id = "".into();
+    empty_req.conversation_id = Some("".into());
     empty_req.execution_mode = Some("new_conversation".into());
     let empty_job = svc.add_job("u1", empty_req).await.unwrap();
     assert_eq!(empty_job.user_id, "u1");
     assert_eq!(empty_job.conversation_id, "");
 
     let mut stale_req = make_create_req("New-conv with stale id", every_60s());
-    stale_req.conversation_id = "missing-conv-that-no-longer-exists".into();
+    stale_req.conversation_id = Some("missing-conv-that-no-longer-exists".into());
     stale_req.execution_mode = Some("new_conversation".into());
     let stale_job = svc.add_job("u1", stale_req).await.unwrap();
     assert_eq!(stale_job.user_id, "u1");
@@ -2554,7 +2556,7 @@ async fn oc2_rejects_existing_jobs_with_missing_conversation() {
     let (svc, _repo, _) = setup().await;
 
     let mut missing_req = make_create_req("Missing Conversation", every_60s());
-    missing_req.conversation_id = "missing-conv-1".into();
+    missing_req.conversation_id = Some("missing-conv-1".into());
     let err = svc.add_job("u1", missing_req).await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::Conversation(_)));
 }
@@ -2592,7 +2594,7 @@ async fn oc2b_rejects_existing_jobs_with_cross_user_conversation_code() {
         .unwrap();
 
     let mut req = make_create_req("Cross User Conversation", every_60s());
-    req.conversation_id = "conv_user_b".into();
+    req.conversation_id = Some("conv_user_b".into());
 
     let err = svc.add_job("u1", req).await.unwrap_err();
     assert!(matches!(
@@ -2607,7 +2609,7 @@ async fn existing_job_with_missing_conversation_is_rejected() {
     let (svc, _repo, _bc, _conv_repo) = setup_with_conv_repo().await;
 
     let mut req = make_create_req("Missing Existing RunNow", every_60s());
-    req.conversation_id = "missing-conv-run-now".into();
+    req.conversation_id = Some("missing-conv-run-now".into());
     req.execution_mode = Some("existing".into());
     let err = svc.add_job("u1", req).await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::Conversation(_)));
@@ -2618,7 +2620,7 @@ async fn run_now_on_running_existing_conversation_returns_active_conversation_wi
     let (svc, cron_repo, bc, _conv_repo, conv_service) = setup_with_conv_runtime().await;
 
     let mut req = make_create_req("Running Existing RunNow", every_60s());
-    req.conversation_id = "conv-running-run-now".into();
+    req.conversation_id = Some("conv-running-run-now".into());
     req.execution_mode = Some("existing".into());
     let job = svc.add_job("u1", req).await.unwrap();
     bc.take_events();
@@ -3359,15 +3361,15 @@ async fn cd1_delete_by_conversation_preserves_jobs() {
     let (svc, _repo, bc) = setup().await;
 
     let mut req_a = make_create_req("Cascade A", every_60s());
-    req_a.conversation_id = "conv_cascade".into();
+    req_a.conversation_id = Some("conv_cascade".into());
     let job_a = svc.add_job("u1", req_a).await.unwrap();
 
     let mut req_b = make_create_req("Cascade B", every_60s());
-    req_b.conversation_id = "conv_cascade".into();
+    req_b.conversation_id = Some("conv_cascade".into());
     let job_b = svc.add_job("u1", req_b).await.unwrap();
 
     let mut req_c = make_create_req("Unrelated", every_60s());
-    req_c.conversation_id = "conv_other".into();
+    req_c.conversation_id = Some("conv_other".into());
     let _job_c = svc.add_job("u1", req_c).await.unwrap();
 
     bc.take_events();
@@ -3417,7 +3419,7 @@ async fn cd3_on_conversation_delete_trait_preserves_jobs() {
     let (svc, _repo, bc) = setup().await;
 
     let mut req = make_create_req("Trait Cascade", every_60s());
-    req.conversation_id = "conv_trait_del".into();
+    req.conversation_id = Some("conv_trait_del".into());
     let job = svc.add_job("u1", req).await.unwrap();
     bc.take_events();
 
@@ -3448,7 +3450,7 @@ async fn cd3b_on_conversation_delete_clears_deleted_workspace_from_jobs() {
     );
 
     let mut req = make_create_req("Clears Deleted Workspace", every_60s());
-    req.conversation_id = conversation_id.clone();
+    req.conversation_id = Some(conversation_id.clone());
     req.agent_config.as_mut().unwrap().workspace = Some(deleted_workspace);
     let job = svc.add_job("u1", req).await.unwrap();
     bc.take_events();
@@ -3561,7 +3563,7 @@ async fn cd3c_on_conversation_delete_preserves_custom_workspace_on_jobs() {
     );
 
     let mut req = make_create_req("Preserves Custom Workspace", every_60s());
-    req.conversation_id = conversation_id.clone();
+    req.conversation_id = Some(conversation_id.clone());
     req.agent_config.as_mut().unwrap().workspace = Some(custom_workspace.clone());
     let job = svc.add_job("u1", req).await.unwrap();
     bc.take_events();
@@ -3583,12 +3585,12 @@ async fn cd4_on_conversation_delete_preserves_all_cron_jobs() {
     let (svc, _repo, bc) = setup().await;
 
     let mut new_conversation_req = make_create_req("Generated Run History", every_60s());
-    new_conversation_req.conversation_id = "conv_generated_run".into();
+    new_conversation_req.conversation_id = Some("conv_generated_run".into());
     new_conversation_req.execution_mode = Some("new_conversation".into());
     let new_conversation_job = svc.add_job("u1", new_conversation_req).await.unwrap();
 
     let mut existing_req = make_create_req("Existing Bound Job", every_60s());
-    existing_req.conversation_id = "conv_generated_run".into();
+    existing_req.conversation_id = Some("conv_generated_run".into());
     existing_req.execution_mode = Some("existing".into());
     let existing_job = svc.add_job("u1", existing_req).await.unwrap();
 
