@@ -52,3 +52,58 @@ fn discord_passes_markdown_through_unchanged() {
     let input = "**bold** _i_ `code` <@123> a < b & c";
     assert_eq!(format_text_for_platform(input, PluginType::Discord), input);
 }
+
+// Telegram headings: HTML mode has no heading tag, so headings become bold
+// standalone lines instead of leaking literal "##".
+#[test]
+fn telegram_h1_becomes_bold() {
+    assert_eq!(
+        format_text_for_platform("# Title", PluginType::Telegram),
+        "<b>Title</b>"
+    );
+}
+
+#[test]
+fn telegram_h2_and_h3_become_bold() {
+    assert_eq!(
+        format_text_for_platform("## Section", PluginType::Telegram),
+        "<b>Section</b>"
+    );
+    assert_eq!(format_text_for_platform("### Sub", PluginType::Telegram), "<b>Sub</b>");
+}
+
+#[test]
+fn telegram_heading_strips_trailing_hashes() {
+    assert_eq!(
+        format_text_for_platform("## Section ##", PluginType::Telegram),
+        "<b>Section</b>"
+    );
+}
+
+#[test]
+fn telegram_heading_preserves_inline_styles() {
+    assert_eq!(
+        format_text_for_platform("## See **bold**", PluginType::Telegram),
+        "<b>See <b>bold</b></b>"
+    );
+}
+
+#[test]
+fn telegram_heading_only_when_line_starts_with_hash() {
+    // A '#' mid-line is not a heading.
+    assert_eq!(format_text_for_platform("issue #42", PluginType::Telegram), "issue #42");
+}
+
+// A shell/Python comment inside a fenced code block must stay literal, not be
+// rewritten as a heading.
+#[test]
+fn telegram_code_block_comments_are_not_headings() {
+    let out = format_text_for_platform("```\n# not a heading\nls -la\n```", PluginType::Telegram);
+    assert_eq!(out, "<pre><code># not a heading\nls -la\n</code></pre>");
+}
+
+#[test]
+fn telegram_multi_line_heading_then_body() {
+    let out = format_text_for_platform("## Head\nbody **x**", PluginType::Telegram);
+    assert_eq!(out, "<b>Head</b>\nbody <b>x</b>");
+}

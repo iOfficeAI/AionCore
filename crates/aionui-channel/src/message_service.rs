@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use crate::channel_settings::{ChannelSettingsService, resolved_model_to_provider};
 use crate::constants::{STREAM_THROTTLE_INTERVAL, TOOL_CONFIRM_TIMEOUT};
 use crate::error::ChannelError;
-use crate::types::{ActionButton, OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
+use crate::types::{ActionButton, OutgoingMessageType, ParseMode, PluginType, UnifiedOutgoingMessage};
 
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
 
@@ -257,11 +257,11 @@ impl ChannelMessageService {
 
     /// Builds the "thinking" placeholder message sent immediately after
     /// receiving a user message, before the AI starts streaming.
-    pub fn build_thinking_message() -> UnifiedOutgoingMessage {
+    pub fn build_thinking_message(parse_mode: Option<ParseMode>) -> UnifiedOutgoingMessage {
         UnifiedOutgoingMessage {
             message_type: OutgoingMessageType::Text,
             text: Some("\u{23f3} Thinking...".into()),
-            parse_mode: None,
+            parse_mode,
             buttons: None,
             keyboard: None,
             image_url: None,
@@ -275,11 +275,11 @@ impl ChannelMessageService {
 
     /// Builds the final message after streaming completes, including
     /// action buttons for the user.
-    pub fn build_final_message(text: &str) -> UnifiedOutgoingMessage {
+    pub fn build_final_message(text: &str, parse_mode: Option<ParseMode>) -> UnifiedOutgoingMessage {
         UnifiedOutgoingMessage {
             message_type: OutgoingMessageType::Buttons,
             text: Some(text.to_owned()),
-            parse_mode: None,
+            parse_mode,
             buttons: Some(vec![vec![
                 ActionButton {
                     label: "\u{1f504} Regenerate".into(),
@@ -308,11 +308,11 @@ impl ChannelMessageService {
     }
 
     /// Builds an intermediate streaming message (for editMessage calls).
-    pub fn build_streaming_message(text: &str) -> UnifiedOutgoingMessage {
+    pub fn build_streaming_message(text: &str, parse_mode: Option<ParseMode>) -> UnifiedOutgoingMessage {
         UnifiedOutgoingMessage {
             message_type: OutgoingMessageType::Text,
             text: Some(text.to_owned()),
-            parse_mode: None,
+            parse_mode,
             buttons: None,
             keyboard: None,
             image_url: None,
@@ -590,7 +590,7 @@ mod tests {
 
     #[test]
     fn thinking_message_has_text() {
-        let msg = ChannelMessageService::build_thinking_message();
+        let msg = ChannelMessageService::build_thinking_message(None);
         assert_eq!(msg.message_type, OutgoingMessageType::Text);
         let text = msg.text.unwrap();
         assert!(text.contains("Thinking"));
@@ -600,7 +600,7 @@ mod tests {
 
     #[test]
     fn final_message_has_buttons() {
-        let msg = ChannelMessageService::build_final_message("Response text");
+        let msg = ChannelMessageService::build_final_message("Response text", None);
         assert_eq!(msg.message_type, OutgoingMessageType::Buttons);
         assert_eq!(msg.text.as_deref(), Some("Response text"));
         let buttons = msg.buttons.unwrap();
@@ -612,7 +612,7 @@ mod tests {
 
     #[test]
     fn streaming_message_is_plain_text() {
-        let msg = ChannelMessageService::build_streaming_message("partial...");
+        let msg = ChannelMessageService::build_streaming_message("partial...", None);
         assert_eq!(msg.message_type, OutgoingMessageType::Text);
         assert_eq!(msg.text.as_deref(), Some("partial..."));
         assert!(msg.buttons.is_none());

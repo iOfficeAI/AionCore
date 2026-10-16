@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::error::ChannelError;
-use crate::formatter::format_text_for_platform;
+use crate::formatter::{format_text_for_platform, parse_mode_for_platform};
 use crate::message_service::{ChannelMessageService, StreamAction};
 use crate::types::{OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
 
@@ -98,7 +98,10 @@ impl ChannelStreamRelay {
                     Some(StreamAction::Thinking(_)) => {}
                     Some(StreamAction::ToolCall { .. }) if has_content && !text_buffer.trim().is_empty() => {
                         let formatted = format_text_for_platform(&text_buffer, self.config.platform);
-                        let flush_msg = ChannelMessageService::build_streaming_message(&formatted);
+                        let flush_msg = ChannelMessageService::build_streaming_message(
+                            &formatted,
+                            parse_mode_for_platform(self.config.platform),
+                        );
                         let _ = self
                             .sender
                             .send_message(
@@ -115,7 +118,10 @@ impl ChannelStreamRelay {
                     Some(StreamAction::Finish) => {
                         if has_content && !text_buffer.trim().is_empty() {
                             let formatted = format_text_for_platform(&text_buffer, self.config.platform);
-                            let final_msg = ChannelMessageService::build_final_message(&formatted);
+                            let final_msg = ChannelMessageService::build_final_message(
+                                &formatted,
+                                parse_mode_for_platform(self.config.platform),
+                            );
                             let _ = self
                                 .sender
                                 .send_message(
@@ -164,7 +170,10 @@ impl ChannelStreamRelay {
                 Err(broadcast::error::RecvError::Closed) => {
                     if has_content && !text_buffer.trim().is_empty() {
                         let formatted = format_text_for_platform(&text_buffer, self.config.platform);
-                        let final_msg = ChannelMessageService::build_final_message(&formatted);
+                        let final_msg = ChannelMessageService::build_final_message(
+                            &formatted,
+                            parse_mode_for_platform(self.config.platform),
+                        );
                         let _ = self
                             .sender
                             .send_message(
@@ -194,7 +203,7 @@ impl ChannelStreamRelay {
     async fn run_editable(self, mut rx: broadcast::Receiver<AgentStreamEvent>) {
         let throttle = Duration::from_millis(self.config.throttle_ms);
 
-        let thinking_msg = ChannelMessageService::build_thinking_message();
+        let thinking_msg = ChannelMessageService::build_thinking_message(parse_mode_for_platform(self.config.platform));
         let thinking_msg_id = match self
             .sender
             .send_message(
@@ -224,7 +233,10 @@ impl ChannelStreamRelay {
                         has_content = true;
                         if last_edit.elapsed() >= throttle {
                             let formatted = format_text_for_platform(&text_buffer, self.config.platform);
-                            let msg = ChannelMessageService::build_streaming_message(&formatted);
+                            let msg = ChannelMessageService::build_streaming_message(
+                                &formatted,
+                                parse_mode_for_platform(self.config.platform),
+                            );
                             let _ = self
                                 .sender
                                 .edit_message(
@@ -240,7 +252,10 @@ impl ChannelStreamRelay {
                     }
                     Some(StreamAction::Thinking(_)) => {}
                     Some(StreamAction::ToolCall { name, .. }) => {
-                        let msg = ChannelMessageService::build_streaming_message(&format!("\u{23f3} {name}..."));
+                        let msg = ChannelMessageService::build_streaming_message(
+                            &format!("\u{23f3} {name}..."),
+                            parse_mode_for_platform(self.config.platform),
+                        );
                         let _ = self
                             .sender
                             .edit_message(
@@ -311,7 +326,8 @@ impl ChannelStreamRelay {
     async fn send_final_edit(&self, text_buffer: &str, has_content: bool, msg_id: &str) {
         if has_content {
             let formatted = format_text_for_platform(text_buffer, self.config.platform);
-            let final_msg = ChannelMessageService::build_final_message(&formatted);
+            let final_msg =
+                ChannelMessageService::build_final_message(&formatted, parse_mode_for_platform(self.config.platform));
             let _ = self
                 .sender
                 .edit_message(
