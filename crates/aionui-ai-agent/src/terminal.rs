@@ -86,6 +86,12 @@ pub struct TerminalRegistry {
     /// aioncore process's cwd (the app bundle), which is never what the
     /// agent means.
     default_cwd: Option<std::path::PathBuf>,
+    /// Conversation runtime env (e.g. `AIONUI_BASE_URL`, `AIONUI_RUNTIME_TOKEN`)
+    /// injected into every spawned terminal, after agent-supplied env so it can
+    /// never be shadowed. Without it, `terminal/create` subprocesses inherit
+    /// only the aioncore daemon env and the agent-facing `aioncore` helper CLI
+    /// fails with missing-variable errors.
+    base_env: Vec<(String, String)>,
 }
 
 impl TerminalRegistry {
@@ -95,6 +101,11 @@ impl TerminalRegistry {
             default_cwd,
             ..Self::default()
         }
+    }
+
+    pub fn with_base_env(mut self, base_env: Vec<(String, String)>) -> Self {
+        self.base_env = base_env;
+        self
     }
 }
 
@@ -141,6 +152,9 @@ impl TerminalRegistry {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         for (k, v) in &params.env {
+            builder.env(k, v);
+        }
+        for (k, v) in &self.base_env {
             builder.env(k, v);
         }
         if let Some(cwd) = params.cwd.as_ref().or(self.default_cwd.as_ref()) {
