@@ -5,9 +5,9 @@ use std::time::Instant;
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{
-    TeamAgentRuntimeStatus, TeamChildTurnPayload, TeamContextResetNotice, TeamContextResetRuntimeStatus,
-    TeamInterruptAgentResponse, TeamInterruptOutcome, TeamMessageEnqueueStatus, TeamQueuedPolicy, TeamRunAckResponse,
-    TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
+    AgentErrorCode, TeamAgentRuntimeStatus, TeamChildTurnPayload, TeamContextResetNotice,
+    TeamContextResetRuntimeStatus, TeamInterruptAgentResponse, TeamInterruptOutcome, TeamMessageEnqueueStatus,
+    TeamQueuedPolicy, TeamRunAckResponse, TeamRunStatus, TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
 };
 use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::ITeamRepository;
@@ -27,8 +27,8 @@ use crate::message_projection::{
     TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest, TeamProjectionSource, teammate_dedupe_key,
 };
 use crate::ports::{
-    AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, NoopNativeSlashCommandPort,
-    SlashCommandRecognition,
+    AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnStatus,
+    NativeSlashCommandPort, NoopNativeSlashCommandPort, SlashCommandRecognition,
 };
 use crate::prompt_dump::{TeamPromptDumpConfig, TeamWakePromptDump, dump_team_wake_prompt};
 use crate::prompts::{build_lead_prompt_for_transport, build_teammate_prompt_for_transport, build_wake_payload};
@@ -84,6 +84,46 @@ pub(crate) enum PrepareBatchResult {
     WaitingForCompletion,
     Blocked,
     Quiescent,
+}
+
+/// Allowlisted delivery failure classes. These are derived from Team turn
+/// control flow, never copied from provider error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryFailureClassification {
+    StartFailed,
+    StartSkipped,
+    Failed,
+    Skipped,
+}
+
+fn normalized_error_code_label(error_code: AgentErrorCode) -> Option<String> {
+    serde_json::to_value(error_code).ok()?.as_str().map(str::to_owned)
+}
+
+impl DeliveryFailureClassification {
+    pub(crate) fn from_start_error(error: &AgentTurnExecutionError) -> Self {
+        match error {
+            AgentTurnExecutionError::Failed { .. } => Self::StartFailed,
+            AgentTurnExecutionError::Skipped { .. } => Self::StartSkipped,
+        }
+    }
+
+    pub(crate) fn from_turn_status(status: AgentTurnStatus) -> Option<Self> {
+        match status {
+            AgentTurnStatus::Completed => None,
+            AgentTurnStatus::Failed => Some(Self::Failed),
+            AgentTurnStatus::Skipped => Some(Self::Skipped),
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::StartFailed => "turn_start_failed",
+            Self::StartSkipped => "turn_start_skipped",
+            Self::Failed => "turn_failed",
+            Self::Skipped => "turn_skipped",
+        }
+    }
 }
 
 /// Input for [`TeamSession::spawn_agent`]. Populated by the lead agent when
@@ -2040,6 +2080,8 @@ impl TeamSession {
         &self,
         slot_id: &str,
         abandoned_count: usize,
+        classification: DeliveryFailureClassification,
+        error_code: Option<AgentErrorCode>,
     ) -> Result<(), TeamError> {
         let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await else {
             return Ok(());
@@ -2048,11 +2090,18 @@ impl TeamSession {
             // The lead itself stalled; there is no higher authority to notify.
             return Ok(());
         }
+        let error_code_detail = error_code
+            .and_then(normalized_error_code_label)
+            .map(|code| format!("; normalized_error_code={code}"))
+            .unwrap_or_default();
         let content = format!(
             "Teammate {slot_id} could not process {abandoned_count} queued message(s) after \
-             {MAX_MESSAGE_DELIVERY_FAILURES} delivery attempts. Those messages were dropped and the \
+             {MAX_MESSAGE_DELIVERY_FAILURES} delivery attempts. Failure classification: {}{}. \
+             Those messages were dropped and the \
              teammate is now paused: it will not pick up new work until you interrupt it with \
-             team_interrupt_agent or the user intervenes. Check on it before assigning more work."
+             team_interrupt_agent or the user intervenes. Check on it before assigning more work.",
+            classification.as_str(),
+            error_code_detail
         );
         self.mailbox
             .write(
@@ -2496,6 +2545,7 @@ mod tests {
                 conversation_id: request.conversation_id,
                 turn_id: "turn-background".into(),
                 status: crate::ports::AgentTurnStatus::Completed,
+                error_code: None,
                 runtime: None,
             })
         }
@@ -2548,6 +2598,7 @@ mod tests {
                 conversation_id: request.conversation_id,
                 turn_id: "turn-test".into(),
                 status: crate::ports::AgentTurnStatus::Completed,
+                error_code: None,
                 runtime: None,
             })
         }
@@ -2912,6 +2963,61 @@ mod tests {
         assert_eq!(state.messages[0].to_agent_id, "worker-1");
         assert_eq!(state.messages[0].content, "Do this task");
         session.stop();
+    }
+
+    #[tokio::test]
+    async fn delivery_exhaustion_notice_includes_safe_failure_classification() {
+        let session = start_session().await;
+        let classification = DeliveryFailureClassification::from_turn_status(AgentTurnStatus::Failed).unwrap();
+
+        session
+            .notify_leader_delivery_exhausted(
+                "worker-1",
+                2,
+                classification,
+                Some(AgentErrorCode::UserLlmProviderGatewayError),
+            )
+            .await
+            .unwrap();
+
+        let notices = session.mailbox().peek_unread("t1", "lead-1").await.unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].content.contains(
+                "Failure classification: turn_failed; normalized_error_code=USER_LLM_PROVIDER_GATEWAY_ERROR."
+            )
+        );
+        session.stop();
+    }
+
+    #[test]
+    fn delivery_failure_classification_uses_normalized_port_variants() {
+        assert_eq!(
+            DeliveryFailureClassification::from_turn_status(crate::ports::AgentTurnStatus::Completed),
+            None
+        );
+        assert_eq!(
+            DeliveryFailureClassification::from_turn_status(crate::ports::AgentTurnStatus::Failed),
+            Some(DeliveryFailureClassification::Failed)
+        );
+        assert_eq!(
+            DeliveryFailureClassification::from_turn_status(crate::ports::AgentTurnStatus::Skipped),
+            Some(DeliveryFailureClassification::Skipped)
+        );
+
+        let skipped = AgentTurnExecutionError::Skipped {
+            reason: "untrusted provider reason".into(),
+        };
+        assert_eq!(
+            DeliveryFailureClassification::from_start_error(&skipped),
+            DeliveryFailureClassification::StartSkipped
+        );
+        assert_eq!(
+            DeliveryFailureClassification::from_start_error(&AgentTurnExecutionError::Failed {
+                reason: "untrusted provider reason".into(),
+            }),
+            DeliveryFailureClassification::StartFailed
+        );
     }
 
     #[tokio::test]

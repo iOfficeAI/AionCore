@@ -1572,6 +1572,11 @@ pub struct SessionBuildInputs<'a> {
     /// Antigravity only: the prepared `.agents/hooks.json` body, so a session
     /// switched out of full auto can restore its approval gate.
     pub permission_hook_body: Option<String>,
+    /// Antigravity only: the prepared Windows wrapper that the body's command
+    /// points at, so a session switched out of full auto restores the whole
+    /// gate. `None` when no hook is configured or the platform installs no
+    /// wrapper.
+    pub permission_hook_wrapper: Option<String>,
 }
 
 /// The mode a session actually starts on.
@@ -1775,6 +1780,7 @@ pub async fn build_antigravity_instance(
         // claude/codex label); skip it rather than mislabel the dump.
         prompt_dump_dir: _,
         permission_hook_body,
+        permission_hook_wrapper,
     } = inputs;
 
     let (spec, mode, model) = spec_mode_model(&conversation_id, backend_session_id, config, session_snapshot, metadata);
@@ -1829,6 +1835,7 @@ pub async fn build_antigravity_instance(
         mode,
         init,
         permission_hook_body,
+        permission_hook_wrapper,
         // agy is NOT shipped with the app: it is a large native binary the user
         // installs themselves, so there is no bundled path to resolve and the
         // backend always spawns the `agy` on PATH.
@@ -1902,6 +1909,7 @@ pub async fn build_session_instance(
         prompt_dump_dir,
         // claude/codex gate through CLI flags, not an installed hook file.
         permission_hook_body: _,
+        permission_hook_wrapper: _,
     } = inputs;
 
     // GAP #1/#2 — the pure spec + mode/model mapping (resume anchor → Resume/Fresh,
@@ -5049,6 +5057,7 @@ mod build_mapping_tests {
                 acp_session_repo: None,
                 prompt_dump_dir: None,
                 permission_hook_body: None,
+                permission_hook_wrapper: None,
             },
             spawner.clone(),
         )

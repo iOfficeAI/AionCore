@@ -16,7 +16,9 @@ use crate::mcp::TeamMcpStdioConfig;
 use crate::ports::TeamConversationBindingLookup;
 use crate::ports::{TeamAssistantCatalogPort, TeamToolCapabilityPort};
 use crate::service::inherit_team_workspace;
-use crate::service::spawn_support::{agent_type_for_backend, cli_backend_metadata, session_mode_for_backend};
+use crate::service::spawn_support::{
+    agent_type_for_backend, cli_backend_metadata, inherited_team_mode_for_backend, session_mode_for_backend,
+};
 use crate::types::{Team, TeamAgent, TeammateRole};
 use crate::workspace::TeamWorkspaceResolver;
 
@@ -867,11 +869,7 @@ impl TeamAgentProvisioner {
         session_mode: Option<&str>,
         mcp_selection: Option<&TeamMcpSelection>,
     ) -> serde_json::Value {
-        let session_mode = session_mode
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| session_mode_for_backend(backend, agent_type, cli_metadata));
+        let session_mode = inherited_team_mode_for_backend(session_mode, backend, agent_type, cli_metadata);
         let mut extra = serde_json::json!({
             "teamId": team_id,
             "slot_id": slot_id,
@@ -1744,6 +1742,33 @@ mod tests {
             "attach must not patch, kill, or warm up"
         );
         assert_eq!(*persisted_extra.lock().unwrap(), existing_extra);
+    }
+
+    #[test]
+    fn new_team_members_inherit_full_auto_semantically_per_backend() {
+        let provisioner = test_provisioner(Arc::new(Mutex::new(Vec::new())));
+        let cases = [
+            ("codex", AgentType::Acp, "agent-full-access"),
+            ("claude", AgentType::Acp, "bypassPermissions"),
+            ("antigravity", AgentType::Antigravity, "yolo"),
+        ];
+
+        for (backend, agent_type, expected_mode) in cases {
+            let extra = provisioner.build_team_extra(
+                "team-1",
+                "slot-1",
+                TeammateRole::Teammate,
+                backend,
+                "model",
+                None,
+                Some("/ws"),
+                agent_type,
+                None,
+                Some("full_auto"),
+                None,
+            );
+            assert_eq!(extra["session_mode"], expected_mode, "backend={backend}");
+        }
     }
 
     #[tokio::test]

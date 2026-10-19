@@ -1,7 +1,7 @@
 //! `aioncore config` subcommand: agent-facing automation CLI for AionUi config.
 
 use std::collections::BTreeMap;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 use reqwest::Method;
@@ -17,6 +17,7 @@ use crate::cli::{
     ConfigSkillsCommand, ConfigSkillsExternalPathsCommand, ConfigSkillsMarketCommand,
 };
 use crate::commands::config_capabilities;
+use crate::commands::json_input::{JsonInputArgs, read_json_input};
 
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
 const ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
@@ -36,17 +37,18 @@ pub async fn run_config(args: ConfigArgs) -> ExitCode {
 
 async fn run(args: ConfigArgs) -> Result<(), ConfigError> {
     let client = reqwest::Client::new();
+    let input = args.json_input;
     match args.command {
         ConfigCommand::Capabilities => print_envelope(config_capabilities::data(), meta(None), "config capabilities"),
         ConfigCommand::Context => run_context(&client).await,
-        ConfigCommand::Conversation(args) => run_conversation(&client, args).await,
-        ConfigCommand::Assistants(args) => run_assistants(&client, args).await,
-        ConfigCommand::Skills(args) => run_skills(&client, args).await,
-        ConfigCommand::Mcp(args) => run_mcp(&client, args).await,
-        ConfigCommand::Providers(args) => run_providers(&client, args).await,
-        ConfigCommand::Settings(args) => run_settings(&client, args).await,
-        ConfigCommand::Agents(args) => run_agents(&client, args).await,
-        ConfigCommand::Cron(args) => run_cron(&client, args).await,
+        ConfigCommand::Conversation(args) => run_conversation(&client, args, &input).await,
+        ConfigCommand::Assistants(args) => run_assistants(&client, args, &input).await,
+        ConfigCommand::Skills(args) => run_skills(&client, args, &input).await,
+        ConfigCommand::Mcp(args) => run_mcp(&client, args, &input).await,
+        ConfigCommand::Providers(args) => run_providers(&client, args, &input).await,
+        ConfigCommand::Settings(args) => run_settings(&client, args, &input).await,
+        ConfigCommand::Agents(args) => run_agents(&client, args, &input).await,
+        ConfigCommand::Cron(args) => run_cron(&client, args, &input).await,
     }
 }
 
@@ -67,11 +69,16 @@ async fn run_context(client: &reqwest::Client) -> Result<(), ConfigError> {
     )
 }
 
-async fn run_conversation(client: &reqwest::Client, args: ConfigConversationArgs) -> Result<(), ConfigError> {
+async fn run_conversation(
+    client: &reqwest::Client,
+    args: ConfigConversationArgs,
+    input: &JsonInputArgs,
+) -> Result<(), ConfigError> {
     match args.command {
         ConfigConversationCommand::Rename => {
             run_id_payload_request_with_resource_readback(
                 client,
+                input,
                 "config conversation rename",
                 Method::PATCH,
                 IdRoute::new("/api/conversations", "", "conversation_id"),
@@ -83,7 +90,11 @@ async fn run_conversation(client: &reqwest::Client, args: ConfigConversationArgs
     }
 }
 
-async fn run_assistants(client: &reqwest::Client, args: ConfigAssistantsArgs) -> Result<(), ConfigError> {
+async fn run_assistants(
+    client: &reqwest::Client,
+    args: ConfigAssistantsArgs,
+    input: &JsonInputArgs,
+) -> Result<(), ConfigError> {
     match args.command {
         ConfigAssistantsCommand::List => {
             let command = "config assistants list";
@@ -91,10 +102,11 @@ async fn run_assistants(client: &reqwest::Client, args: ConfigAssistantsArgs) ->
             let data = request_json(client, &env, Method::GET, "/api/assistants", None, command).await?;
             print_envelope(data, meta(None), command)
         }
-        ConfigAssistantsCommand::Get => run_assistant_get(client).await,
+        ConfigAssistantsCommand::Get => run_assistant_get(client, input).await,
         ConfigAssistantsCommand::Create => {
             run_payload_request_with_collection_readback(
                 client,
+                input,
                 "config assistants create",
                 Method::POST,
                 "/api/assistants",
@@ -103,11 +115,12 @@ async fn run_assistants(client: &reqwest::Client, args: ConfigAssistantsArgs) ->
             )
             .await
         }
-        ConfigAssistantsCommand::Update => run_assistant_update(client).await,
-        ConfigAssistantsCommand::Delete => run_assistant_delete(client).await,
+        ConfigAssistantsCommand::Update => run_assistant_update(client, input).await,
+        ConfigAssistantsCommand::Delete => run_assistant_delete(client, input).await,
         ConfigAssistantsCommand::Import => {
             run_payload_request_with_collection_readback(
                 client,
+                input,
                 "config assistants import",
                 Method::POST,
                 "/api/assistants/import",
@@ -116,20 +129,20 @@ async fn run_assistants(client: &reqwest::Client, args: ConfigAssistantsArgs) ->
             )
             .await
         }
-        ConfigAssistantsCommand::State => run_assistant_state(client).await,
+        ConfigAssistantsCommand::State => run_assistant_state(client, input).await,
         ConfigAssistantsCommand::Rule(args) => {
-            run_assistant_text(client, "rule", args.command, "/api/skills/assistant-rule").await
+            run_assistant_text(client, "rule", args.command, "/api/skills/assistant-rule", input).await
         }
         ConfigAssistantsCommand::Skill(args) => {
-            run_assistant_text(client, "skill", args.command, "/api/skills/assistant-skill").await
+            run_assistant_text(client, "skill", args.command, "/api/skills/assistant-skill", input).await
         }
     }
 }
 
-async fn run_assistant_get(client: &reqwest::Client) -> Result<(), ConfigError> {
+async fn run_assistant_get(client: &reqwest::Client, input: &JsonInputArgs) -> Result<(), ConfigError> {
     let command = "config assistants get";
     let env = ConfigEnv::from_env(command)?;
-    let mut payload = read_stdin_payload(command)?;
+    let mut payload = read_stdin_payload(command, input)?;
     let mut selectors = SelectorMeta::default();
     resolve_top_level_selectors(client, &env, command, &mut payload, &mut selectors).await?;
     let id = required_string_field(&payload, "assistant_id", command)?;
@@ -139,10 +152,10 @@ async fn run_assistant_get(client: &reqwest::Client) -> Result<(), ConfigError> 
     print_envelope(data, meta(Some(selectors)), command)
 }
 
-async fn run_assistant_update(client: &reqwest::Client) -> Result<(), ConfigError> {
+async fn run_assistant_update(client: &reqwest::Client, input: &JsonInputArgs) -> Result<(), ConfigError> {
     let command = "config assistants update";
     let env = ConfigEnv::from_env(command)?;
-    let mut payload = read_stdin_payload(command)?;
+    let mut payload = read_stdin_payload(command, input)?;
     let mut selectors = SelectorMeta::default();
     resolve_top_level_selectors(client, &env, command, &mut payload, &mut selectors).await?;
     let id = take_required_string_field(&mut payload, "assistant_id", command)?;
@@ -158,10 +171,10 @@ async fn run_assistant_update(client: &reqwest::Client) -> Result<(), ConfigErro
     print_envelope(data, meta_from_map(extra), command)
 }
 
-async fn run_assistant_state(client: &reqwest::Client) -> Result<(), ConfigError> {
+async fn run_assistant_state(client: &reqwest::Client, input: &JsonInputArgs) -> Result<(), ConfigError> {
     let command = "config assistants state";
     let env = ConfigEnv::from_env(command)?;
-    let mut payload = read_stdin_payload(command)?;
+    let mut payload = read_stdin_payload(command, input)?;
     let mut selectors = SelectorMeta::default();
     resolve_top_level_selectors(client, &env, command, &mut payload, &mut selectors).await?;
     let id = take_required_string_field(&mut payload, "assistant_id", command)?;
@@ -176,10 +189,10 @@ async fn run_assistant_state(client: &reqwest::Client) -> Result<(), ConfigError
     print_envelope(data, meta_from_map(extra), command)
 }
 
-async fn run_assistant_delete(client: &reqwest::Client) -> Result<(), ConfigError> {
+async fn run_assistant_delete(client: &reqwest::Client, input: &JsonInputArgs) -> Result<(), ConfigError> {
     let command = "config assistants delete";
     let env = ConfigEnv::from_env(command)?;
-    let mut payload = read_stdin_payload(command)?;
+    let mut payload = read_stdin_payload(command, input)?;
     let mut selectors = SelectorMeta::default();
     resolve_top_level_selectors(client, &env, command, &mut payload, &mut selectors).await?;
     let id = required_string_field(&payload, "assistant_id", command)?;
@@ -206,6 +219,7 @@ async fn run_assistant_text(
     kind: &'static str,
     action: ConfigAssistantTextCommand,
     route_prefix: &'static str,
+    input: &JsonInputArgs,
 ) -> Result<(), ConfigError> {
     let action_name = match action {
         ConfigAssistantTextCommand::Read => "read",
@@ -215,7 +229,7 @@ async fn run_assistant_text(
     let command = format!("config assistants {kind} {action_name}");
     let command = command.as_str();
     let env = ConfigEnv::from_env(command)?;
-    let mut payload = read_stdin_payload(command)?;
+    let mut payload = read_stdin_payload(command, input)?;
     let mut selectors = SelectorMeta::default();
     resolve_top_level_selectors(client, &env, command, &mut payload, &mut selectors).await?;
 
@@ -300,7 +314,11 @@ async fn run_assistant_text(
     }
 }
 
-async fn run_skills(client: &reqwest::Client, args: ConfigSkillsArgs) -> Result<(), ConfigError> {
+async fn run_skills(
+    client: &reqwest::Client,
+    args: ConfigSkillsArgs,
+    input: &JsonInputArgs,
+) -> Result<(), ConfigError> {
     match args.command {
         ConfigSkillsCommand::List => {
             let command = "config skills list";
@@ -311,6 +329,7 @@ async fn run_skills(client: &reqwest::Client, args: ConfigSkillsArgs) -> Result<
         ConfigSkillsCommand::Info => {
             run_payload_passthrough(
                 client,
+                input,
                 "config skills info",
                 Method::POST,
                 "/api/skills/info",
@@ -328,6 +347,7 @@ async fn run_skills(client: &reqwest::Client, args: ConfigSkillsArgs) -> Result<
         ConfigSkillsCommand::Import => {
             run_payload_request_with_collection_readback(
                 client,
+                input,
                 "config skills import",
                 Method::POST,
                 "/api/skills/import",
@@ -336,10 +356,11 @@ async fn run_skills(client: &reqwest::Client, args: ConfigSkillsArgs) -> Result<
             )
             .await
         }
-        ConfigSkillsCommand::Delete => run_skill_delete(client).await,
+        ConfigSkillsCommand::Delete => run_skill_delete(client, input).await,
         ConfigSkillsCommand::Scan => {
             run_payload_passthrough(
                 client,
+                input,
                 "config skills scan",
                 Method::POST,
                 "/api/skills/scan",
@@ -362,6 +383,7 @@ async fn run_skills(client: &reqwest::Client, args: ConfigSkillsArgs) -> Result<
             ConfigSkillsExternalPathsCommand::Add => {
                 run_payload_request_with_collection_readback(
                     client,
+                    input,
                     "config skills external-paths add",
                     Method::POST,
                     "/api/skills/external-paths",
@@ -373,6 +395,7 @@ async fn run_skills(client: &reqwest::Client, args: ConfigSkillsArgs) -> Result<
             ConfigSkillsExternalPathsCommand::Remove => {
                 run_payload_request_with_collection_readback(
                     client,
+                    input,
                     "config skills external-paths remove",
                     Method::DELETE,
                     "/api/skills/external-paths",
@@ -409,10 +432,10 @@ async fn run_skills(client: &reqwest::Client, args: ConfigSkillsArgs) -> Result<
     }
 }
 
-async fn run_skill_delete(client: &reqwest::Client) -> Result<(), ConfigError> {
+async fn run_skill_delete(client: &reqwest::Client, input: &JsonInputArgs) -> Result<(), ConfigError> {
     let command = "config skills delete";
     let env = ConfigEnv::from_env(command)?;
-    let payload = read_stdin_payload(command)?;
+    let payload = read_stdin_payload(command, input)?;
     let skill_name = required_string_field(&payload, "skill_name", command)?;
     let path = format!("/api/skills/{}", encode_path_segment(&skill_name));
     let before = request_json(client, &env, Method::GET, "/api/skills", None, command).await?;
@@ -424,7 +447,7 @@ async fn run_skill_delete(client: &reqwest::Client) -> Result<(), ConfigError> {
     print_envelope(data, meta_from_map(extra), command)
 }
 
-async fn run_mcp(client: &reqwest::Client, args: ConfigMcpArgs) -> Result<(), ConfigError> {
+async fn run_mcp(client: &reqwest::Client, args: ConfigMcpArgs, input: &JsonInputArgs) -> Result<(), ConfigError> {
     match args.command {
         ConfigMcpCommand::Servers(args) => match args.command {
             ConfigMcpServersCommand::List => {
@@ -433,11 +456,10 @@ async fn run_mcp(client: &reqwest::Client, args: ConfigMcpArgs) -> Result<(), Co
             ConfigMcpServersCommand::Get => {
                 run_id_no_body_request(
                     client,
+                    input,
                     "config mcp servers get",
                     Method::GET,
-                    "/api/mcp/servers",
-                    "",
-                    "server_id",
+                    IdRoute::new("/api/mcp/servers", "", "server_id"),
                     true,
                 )
                 .await
@@ -445,6 +467,7 @@ async fn run_mcp(client: &reqwest::Client, args: ConfigMcpArgs) -> Result<(), Co
             ConfigMcpServersCommand::Create => {
                 run_payload_request_with_collection_readback(
                     client,
+                    input,
                     "config mcp servers create",
                     Method::POST,
                     "/api/mcp/servers",
@@ -453,10 +476,11 @@ async fn run_mcp(client: &reqwest::Client, args: ConfigMcpArgs) -> Result<(), Co
                 )
                 .await
             }
-            ConfigMcpServersCommand::Update => run_mcp_server_update(client).await,
+            ConfigMcpServersCommand::Update => run_mcp_server_update(client, input).await,
             ConfigMcpServersCommand::Delete => {
                 run_id_no_body_request_with_collection_readback(
                     client,
+                    input,
                     "config mcp servers delete",
                     Method::DELETE,
                     IdRoute::new("/api/mcp/servers", "", "server_id"),
@@ -468,6 +492,7 @@ async fn run_mcp(client: &reqwest::Client, args: ConfigMcpArgs) -> Result<(), Co
             ConfigMcpServersCommand::Toggle => {
                 run_id_no_body_request_with_resource_readback(
                     client,
+                    input,
                     "config mcp servers toggle",
                     Method::POST,
                     IdRoute::new("/api/mcp/servers", "/toggle", "server_id"),
@@ -479,6 +504,7 @@ async fn run_mcp(client: &reqwest::Client, args: ConfigMcpArgs) -> Result<(), Co
             ConfigMcpServersCommand::Import => {
                 run_payload_request_with_collection_readback(
                     client,
+                    input,
                     "config mcp servers import",
                     Method::POST,
                     "/api/mcp/servers/import",
@@ -491,6 +517,7 @@ async fn run_mcp(client: &reqwest::Client, args: ConfigMcpArgs) -> Result<(), Co
         ConfigMcpCommand::TestConnection => {
             run_payload_request(
                 client,
+                input,
                 "config mcp test-connection",
                 Method::POST,
                 "/api/mcp/test-connection",
@@ -512,6 +539,7 @@ async fn run_mcp(client: &reqwest::Client, args: ConfigMcpArgs) -> Result<(), Co
             ConfigMcpOauthCommand::CheckStatus => {
                 run_payload_request(
                     client,
+                    input,
                     "config mcp oauth check-status",
                     Method::POST,
                     "/api/mcp/oauth/check-status",
@@ -522,6 +550,7 @@ async fn run_mcp(client: &reqwest::Client, args: ConfigMcpArgs) -> Result<(), Co
             ConfigMcpOauthCommand::Login => {
                 run_payload_request_with_body_readback(
                     client,
+                    input,
                     "config mcp oauth login",
                     Method::POST,
                     "/api/mcp/oauth/login",
@@ -533,6 +562,7 @@ async fn run_mcp(client: &reqwest::Client, args: ConfigMcpArgs) -> Result<(), Co
             ConfigMcpOauthCommand::Logout => {
                 run_payload_request_with_body_readback(
                     client,
+                    input,
                     "config mcp oauth logout",
                     Method::POST,
                     "/api/mcp/oauth/logout",
@@ -555,10 +585,10 @@ async fn run_mcp(client: &reqwest::Client, args: ConfigMcpArgs) -> Result<(), Co
     }
 }
 
-async fn run_mcp_server_update(client: &reqwest::Client) -> Result<(), ConfigError> {
+async fn run_mcp_server_update(client: &reqwest::Client, input: &JsonInputArgs) -> Result<(), ConfigError> {
     let command = "config mcp servers update";
     let env = ConfigEnv::from_env(command)?;
-    let mut payload = read_stdin_payload(command)?;
+    let mut payload = read_stdin_payload(command, input)?;
     let mut selectors = SelectorMeta::default();
     resolve_top_level_selectors(client, &env, command, &mut payload, &mut selectors).await?;
     let id = take_required_string_field(&mut payload, "server_id", command)?;
@@ -572,7 +602,11 @@ async fn run_mcp_server_update(client: &reqwest::Client) -> Result<(), ConfigErr
     print_envelope(redact_meta_value(data), meta_from_map(extra), command)
 }
 
-async fn run_providers(client: &reqwest::Client, args: ConfigProvidersArgs) -> Result<(), ConfigError> {
+async fn run_providers(
+    client: &reqwest::Client,
+    args: ConfigProvidersArgs,
+    input: &JsonInputArgs,
+) -> Result<(), ConfigError> {
     match args.command {
         ConfigProvidersCommand::List => {
             run_no_input_request(client, "config providers list", Method::GET, "/api/providers", true).await
@@ -580,6 +614,7 @@ async fn run_providers(client: &reqwest::Client, args: ConfigProvidersArgs) -> R
         ConfigProvidersCommand::Create => {
             run_payload_request_with_collection_readback(
                 client,
+                input,
                 "config providers create",
                 Method::POST,
                 "/api/providers",
@@ -591,6 +626,7 @@ async fn run_providers(client: &reqwest::Client, args: ConfigProvidersArgs) -> R
         ConfigProvidersCommand::Update => {
             run_id_payload_request_with_collection_readback(
                 client,
+                input,
                 "config providers update",
                 Method::PUT,
                 IdRoute::new("/api/providers", "", "provider_id"),
@@ -602,6 +638,7 @@ async fn run_providers(client: &reqwest::Client, args: ConfigProvidersArgs) -> R
         ConfigProvidersCommand::Delete => {
             run_id_no_body_request_with_collection_readback(
                 client,
+                input,
                 "config providers delete",
                 Method::DELETE,
                 IdRoute::new("/api/providers", "", "provider_id"),
@@ -613,6 +650,7 @@ async fn run_providers(client: &reqwest::Client, args: ConfigProvidersArgs) -> R
         ConfigProvidersCommand::DetectProtocol => {
             run_payload_request(
                 client,
+                input,
                 "config providers detect-protocol",
                 Method::POST,
                 "/api/providers/detect-protocol",
@@ -623,6 +661,7 @@ async fn run_providers(client: &reqwest::Client, args: ConfigProvidersArgs) -> R
         ConfigProvidersCommand::FetchModels => {
             run_payload_request(
                 client,
+                input,
                 "config providers fetch-models",
                 Method::POST,
                 "/api/providers/fetch-models",
@@ -634,6 +673,7 @@ async fn run_providers(client: &reqwest::Client, args: ConfigProvidersArgs) -> R
             ConfigProviderModelsCommand::Fetch => {
                 run_id_payload_request_with_collection_readback(
                     client,
+                    input,
                     "config providers models fetch",
                     Method::POST,
                     IdRoute::new("/api/providers", "/models", "provider_id"),
@@ -646,6 +686,7 @@ async fn run_providers(client: &reqwest::Client, args: ConfigProvidersArgs) -> R
         ConfigProvidersCommand::HealthCheck => {
             run_payload_request(
                 client,
+                input,
                 "config providers health-check",
                 Method::POST,
                 "/api/agents/provider-health-check",
@@ -656,12 +697,16 @@ async fn run_providers(client: &reqwest::Client, args: ConfigProvidersArgs) -> R
     }
 }
 
-async fn run_settings(client: &reqwest::Client, args: ConfigSettingsArgs) -> Result<(), ConfigError> {
+async fn run_settings(
+    client: &reqwest::Client,
+    args: ConfigSettingsArgs,
+    input: &JsonInputArgs,
+) -> Result<(), ConfigError> {
     match args.command {
         ConfigSettingsCommand::Get => {
             run_no_input_request(client, "config settings get", Method::GET, "/api/settings", false).await
         }
-        ConfigSettingsCommand::Patch => run_settings_patch(client).await,
+        ConfigSettingsCommand::Patch => run_settings_patch(client, input).await,
         ConfigSettingsCommand::Client(args) => match args.command {
             ConfigSettingsClientCommand::Get => {
                 run_no_input_request(
@@ -673,15 +718,15 @@ async fn run_settings(client: &reqwest::Client, args: ConfigSettingsArgs) -> Res
                 )
                 .await
             }
-            ConfigSettingsClientCommand::Put => run_settings_client_put(client).await,
+            ConfigSettingsClientCommand::Put => run_settings_client_put(client, input).await,
         },
     }
 }
 
-async fn run_settings_patch(client: &reqwest::Client) -> Result<(), ConfigError> {
+async fn run_settings_patch(client: &reqwest::Client, input: &JsonInputArgs) -> Result<(), ConfigError> {
     let command = "config settings patch";
     let env = ConfigEnv::from_env(command)?;
-    let mut payload = read_stdin_payload(command)?;
+    let mut payload = read_stdin_payload(command, input)?;
     let mut selectors = SelectorMeta::default();
     resolve_top_level_selectors(client, &env, command, &mut payload, &mut selectors).await?;
     let before = request_json(client, &env, Method::GET, "/api/settings", None, command).await?;
@@ -693,10 +738,10 @@ async fn run_settings_patch(client: &reqwest::Client) -> Result<(), ConfigError>
     print_envelope(redact_meta_value(data), meta_from_map(extra), command)
 }
 
-async fn run_settings_client_put(client: &reqwest::Client) -> Result<(), ConfigError> {
+async fn run_settings_client_put(client: &reqwest::Client, input: &JsonInputArgs) -> Result<(), ConfigError> {
     let command = "config settings client put";
     let env = ConfigEnv::from_env(command)?;
-    let mut payload = read_stdin_payload(command)?;
+    let mut payload = read_stdin_payload(command, input)?;
     let mut selectors = SelectorMeta::default();
     resolve_top_level_selectors(client, &env, command, &mut payload, &mut selectors).await?;
     let before = request_json(client, &env, Method::GET, "/api/settings/client", None, command).await?;
@@ -716,7 +761,11 @@ async fn run_settings_client_put(client: &reqwest::Client) -> Result<(), ConfigE
     print_envelope(redact_meta_value(data), meta_from_map(extra), command)
 }
 
-async fn run_agents(client: &reqwest::Client, args: ConfigAgentsArgs) -> Result<(), ConfigError> {
+async fn run_agents(
+    client: &reqwest::Client,
+    args: ConfigAgentsArgs,
+    input: &JsonInputArgs,
+) -> Result<(), ConfigError> {
     match args.command {
         ConfigAgentsCommand::List => {
             run_no_input_request(
@@ -731,6 +780,7 @@ async fn run_agents(client: &reqwest::Client, args: ConfigAgentsArgs) -> Result<
         ConfigAgentsCommand::Enable => {
             run_id_payload_request_with_collection_readback(
                 client,
+                input,
                 "config agents enable",
                 Method::PATCH,
                 IdRoute::new("/api/agents", "/enabled", "agent_id"),
@@ -743,11 +793,10 @@ async fn run_agents(client: &reqwest::Client, args: ConfigAgentsArgs) -> Result<
             ConfigAgentOverridesCommand::Get => {
                 run_id_no_body_request(
                     client,
+                    input,
                     "config agents overrides get",
                     Method::GET,
-                    "/api/agents",
-                    "/overrides",
-                    "agent_id",
+                    IdRoute::new("/api/agents", "/overrides", "agent_id"),
                     true,
                 )
                 .await
@@ -755,6 +804,7 @@ async fn run_agents(client: &reqwest::Client, args: ConfigAgentsArgs) -> Result<
             ConfigAgentOverridesCommand::Set => {
                 run_id_payload_request_with_resource_readback(
                     client,
+                    input,
                     "config agents overrides set",
                     Method::PUT,
                     IdRoute::new("/api/agents", "/overrides", "agent_id"),
@@ -768,6 +818,7 @@ async fn run_agents(client: &reqwest::Client, args: ConfigAgentsArgs) -> Result<
             ConfigAgentCustomCommand::Create => {
                 run_payload_request_with_collection_readback(
                     client,
+                    input,
                     "config agents custom create",
                     Method::POST,
                     "/api/agents/custom",
@@ -779,6 +830,7 @@ async fn run_agents(client: &reqwest::Client, args: ConfigAgentsArgs) -> Result<
             ConfigAgentCustomCommand::Update => {
                 run_id_payload_request_with_collection_readback(
                     client,
+                    input,
                     "config agents custom update",
                     Method::PUT,
                     IdRoute::new("/api/agents/custom", "", "agent_id"),
@@ -790,6 +842,7 @@ async fn run_agents(client: &reqwest::Client, args: ConfigAgentsArgs) -> Result<
             ConfigAgentCustomCommand::Delete => {
                 run_id_no_body_request_with_collection_readback(
                     client,
+                    input,
                     "config agents custom delete",
                     Method::DELETE,
                     IdRoute::new("/api/agents/custom", "", "agent_id"),
@@ -801,6 +854,7 @@ async fn run_agents(client: &reqwest::Client, args: ConfigAgentsArgs) -> Result<
             ConfigAgentCustomCommand::TryConnect => {
                 run_payload_request(
                     client,
+                    input,
                     "config agents custom try-connect",
                     Method::POST,
                     "/api/agents/custom/try-connect",
@@ -812,14 +866,18 @@ async fn run_agents(client: &reqwest::Client, args: ConfigAgentsArgs) -> Result<
     }
 }
 
-async fn run_cron(client: &reqwest::Client, args: ConfigCronArgs) -> Result<(), ConfigError> {
+async fn run_cron(client: &reqwest::Client, args: ConfigCronArgs, input: &JsonInputArgs) -> Result<(), ConfigError> {
     match args.command {
-        ConfigCronCommand::Jobs(args) => run_cron_jobs(client, args).await,
-        ConfigCronCommand::Current(args) => run_cron_current(client, args).await,
+        ConfigCronCommand::Jobs(args) => run_cron_jobs(client, args, input).await,
+        ConfigCronCommand::Current(args) => run_cron_current(client, args, input).await,
     }
 }
 
-async fn run_cron_jobs(client: &reqwest::Client, args: ConfigCronJobsArgs) -> Result<(), ConfigError> {
+async fn run_cron_jobs(
+    client: &reqwest::Client,
+    args: ConfigCronJobsArgs,
+    input: &JsonInputArgs,
+) -> Result<(), ConfigError> {
     match args.command {
         ConfigCronJobsCommand::List => {
             run_no_input_request(client, "config cron jobs list", Method::GET, "/api/cron/jobs", false).await
@@ -827,11 +885,10 @@ async fn run_cron_jobs(client: &reqwest::Client, args: ConfigCronJobsArgs) -> Re
         ConfigCronJobsCommand::Get => {
             run_id_no_body_request(
                 client,
+                input,
                 "config cron jobs get",
                 Method::GET,
-                "/api/cron/jobs",
-                "",
-                "job_id",
+                IdRoute::new("/api/cron/jobs", "", "job_id"),
                 false,
             )
             .await
@@ -839,6 +896,7 @@ async fn run_cron_jobs(client: &reqwest::Client, args: ConfigCronJobsArgs) -> Re
         ConfigCronJobsCommand::Create => {
             run_payload_request_with_collection_readback(
                 client,
+                input,
                 "config cron jobs create",
                 Method::POST,
                 "/api/cron/jobs",
@@ -850,6 +908,7 @@ async fn run_cron_jobs(client: &reqwest::Client, args: ConfigCronJobsArgs) -> Re
         ConfigCronJobsCommand::Update => {
             run_id_payload_request_with_resource_readback(
                 client,
+                input,
                 "config cron jobs update",
                 Method::PUT,
                 IdRoute::new("/api/cron/jobs", "", "job_id"),
@@ -861,6 +920,7 @@ async fn run_cron_jobs(client: &reqwest::Client, args: ConfigCronJobsArgs) -> Re
         ConfigCronJobsCommand::Delete => {
             run_id_no_body_request_with_collection_readback(
                 client,
+                input,
                 "config cron jobs delete",
                 Method::DELETE,
                 IdRoute::new("/api/cron/jobs", "", "job_id"),
@@ -872,11 +932,10 @@ async fn run_cron_jobs(client: &reqwest::Client, args: ConfigCronJobsArgs) -> Re
         ConfigCronJobsCommand::Run => {
             run_id_no_body_request(
                 client,
+                input,
                 "config cron jobs run",
                 Method::POST,
-                "/api/cron/jobs",
-                "/run",
-                "job_id",
+                IdRoute::new("/api/cron/jobs", "/run", "job_id"),
                 false,
             )
             .await
@@ -885,11 +944,10 @@ async fn run_cron_jobs(client: &reqwest::Client, args: ConfigCronJobsArgs) -> Re
             ConfigCronJobSkillCommand::Get => {
                 run_id_no_body_request(
                     client,
+                    input,
                     "config cron jobs skill get",
                     Method::GET,
-                    "/api/cron/jobs",
-                    "/skill",
-                    "job_id",
+                    IdRoute::new("/api/cron/jobs", "/skill", "job_id"),
                     false,
                 )
                 .await
@@ -897,6 +955,7 @@ async fn run_cron_jobs(client: &reqwest::Client, args: ConfigCronJobsArgs) -> Re
             ConfigCronJobSkillCommand::Save => {
                 run_id_payload_request_with_resource_readback(
                     client,
+                    input,
                     "config cron jobs skill save",
                     Method::POST,
                     IdRoute::new("/api/cron/jobs", "/skill", "job_id"),
@@ -908,6 +967,7 @@ async fn run_cron_jobs(client: &reqwest::Client, args: ConfigCronJobsArgs) -> Re
             ConfigCronJobSkillCommand::Delete => {
                 run_id_no_body_request_with_resource_readback(
                     client,
+                    input,
                     "config cron jobs skill delete",
                     Method::DELETE,
                     IdRoute::new("/api/cron/jobs", "/skill", "job_id"),
@@ -920,7 +980,11 @@ async fn run_cron_jobs(client: &reqwest::Client, args: ConfigCronJobsArgs) -> Re
     }
 }
 
-async fn run_cron_current(client: &reqwest::Client, args: ConfigCronCurrentArgs) -> Result<(), ConfigError> {
+async fn run_cron_current(
+    client: &reqwest::Client,
+    args: ConfigCronCurrentArgs,
+    input: &JsonInputArgs,
+) -> Result<(), ConfigError> {
     match args.command {
         ConfigCronCurrentCommand::List => {
             let command = "config cron current list";
@@ -939,6 +1003,7 @@ async fn run_cron_current(client: &reqwest::Client, args: ConfigCronCurrentArgs)
         ConfigCronCurrentCommand::Create => {
             run_payload_request_with_collection_readback(
                 client,
+                input,
                 "config cron current create",
                 Method::POST,
                 "/api/internal/conversation-cron/create",
@@ -947,14 +1012,14 @@ async fn run_cron_current(client: &reqwest::Client, args: ConfigCronCurrentArgs)
             )
             .await
         }
-        ConfigCronCurrentCommand::Update => run_cron_current_update(client).await,
+        ConfigCronCurrentCommand::Update => run_cron_current_update(client, input).await,
     }
 }
 
-async fn run_cron_current_update(client: &reqwest::Client) -> Result<(), ConfigError> {
+async fn run_cron_current_update(client: &reqwest::Client, input: &JsonInputArgs) -> Result<(), ConfigError> {
     let command = "config cron current update";
     let env = ConfigEnv::from_env(command)?;
-    let mut payload = read_stdin_payload(command)?;
+    let mut payload = read_stdin_payload(command, input)?;
     let mut selectors = SelectorMeta::default();
     resolve_top_level_selectors(client, &env, command, &mut payload, &mut selectors).await?;
     let job_id = take_required_string_field(&mut payload, "job_id", command)?;
@@ -1013,13 +1078,14 @@ async fn run_no_input_request_with_collection_readback(
 
 async fn run_payload_request(
     client: &reqwest::Client,
+    input: &JsonInputArgs,
     command: &'static str,
     method: Method,
     path: &'static str,
     redact_output: bool,
 ) -> Result<(), ConfigError> {
     let env = ConfigEnv::from_env(command)?;
-    let mut payload = read_stdin_payload(command)?;
+    let mut payload = read_stdin_payload(command, input)?;
     let mut selectors = SelectorMeta::default();
     resolve_top_level_selectors(client, &env, command, &mut payload, &mut selectors).await?;
     let data = request_json(client, &env, method, path, Some(payload), command).await?;
@@ -1028,6 +1094,7 @@ async fn run_payload_request(
 
 async fn run_payload_request_with_collection_readback(
     client: &reqwest::Client,
+    input: &JsonInputArgs,
     command: &'static str,
     method: Method,
     path: &'static str,
@@ -1035,7 +1102,7 @@ async fn run_payload_request_with_collection_readback(
     redact_output: bool,
 ) -> Result<(), ConfigError> {
     let env = ConfigEnv::from_env(command)?;
-    let mut payload = read_stdin_payload(command)?;
+    let mut payload = read_stdin_payload(command, input)?;
     let mut selectors = SelectorMeta::default();
     resolve_top_level_selectors(client, &env, command, &mut payload, &mut selectors).await?;
     let before = request_json(client, &env, Method::GET, collection_path, None, command).await?;
@@ -1051,6 +1118,7 @@ async fn run_payload_request_with_collection_readback(
 
 async fn run_payload_request_with_body_readback(
     client: &reqwest::Client,
+    input: &JsonInputArgs,
     command: &'static str,
     method: Method,
     path: &'static str,
@@ -1058,7 +1126,7 @@ async fn run_payload_request_with_body_readback(
     redact_output: bool,
 ) -> Result<(), ConfigError> {
     let env = ConfigEnv::from_env(command)?;
-    let mut payload = read_stdin_payload(command)?;
+    let mut payload = read_stdin_payload(command, input)?;
     let mut selectors = SelectorMeta::default();
     resolve_top_level_selectors(client, &env, command, &mut payload, &mut selectors).await?;
     let before = request_json(client, &env, Method::POST, read_path, Some(payload.clone()), command).await?;
@@ -1074,23 +1142,23 @@ async fn run_payload_request_with_body_readback(
 
 async fn run_id_no_body_request(
     client: &reqwest::Client,
+    input: &JsonInputArgs,
     command: &'static str,
     method: Method,
-    path_prefix: &'static str,
-    path_suffix: &'static str,
-    id_field: &'static str,
+    route: IdRoute,
     redact_output: bool,
 ) -> Result<(), ConfigError> {
     let env = ConfigEnv::from_env(command)?;
-    let payload = read_stdin_payload(command)?;
-    let id = required_string_field(&payload, id_field, command)?;
-    let path = id_path(path_prefix, &id, path_suffix);
+    let payload = read_stdin_payload(command, input)?;
+    let id = required_string_field(&payload, route.id_field, command)?;
+    let path = route.path(&id);
     let data = request_json(client, &env, method, &path, None, command).await?;
     print_config_output(data, meta(None), command, redact_output)
 }
 
 async fn run_id_no_body_request_with_collection_readback(
     client: &reqwest::Client,
+    input: &JsonInputArgs,
     command: &'static str,
     method: Method,
     route: IdRoute,
@@ -1098,7 +1166,7 @@ async fn run_id_no_body_request_with_collection_readback(
     redact_output: bool,
 ) -> Result<(), ConfigError> {
     let env = ConfigEnv::from_env(command)?;
-    let payload = read_stdin_payload(command)?;
+    let payload = read_stdin_payload(command, input)?;
     let id = required_string_field(&payload, route.id_field, command)?;
     let path = route.path(&id);
     let before = request_json(client, &env, Method::GET, collection_path, None, command).await?;
@@ -1109,6 +1177,7 @@ async fn run_id_no_body_request_with_collection_readback(
 
 async fn run_id_no_body_request_with_resource_readback(
     client: &reqwest::Client,
+    input: &JsonInputArgs,
     command: &'static str,
     method: Method,
     write_route: IdRoute,
@@ -1116,7 +1185,7 @@ async fn run_id_no_body_request_with_resource_readback(
     redact_output: bool,
 ) -> Result<(), ConfigError> {
     let env = ConfigEnv::from_env(command)?;
-    let payload = read_stdin_payload(command)?;
+    let payload = read_stdin_payload(command, input)?;
     let id = required_string_field(&payload, write_route.id_field, command)?;
     let path = write_route.path(&id);
     let read_path = read_route.path(&id);
@@ -1128,6 +1197,7 @@ async fn run_id_no_body_request_with_resource_readback(
 
 async fn run_id_payload_request_with_collection_readback(
     client: &reqwest::Client,
+    input: &JsonInputArgs,
     command: &'static str,
     method: Method,
     route: IdRoute,
@@ -1135,7 +1205,7 @@ async fn run_id_payload_request_with_collection_readback(
     redact_output: bool,
 ) -> Result<(), ConfigError> {
     let env = ConfigEnv::from_env(command)?;
-    let mut payload = read_stdin_payload(command)?;
+    let mut payload = read_stdin_payload(command, input)?;
     let mut selectors = SelectorMeta::default();
     resolve_top_level_selectors(client, &env, command, &mut payload, &mut selectors).await?;
     let id = take_required_string_field(&mut payload, route.id_field, command)?;
@@ -1153,6 +1223,7 @@ async fn run_id_payload_request_with_collection_readback(
 
 async fn run_id_payload_request_with_resource_readback(
     client: &reqwest::Client,
+    input: &JsonInputArgs,
     command: &'static str,
     method: Method,
     write_route: IdRoute,
@@ -1160,7 +1231,7 @@ async fn run_id_payload_request_with_resource_readback(
     redact_output: bool,
 ) -> Result<(), ConfigError> {
     let env = ConfigEnv::from_env(command)?;
-    let mut payload = read_stdin_payload(command)?;
+    let mut payload = read_stdin_payload(command, input)?;
     let mut selectors = SelectorMeta::default();
     resolve_top_level_selectors(client, &env, command, &mut payload, &mut selectors).await?;
     let id = take_required_string_field(&mut payload, write_route.id_field, command)?;
@@ -1219,6 +1290,7 @@ enum ReadBack {
 
 async fn run_payload_passthrough(
     client: &reqwest::Client,
+    input: &JsonInputArgs,
     command: &'static str,
     method: Method,
     path: &'static str,
@@ -1228,7 +1300,7 @@ async fn run_payload_passthrough(
     let env = ConfigEnv::from_env(command)?;
     let payload = match payload_override {
         Some(value) => value,
-        None => read_stdin_payload(command)?,
+        None => read_stdin_payload(command, input)?,
     };
     let mut payload = payload;
     let mut selectors = SelectorMeta::default();
@@ -1502,32 +1574,22 @@ fn extract_api_data(value: Value, command: &str) -> Result<Value, ConfigError> {
     ))
 }
 
-fn read_stdin_payload(command: &str) -> Result<Value, ConfigError> {
-    let mut raw = String::new();
-    io::stdin().read_to_string(&mut raw).map_err(|_| {
-        ConfigError::new(
-            ConfigErrorCode::PayloadInvalid,
-            command,
-            "failed to read JSON payload from stdin",
-        )
-        .field("field", "stdin")
+fn read_stdin_payload(command: &str, input: &JsonInputArgs) -> Result<Value, ConfigError> {
+    let document = read_json_input(input).map_err(|error| {
+        let mut mapped = ConfigError::new(ConfigErrorCode::PayloadInvalid, command, error.failure.message());
+        for (key, value) in error.metadata.fields() {
+            mapped = mapped.field(key, value);
+        }
+        mapped
     })?;
-    if raw.trim().is_empty() {
-        return Err(ConfigError::new(
-            ConfigErrorCode::PayloadMissing,
-            command,
-            "JSON payload is required on stdin",
-        )
-        .field("field", "stdin"));
+    if document.metadata.bytes_read == 0 {
+        let mut missing = ConfigError::new(ConfigErrorCode::PayloadMissing, command, "JSON payload is required");
+        for (key, value) in document.metadata.fields() {
+            missing = missing.field(key, value);
+        }
+        return Err(missing);
     }
-    serde_json::from_str(&raw).map_err(|_| {
-        ConfigError::new(
-            ConfigErrorCode::PayloadInvalid,
-            command,
-            "invalid JSON payload on stdin",
-        )
-        .field("field", "stdin")
-    })
+    Ok(document.value)
 }
 
 fn print_envelope(data: Value, meta: Value, command: &str) -> Result<(), ConfigError> {
@@ -1795,6 +1857,31 @@ fn escape_stderr_field(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_empty_object_is_a_valid_config_payload() {
+        let input = JsonInputArgs {
+            json: Some("{}".to_owned()),
+            input: None,
+        };
+
+        let payload = read_stdin_payload("config settings patch", &input).unwrap();
+
+        assert_eq!(payload, json!({}));
+    }
+
+    #[test]
+    fn zero_byte_config_payload_is_missing() {
+        let input = JsonInputArgs {
+            json: Some(String::new()),
+            input: None,
+        };
+
+        let error = read_stdin_payload("config settings patch", &input).unwrap_err();
+
+        assert_eq!(error.code, ConfigErrorCode::PayloadMissing);
+        assert_eq!(error.fields.get("bytes_read").map(String::as_str), Some("0"));
+    }
 
     #[test]
     fn config_error_renders_quoted_stable_contract() {

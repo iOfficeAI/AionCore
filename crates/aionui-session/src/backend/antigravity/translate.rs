@@ -25,6 +25,43 @@ pub(crate) fn explain_turn_error(raw: &str) -> String {
     raw.to_owned()
 }
 
+/// Metadata from the last `result` frame. Status token and counts only —
+/// never `response`, `error`, or any other payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalDiagnostics {
+    pub status: String,
+    pub is_error: bool,
+    pub outcome: &'static str,
+    pub failed_steps: u32,
+}
+
+/// Keep a status word safe to log. Anything that is not a short token is
+/// replaced so a future payload-shaped field cannot land in the log line.
+fn status_token(status: &str) -> String {
+    let trimmed = status.trim();
+    let token_shaped = !trimmed.is_empty()
+        && trimmed.len() <= 32
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if token_shaped {
+        trimmed.to_owned()
+    } else if trimmed.is_empty() {
+        "empty".to_owned()
+    } else {
+        "non_token".to_owned()
+    }
+}
+
+pub(crate) fn outcome_class(outcome: &TurnOutcome) -> &'static str {
+    match outcome {
+        TurnOutcome::EndTurn => "end_turn",
+        TurnOutcome::Completed { .. } => "completed",
+        TurnOutcome::Cancelled { .. } => "cancelled",
+        TurnOutcome::Failed => "failed",
+    }
+}
+
 /// Folds the agy stream into `SessionEvent`s, carrying the small amount of
 /// cross-frame state the translation needs.
 #[derive(Debug, Default)]
@@ -45,6 +82,9 @@ pub(crate) struct Translator {
     /// and its closing message claims the work is done. Counting these is the
     /// only way to notice, because the terminal frame carries no trace of them.
     failed_steps: u32,
+    /// Last `result` frame, metadata only. Set beside the existing outcome
+    /// mapping; it does not decide the outcome.
+    last_terminal: Option<TerminalDiagnostics>,
 }
 
 impl Translator {
@@ -58,6 +98,10 @@ impl Translator {
 
     pub(crate) fn model_fallback_detected(&self) -> bool {
         self.model_fallback
+    }
+
+    pub(crate) fn terminal_diagnostics(&self) -> Option<&TerminalDiagnostics> {
+        self.last_terminal.as_ref()
     }
 
     pub(crate) fn translate(&mut self, ev: AgyEvent) -> Vec<SessionEvent> {
@@ -120,6 +164,12 @@ impl Translator {
                 // own kind of lie. This only refuses to let "success" stand
                 // unqualified.
                 let failed = std::mem::take(&mut self.failed_steps);
+                self.last_terminal = Some(TerminalDiagnostics {
+                    status: status_token(&r.status),
+                    is_error,
+                    outcome: outcome_class(&outcome),
+                    failed_steps: failed,
+                });
                 if !is_error && failed > 0 {
                     out.push(SessionEvent::Notice {
                         // Info, not Warning. The common trigger is a refusal the
@@ -512,6 +562,103 @@ mod tests {
             evs.iter()
                 .any(|e| matches!(e, SessionEvent::UsageDelta { total_tokens: 12, .. }))
         );
+    }
+
+    #[test]
+    fn terminal_diagnostics_record_status_and_class_without_payload() {
+        // The outcome mapping is unchanged. This only checks the metadata
+        // recorded beside it, and that the reply / error text never enters it.
+        let cases = [
+            (
+                r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"PONG secret","num_turns":1}}"#,
+                "SUCCESS",
+                false,
+                "end_turn",
+                TurnOutcome::EndTurn,
+                "PONG secret",
+            ),
+            (
+                r#"{"event":"result","result":{"conversation_id":"","status":"ERROR","error":"authentication failed or timed out"}}"#,
+                "ERROR",
+                true,
+                "failed",
+                TurnOutcome::Failed,
+                "authentication failed or timed out",
+            ),
+            (
+                r#"{"event":"result","result":{"conversation_id":"c1","status":"INTERRUPTED","response":"partial reply"}}"#,
+                "INTERRUPTED",
+                true,
+                "cancelled",
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::UserCancel,
+                },
+                "partial reply",
+            ),
+            (
+                r#"{"event":"result","result":{"conversation_id":"c1","status":"WHATEVER","error":"do not log this sentence"}}"#,
+                "WHATEVER",
+                true,
+                "failed",
+                TurnOutcome::Failed,
+                "do not log this sentence",
+            ),
+        ];
+        for (line, status, is_error, class, outcome, secret) in cases {
+            let (t, evs) = tr(&[line]);
+            let diag = t.terminal_diagnostics().expect("result frame records diagnostics");
+            assert_eq!(diag.status, status);
+            assert_eq!(diag.is_error, is_error);
+            assert_eq!(diag.outcome, class);
+            assert_eq!(diag.failed_steps, 0);
+            assert!(
+                !format!("{diag:?}").contains(secret),
+                "diagnostics leaked payload: {diag:?}"
+            );
+            match evs.last() {
+                Some(SessionEvent::TurnResult {
+                    is_error: event_error,
+                    outcome: event_outcome,
+                    result_text,
+                    ..
+                }) => {
+                    assert_eq!(*event_error, is_error);
+                    assert_eq!(event_outcome, &outcome);
+                    assert!(result_text.contains(secret), "user-facing text stays on the event");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_payload_shaped_status_is_not_logged_verbatim() {
+        let (t, evs) = tr(&[r#"{"event":"result","result":{"status":"error: user prompt leaked","error":"boom"}}"#]);
+        let diag = t.terminal_diagnostics().unwrap();
+        assert_eq!(diag.status, "non_token");
+        assert!(diag.is_error);
+        assert_eq!(diag.outcome, "failed");
+        assert!(!format!("{diag:?}").contains("user prompt"));
+        assert!(matches!(
+            evs.last(),
+            Some(SessionEvent::TurnResult {
+                outcome: TurnOutcome::Failed,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn terminal_diagnostics_count_failed_steps_without_their_text() {
+        let (t, _) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":3,"state":"DONE","step_type":"error_message","text_delta":"secret failure detail"}}"#,
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"DONE"}}"#,
+        ]);
+        let diag = t.terminal_diagnostics().unwrap();
+        assert_eq!(diag.failed_steps, 1);
+        assert!(!diag.is_error);
+        assert_eq!(diag.outcome, "end_turn");
+        assert!(!format!("{diag:?}").contains("secret"));
     }
 
     #[test]

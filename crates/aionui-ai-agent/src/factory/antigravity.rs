@@ -37,6 +37,27 @@ pub(crate) fn is_full_auto(session_mode: Option<&str>, yolo_id: &str) -> bool {
     session_mode.is_some_and(|m| m.eq_ignore_ascii_case(yolo_id))
 }
 
+/// The wrapper body to carry for a later mode switch, if a callback address is
+/// configured: `Ok(None)` when there is no hook to restore or the platform
+/// installs no wrapper, `Ok(Some(contents))` on Windows, and an error when the
+/// binary cannot be canonicalized.
+///
+/// Prepared, never written — a session in full auto must not install the gate,
+/// but it may leave full auto later and the session layer cannot rebuild the
+/// file on its own. Failing here is deliberate: carrying `None` for an
+/// unpreparable wrapper would later restore a `hooks.json` that points at a
+/// file which was never written.
+fn prepare_hook_wrapper(base_url: Option<&str>, hook_binary: &std::path::Path) -> Result<Option<String>, AgentError> {
+    if base_url.is_none() {
+        return Ok(None);
+    }
+    crate::antigravity_hook::prepare_wrapper_body(hook_binary).map_err(|e| {
+        AgentError::internal(format!(
+            "antigravity: could not prepare the permission hook wrapper: {e}"
+        ))
+    })
+}
+
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AntigravitySessionBuildContext,
@@ -119,6 +140,13 @@ pub(super) async fn build(
         .antigravity_hook_base_url
         .as_deref()
         .map(|_| crate::antigravity_hook::hooks_json_body(deps.backend_binary_path.as_path()));
+    // The Windows wrapper that body points at, prepared the same way and never
+    // written here: without it a session that leaves full auto would restore a
+    // hooks.json naming a file that does not exist.
+    let permission_hook_wrapper = prepare_hook_wrapper(
+        deps.antigravity_hook_base_url.as_deref(),
+        deps.backend_binary_path.as_path(),
+    )?;
 
     let mut runtime_env = ctx.runtime_env.clone();
     runtime_env.extend(hook_env);
@@ -162,6 +190,7 @@ pub(super) async fn build(
             acp_session_repo: Some(deps.acp_agent_service.repo()),
             prompt_dump_dir: None,
             permission_hook_body,
+            permission_hook_wrapper,
         },
         deps.session_spawner.clone(),
     )
@@ -176,7 +205,45 @@ pub(super) async fn build(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_full_auto, yolo_mode_id};
+    use super::{is_full_auto, prepare_hook_wrapper, yolo_mode_id};
+
+    #[test]
+    fn no_callback_address_prepares_no_wrapper() {
+        // No hook to restore, so nothing is prepared — and a path that could
+        // not be canonicalized must not fail the build in that case.
+        let prepared = prepare_hook_wrapper(None, std::path::Path::new("/nope/aioncore")).unwrap();
+        assert!(prepared.is_none(), "no hook configured means no wrapper to prepare");
+    }
+
+    #[test]
+    fn a_configured_callback_prepares_the_platform_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("aioncore.exe");
+        std::fs::write(&exe, b"stub").unwrap();
+
+        let prepared = prepare_hook_wrapper(Some("http://127.0.0.1:25808"), &exe).unwrap();
+        assert_eq!(prepared.is_some(), cfg!(windows), "the wrapper is Windows-only");
+        if let Some(body) = prepared {
+            assert!(
+                body.contains("antigravity-hook"),
+                "wrapper must carry the subcommand: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unpreparable_binary_fails_only_where_a_wrapper_exists() {
+        // Windows requires canonicalization, so a missing binary is a hard
+        // error there; off Windows no wrapper exists and nothing is read.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.exe");
+        let prepared = prepare_hook_wrapper(Some("http://127.0.0.1:25808"), &missing);
+        if cfg!(windows) {
+            assert!(prepared.is_err(), "windows must refuse an uncanonicalizable binary");
+        } else {
+            assert!(prepared.unwrap().is_none(), "unix installs no wrapper");
+        }
+    }
 
     #[test]
     fn the_catalog_sentinel_turns_off_the_approval_hook() {

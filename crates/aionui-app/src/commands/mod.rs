@@ -21,6 +21,7 @@ pub(crate) mod config_capabilities;
 pub(crate) mod conversation_capabilities;
 pub(crate) mod diagnose_capabilities;
 pub(crate) mod error;
+pub(crate) mod json_input;
 pub(crate) mod session_capabilities;
 pub(crate) mod skills_capabilities;
 pub(crate) mod team_capabilities;

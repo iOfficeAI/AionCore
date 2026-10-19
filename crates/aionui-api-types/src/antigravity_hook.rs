@@ -11,6 +11,8 @@
 //! Flow: agy → hook process (stdin JSON) → AionUi endpoint → user's permission
 //! card → decision → hook stdout JSON → agy.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 /// How the hook process learns where to call back.
@@ -37,6 +39,42 @@ impl AntigravityHookConfig {
     pub const TOKEN_HEADER: &'static str = "x-aionui-hook-token";
     /// Name under which the bridge registers itself in `hooks.json`.
     pub const HOOK_NAME: &'static str = "aionui-permission-bridge";
+
+    /// File name of the Windows wrapper `hooks.json` points at instead of the
+    /// binary directly.
+    ///
+    /// The value lives in `aionui-common` so `aionui-session`'s mode-switch
+    /// sync can name the file too (that crate depends only on `aionui-common`
+    /// and `aionui-process` by design); this associated constant is the hook
+    /// contract's spelling of it. Off Windows there is no wrapper — agy runs
+    /// the quoted binary itself.
+    pub const WINDOWS_WRAPPER_FILE_NAME: &'static str = aionui_common::constants::ANTIGRAVITY_WINDOWS_WRAPPER_FILE_NAME;
+
+    /// How long the hook process waits for AionUi to answer before it denies.
+    ///
+    /// Bounds a wedged backend so a tool call fails closed instead of stalling
+    /// agy's turn. Stays well under the turn cap AionCore passes to agy
+    /// (`--print-timeout 1h`, verified: `aionui-session`'s `argv.rs`). agy
+    /// 1.4.2's own default is `0` — wait until the turn completes (verified:
+    /// `~/aion/protocols/samples/agy/1.4.2/root-probe-help.txt`, the captured
+    /// 1.4.2 `--help`).
+    pub const CALLBACK_TIMEOUT: Duration = Duration::from_secs(240);
+
+    /// Headroom the `hooks.json` handler timeout adds on top of
+    /// [`Self::CALLBACK_TIMEOUT`]: process start, the stdin read, and writing
+    /// the deny back out.
+    pub const HANDLER_TIMEOUT_MARGIN_SECS: u64 = 20;
+
+    /// `timeout` (whole seconds) written into the `hooks.json` handler.
+    ///
+    /// agy runs each handler with a default timeout of 30 s (verified:
+    /// `~/.gemini/antigravity-cli/builtin/skills/agy-customizations/docs/hooks.md`
+    /// lines 132-133, "Hook Handler Fields") — shorter than
+    /// [`Self::CALLBACK_TIMEOUT`], so without this agy kills the hook at 30 s
+    /// while the permission card is still waiting for the user, and no decision
+    /// is ever written. The handler must outlive our own wait so the hook always
+    /// answers for itself: a named fail-closed denial, not a killed process.
+    pub const HANDLER_TIMEOUT_SECS: u64 = Self::CALLBACK_TIMEOUT.as_secs() + Self::HANDLER_TIMEOUT_MARGIN_SECS;
 }
 
 /// What agy writes to the hook's stdin before a tool runs.

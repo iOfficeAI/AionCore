@@ -38,7 +38,15 @@ use crate::event::{LocalizedText, NoticeLevel};
 /// 0.147.0 and leaves it unverified rather than a floor anyone can install into.
 pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.287";
 pub const VERIFIED_CODEX_VERSION: &str = "0.151.0";
-pub const VERIFIED_AGY_VERSION: &str = "1.3.5";
+/// Verified against the seven `live_antigravity_*` live gates on transport
+/// 5345050a (cancel, context usage, resume after restart, broken MCP, team MCP
+/// tools, tool card, ws/http parity; 477.60 s, exit 0) and a distinct-nonce
+/// stdin resume pair (NOVA → NOVB, same owned anchor). Evidence:
+/// `~/aion/protocols/samples/agy/1.4.2/live-ws-http-suite-5345050a.result.json`,
+/// `.log`, `.process-transport.json`, and `live-suite-agy-version.txt` (1.4.2).
+/// The shipping argv path also completed a real Team task and resumed follow-up:
+/// `~/aion/protocols/samples/agy/1.4.2/team-argv-58b9fc16.summary.json`.
+pub const VERIFIED_AGY_VERSION: &str = "1.4.2";
 
 /// The verified release for a direct-CLI backend, keyed by the program name the
 /// backend spawns. `None` for anything not version-gated here.
@@ -475,15 +483,18 @@ mod tests {
         // The literal the other two CLIs already pin, which agy was missing: a
         // user on exactly the verified release is told nothing, and a bump that
         // lands without re-verifying against that exact binary breaks here.
-        assert_eq!(classify("1.3.5", VERIFIED_AGY_VERSION), VersionVerdict::Verified);
-        assert!(drift_notice("agy", "1.3.5", VERIFIED_AGY_VERSION).is_none());
+        assert_eq!(classify("1.4.2", VERIFIED_AGY_VERSION), VersionVerdict::Verified);
+        assert!(drift_notice("agy", "1.4.2", VERIFIED_AGY_VERSION).is_none());
 
         // agy prints a bare version, so the older/newer paths are worth pinning
         // on that exact shape rather than only on a decorated one.
         // 1.1.29 is OLDER than 1.2.0: the minor component decides, and a
         // lexical compare would get this backwards ("1.1.29" > "1.2.0").
         assert_eq!(classify("1.1.29", VERIFIED_AGY_VERSION), VersionVerdict::Older);
-        assert_eq!(classify("1.3.6", VERIFIED_AGY_VERSION), VersionVerdict::Newer);
+        // The previous verified release now drifts as older, so a bump stays
+        // visible to users still on it instead of being silently accepted.
+        assert_eq!(classify("1.3.5", VERIFIED_AGY_VERSION), VersionVerdict::Older);
+        assert_eq!(classify("1.4.3", VERIFIED_AGY_VERSION), VersionVerdict::Newer);
     }
 
     /// Both drift directions are `Info` — the tier the frontend draws as a quiet

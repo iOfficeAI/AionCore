@@ -8,16 +8,17 @@
 //! FAIL-CLOSED: every failure path (missing env, unreachable backend, malformed
 //! payload, timeout) answers `deny`. The alternative — defaulting to allow —
 //! would let an unapproved tool run whenever the bridge is unhealthy.
+//!
+//! The wait for the user is bounded by
+//! [`AntigravityHookConfig::CALLBACK_TIMEOUT`], which agy's own handler timeout
+//! deliberately outlives ([`AntigravityHookConfig::HANDLER_TIMEOUT_SECS`],
+//! written into `hooks.json` by `aionui-ai-agent`): a user who never answers
+//! gets a named denial from this process, not a process agy killed.
 
 use std::process::ExitCode;
-use std::time::Duration;
 
 use aionui_api_types::{AntigravityHookConfig, AntigravityHookInput, AntigravityHookOutput};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-/// agy's own headless timeout is `--print-timeout` (default 5m). Stay well
-/// under it so a wedged bridge surfaces as a denial rather than a stalled turn.
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(240);
 
 pub(crate) async fn run_antigravity_hook() -> ExitCode {
     let decision = decide().await;
@@ -58,7 +59,10 @@ async fn decide() -> AntigravityHookOutput {
         "{}/internal/antigravity-hook/{conversation_id}",
         base_url.trim_end_matches('/')
     );
-    let client = match reqwest::Client::builder().timeout(CALLBACK_TIMEOUT).build() {
+    let client = match reqwest::Client::builder()
+        .timeout(AntigravityHookConfig::CALLBACK_TIMEOUT)
+        .build()
+    {
         Ok(c) => c,
         Err(e) => return AntigravityHookOutput::deny(format!("aionui hook could not build its client: {e}")),
     };

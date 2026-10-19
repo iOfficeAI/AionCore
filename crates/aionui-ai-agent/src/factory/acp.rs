@@ -153,6 +153,7 @@ pub(super) async fn build(
                 // claude/codex gate permissions through their own CLI flags, not
                 // through an installed hook file.
                 permission_hook_body: None,
+                permission_hook_wrapper: None,
             },
             deps.session_spawner.clone(),
         )

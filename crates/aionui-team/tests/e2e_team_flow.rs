@@ -92,6 +92,7 @@ impl AgentTurnExecutionPort for RecordingTurnPort {
             conversation_id: request.conversation_id,
             turn_id,
             status: AgentTurnStatus::Completed,
+            error_code: None,
             runtime: None,
         })
     }
@@ -157,6 +158,7 @@ impl AgentTurnExecutionPort for ErrorBeforeStartTurnPort {
             conversation_id: request.conversation_id,
             turn_id,
             status: AgentTurnStatus::Completed,
+            error_code: None,
             runtime: None,
         })
     }
@@ -221,6 +223,7 @@ impl AgentTurnExecutionPort for StartedThenFailedTurnPort {
             } else {
                 AgentTurnStatus::Completed
             },
+            error_code: None,
             runtime: None,
         })
     }
@@ -283,6 +286,7 @@ impl AgentTurnExecutionPort for HoldFirstRunningTurnPort {
             conversation_id: request.conversation_id,
             turn_id,
             status: AgentTurnStatus::Completed,
+            error_code: None,
             runtime: None,
         })
     }
@@ -321,6 +325,7 @@ impl AgentTurnExecutionPort for BlockingStartTurnPort {
             conversation_id: request.conversation_id,
             turn_id: "turn-late-start".into(),
             status: AgentTurnStatus::Completed,
+            error_code: None,
             runtime: None,
         })
     }

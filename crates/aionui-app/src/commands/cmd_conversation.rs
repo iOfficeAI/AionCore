@@ -6,7 +6,7 @@
 //! appears.
 
 use std::ffi::OsString;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 use aionui_api_types::{
@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 
 use crate::cli::{ConversationArgs, ConversationCommand};
 use crate::commands::conversation_capabilities;
+use crate::commands::json_input::{JsonInputArgs, JsonInputFailure, read_json_input};
 
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
 const ENV_USER_ID: &str = "AIONUI_USER_ID";
@@ -23,30 +24,31 @@ const ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
 const ENV_RUNTIME_TOKEN: &str = "AIONUI_RUNTIME_TOKEN";
 
 pub(crate) async fn run_conversation(args: ConversationArgs) -> ExitCode {
-    match run_conversation_inner(args).await {
+    let input = args.json_input;
+    match run_conversation_inner(args.command, &input).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(code) => code,
     }
 }
 
-async fn run_conversation_inner(args: ConversationArgs) -> Result<(), ExitCode> {
-    match args.command {
+async fn run_conversation_inner(command: ConversationCommand, input: &JsonInputArgs) -> Result<(), ExitCode> {
+    match command {
         // Static contract; needs no runtime env.
         ConversationCommand::Capabilities => print_json(&ConversationCliEnvelope::success(
             conversation_capabilities::data(),
             Some("conversation capabilities".to_owned()),
         )),
-        ConversationCommand::Create => create().await,
+        ConversationCommand::Create => create(input).await,
         ConversationCommand::Unknown(path) => {
             Err(unknown_command("conversation", path, "unknown conversation command"))
         }
     }
 }
 
-async fn create() -> Result<(), ExitCode> {
+async fn create(input: &JsonInputArgs) -> Result<(), ExitCode> {
     let command = "conversation create";
     let env = runtime_env(command)?;
-    let body = read_stdin_json_object(command, ConversationToolName::ConversationCreate)?;
+    let body = read_stdin_json_object(command, ConversationToolName::ConversationCreate, input)?;
     let url = format!(
         "{}/api/runtime/conversations/create",
         env.base_url.trim_end_matches('/')
@@ -114,27 +116,26 @@ fn required_env(command: &str, name: &'static str) -> Result<String, ExitCode> {
     })
 }
 
-fn read_stdin_json_object(command: &str, tool: ConversationToolName) -> Result<Value, ExitCode> {
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input).map_err(|error| {
+fn read_stdin_json_object(command: &str, tool: ConversationToolName, input: &JsonInputArgs) -> Result<Value, ExitCode> {
+    let document = read_json_input(input).map_err(|error| {
+        let code = match error.failure {
+            JsonInputFailure::ReadTimeout => "CONVERSATION_CLI_JSON_INPUT_TIMEOUT",
+            JsonInputFailure::ReadFailed => "CONVERSATION_CLI_JSON_INPUT_READ_FAILED",
+            JsonInputFailure::TooLarge => "CONVERSATION_CLI_JSON_INPUT_TOO_LARGE",
+            JsonInputFailure::InvalidEncoding => "CONVERSATION_CLI_JSON_INPUT_ENCODING_INVALID",
+            JsonInputFailure::InvalidJson => "CONVERSATION_CLI_JSON_INPUT_INVALID",
+        };
         print_failure(
             command,
-            "CONVERSATION_CLI_STDIN_READ_FAILED",
-            ConversationToolErrorPayload::new(ConversationToolErrorCode::SchemaValidationFailed, error.to_string()),
+            code,
+            ConversationToolErrorPayload::new(
+                ConversationToolErrorCode::SchemaValidationFailed,
+                error.failure.message(),
+            )
+            .with_details(error.metadata.details()),
         )
     })?;
-    let value = if input.trim().is_empty() {
-        json!({})
-    } else {
-        serde_json::from_str(&input).map_err(|error| {
-            print_failure(
-                command,
-                "CONVERSATION_CLI_STDIN_JSON_INVALID",
-                ConversationToolErrorPayload::new(ConversationToolErrorCode::SchemaValidationFailed, error.to_string()),
-            )
-        })?
-    };
-    validate_against_descriptor(command, tool, value)
+    validate_against_descriptor(command, tool, document.value)
 }
 
 /// Validate stdin against the registry descriptor before spending a round trip,
@@ -146,7 +147,7 @@ fn validate_against_descriptor(command: &str, tool: ConversationToolName, value:
             "CONVERSATION_CLI_SCHEMA_VALIDATION_FAILED",
             ConversationToolErrorPayload::new(
                 ConversationToolErrorCode::SchemaValidationFailed,
-                "stdin JSON must be an object",
+                "JSON input must be an object",
             ),
         ));
     };
@@ -163,7 +164,7 @@ fn validate_against_descriptor(command: &str, tool: ConversationToolName, value:
                 "CONVERSATION_CLI_SCHEMA_VALIDATION_FAILED",
                 ConversationToolErrorPayload::new(
                     ConversationToolErrorCode::SchemaValidationFailed,
-                    format!("unknown stdin field: {key}"),
+                    format!("unknown JSON input field: {key}"),
                 )
                 .with_details(json!({ "expected_schema": descriptor.input_schema })),
             ));
@@ -177,7 +178,7 @@ fn validate_against_descriptor(command: &str, tool: ConversationToolName, value:
                     "CONVERSATION_CLI_SCHEMA_VALIDATION_FAILED",
                     ConversationToolErrorPayload::new(
                         ConversationToolErrorCode::SchemaValidationFailed,
-                        format!("missing required stdin field: {key}"),
+                        format!("missing required JSON input field: {key}"),
                     )
                     .with_details(json!({ "expected_schema": descriptor.input_schema })),
                 ));

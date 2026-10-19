@@ -1,7 +1,7 @@
 //! `aioncore diagnose` subcommand: agent-facing read-only troubleshooting CLI.
 
 use std::collections::BTreeMap;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -13,6 +13,7 @@ use crate::cli::{
     DiagnoseProvidersArgs, DiagnoseSummaryCommand, DiagnoseTeamsArgs,
 };
 use crate::commands::diagnose_capabilities;
+use crate::commands::json_input::{JsonInputArgs, JsonInputMetadata, read_json_input};
 
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
 const ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
@@ -24,7 +25,8 @@ const MAX_LOG_LINES: usize = 1000;
 const MAX_LOG_SEARCH_DEPTH: usize = 6;
 
 pub async fn run_diagnose(args: DiagnoseArgs) -> ExitCode {
-    match run(args).await {
+    let input = args.json_input;
+    match run(args.command, &input).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{}", error.stderr_line());
@@ -33,9 +35,9 @@ pub async fn run_diagnose(args: DiagnoseArgs) -> ExitCode {
     }
 }
 
-async fn run(args: DiagnoseArgs) -> Result<(), DiagnoseError> {
+async fn run(command: DiagnoseCommand, input: &JsonInputArgs) -> Result<(), DiagnoseError> {
     let client = reqwest::Client::new();
-    match args.command {
+    match command {
         DiagnoseCommand::Capabilities => print_envelope(
             diagnose_capabilities::data(),
             meta_from_map(Map::new()),
@@ -44,13 +46,13 @@ async fn run(args: DiagnoseArgs) -> Result<(), DiagnoseError> {
         DiagnoseCommand::Context => run_context(),
         DiagnoseCommand::Health => run_health(&client).await,
         DiagnoseCommand::Overview => run_overview(&client).await,
-        DiagnoseCommand::Conversations(args) => run_conversations(&client, args).await,
+        DiagnoseCommand::Conversations(args) => run_conversations(&client, args, input).await,
         DiagnoseCommand::Providers(args) => run_providers(&client, args).await,
         DiagnoseCommand::Mcp(args) => run_mcp(&client, args).await,
         DiagnoseCommand::Cron(args) => run_cron(&client, args).await,
         DiagnoseCommand::Teams(args) => run_teams(&client, args).await,
-        DiagnoseCommand::Logs(args) => run_logs(args),
-        DiagnoseCommand::Http(args) => run_http(&client, args).await,
+        DiagnoseCommand::Logs(args) => run_logs(args, input),
+        DiagnoseCommand::Http(args) => run_http(&client, args, input).await,
     }
 }
 
@@ -98,26 +100,30 @@ async fn run_overview(client: &reqwest::Client) -> Result<(), DiagnoseError> {
     )
 }
 
-async fn run_conversations(client: &reqwest::Client, args: DiagnoseConversationsArgs) -> Result<(), DiagnoseError> {
+async fn run_conversations(
+    client: &reqwest::Client,
+    args: DiagnoseConversationsArgs,
+    input: &JsonInputArgs,
+) -> Result<(), DiagnoseError> {
     match args.command {
         DiagnoseConversationsCommand::List => {
             let command = "diagnose conversations list";
             let env = DiagnoseEnv::from_env(command)?;
-            let payload = read_optional_stdin_payload(command)?;
+            let payload = read_optional_stdin_payload(command, input)?.value;
             let limit = optional_usize_field(&payload, "limit", 50, 200, command)?;
             let path = format!("/api/conversations?limit={limit}");
             let data = request_json(client, &env, &path, command).await?;
             print_envelope(redact_value(data), meta_from_map(Map::new()), command)
         }
-        DiagnoseConversationsCommand::Get => run_conversation_get(client).await,
-        DiagnoseConversationsCommand::Messages => run_conversation_messages(client).await,
+        DiagnoseConversationsCommand::Get => run_conversation_get(client, input).await,
+        DiagnoseConversationsCommand::Messages => run_conversation_messages(client, input).await,
     }
 }
 
-async fn run_conversation_get(client: &reqwest::Client) -> Result<(), DiagnoseError> {
+async fn run_conversation_get(client: &reqwest::Client, input: &JsonInputArgs) -> Result<(), DiagnoseError> {
     let command = "diagnose conversations get";
     let env = DiagnoseEnv::from_env(command)?;
-    let mut payload = read_stdin_payload(command)?;
+    let mut payload = read_stdin_payload(command, input)?;
     let mut selectors = SelectorMeta::default();
     resolve_conversation_selector(&env, command, &mut payload, &mut selectors)?;
     let conversation_id = required_string_field(&payload, "conversation_id", command)?;
@@ -130,10 +136,10 @@ async fn run_conversation_get(client: &reqwest::Client) -> Result<(), DiagnoseEr
     )
 }
 
-async fn run_conversation_messages(client: &reqwest::Client) -> Result<(), DiagnoseError> {
+async fn run_conversation_messages(client: &reqwest::Client, input: &JsonInputArgs) -> Result<(), DiagnoseError> {
     let command = "diagnose conversations messages";
     let env = DiagnoseEnv::from_env(command)?;
-    let mut payload = read_stdin_payload(command)?;
+    let mut payload = read_stdin_payload(command, input)?;
     let mut selectors = SelectorMeta::default();
     resolve_conversation_selector(&env, command, &mut payload, &mut selectors)?;
     let conversation_id = required_string_field(&payload, "conversation_id", command)?;
@@ -199,15 +205,15 @@ async fn run_teams(client: &reqwest::Client, args: DiagnoseTeamsArgs) -> Result<
     }
 }
 
-fn run_logs(args: DiagnoseLogsArgs) -> Result<(), DiagnoseError> {
+fn run_logs(args: DiagnoseLogsArgs, input: &JsonInputArgs) -> Result<(), DiagnoseError> {
     match args.command {
-        DiagnoseLogsCommand::Tail => run_logs_tail(),
+        DiagnoseLogsCommand::Tail => run_logs_tail(input),
     }
 }
 
-fn run_logs_tail() -> Result<(), DiagnoseError> {
+fn run_logs_tail(input: &JsonInputArgs) -> Result<(), DiagnoseError> {
     let command = "diagnose logs tail";
-    let mut payload = read_optional_stdin_payload(command)?;
+    let mut payload = read_optional_stdin_payload(command, input)?.value;
     let mut selectors = SelectorMeta::default();
     resolve_optional_log_conversation_selector(command, &mut payload, &mut selectors)?;
     let log_dir = optional_string_field(&payload, "log_dir")
@@ -235,12 +241,16 @@ fn run_logs_tail() -> Result<(), DiagnoseError> {
     print_envelope(redact_value(result), meta_from_map(selectors.into_map()), command)
 }
 
-async fn run_http(client: &reqwest::Client, args: DiagnoseHttpArgs) -> Result<(), DiagnoseError> {
+async fn run_http(
+    client: &reqwest::Client,
+    args: DiagnoseHttpArgs,
+    input: &JsonInputArgs,
+) -> Result<(), DiagnoseError> {
     match args.command {
         DiagnoseHttpCommand::Get => {
             let command = "diagnose http get";
             let env = DiagnoseEnv::from_env(command)?;
-            let payload = read_stdin_payload(command)?;
+            let payload = read_stdin_payload(command, input)?;
             let path = required_string_field(&payload, "path", command)?;
             let path = validate_http_path(&path, command)?;
             let data = request_json(client, &env, &path, command).await?;
@@ -374,49 +384,41 @@ fn extract_api_data(value: Value, command: &str) -> Result<Value, DiagnoseError>
     ))
 }
 
-fn read_stdin_payload(command: &str) -> Result<Value, DiagnoseError> {
-    let payload = read_optional_stdin_payload(command)?;
-    if payload.as_object().is_some_and(Map::is_empty) {
-        return Err(DiagnoseError::new(
-            DiagnoseErrorCode::PayloadMissing,
-            command,
-            "JSON payload is required on stdin",
-        )
-        .field("field", "stdin"));
+fn read_stdin_payload(command: &str, input: &JsonInputArgs) -> Result<Value, DiagnoseError> {
+    let document = read_optional_stdin_payload(command, input)?;
+    if document.value.as_object().is_some_and(Map::is_empty) {
+        let mut missing = DiagnoseError::new(DiagnoseErrorCode::PayloadMissing, command, "JSON payload is required");
+        add_input_metadata(&mut missing, &document.metadata);
+        return Err(missing);
     }
-    Ok(payload)
+    Ok(document.value)
 }
 
-fn read_optional_stdin_payload(command: &str) -> Result<Value, DiagnoseError> {
-    let mut raw = String::new();
-    io::stdin().read_to_string(&mut raw).map_err(|_| {
-        DiagnoseError::new(
-            DiagnoseErrorCode::PayloadInvalid,
-            command,
-            "failed to read JSON payload from stdin",
-        )
-        .field("field", "stdin")
+fn read_optional_stdin_payload(
+    command: &str,
+    input: &JsonInputArgs,
+) -> Result<crate::commands::json_input::JsonInputDocument, DiagnoseError> {
+    let document = read_json_input(input).map_err(|error| {
+        let mut mapped = DiagnoseError::new(DiagnoseErrorCode::PayloadInvalid, command, error.failure.message());
+        add_input_metadata(&mut mapped, &error.metadata);
+        mapped
     })?;
-    if raw.trim().is_empty() {
-        return Ok(Value::Object(Map::new()));
-    }
-    let value: Value = serde_json::from_str(&raw).map_err(|_| {
-        DiagnoseError::new(
-            DiagnoseErrorCode::PayloadInvalid,
-            command,
-            "invalid JSON payload on stdin",
-        )
-        .field("field", "stdin")
-    })?;
-    if !value.is_object() {
-        return Err(DiagnoseError::new(
+    if !document.value.is_object() {
+        let mut invalid = DiagnoseError::new(
             DiagnoseErrorCode::PayloadInvalid,
             command,
             "JSON payload must be an object",
-        )
-        .field("field", "stdin"));
+        );
+        add_input_metadata(&mut invalid, &document.metadata);
+        return Err(invalid);
     }
-    Ok(value)
+    Ok(document)
+}
+
+fn add_input_metadata(error: &mut DiagnoseError, metadata: &JsonInputMetadata) {
+    error.fields.insert("source", metadata.source.as_str().to_owned());
+    error.fields.insert("bytes_read", metadata.bytes_read.to_string());
+    error.fields.insert("prefix_hex", metadata.prefix_hex.clone());
 }
 
 fn print_envelope(data: Value, meta: Value, command: &str) -> Result<(), DiagnoseError> {

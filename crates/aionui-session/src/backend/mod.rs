@@ -295,6 +295,13 @@ pub struct SessionConfig {
     /// it lets a later switch OUT of full auto restore the gate; without it that
     /// switch would silently leave the session running unattended.
     pub permission_hook_body: Option<String>,
+    /// Antigravity only: the Windows wrapper that `permission_hook_body`'s
+    /// command points at, prepared by the factory beside it.
+    ///
+    /// Carried for the same reason as the body: a session that leaves full auto
+    /// must restore a runnable gate, and the session layer cannot rebuild the
+    /// file itself. `None` off Windows or when no hook is configured.
+    pub permission_hook_wrapper: Option<String>,
     /// G1-A: the codex sandbox policy injected into `thread/start` (the native
     /// codex app-server `sandbox` field; codex_conn serializes it data-driven
     /// instead of the hardcoded `"workspace-write"`). `None` (default) ⇒

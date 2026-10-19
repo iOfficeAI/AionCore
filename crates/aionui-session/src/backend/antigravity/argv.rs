@@ -1,22 +1,30 @@
 //! Command-line construction for one agy turn. Pure: no IO, no spawning.
 
-/// AionUi's sentinel mode id meaning "run without approval prompts".
+/// AionUi's sentinel mode id meaning "run without approval prompts" (verified:
+/// `crates/aionui-ai-agent/src/factory/antigravity.rs:36-70`).
 ///
-/// Not one of agy's modes and never sent to it; answered by removing the approval hook.
+/// Absent from agy's captured 1.4.2 mode list and never sent to it; the factory
+/// answers it by removing the approval hook (verified: `~/aion/protocols/samples/agy/1.4.2/root-probe-help.txt:14`
+/// and `crates/aionui-ai-agent/src/factory/antigravity.rs:36-70`).
 pub(crate) const FULL_AUTO_SENTINEL: &str = "yolo";
 
 /// AionUi's mode id meaning "ask before sensitive things" — its counterpart to
 /// [`FULL_AUTO_SENTINEL`], answered by KEEPING the approval hook installed.
 ///
-/// Also not an agy value: `agy --help` lists exactly two (verified:
-/// samples/antigravity-cli/1.1.8/agy_--help.txt:12 — "Set the agent execution mode for
-/// this session (accept-edits, plan)"). Passing `--mode default` makes agy print
-/// `warning: unrecognized --mode value "default" (valid: accept-edits, plan)` and drop
-/// the flag, leaving the session on whatever agy defaults to while the UI reports the
-/// switch as applied.
+/// Not among the native values in the captured 1.4.2 help (verified:
+/// `~/aion/protocols/samples/agy/1.4.2/root-probe-help.txt:14`, sha256
+/// `a12355e8fc064b330eeb25ba52de596406582752442e293083bcda6388a63b78`). The argv
+/// guard forwards only values advertised by that captured help.
 ///
-/// Omitting the flag is the correct translation anyway: agy's own default IS this mode.
+/// The guard omits the value because the current captured help does not advertise it.
 pub(crate) const HOST_DEFAULT_MODE: &str = "default";
+
+// Captured from agy's own help (verified: ~/aion/protocols/samples/agy/1.4.2/root-probe-help.txt:14,
+// sha256 a12355e8fc064b330eeb25ba52de596406582752442e293083bcda6388a63b78).
+const HELP_ADVERTISED_AGY_MODES: &[&str] = &["accept-edits", "auto", "plan"];
+// Help documents syntax; it does not guarantee account availability. The
+// 1.4.2 `auto` probe warned it was unavailable for that account (verified:
+// `~/aion/protocols/samples/agy/1.4.2/print_stream-json_mode-auto.stderr.txt:1`).
 
 /// Everything one `agy` invocation needs. There is deliberately no `effort`
 /// field: agy's model ids already carry the effort suffix (see `model`).
@@ -32,8 +40,8 @@ pub(crate) struct ArgvInput {
     /// agy silently ignores anything else and falls back to its default model
     /// without reporting an error.
     pub model: Option<String>,
-    /// An AionUi mode id, not necessarily an agy one. `accept-edits` / `plan` reach agy;
-    /// `yolo` and `default` are host-side and filtered out (see the constants above).
+    /// An AionUi mode id, not necessarily an agy one. Only values advertised by agy's
+    /// captured help reach `--mode`; `yolo` and `default` are host-side and filtered out.
     pub mode: Option<String>,
     /// The composed `[Assistant Rules]` block (preset context + skills index +
     /// dual-channel instructions), prepended to the prompt on the FIRST
@@ -49,30 +57,62 @@ pub(crate) struct ArgvInput {
     pub extra_args: Vec<String>,
 }
 
-/// How long agy may wait in print mode before abandoning the turn.
+/// Host limit on waiting for agy's print result.
 ///
-/// agy's own default is 5m0s (`agy --help`, 1.1.9) and it is a wall-clock cap
-/// on the WHOLE turn, not an idle timeout: a long build, a big refactor or a
-/// slow tool run trips it while agy is still making steady progress. Measured
-/// on 1.1.9, the cap fires as a clean terminal frame — `result` with
-/// `status:"ERROR"`, `error:"timeout waiting for response"`, exit 1 — so the
-/// turn dies with an error the user cannot act on.
+/// The captured 1.4.2 help reports a default of `0` (wait until completion;
+/// verified:
+/// `~/aion/protocols/samples/agy/1.4.2/root-probe-help.txt:20`). The host keeps
+/// its existing one-hour policy so scheduled turns have a finite wait.
+/// `1h` was accepted by the real live gates (verified:
+/// `~/aion/protocols/samples/agy/1.4.2/live-ws-http-suite-5345050a.log`).
 ///
-/// It is raised, but NOT removed, because it is the only automatic recovery
-/// this integration has. There is no in-turn silence watchdog anywhere in the
-/// stack: `suspend.rs`'s `last_activity` only moves on dispatch (a session
-/// dormancy TTL), and `collect_idle` skips tasks that are still running. So if
-/// agy goes quiet while alive, the only other ways out are the user's Cancel —
-/// which nobody is there to press on a scheduled run — and this cap.
-///
-/// One hour is therefore the trade: 12× agy's default, comfortably past any
-/// legitimate turn, while still bounding a silent hang instead of parking a
-/// cron conversation for a day. Go duration syntax; verified accepted by agy
-/// 1.1.9 (an unparseable value is a hard flag error).
+/// A short cap does not necessarily produce an error: the captured 8 s and
+/// 12 s invocations returned SUCCESS, partial output, and exit 0 (verified:
+/// `~/aion/protocols/samples/agy/1.4.2/flags-stream-json-print-timeout-8s.stdout.txt`,
+/// `flags-stream-json-print-timeout-12s.stdout.txt`, and their stderr captures).
+/// Those captures establish a partial return while the turn was in progress;
+/// they do not establish cancellation of the underlying work.
 const PRINT_TIMEOUT: &str = "1h";
 
 fn non_blank(value: &Option<String>) -> Option<&str> {
     value.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn agy_mode_for_argv(mode: Option<&str>) -> Option<&str> {
+    let mode = mode.map(str::trim).filter(|mode| !mode.is_empty())?;
+    if mode.eq_ignore_ascii_case(FULL_AUTO_SENTINEL) || mode.eq_ignore_ascii_case(HOST_DEFAULT_MODE) {
+        return None;
+    }
+    if HELP_ADVERTISED_AGY_MODES.contains(&mode) {
+        return Some(mode);
+    }
+
+    tracing::warn!("dropping agy --mode value absent from captured --help");
+    None
+}
+
+fn extra_args_without_mode(extra_args: &[String]) -> Vec<String> {
+    let mut filtered = Vec::with_capacity(extra_args.len());
+    let mut index = 0;
+    while index < extra_args.len() {
+        let argument = &extra_args[index];
+        if argument == "--mode" {
+            tracing::warn!("dropping --mode from agy extra_args; use the validated mode field");
+            index += 1;
+            if extra_args.get(index).is_some_and(|value| !value.starts_with('-')) {
+                index += 1;
+            }
+            continue;
+        }
+        if argument.starts_with("--mode=") {
+            tracing::warn!("dropping --mode from agy extra_args; use the validated mode field");
+            index += 1;
+            continue;
+        }
+        filtered.push(argument.clone());
+        index += 1;
+    }
+    filtered
 }
 
 pub(crate) fn build_argv(input: &ArgvInput) -> Vec<String> {
@@ -116,24 +156,18 @@ pub(crate) fn build_argv(input: &ArgvInput) -> Vec<String> {
     }
     // No `--effort`: effort lives inside the model id, and a stripped id is
     // silently ignored by agy.
-    // agy takes exactly two values here: `accept-edits` and `plan`. AionUi's other two
-    // modes are host-side concepts expressed through the approval hook — `yolo` by
-    // removing it, `default` by keeping it — and agy rejects both by name, warning and
-    // discarding the flag. Sending either would look fine (exit 0) while silently
-    // leaving the session on agy's default. See the two constants above.
-    let mode = input
-        .mode
-        .as_deref()
-        .filter(|m| !m.eq_ignore_ascii_case(FULL_AUTO_SENTINEL) && !m.eq_ignore_ascii_case(HOST_DEFAULT_MODE));
-    let mode = mode.map(str::to_owned);
+    // `yolo` and `default` are host-side concepts expressed through the approval
+    // hook. Forward only the native values documented by captured help; unknown
+    // raw values are warned and dropped instead of silently changing CLI behavior.
+    let mode = agy_mode_for_argv(non_blank(&input.mode)).map(str::to_owned);
     for (flag, value) in [("--model", &input.model), ("--mode", &mode)] {
         if let Some(v) = non_blank(value) {
             a.push(flag.into());
             a.push(v.to_owned());
         }
     }
-    // Skill-delivery args last, so they cannot displace anything above.
-    a.extend(input.extra_args.iter().cloned());
+    // Skill-delivery args last. They cannot provide a second, unvalidated --mode.
+    a.extend(extra_args_without_mode(&input.extra_args));
     a
 }
 
@@ -220,10 +254,9 @@ mod tests {
     }
 
     #[test]
-    fn every_turn_lifts_agys_five_minute_wall_clock_cap() {
-        // Left at agy's 5m0s default, a long-but-healthy turn (big refactor,
-        // slow build) is killed by agy itself while this layer — which has no
-        // wall-clock cap and detects hangs by dead silence — sees nothing wrong.
+    fn every_turn_sets_the_explicit_host_print_limit() {
+        // Keep the host's finite wait on every invocation. The captured CLI
+        // default and partial-return behavior are documented beside the constant.
         for input in [
             base(),
             ArgvInput {
@@ -262,19 +295,14 @@ mod tests {
 
     /// `default` is AionUi's "ask before sensitive things" mode, NOT an agy value.
     ///
-    /// agy takes only `accept-edits` and `plan` (verified:
-    /// samples/antigravity-cli/1.1.8/agy_--help.txt:12 — "Set the agent execution mode
-    /// for this session (accept-edits, plan)"). Sending `--mode default` makes agy print
-    /// `warning: unrecognized --mode value "default" (valid: accept-edits, plan)` and
-    /// DROP the flag, so the session silently stays on whatever agy defaults to while the
-    /// UI reports the switch as done.
-    ///
-    /// An earlier note claimed agy "accepts unknown --mode values silently (exits 0)".
-    /// Exit 0 is not acceptance: the observed run warns and discards the argument.
+    /// The 1.4.2 captured help advertises `accept-edits`, `auto`, and `plan`, not
+    /// `default` (verified:
+    /// `~/aion/protocols/samples/agy/1.4.2/root-probe-help.txt:14`, sha256
+    /// `a12355e8fc064b330eeb25ba52de596406582752442e293083bcda6388a63b78`).
     ///
     /// Like `yolo`, this mode is expressed by the host — `yolo` by removing the approval
     /// hook, `default` by keeping it — so neither belongs on agy's command line. Omitting
-    /// the flag is also exactly right semantically: agy's own default IS "default".
+    /// the flag keeps the host-side choice out of the native value list.
     #[test]
     fn the_default_mode_is_host_side_and_never_sent_to_agy() {
         let mut i = base();
@@ -282,25 +310,44 @@ mod tests {
         let a = build_argv(&i);
         assert!(
             !a.contains(&"--mode".to_string()),
-            "agy rejects `--mode default`; the flag must be omitted, argv={a:?}"
+            "unadvertised mode must be omitted, argv={a:?}"
         );
         assert!(!a.iter().any(|x| x == "default"), "argv={a:?}");
     }
 
     #[test]
-    /// Only the two values agy actually documents are forwarded.
-    ///
-    /// `default` used to be in this list, which is what put an unrecognized value on
-    /// agy's command line; it is host-side and covered by
-    /// `the_default_mode_is_host_side_and_never_sent_to_agy`.
-    fn agys_real_modes_are_forwarded() {
-        for mode in ["accept-edits", "plan"] {
+    /// Only the values agy advertises in the captured help are forwarded.
+    fn captured_help_modes_are_forwarded_to_argv() {
+        for &mode in HELP_ADVERTISED_AGY_MODES {
             let mut i = base();
             i.mode = Some(mode.to_owned());
             let a = build_argv(&i);
             let at = a.iter().position(|x| x == "--mode").expect("mode flag missing");
             assert_eq!(a[at + 1], mode);
         }
+    }
+
+    #[test]
+    fn unknown_agy_mode_values_are_dropped() {
+        let mut i = base();
+        i.mode = Some("future-mode".to_owned());
+        let a = build_argv(&i);
+        assert!(!a.contains(&"--mode".to_string()), "argv={a:?}");
+        assert!(!a.iter().any(|arg| arg == "future-mode"), "argv={a:?}");
+    }
+
+    #[test]
+    fn mode_cannot_be_smuggled_through_skill_extra_args() {
+        let mut i = base();
+        i.extra_args = vec![
+            "--mode".into(),
+            "future-mode".into(),
+            "--add-dir".into(),
+            "/src/skill".into(),
+        ];
+        let a = build_argv(&i);
+        assert!(!a.contains(&"--mode".to_string()), "argv={a:?}");
+        assert!(a.windows(2).any(|pair| pair == ["--add-dir", "/src/skill"]));
     }
 
     #[test]

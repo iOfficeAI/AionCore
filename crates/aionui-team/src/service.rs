@@ -51,6 +51,10 @@ use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort
 use crate::runtime_tools::{
     ResolvedTeamToolContext, agent_for_conversation, error_payload, execute_with_scheduler, role_to_tool_role,
 };
+use crate::service::spawn_support::{
+    agent_type_for_backend, cli_backend_metadata, config_options_advertise_mode, is_team_full_auto_mode,
+    metadata_advertises_mode, normalize_team_mode_from_lead, team_mode_for_backend,
+};
 use crate::session::{
     AgentMessageQueueResult, TeamSession, attach_member_runtime, attach_member_runtime_after_kill,
     spawn_attach_agent_process_bg,
@@ -3104,6 +3108,10 @@ impl TeamSessionService {
     }
 
     pub async fn set_session_mode(&self, user_id: &str, team_id: &str, mode: &str) -> Result<(), TeamError> {
+        let requested_mode = mode.trim();
+        if requested_mode.is_empty() {
+            return Err(TeamError::InvalidRequest("mode must not be empty".into()));
+        }
         let team = self.load_owned_team(user_id, team_id).await?;
         if let Some(starting_member) = team
             .agents
@@ -3112,21 +3120,106 @@ impl TeamSessionService {
         {
             return Err(Self::member_runtime_starting_error(team_id, starting_member));
         }
+
+        // The UI sends the lead's selected native id. Normalize its own
+        // full-auto id into the semantic Team value before member mapping.
+        let mode = if is_team_full_auto_mode(requested_mode) {
+            crate::service::spawn_support::TEAM_FULL_AUTO_MODE.to_owned()
+        } else {
+            let lead = team
+                .agents
+                .iter()
+                .find(|agent| agent.role == TeammateRole::Lead)
+                .ok_or_else(|| TeamError::InvalidRequest("Team has no lead agent".into()))?;
+            let lead_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, &lead.backend).await?;
+            let lead_agent_type = match lead_metadata.as_ref() {
+                Some(metadata) => agent_type_for_backend(Some(metadata), &lead.backend).ok(),
+                None => self
+                    .task_manager
+                    .get_task(&lead.conversation_id)
+                    .map(|instance| instance.agent_type()),
+            };
+            match lead_agent_type {
+                Some(lead_agent_type) => normalize_team_mode_from_lead(
+                    requested_mode,
+                    &lead.backend,
+                    lead_agent_type,
+                    lead_metadata.as_ref(),
+                ),
+                None => requested_mode.to_owned(),
+            }
+        };
+
+        // Resolve the semantic Team mode into a member-native value before
+        // persisting any runtime seeds. A raw native mode is accepted for a
+        // member only when its live options (or stored handshake metadata for
+        // an inactive member) advertise it.
+        let mut member_modes = Vec::with_capacity(team.agents.len());
+        for agent in &team.agents {
+            let instance = self.task_manager.get_task(&agent.conversation_id);
+            let metadata = if is_team_full_auto_mode(&mode) || instance.is_none() {
+                cli_backend_metadata(&self.agent_metadata_repo, user_id, &agent.backend).await?
+            } else {
+                None
+            };
+            let member_mode = if is_team_full_auto_mode(&mode) {
+                let agent_type = match metadata.as_ref() {
+                    Some(metadata) => agent_type_for_backend(Some(metadata), &agent.backend)?,
+                    None => match instance.as_ref() {
+                        Some(instance) => instance.agent_type(),
+                        None => agent_type_for_backend(None, &agent.backend)?,
+                    },
+                };
+                team_mode_for_backend(Some(mode.as_str()), &agent.backend, agent_type, metadata.as_ref())
+            } else if let Some(instance) = &instance {
+                match instance.get_config_options().await {
+                    Ok(options) if config_options_advertise_mode(&options, &mode) => Some(mode.to_owned()),
+                    Ok(_) => None,
+                    Err(error) => {
+                        warn!(
+                            team_id,
+                            slot_id = %agent.slot_id,
+                            backend = %agent.backend,
+                            error = %error,
+                            "could not inspect member modes; skipping unadvertised Team mode"
+                        );
+                        None
+                    }
+                }
+            } else if metadata_advertises_mode(metadata.as_ref(), &mode) {
+                Some(mode.to_owned())
+            } else {
+                None
+            };
+            member_modes.push((agent.clone(), instance, member_mode));
+        }
+
         let provisioner = self.provisioner();
         self.repo
             .update_team(
                 user_id,
                 team_id,
                 &UpdateTeamParams {
+                    // Keep the semantic Team selection here. Provisioning maps
+                    // it separately for every future member backend.
                     session_mode: Some(mode.to_owned()),
                     ..Default::default()
                 },
             )
             .await?;
 
-        for agent in &team.agents {
-            let mode_applied = match self.task_manager.get_task(&agent.conversation_id) {
-                Some(instance) => match set_active_agent_session_mode(&instance, mode).await {
+        for (agent, instance, member_mode) in member_modes {
+            let Some(member_mode) = member_mode else {
+                info!(
+                    team_id,
+                    slot_id = %agent.slot_id,
+                    backend = %agent.backend,
+                    "skipping Team mode because the member does not advertise it"
+                );
+                continue;
+            };
+            let mode_applied = match instance {
+                Some(instance) => match set_active_agent_session_mode(&instance, &member_mode).await {
                     Ok(()) => true,
                     Err(e) => {
                         warn!(
@@ -3141,7 +3234,7 @@ impl TeamSessionService {
                 },
                 None => true,
             };
-            if mode_applied && let Err(e) = provisioner.update_session_mode_seed(agent, mode).await {
+            if mode_applied && let Err(e) = provisioner.update_session_mode_seed(&agent, &member_mode).await {
                 warn!(
                     team_id,
                     slot_id = %agent.slot_id,
@@ -3253,17 +3346,19 @@ mod tests {
         IWorkerTaskManager, IdleCleanupCoordinator,
     };
     use aionui_api_types::{
-        AddAgentRequest, ConfigOptionConfirmation, SetConfigOptionRequest, SetConfigOptionResponse,
-        TeamContextResetAvailability, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamRunTargetRole,
+        AcpConfigOptionDto, AcpConfigSelectOptionDto, AddAgentRequest, ConfigOptionConfirmation,
+        GetConfigOptionsResponse, SetConfigOptionRequest, SetConfigOptionResponse, TeamContextResetAvailability,
+        TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamRunTargetRole,
     };
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs, now_ms};
-    use aionui_db::{IConversationRepository, ITeamRepository};
+    use aionui_db::{IAgentMetadataRepository, IConversationRepository, ITeamRepository};
     use tokio::sync::broadcast;
 
     use super::TeamIdleCleanupCoordinator;
     use crate::member_runtime::{MemberRuntimeFailure, ReserveAttach};
+    use crate::service::spawn_support::tests::{RowsAgentMetadataRepo, agent_metadata_row};
     use crate::test_utils::workspace_harness::{
-        setup_with_factory_metadata_team_repo_and_conversation_repo,
+        setup_with_agent_metadata_repo_and_task_manager, setup_with_factory_metadata_team_repo_and_conversation_repo,
         setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster,
         setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager,
         single_agent_team_request,
@@ -3277,6 +3372,7 @@ mod tests {
         conversation_id: String,
         agent_type: AgentType,
         mode_result: Mutex<Result<(), String>>,
+        advertised_modes: Vec<String>,
         event_tx: broadcast::Sender<AgentStreamEvent>,
         status: Option<ConversationStatus>,
         last_activity_at: TimestampMs,
@@ -3297,6 +3393,7 @@ mod tests {
                 conversation_id: conversation_id.to_owned(),
                 agent_type: AgentType::Acp,
                 mode_result: Mutex::new(mode_result),
+                advertised_modes: vec!["read-only".to_owned()],
                 event_tx,
                 status: None,
                 last_activity_at: now_ms(),
@@ -3318,6 +3415,11 @@ mod tests {
 
         fn with_agent_type(mut self, agent_type: AgentType) -> Self {
             self.agent_type = agent_type;
+            self
+        }
+
+        fn with_advertised_modes(mut self, modes: &[&str]) -> Self {
+            self.advertised_modes = modes.iter().map(|mode| (*mode).to_owned()).collect();
             self
         }
 
@@ -3373,6 +3475,30 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IMockAgent for ModeSettingAgent {
+        async fn get_config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
+            Ok(GetConfigOptionsResponse {
+                config_options: vec![AcpConfigOptionDto {
+                    id: "mode".to_owned(),
+                    name: None,
+                    label: Some("Mode".to_owned()),
+                    description: None,
+                    category: Some("mode".to_owned()),
+                    option_type: "select".to_owned(),
+                    current_value: Some("default".to_owned()),
+                    options: self
+                        .advertised_modes
+                        .iter()
+                        .map(|mode| AcpConfigSelectOptionDto {
+                            value: mode.clone(),
+                            name: None,
+                            label: Some(mode.clone()),
+                            description: None,
+                        })
+                        .collect(),
+                }],
+            })
+        }
+
         async fn set_config_option(&self, option_id: &str, value: &str) -> Result<SetConfigOptionResponse, AgentError> {
             assert_eq!(option_id, "mode");
             assert_eq!(value, "read-only");
@@ -4774,14 +4900,91 @@ mod tests {
 
         assert_eq!(
             extra.get("session_mode").and_then(serde_json::Value::as_str),
-            Some("full_auto")
+            Some("yolo"),
+            "the Team keeps the semantic full_auto value, while the new member receives its own backend mode"
         );
+    }
+
+    #[tokio::test]
+    async fn set_session_mode_normalizes_lead_full_auto_ids_for_heterogeneous_members() {
+        for (lead_backend, lead_mode) in [("claude", "bypassPermissions"), ("codex", "agent-full-access")] {
+            let lead_metadata = agent_metadata_row(lead_backend, Some(lead_mode));
+            let mut agy_metadata = agent_metadata_row("antigravity", Some("yolo"));
+            agy_metadata.agent_type = AgentType::Antigravity.serde_name().to_owned();
+            let metadata_repo: Arc<dyn IAgentMetadataRepository> =
+                Arc::new(RowsAgentMetadataRepo::new(vec![lead_metadata, agy_metadata]));
+            let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(StaticTaskManager::new(HashMap::new()));
+            let (svc, repo, _task_manager, conv_repo, _) =
+                setup_with_agent_metadata_repo_and_task_manager(metadata_repo, task_manager);
+            let created = svc
+                .create_team(
+                    "user-test",
+                    aionui_api_types::CreateTeamRequest {
+                        name: format!("{lead_backend} mode propagation"),
+                        agents: vec![
+                            aionui_api_types::TeamAgentInput {
+                                name: "Lead".to_owned(),
+                                role: "lead".to_owned(),
+                                backend: Some(lead_backend.to_owned()),
+                                model: format!("{lead_backend}-model"),
+                                assistant_id: None,
+                                conversation_id: None,
+                            },
+                            aionui_api_types::TeamAgentInput {
+                                name: "Antigravity".to_owned(),
+                                role: "teammate".to_owned(),
+                                backend: Some("antigravity".to_owned()),
+                                model: "gemini-model".to_owned(),
+                                assistant_id: None,
+                                conversation_id: None,
+                            },
+                        ],
+                        workspace: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let lead = created
+                .assistants
+                .iter()
+                .find(|agent| agent.role == "lead")
+                .expect("lead agent");
+            let agy = created
+                .assistants
+                .iter()
+                .find(|agent| agent.backend == "antigravity")
+                .expect("agy teammate");
+
+            // Start from an existing native raw mode so this exercises the UI's
+            // lead-native full-auto selection being normalized at the API entry.
+            let mut agy_extra = conv_repo.get_extra(&agy.conversation_id).expect("agy extra");
+            agy_extra["session_mode"] = serde_json::Value::String("plan".to_owned());
+            conv_repo.set_extra(&agy.conversation_id, agy_extra);
+
+            svc.set_session_mode("user-test", &created.id, lead_mode).await.unwrap();
+
+            let team_row = repo
+                .get_team("user-test", &created.id)
+                .await
+                .unwrap()
+                .expect("team row");
+            assert_eq!(team_row.session_mode.as_deref(), Some("full_auto"));
+            assert_eq!(
+                conv_repo.get_extra(&lead.conversation_id).unwrap()["session_mode"],
+                lead_mode
+            );
+            assert_eq!(
+                conv_repo.get_extra(&agy.conversation_id).unwrap()["session_mode"],
+                "yolo"
+            );
+        }
     }
 
     #[tokio::test]
     async fn set_session_mode_does_not_persist_agent_seed_when_active_runtime_rejects_mode() {
         let accepting_conversation_id = "conv-accepts";
         let rejecting_conversation_id = "conv-rejects";
+        let unadvertised_conversation_id = "conv-unadvertised";
         let task_manager = Arc::new(StaticTaskManager::new(HashMap::from([
             (
                 accepting_conversation_id.to_owned(),
@@ -4793,6 +4996,12 @@ mod tests {
                     rejecting_conversation_id,
                     "Value 'read-only' is not selectable for config option 'mode'",
                 ))),
+            ),
+            (
+                unadvertised_conversation_id.to_owned(),
+                AgentInstance::Mock(Arc::new(
+                    ModeSettingAgent::accepts_mode(unadvertised_conversation_id).with_advertised_modes(&["default"]),
+                )),
             ),
         ])));
         let (svc, repo, _task_manager, conv_repo, _broadcaster) =
@@ -4824,6 +5033,15 @@ mod tests {
                 "backend": "claude",
                 "model": "global.anthropic.claude-opus-4-8",
                 "assistant_id": "bare:claude"
+            },
+            {
+                "slot_id": "slot-unadvertised",
+                "name": "Unadvertised Agent",
+                "role": "teammate",
+                "conversation_id": unadvertised_conversation_id,
+                "backend": "aionrs",
+                "model": "aionrs-model",
+                "assistant_id": "bare:aionrs"
             }
         ])
         .to_string();
@@ -4843,6 +5061,31 @@ mod tests {
                 user_id: "user-test".to_owned(),
                 name: "Codex CLI".to_owned(),
                 r#type: AgentType::Acp.serde_name().to_owned(),
+                extra: serde_json::json!({
+                    "current_mode_id": "default",
+                    "session_mode": "default"
+                })
+                .to_string(),
+                model: None,
+                status: Some("pending".to_owned()),
+                source: None,
+                channel_chat_id: None,
+                pinned: false,
+                pinned_at: None,
+                created_at: now_ms(),
+                updated_at: now_ms(),
+                project_id: None,
+                folder_id: None,
+                name_source: None,
+            })
+            .await
+            .unwrap();
+        conv_repo
+            .create(&aionui_db::models::ConversationRow {
+                id: unadvertised_conversation_id.to_owned(),
+                user_id: "user-test".to_owned(),
+                name: "Unadvertised Agent".to_owned(),
+                r#type: AgentType::Aionrs.serde_name().to_owned(),
                 extra: serde_json::json!({
                     "current_mode_id": "default",
                     "session_mode": "default"
@@ -4909,6 +5152,15 @@ mod tests {
         assert_eq!(
             rejecting_extra.get("session_mode").and_then(serde_json::Value::as_str),
             Some("default")
+        );
+
+        let unadvertised_extra = conv_repo.get_extra(unadvertised_conversation_id).unwrap();
+        assert_eq!(
+            unadvertised_extra
+                .get("session_mode")
+                .and_then(serde_json::Value::as_str),
+            Some("default"),
+            "a raw native mode must not be persisted for a member that did not advertise it"
         );
     }
 

@@ -29,31 +29,50 @@ fn main() -> ExitCode {
 fn run_main() -> Result<ExitCode, MainError> {
     let cli = Cli::parse();
 
-    // mcp-* subcommands route into short-lived stdio helpers that live entirely
-    // outside the main HTTP server. They share the global flags so clap can
-    // parse a uniform CLI, but bypass `aionui_runtime::init` (which would
+    // mcp-* and the other short-lived helpers share the global flags so clap
+    // can parse a uniform CLI, but bypass `aionui_runtime::init` (which would
     // anchor managed runtime state under --data-dir) — these helpers don't
     // host agents.
     //
     // `doctor`, in contrast, is meant to mirror the real server's CLI
     // detection path exactly. It must hit the same `aionui_runtime::init`
-    // before performing managed-runtime and PATH probing.
-    let needs_runtime = cli.command.as_ref().is_none_or(Command::need_runtime);
+    // before performing managed-runtime and PATH probing. `prepare` does too:
+    // it materializes the managed runtime the server will launch.
+    let needs_runtime = command_needs_path_enhancement(cli.command.as_ref());
     if needs_runtime {
         aionui_runtime::set_managed_resources_mode(cli.managed_resources_mode.into());
         aionui_runtime::init(&cli.data_dir);
     }
 
-    // SAFETY: called before any worker thread exists (including the tokio
-    // runtime constructed below). Rust 2024 requires `unsafe` for
-    // `std::env::set_var` invoked inside `enhance_process_path`.
-    let merged_path = unsafe { aionui_runtime::enhance_process_path() };
+    // The login-shell probe inside `enhance_process_path` blocks for up to 3s
+    // before any stdin read. Short-lived helpers do not launch agents, so they
+    // keep the inherited PATH and never call it. Server, doctor, and prepare
+    // still enrich. The returned string is a length/segment input for those
+    // runtime commands; helpers do not log it.
+    let merged_path = if needs_runtime {
+        // SAFETY: called before any worker thread exists (including the tokio
+        // runtime constructed below). Rust 2024 requires `unsafe` for
+        // `std::env::set_var` invoked inside `enhance_process_path`.
+        unsafe { aionui_runtime::enhance_process_path() }
+    } else {
+        std::env::var("PATH").unwrap_or_default()
+    };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| runtime_init_error_for_command(&cli.command, error))?;
     runtime.block_on(async_main(merged_path, cli))
+}
+
+/// Login-shell PATH enrichment is only for processes that host or probe agents.
+///
+/// Same set as managed-runtime init: the server (no subcommand), `doctor`,
+/// and `prepare-managed-resources`. Every other subcommand is a short-lived
+/// helper and must keep the inherited PATH. `user` and `secret` are in that
+/// helper set: they open the data-dir database and do not spawn agents.
+fn command_needs_path_enhancement(command: Option<&Command>) -> bool {
+    command.is_none_or(Command::need_runtime)
 }
 
 fn runtime_init_error_for_command(command: &Option<Command>, error: std::io::Error) -> MainError {
@@ -208,5 +227,41 @@ mod tests {
             err.stderr_line()
                 .starts_with("CLI_RUNTIME_INIT_FAILED subcommand=doctor")
         );
+    }
+
+    #[test]
+    fn path_enhancement_is_only_for_server_doctor_and_prepare() {
+        use clap::Parser;
+
+        // Parse argv instead of building arg structs. Integrated WS-1 adds
+        // fields these structs do not have on this branch; naming the fields
+        // would fail there. This does not read or log PATH.
+        let cases = [
+            (&["aioncore"][..], true),
+            (&["aioncore", "doctor"][..], true),
+            (
+                &["aioncore", "prepare-managed-resources", "--bundle-out", "bundle"][..],
+                true,
+            ),
+            (&["aioncore", "capabilities"][..], false),
+            (&["aioncore", "config", "capabilities"][..], false),
+            (&["aioncore", "diagnose", "capabilities"][..], false),
+            (&["aioncore", "team", "capabilities"][..], false),
+            (&["aioncore", "session", "capabilities"][..], false),
+            (&["aioncore", "conversation", "capabilities"][..], false),
+            (&["aioncore", "skills", "capabilities"][..], false),
+            (&["aioncore", "antigravity-hook"][..], false),
+            (&["aioncore", "mcp-team-stdio"][..], false),
+            (&["aioncore", "user", "list"][..], false),
+            (&["aioncore", "secret", "status"][..], false),
+        ];
+        for (argv, enhance) in cases {
+            let cli = Cli::try_parse_from(argv).unwrap_or_else(|error| panic!("parse {argv:?}: {error}"));
+            assert_eq!(
+                command_needs_path_enhancement(cli.command.as_ref()),
+                enhance,
+                "{argv:?}"
+            );
+        }
     }
 }

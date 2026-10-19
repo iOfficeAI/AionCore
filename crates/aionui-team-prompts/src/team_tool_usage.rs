@@ -43,25 +43,63 @@ For exact schema, run team capabilities.\n\n\
 
 fn render_cli_usage(role: TeamPromptRole, descriptors: &[TeamToolDescriptor]) -> String {
     let mut text = String::from(
-        "You MUST use AionCore Team CLI for ALL team coordination:\n\
-\"$AIONUI_HELPER_BIN\" team ...\n\n\
-Run \"$AIONUI_HELPER_BIN\" team capabilities when you need command names,\n\
-stdin JSON schema, required fields, enum values, permissions, examples,\n\
-or error meanings.\n\n\
-Run \"$AIONUI_HELPER_BIN\" team help when you need a short readable guide.\n\n\
-Do not guess team_id, slot_id, role, permissions, or internal tokens.\n\
-Do not claim you used MCP tools in CLI transport.\n\
-Use slot_id values from this prompt, team context, or team members results\n\
-for all agent targets.\n\n\
-If the CLI returns schema_validation_failed, unknown_command, or permission_denied,\n\
-consult team capabilities or team help, correct the call, and retry at most once.\n\n\
-For exact schema, run team capabilities.\n\n\
-| When | CLI command | Canonical tool | Input summary |\n\
-| --- | --- | --- | --- |\n",
+        r##"You MUST use AionCore Team CLI for ALL team coordination:
+"$AIONUI_HELPER_BIN" team ...
+
+Run "$AIONUI_HELPER_BIN" team capabilities when you need command names,
+stdin JSON schema, required fields, enum values, permissions, examples,
+or error meanings.
+
+Run "$AIONUI_HELPER_BIN" team help when you need a short readable guide.
+
+Supply JSON with --json JSON (highest precedence), --input PATH,
+--input -, or piped stdin, in that order. Terminal stdin is not read
+automatically. If implicit stdin stays open without a first byte for
+1000 ms, it becomes an empty JSON object; AIONUI_CLI_STDIN_TIMEOUT_MS
+overrides that wait from 1 to 30000 ms. After a byte arrives, the total
+read limit is 30 seconds. Input is limited to 4 MiB. An explicit stdin
+timeout returns TEAM_CLI_STDIN_TIMEOUT with source, bytes_read, and a
+16-byte prefix only (verified: crates/aionui-app/src/cli.rs, crates/aionui-app/src/commands/cmd_team.rs, and crates/aionui-app/src/commands/json_input.rs).
+Run each Team CLI command in the foreground; do not background it
+(verified: crates/aionui-app/src/commands/team_capabilities.rs).
+
+No-input read, POSIX shell:
+"$AIONUI_HELPER_BIN" team read-messages --json '{}'
+
+No-input read, Windows PowerShell:
+& $env:AIONUI_HELPER_BIN team read-messages --json '{}'
+
+Send message, POSIX shell (the descriptor requires to and message, verified: crates/aionui-api-types/src/team_tools.rs):
+"$AIONUI_HELPER_BIN" team send-message --json '{"to":"<slot_id>","message":"Review complete."}'
+
+Send message, Windows PowerShell 7.3+ with Standard/Windows native argument mode
+(PowerShell 7.3 changed native argument parsing; source:
+https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_parsing?view=powershell-7.5#passing-arguments-that-contain-quote-characters):
+& $env:AIONUI_HELPER_BIN team send-message --json '{"to":"<slot_id>","message":"Review complete."}'
+
+Send message, Windows PowerShell 5.1 or Legacy native argument mode, using a temporary JSON file:
+$teamInputPath = [IO.Path]::GetTempFileName()
+[IO.File]::WriteAllText($teamInputPath, '{"to":"<slot_id>","message":"Review complete."}', [Text.Encoding]::UTF8)
+& $env:AIONUI_HELPER_BIN team send-message --input $teamInputPath
+Remove-Item -LiteralPath $teamInputPath
+
+Do not guess team_id, slot_id, role, permissions, or internal tokens.
+Do not claim you used MCP tools in CLI transport.
+Use slot_id values from this prompt, team context, or team members results
+for all agent targets.
+
+If the CLI returns schema_validation_failed, unknown_command, or permission_denied,
+consult team capabilities or team help, correct the call, and retry at most once.
+
+For exact schema, run team capabilities.
+
+| When | CLI command | Canonical tool | Input summary |
+| --- | --- | --- | --- |
+"##,
     );
     for tool in descriptors {
         text.push_str(&format!(
-            "| {} | `team {}` | `{}` | {} |\n",
+            "| {} | team {} | {} | {} |\n",
             tool.when,
             tool.cli_command.join(" "),
             tool.name,
@@ -85,6 +123,19 @@ mod tests {
         assert!(usage.contains("team send-message"));
         assert!(!usage.contains("team spawn-agent"));
         assert!(usage.contains("Lead-only tools are unavailable to teammates"));
+        assert!(usage.contains("--json JSON"));
+        assert!(usage.contains("foreground; do not background it"));
+        assert!(usage.contains("team read-messages --json '{}'"));
+        assert!(usage.contains("& $env:AIONUI_HELPER_BIN team read-messages --json '{}'"));
+        assert!(usage.contains(r#""message":"Review complete.""#));
+        assert!(usage.contains("Windows PowerShell 7.3+ with Standard/Windows native argument mode"));
+        assert!(usage.contains("Windows PowerShell 5.1 or Legacy native argument mode"));
+        assert!(usage.contains("--input $teamInputPath"));
+        assert!(
+            usage.contains("learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_parsing")
+        );
+        assert!(usage.contains("TEAM_CLI_STDIN_TIMEOUT"));
+        assert!(!usage.contains(r#""content":"Review complete.""#));
     }
 
     #[test]

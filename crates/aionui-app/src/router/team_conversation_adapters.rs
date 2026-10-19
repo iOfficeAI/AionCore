@@ -139,6 +139,7 @@ impl AgentTurnExecutionPort for TeamConversationAdapters {
                 ConversationAgentTurnStatus::Completed => AgentTurnStatus::Completed,
                 ConversationAgentTurnStatus::Failed => AgentTurnStatus::Failed,
             },
+            error_code: outcome.error_code,
             runtime: Some(outcome.runtime),
         })
     }

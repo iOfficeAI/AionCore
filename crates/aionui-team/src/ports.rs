@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use aionui_api_types::{ConversationRuntimeSummary, TeamRunTargetRole};
+use aionui_api_types::{AgentErrorCode, ConversationRuntimeSummary, TeamRunTargetRole};
 use aionui_common::ResolvedBackendCapabilities;
 use async_trait::async_trait;
 
@@ -229,6 +229,7 @@ pub struct AgentTurnOutcome {
     pub conversation_id: String,
     pub turn_id: String,
     pub status: AgentTurnStatus,
+    pub error_code: Option<AgentErrorCode>,
     pub runtime: Option<ConversationRuntimeSummary>,
 }
 

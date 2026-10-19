@@ -7,13 +7,14 @@
 //! relative path.
 
 use std::ffi::OsString;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 use aionui_api_types::{SkillRuntimeEnvelope, SkillRuntimeErrorCode, SkillRuntimeErrorPayload};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::cli::{SkillsArgs, SkillsCommand};
+use crate::commands::json_input::{JsonInputArgs, JsonInputFailure, read_json_input};
 use crate::commands::skills_capabilities;
 
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
@@ -22,22 +23,23 @@ const ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
 const ENV_RUNTIME_TOKEN: &str = "AIONUI_RUNTIME_TOKEN";
 
 pub(crate) async fn run_skills(args: SkillsArgs) -> ExitCode {
-    match run_skills_inner(args).await {
+    let input = args.json_input;
+    match run_skills_inner(args.command, &input).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(code) => code,
     }
 }
 
-async fn run_skills_inner(args: SkillsArgs) -> Result<(), ExitCode> {
-    match args.command {
+async fn run_skills_inner(command: SkillsCommand, input: &JsonInputArgs) -> Result<(), ExitCode> {
+    match command {
         // Static contract: no conversation data, so it works with no runtime env.
         SkillsCommand::Capabilities => print_json(&SkillRuntimeEnvelope::success(
             skills_capabilities::data(),
             Some("skills capabilities".to_owned()),
         )),
         SkillsCommand::List => list().await,
-        SkillsCommand::Show => show().await,
-        SkillsCommand::Cat => cat().await,
+        SkillsCommand::Show => show(input).await,
+        SkillsCommand::Cat => cat(input).await,
         SkillsCommand::Unknown(path) => Err(unknown_command(path)),
     }
 }
@@ -49,10 +51,10 @@ async fn list() -> Result<(), ExitCode> {
     get(command, &env, url).await
 }
 
-async fn show() -> Result<(), ExitCode> {
+async fn show(input: &JsonInputArgs) -> Result<(), ExitCode> {
     let command = "skills show";
     let env = runtime_env(command)?;
-    let name = required_string_field(command, "name")?;
+    let name = required_string_field(command, "name", input)?;
     let url = format!(
         "{}/api/runtime/skills/{}",
         env.base_url.trim_end_matches('/'),
@@ -61,10 +63,10 @@ async fn show() -> Result<(), ExitCode> {
     get(command, &env, url).await
 }
 
-async fn cat() -> Result<(), ExitCode> {
+async fn cat(input: &JsonInputArgs) -> Result<(), ExitCode> {
     let command = "skills cat";
     let env = runtime_env(command)?;
-    let path = required_string_field(command, "path")?;
+    let path = required_string_field(command, "path", input)?;
     let (name, rel) = split_skill_path(command, &path)?;
     let url = format!(
         "{}/api/runtime/skills/{}/file?path={}",
@@ -157,29 +159,32 @@ fn required_env(command: &str, name: &'static str) -> Result<String, ExitCode> {
     })
 }
 
-fn read_stdin_json_object(command: &str) -> Result<Value, ExitCode> {
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input).map_err(|error| {
+fn read_stdin_json_object(command: &str, input: &JsonInputArgs) -> Result<Value, ExitCode> {
+    read_json_input(input).map(|document| document.value).map_err(|error| {
+        let code = match error.failure {
+            JsonInputFailure::ReadTimeout => "SKILLS_CLI_JSON_INPUT_TIMEOUT",
+            JsonInputFailure::ReadFailed => "SKILLS_CLI_JSON_INPUT_READ_FAILED",
+            JsonInputFailure::TooLarge => "SKILLS_CLI_JSON_INPUT_TOO_LARGE",
+            JsonInputFailure::InvalidEncoding => "SKILLS_CLI_JSON_INPUT_ENCODING_INVALID",
+            JsonInputFailure::InvalidJson => "SKILLS_CLI_JSON_INPUT_INVALID",
+        };
+        let message = format!(
+            "{}; source={} bytes_read={} prefix_hex={}",
+            error.failure.message(),
+            error.metadata.source.as_str(),
+            error.metadata.bytes_read,
+            error.metadata.prefix_hex,
+        );
         print_failure(
             command,
-            "SKILLS_CLI_STDIN_READ_FAILED",
-            SkillRuntimeErrorPayload::new(SkillRuntimeErrorCode::SchemaValidationFailed, error.to_string()),
-        )
-    })?;
-    if input.trim().is_empty() {
-        return Ok(json!({}));
-    }
-    serde_json::from_str(&input).map_err(|error| {
-        print_failure(
-            command,
-            "SKILLS_CLI_STDIN_JSON_INVALID",
-            SkillRuntimeErrorPayload::new(SkillRuntimeErrorCode::SchemaValidationFailed, error.to_string()),
+            code,
+            SkillRuntimeErrorPayload::new(SkillRuntimeErrorCode::SchemaValidationFailed, message),
         )
     })
 }
 
-fn required_string_field(command: &str, field: &'static str) -> Result<String, ExitCode> {
-    let value = read_stdin_json_object(command)?;
+fn required_string_field(command: &str, field: &'static str, input: &JsonInputArgs) -> Result<String, ExitCode> {
+    let value = read_stdin_json_object(command, input)?;
     value
         .get(field)
         .and_then(Value::as_str)

@@ -57,6 +57,19 @@ pub const BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// File upload size limit (30 MB).
 pub const UPLOAD_MAX_SIZE: usize = 30 * 1024 * 1024;
 
+// --- Antigravity permission hook ---
+
+/// File name of the Windows wrapper that agy's `.agents/hooks.json` points at
+/// instead of the binary directly.
+///
+/// Shared by every layer that writes or removes it: `aionui-ai-agent` installs
+/// it, `aionui-session`'s mode-switch sync restores/removes it, and
+/// `aionui-api-types` re-exports it on `AntigravityHookConfig` for the hook
+/// contract. It lives here because `aionui-session` depends only on this crate
+/// and `aionui-process` by design. Off Windows there is no wrapper — agy runs
+/// the quoted binary itself.
+pub const ANTIGRAVITY_WINDOWS_WRAPPER_FILE_NAME: &str = "aionui-permission-hook.cmd";
+
 // --- Team mode ---
 
 /// Runtime backend that supports Team MCP without ACP capability metadata.

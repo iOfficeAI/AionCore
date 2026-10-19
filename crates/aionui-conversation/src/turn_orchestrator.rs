@@ -54,6 +54,7 @@ pub(crate) enum ConversationTurnStatus {
 pub(crate) struct ConversationTurnResult {
     pub status: ConversationTurnStatus,
     pub error_message: Option<String>,
+    pub error_code: Option<AgentErrorCode>,
 }
 
 pub(crate) struct ConversationTurnOrchestrator {
@@ -172,6 +173,7 @@ impl ConversationTurnOrchestrator {
                 return Err(ConversationTurnResult {
                     status: ConversationTurnStatus::Failed,
                     error_message: Some(failure_message),
+                    error_code: send_error.code(),
                 });
             }
         };
@@ -208,6 +210,7 @@ impl ConversationTurnOrchestrator {
             return Err(ConversationTurnResult {
                 status: ConversationTurnStatus::Failed,
                 error_message: Some(failure_message),
+                error_code: send_error.code(),
             });
         }
 
@@ -265,6 +268,7 @@ impl ConversationTurnOrchestrator {
             return Err(ConversationTurnResult {
                 status: ConversationTurnStatus::Completed,
                 error_message: None,
+                error_code: None,
             });
         }
 
@@ -361,6 +365,7 @@ impl ConversationTurnOrchestrator {
                         return Err(ConversationTurnResult {
                             status: ConversationTurnStatus::Failed,
                             error_message: Some(failure_message),
+                            error_code: send_error.code(),
                         });
                     }
                 }
@@ -476,6 +481,7 @@ impl ConversationTurnOrchestrator {
         let superseding_tips = SupersedingTipTotals::default();
         let mut replay_started_at = None;
         let mut final_error_message;
+        let mut final_error_code;
         let mut auth_failure = false;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
@@ -502,6 +508,7 @@ impl ConversationTurnOrchestrator {
                 Ok(result) => result,
                 Err(result) => {
                     final_error_message = result.error_message;
+                    final_error_code = result.error_code;
                     break result.status == ConversationTurnStatus::Failed;
                 }
             };
@@ -513,6 +520,7 @@ impl ConversationTurnOrchestrator {
             let lifecycle = runtime_state.lifecycle_for(&conv_id);
             if !attempt_result.outcome.terminal.is_error() {
                 final_error_message = None;
+                final_error_code = None;
                 if replayed {
                     info!(
                         conversation_id = %conv_id,
@@ -527,6 +535,7 @@ impl ConversationTurnOrchestrator {
                 break false;
             }
             final_error_message = turn_attempt_error_message(&attempt_result.summary);
+            final_error_code = attempt_result.outcome.terminal.code();
             if replayed {
                 warn!(
                     conversation_id = %conv_id,
@@ -653,6 +662,7 @@ impl ConversationTurnOrchestrator {
                 ConversationTurnStatus::Completed
             },
             error_message: if final_failed { final_error_message } else { None },
+            error_code: if final_failed { final_error_code } else { None },
         }
     }
 }

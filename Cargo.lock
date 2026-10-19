@@ -360,6 +360,7 @@ dependencies = [
  "base64",
  "dashmap",
  "dirs",
+ "dunce",
  "ed25519-dalek",
  "fs2",
  "futures-util",

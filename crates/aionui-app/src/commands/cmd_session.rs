@@ -6,13 +6,14 @@
 //! is the body), and there is no `help` / `context` subcommand.
 
 use std::ffi::OsString;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 use aionui_api_types::{SessionCliEnvelope, SessionToolErrorCode, SessionToolErrorPayload, SessionToolName};
 use serde_json::{Value, json};
 
 use crate::cli::{SessionArgs, SessionCommand};
+use crate::commands::json_input::{JsonInputArgs, JsonInputFailure, read_json_input};
 use crate::commands::session_capabilities;
 
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
@@ -21,14 +22,15 @@ const ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
 const ENV_RUNTIME_TOKEN: &str = "AIONUI_RUNTIME_TOKEN";
 
 pub(crate) async fn run_session(args: SessionArgs) -> ExitCode {
-    match run_session_inner(args).await {
+    let input = args.json_input;
+    match run_session_inner(args.command, &input).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(code) => code,
     }
 }
 
-async fn run_session_inner(args: SessionArgs) -> Result<(), ExitCode> {
-    match args.command {
+async fn run_session_inner(command: SessionCommand, input: &JsonInputArgs) -> Result<(), ExitCode> {
+    match command {
         // Always available: a static contract that touches no conversation data,
         // so it works with no runtime env and even when the feature is off
         // (spec §6.9.2).
@@ -36,16 +38,16 @@ async fn run_session_inner(args: SessionArgs) -> Result<(), ExitCode> {
             session_capabilities::data(),
             Some("session capabilities".to_owned()),
         )),
-        SessionCommand::List => list().await,
-        SessionCommand::SendMessage => send_message().await,
+        SessionCommand::List => list(input).await,
+        SessionCommand::SendMessage => send_message(input).await,
         SessionCommand::Unknown(path) => Err(unknown_command("session", path, "unknown session command")),
     }
 }
 
-async fn list() -> Result<(), ExitCode> {
+async fn list(input: &JsonInputArgs) -> Result<(), ExitCode> {
     let command = "session list";
     let env = runtime_env(command)?;
-    let arguments = read_stdin_json_object(command, SessionToolName::SessionList)?;
+    let arguments = read_stdin_json_object(command, SessionToolName::SessionList, input)?;
     let query = query_string(&arguments);
     let url = format!(
         "{}/api/runtime/session-messages/targets{query}",
@@ -60,10 +62,10 @@ async fn list() -> Result<(), ExitCode> {
     print_response(command, response).await
 }
 
-async fn send_message() -> Result<(), ExitCode> {
+async fn send_message(input: &JsonInputArgs) -> Result<(), ExitCode> {
     let command = "session send-message";
     let env = runtime_env(command)?;
-    let body = read_stdin_json_object(command, SessionToolName::SessionSendMessage)?;
+    let body = read_stdin_json_object(command, SessionToolName::SessionSendMessage, input)?;
     let url = format!(
         "{}/api/runtime/session-messages/send",
         env.base_url.trim_end_matches('/')
@@ -174,27 +176,23 @@ fn required_env(command: &str, name: &'static str) -> Result<String, ExitCode> {
     })
 }
 
-fn read_stdin_json_object(command: &str, tool: SessionToolName) -> Result<Value, ExitCode> {
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input).map_err(|error| {
+fn read_stdin_json_object(command: &str, tool: SessionToolName, input: &JsonInputArgs) -> Result<Value, ExitCode> {
+    let document = read_json_input(input).map_err(|error| {
+        let code = match error.failure {
+            JsonInputFailure::ReadTimeout => "SESSION_CLI_JSON_INPUT_TIMEOUT",
+            JsonInputFailure::ReadFailed => "SESSION_CLI_JSON_INPUT_READ_FAILED",
+            JsonInputFailure::TooLarge => "SESSION_CLI_JSON_INPUT_TOO_LARGE",
+            JsonInputFailure::InvalidEncoding => "SESSION_CLI_JSON_INPUT_ENCODING_INVALID",
+            JsonInputFailure::InvalidJson => "SESSION_CLI_JSON_INPUT_INVALID",
+        };
         print_failure(
             command,
-            "SESSION_CLI_STDIN_READ_FAILED",
-            SessionToolErrorPayload::new(SessionToolErrorCode::SchemaValidationFailed, error.to_string()),
+            code,
+            SessionToolErrorPayload::new(SessionToolErrorCode::SchemaValidationFailed, error.failure.message())
+                .with_details(error.metadata.details()),
         )
     })?;
-    let value = if input.trim().is_empty() {
-        json!({})
-    } else {
-        serde_json::from_str(&input).map_err(|error| {
-            print_failure(
-                command,
-                "SESSION_CLI_STDIN_JSON_INVALID",
-                SessionToolErrorPayload::new(SessionToolErrorCode::SchemaValidationFailed, error.to_string()),
-            )
-        })?
-    };
-    validate_against_descriptor(command, tool, value)
+    validate_against_descriptor(command, tool, document.value)
 }
 
 /// Validate stdin against the registry descriptor before spending a round trip,
@@ -207,7 +205,7 @@ fn validate_against_descriptor(command: &str, tool: SessionToolName, value: Valu
             "SESSION_CLI_SCHEMA_VALIDATION_FAILED",
             SessionToolErrorPayload::new(
                 SessionToolErrorCode::SchemaValidationFailed,
-                "stdin JSON must be an object",
+                "JSON input must be an object",
             ),
         ));
     };
@@ -223,7 +221,7 @@ fn validate_against_descriptor(command: &str, tool: SessionToolName, value: Valu
                 "SESSION_CLI_SCHEMA_VALIDATION_FAILED",
                 SessionToolErrorPayload::new(
                     SessionToolErrorCode::SchemaValidationFailed,
-                    format!("unknown stdin field: {key}"),
+                    format!("unknown JSON input field: {key}"),
                 )
                 .with_details(json!({ "expected_schema": descriptor.input_schema })),
             ));
@@ -237,7 +235,7 @@ fn validate_against_descriptor(command: &str, tool: SessionToolName, value: Valu
                     "SESSION_CLI_SCHEMA_VALIDATION_FAILED",
                     SessionToolErrorPayload::new(
                         SessionToolErrorCode::SchemaValidationFailed,
-                        format!("missing required stdin field: {key}"),
+                        format!("missing required JSON input field: {key}"),
                     )
                     .with_details(json!({ "expected_schema": descriptor.input_schema })),
                 ));

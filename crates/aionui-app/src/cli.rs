@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::commands::json_input::JsonInputArgs;
+
 #[derive(Parser)]
 #[command(name = "aioncore", about = "AionUi Backend Server", version)]
 pub(crate) struct Cli {
@@ -181,12 +183,16 @@ impl Command {
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct ConfigArgs {
+    #[command(flatten)]
+    pub json_input: JsonInputArgs,
     #[command(subcommand)]
     pub command: ConfigCommand,
 }
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct DiagnoseArgs {
+    #[command(flatten)]
+    pub json_input: JsonInputArgs,
     #[command(subcommand)]
     pub command: DiagnoseCommand,
 }
@@ -194,6 +200,8 @@ pub(crate) struct DiagnoseArgs {
 #[derive(Args, Debug, Clone)]
 #[command(disable_help_subcommand = true)]
 pub(crate) struct TeamArgs {
+    #[command(flatten)]
+    pub json_input: JsonInputArgs,
     #[command(subcommand)]
     pub command: TeamCommand,
 }
@@ -235,6 +243,8 @@ pub(crate) enum TeamTaskCommand {
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct SessionArgs {
+    #[command(flatten)]
+    pub json_input: JsonInputArgs,
     #[command(subcommand)]
     pub command: SessionCommand,
 }
@@ -250,6 +260,8 @@ pub(crate) enum SessionCommand {
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct ConversationArgs {
+    #[command(flatten)]
+    pub json_input: JsonInputArgs,
     #[command(subcommand)]
     pub command: ConversationCommand,
 }
@@ -264,6 +276,8 @@ pub(crate) enum ConversationCommand {
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct SkillsArgs {
+    #[command(flatten)]
+    pub json_input: JsonInputArgs,
     #[command(subcommand)]
     pub command: SkillsCommand,
 }
@@ -836,6 +850,8 @@ mod tests {
     use clap::Parser;
     use clap::error::ErrorKind;
 
+    use crate::commands::json_input::JsonInputArgs;
+
     use super::{
         Cli, Command, ConfigArgs, ConfigCommand, ConversationCommand, ManagedResourcesModeArg,
         PrepareManagedResourcesArgs, SecretArgs, SecretCommand, SessionCommand, TeamCommand, UserArgs, UserCommand,
@@ -952,6 +968,7 @@ mod tests {
         let cases = [
             (
                 Command::Config(ConfigArgs {
+                    json_input: JsonInputArgs::default(),
                     command: ConfigCommand::Context,
                 }),
                 "config",
@@ -1208,6 +1225,44 @@ mod tests {
                 "command should parse to a wired subcommand: {command:?}"
             );
         }
+    }
+
+    #[test]
+    fn json_input_flags_parse_after_leaf_commands_across_all_input_families() {
+        let commands: &[&[&str]] = &[
+            &["aioncore", "team", "send-message", "--json", "{}"],
+            &["aioncore", "session", "send-message", "--input", "-"],
+            &["aioncore", "conversation", "create", "--json", "{}"],
+            &["aioncore", "skills", "show", "--json", "{}"],
+            &["aioncore", "config", "assistants", "create", "--input", "payload.json"],
+            &["aioncore", "diagnose", "conversations", "get", "--json", "{}"],
+        ];
+
+        for command in commands {
+            assert!(
+                Cli::try_parse_from(*command).is_ok(),
+                "JSON input flags should parse after the leaf command: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn team_cli_preserves_json_and_input_so_json_precedence_is_applied_by_reader() {
+        let cli = Cli::try_parse_from([
+            "aioncore",
+            "team",
+            "send-message",
+            "--input",
+            "payload.json",
+            "--json",
+            r#"{"to":"*","message":"hi"}"#,
+        ])
+        .unwrap();
+        let Some(Command::Team(args)) = cli.command else {
+            panic!("expected a team command");
+        };
+        assert_eq!(args.json_input.input, Some(PathBuf::from("payload.json")));
+        assert_eq!(args.json_input.json.as_deref(), Some(r#"{"to":"*","message":"hi"}"#));
     }
 
     #[test]

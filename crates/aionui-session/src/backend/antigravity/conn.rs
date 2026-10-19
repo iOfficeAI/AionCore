@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aionui_common::CommandSpec;
+use aionui_common::constants::ANTIGRAVITY_WINDOWS_WRAPPER_FILE_NAME;
 use aionui_process::Spawner;
 use futures_util::stream::BoxStream;
 use tokio::sync::{Mutex, broadcast, oneshot};
@@ -28,7 +29,7 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 use super::argv::{ArgvInput, build_argv};
 use super::models::probe_models;
 use super::skills::skill_commands_from_dirs;
-use super::translate::Translator;
+use super::translate::{TerminalDiagnostics, Translator};
 use super::wire::parse_line;
 use crate::backend::cli_version::session_drift_notice;
 use crate::backend::types::{
@@ -109,6 +110,80 @@ fn final_turn_text(is_error: bool, result_text: &str, buffered: &str) -> Option<
         .filter(|t| !t.is_empty())
 }
 
+/// How long to wait, after stdout EOF, for the process watcher to publish an
+/// exit that has not landed yet. Stdout can close before that watch update.
+/// This is not a turn timeout: if it expires the exit is reported as not yet
+/// published, and no code is invented.
+const EXIT_WATCH_FOLLOW_UP: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// `result_status` used when the process ended without a `result` frame.
+const ABSENT_RESULT_STATUS: &str = "absent";
+
+/// Exit fields safe to log. No `TerminalExit` means the watcher has not
+/// published yet — that is `still_running`, not a successful exit. A failed
+/// `wait()` is `wait_errored` and also carries no code.
+fn exit_log_fields(exit: Option<aionui_process::TerminalExit>) -> (Option<i32>, Option<bool>, &'static str) {
+    match exit {
+        Some(aionui_process::TerminalExit::Exited(status)) => (status.code(), Some(status.success()), "exited"),
+        Some(aionui_process::TerminalExit::WaitErrored) => (None, None, "wait_errored"),
+        None => (None, None, "still_running"),
+    }
+}
+
+fn synthesized_classification(exit_success: Option<bool>) -> &'static str {
+    if exit_success == Some(true) {
+        "synthesized_exit_success"
+    } else {
+        "synthesized_exit_failure"
+    }
+}
+
+/// Wire classification distinguishes an error result from a success result.
+/// It is not a single constant for every `result` frame.
+fn wire_classification(is_error: bool) -> &'static str {
+    if is_error { "wire_error" } else { "wire_success" }
+}
+
+/// Logged at the moment the error `TurnResult` is produced, before stdout EOF.
+/// Exit is intentionally absent: the watcher may not have published it yet.
+fn log_error_result_frame(session_id: &str, diag: Option<&TerminalDiagnostics>) {
+    let (result_status, outcome, failed_steps) = match diag {
+        Some(diag) => (diag.status.as_str(), diag.outcome, diag.failed_steps),
+        None => ("unavailable", "failed", 0),
+    };
+    tracing::warn!(
+        session_id = %session_id,
+        saw_terminal = true,
+        result_status = result_status,
+        is_error = true,
+        outcome = outcome,
+        failed_steps = failed_steps,
+        classification = wire_classification(true),
+        exit_state = "not_observed_yet",
+        "antigravity: error result frame"
+    );
+}
+
+/// Immediate watcher state, then one bounded follow-up if it was not published.
+/// `timed_out` means the follow-up expired with the watcher still silent.
+async fn observe_exit_after_eof(
+    proc: &aionui_process::ManagedProcess,
+) -> (Option<i32>, Option<bool>, &'static str, &'static str) {
+    if proc.terminal_exit().is_some() {
+        let (code, success, state) = exit_log_fields(proc.terminal_exit());
+        return (code, success, state, "already_published");
+    }
+    let follow_up = tokio::time::timeout(EXIT_WATCH_FOLLOW_UP, proc.wait_for_exit()).await;
+    let (code, success, state) = exit_log_fields(proc.terminal_exit());
+    let label = if state == "still_running" {
+        let _ = follow_up;
+        "timed_out"
+    } else {
+        "resolved"
+    };
+    (code, success, state, label)
+}
+
 /// Append one `text_delta` to the turn's buffered reply, collapsing the
 /// U+FFFD run agy leaves at the join.
 ///
@@ -181,8 +256,14 @@ pub fn antigravity_capabilities() -> Capabilities {
     }
 }
 
-/// agy's fixed mode axis (`--mode`). Unlike models this never depends on the
-/// account, so it needs no probe.
+/// agy's captured `--mode` values plus AionUi's host-side modes. The 1.4.2
+/// help lists `accept-edits`, `auto`, and `plan` (verified:
+/// `~/aion/protocols/samples/agy/1.4.2/root-probe-help.txt:14`, sha256
+/// `a12355e8fc064b330eeb25ba52de596406582752442e293083bcda6388a63b78`).
+/// Help syntax does not prove account availability: the captured account
+/// reported `auto` unavailable and continued in default mode (verified:
+/// `~/aion/protocols/samples/agy/1.4.2/print_stream-json_mode-auto.stderr.txt:1`,
+/// sha256 `a5fba73a86e08667947af7c14279816e503a59027e217db46dd61470521cd36f`).
 pub fn antigravity_modes() -> Vec<ModeInfo> {
     // `yolo` is NOT one of agy's modes — it is AionUi's sentinel for "run
     // without asking", offered here so a user can pick full auto deliberately
@@ -196,6 +277,7 @@ pub fn antigravity_modes() -> Vec<ModeInfo> {
             "Accept Edits",
             Some("File edits are auto-approved; commands still ask."),
         ),
+        ("auto", "Auto", Some("Availability depends on your account.")),
         ("plan", "Plan", Some("Research and plan only.")),
         (
             "yolo",
@@ -523,12 +605,23 @@ impl AntigravitySessionBackend {
     /// Removal alone would be unsafe in reverse: with no `hooks.json` agy never
     /// calls back, so switching OUT of full auto has to put the file back or the
     /// session keeps running unattended behind a UI that says otherwise.
+    ///
+    /// A non-full-auto install is TWO files on Windows: `hooks.json` names the
+    /// wrapper, and the wrapper runs the binary (agy executes handlers through
+    /// `cmd /c` — verified: the installed `agy-customizations/docs/hooks.md`,
+    /// "Hook Handler Fields"). The wrapper exists because the quoted absolute
+    /// path is reporter-observed reaching cmd literally (#4317 stderr, a
+    /// regression of the `\\?\`-verbatim-path fix #4095). It is written BEFORE
+    /// `hooks.json`, so a failed restore never publishes a `hooks.json` that
+    /// points at a file which is not on disk. Off Windows the prepared wrapper
+    /// is `None` and only `hooks.json` is managed.
     fn sync_permission_hook(&self) {
         let Some(cwd) = self.config.cwd.as_deref() else {
             return;
         };
         let dir = std::path::Path::new(cwd).join(".agents");
         let path = dir.join("hooks.json");
+        let wrapper_path = dir.join(ANTIGRAVITY_WINDOWS_WRAPPER_FILE_NAME);
         if self.is_full_auto() {
             match std::fs::remove_file(&path) {
                 Ok(()) => {
@@ -537,6 +630,17 @@ impl AntigravitySessionBackend {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     tracing::warn!(session_id = %self.session_id, error = %e, "antigravity: could not remove the approval hook")
+                }
+            }
+            // The wrapper belongs to the same install; leaving it behind would
+            // keep a stale reference to this binary in the workspace.
+            match std::fs::remove_file(&wrapper_path) {
+                Ok(()) => {
+                    tracing::info!(session_id = %self.session_id, "antigravity: full auto — hook wrapper removed")
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(session_id = %self.session_id, error = %e, "antigravity: could not remove the hook wrapper")
                 }
             }
             return;
@@ -550,6 +654,19 @@ impl AntigravitySessionBackend {
             );
             return;
         };
+        // Wrapper first: `hooks.json` must never name a file that failed to be
+        // written. A failure here aborts the restore instead of publishing the
+        // JSON alone.
+        if let Some(wrapper) = self.config.permission_hook_wrapper.as_deref()
+            && let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&wrapper_path, wrapper))
+        {
+            tracing::warn!(
+                session_id = %self.session_id,
+                error = %e,
+                "antigravity: could not restore the hook wrapper; hooks.json left unwritten"
+            );
+            return;
+        }
         if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, body)) {
             tracing::warn!(session_id = %self.session_id, error = %e, "antigravity: could not restore the approval hook");
         } else {
@@ -749,6 +866,14 @@ impl AntigravitySessionBackend {
                                 ..
                             } => {
                                 saw_terminal = true;
+                                // An error result is diagnosed here, while the
+                                // frame is in hand. Waiting for stdout EOF can
+                                // withhold it if the process keeps stdout open
+                                // after the terminal frame. Exit is not claimed
+                                // yet — the watcher publishes that separately.
+                                if *is_error {
+                                    log_error_result_frame(&session_id, translator.terminal_diagnostics());
+                                }
                                 if let Some(text) = final_turn_text(*is_error, result_text, &buffered_text) {
                                     text_flushed = true;
                                     let _ = event_tx.send(SessionEnvelope {
@@ -807,11 +932,67 @@ impl AntigravitySessionBackend {
                 tracing::debug!(session_id = %session_id, model = %model, "agy turn model confirmed");
             }
 
+            // Exit observation is separate from the result classification.
+            // Snapshot the watcher immediately, then allow one short follow-up
+            // so a publish that loses the race with stdout EOF is visible.
+            // A timeout leaves the code unset.
+            if let Some(diag) = translator.terminal_diagnostics() {
+                let (immediate_code, immediate_success, immediate_state) = exit_log_fields(proc.terminal_exit());
+                let (exit_code, exit_success, exit_state, exit_follow_up) = observe_exit_after_eof(&proc).await;
+                tracing::info!(
+                    session_id = %session_id,
+                    saw_terminal = true,
+                    result_status = %diag.status,
+                    is_error = diag.is_error,
+                    outcome = diag.outcome,
+                    failed_steps = diag.failed_steps,
+                    classification = wire_classification(diag.is_error),
+                    exit_state_immediate = immediate_state,
+                    exit_code_immediate = immediate_code,
+                    exit_success_immediate = immediate_success,
+                    exit_state = exit_state,
+                    exit_code = exit_code,
+                    exit_success = exit_success,
+                    exit_follow_up = exit_follow_up,
+                    "antigravity: turn terminal exit observation"
+                );
+                if exit_state == "exited" && exit_success == Some(false) && !diag.is_error {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        result_status = %diag.status,
+                        exit_code = exit_code,
+                        classification = wire_classification(false),
+                        "antigravity: wire result is not an error but the process exited unsuccessfully"
+                    );
+                } else if exit_state == "exited" && exit_success == Some(true) && diag.is_error {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        result_status = %diag.status,
+                        exit_code = exit_code,
+                        classification = wire_classification(true),
+                        "antigravity: wire result is an error but the process exited successfully"
+                    );
+                }
+            }
+
             // A cancelled or crashed run exits without emitting `result`; the
             // FSM still needs a terminal, so synthesize one from the exit.
+            // That wait is the pre-existing synthesis wait, not a new bound.
             if !saw_terminal {
                 let exit = proc.wait_for_exit().await;
-                let ok = exit.map(|s| s.success()).unwrap_or(false);
+                let exit_success = exit.as_ref().map(|s| s.success());
+                let ok = exit_success.unwrap_or(false);
+                let exit_state = if exit.is_some() { "exited" } else { "wait_errored" };
+                tracing::warn!(
+                    session_id = %session_id,
+                    saw_terminal = false,
+                    result_status = ABSENT_RESULT_STATUS,
+                    exit_code = exit.as_ref().and_then(|s| s.code()),
+                    exit_success = exit_success,
+                    exit_state = exit_state,
+                    classification = synthesized_classification(exit_success),
+                    "antigravity: no result frame; terminal synthesized from process exit"
+                );
                 let _ = event_tx.send(SessionEnvelope {
                     session_id: session_id.clone(),
                     turn_gen,
@@ -1150,6 +1331,29 @@ mod tests {
             .expect("open_session must not fail — agy spawns nothing until the first turn")
     }
 
+    #[test]
+    fn exit_log_fields_do_not_invent_success() {
+        assert_eq!(super::exit_log_fields(None), (None, None, "still_running"));
+        assert_eq!(
+            super::exit_log_fields(Some(aionui_process::TerminalExit::WaitErrored)),
+            (None, None, "wait_errored")
+        );
+        assert_eq!(
+            super::synthesized_classification(Some(true)),
+            "synthesized_exit_success"
+        );
+        assert_eq!(
+            super::synthesized_classification(Some(false)),
+            "synthesized_exit_failure"
+        );
+        // No status is the same class as a failed exit: the synthesizer treats
+        // `unwrap_or(false)` as failure and this label must not say otherwise.
+        assert_eq!(super::synthesized_classification(None), "synthesized_exit_failure");
+        assert_eq!(super::wire_classification(false), "wire_success");
+        assert_eq!(super::wire_classification(true), "wire_error");
+        assert_eq!(super::ABSENT_RESULT_STATUS, "absent");
+    }
+
     fn send(text: &str) -> Command {
         Command::Send {
             content: vec![ContentBlock::Text(text.to_owned())],
@@ -1382,10 +1586,22 @@ mod tests {
         mode: Option<&str>,
         hook_body: Option<&str>,
     ) -> Arc<AntigravitySessionBackend> {
+        backend_with_hook_files(cwd, mode, hook_body, None)
+    }
+
+    /// A backend carrying the two prepared hook files a non-full-auto build
+    /// installs: the `hooks.json` body and the Windows wrapper's contents.
+    fn backend_with_hook_files(
+        cwd: &std::path::Path,
+        mode: Option<&str>,
+        hook_body: Option<&str>,
+        wrapper: Option<&str>,
+    ) -> Arc<AntigravitySessionBackend> {
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let mut cfg = config(&cwd.to_string_lossy());
         cfg.mode = mode.map(str::to_owned);
         cfg.permission_hook_body = hook_body.map(str::to_owned);
+        cfg.permission_hook_wrapper = wrapper.map(str::to_owned);
         Arc::new(AntigravitySessionBackend {
             session_id: "s1".into(),
             slash_commands: Vec::new(),
@@ -1464,6 +1680,85 @@ mod tests {
         .unwrap();
 
         assert!(!hook.exists(), "full auto must not leave a hook agy would call");
+    }
+
+    /// On Windows the gate is two files; leaving full auto restores both, and
+    /// entering it removes both, so a later restore never finds half an install.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn switching_modes_syncs_the_wrapper_with_hooks_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(".agents");
+        let hook = agents.join("hooks.json");
+        let wrapper = agents.join(ANTIGRAVITY_WINDOWS_WRAPPER_FILE_NAME);
+        let b = backend_with_hook_files(
+            dir.path(),
+            Some("yolo"),
+            Some("{\"stub\":true}"),
+            Some("wrapper-body\r\n"),
+        );
+
+        b.dispatch(Command::SetMode {
+            mode: "default".to_owned(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&wrapper).unwrap(), "wrapper-body\r\n");
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), "{\"stub\":true}");
+
+        b.dispatch(Command::SetMode {
+            mode: "yolo".to_owned(),
+        })
+        .await
+        .unwrap();
+        assert!(!hook.exists(), "full auto must not leave a hook agy would call");
+        assert!(!wrapper.exists(), "the wrapper must go with hooks.json");
+    }
+
+    /// Off Windows the factory prepares no wrapper, so leaving full auto must
+    /// install only `hooks.json` and never drop a `.cmd` into the workspace.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn leaving_full_auto_installs_no_wrapper_off_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join(".agents/hooks.json");
+        let wrapper = dir.path().join(".agents").join(ANTIGRAVITY_WINDOWS_WRAPPER_FILE_NAME);
+        let b = backend_with_hook_body(dir.path(), Some("yolo"), Some("{\"stub\":true}"));
+
+        b.dispatch(Command::SetMode {
+            mode: "default".to_owned(),
+        })
+        .await
+        .unwrap();
+
+        assert!(hook.exists(), "leaving full auto must restore the gate");
+        assert!(!wrapper.exists(), "unix installs no wrapper");
+    }
+
+    /// The wrapper is written first, so a failed wrapper write must leave the
+    /// old state untouched instead of publishing a `hooks.json` that names a
+    /// file which is not there.
+    #[tokio::test]
+    async fn a_failed_wrapper_restore_never_publishes_hooks_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(".agents");
+        let hook = agents.join("hooks.json");
+        let wrapper = agents.join(ANTIGRAVITY_WINDOWS_WRAPPER_FILE_NAME);
+        // A directory at the wrapper path makes the write fail after
+        // `create_dir_all` has already succeeded.
+        std::fs::create_dir_all(&wrapper).unwrap();
+        let b = backend_with_hook_files(dir.path(), Some("yolo"), Some("{\"stub\":true}"), Some("wrapper-body"));
+
+        b.dispatch(Command::SetMode {
+            mode: "default".to_owned(),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            !hook.exists(),
+            "hooks.json must not be published when its wrapper failed to write"
+        );
     }
 
     /// A session whose turn is running WITH the approval hook installed applies a mode
@@ -1778,26 +2073,30 @@ mod tests {
         assert_eq!(caps.current_model.as_deref(), Some("gemini-3.1-pro-high"));
         assert_eq!(
             caps.available_modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["default", "accept-edits", "plan", "yolo"]
+            vec!["default", "accept-edits", "auto", "plan", "yolo"]
         );
         assert_eq!(caps.current_mode.as_deref(), Some("plan"));
     }
 
     #[test]
-    fn modes_are_agys_three_plus_the_full_auto_sentinel() {
-        // agy's own axis is default / accept-edits / plan. `yolo` is AionUi's
-        // sentinel for "no approval prompts" — offered as a choice so a user can
-        // pick full auto deliberately, and carried by teams / scheduled runs.
+    fn modes_include_captured_agy_values_and_the_full_auto_sentinel() {
+        // agy's captured 1.4.2 help lists accept-edits / auto / plan; `default`
+        // and `yolo` are AionUi host-side modes (verified:
+        // `~/aion/protocols/samples/agy/1.4.2/root-probe-help.txt:14`, sha256
+        // `a12355e8fc064b330eeb25ba52de596406582752442e293083bcda6388a63b78`).
+        // `yolo` is the sentinel for "no approval prompts", offered as a choice
+        // so a user can pick full auto deliberately and carried by teams / runs.
         let modes = antigravity_modes();
         assert_eq!(
             modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["default", "accept-edits", "plan", "yolo"]
+            vec!["default", "accept-edits", "auto", "plan", "yolo"]
         );
         assert_eq!(modes[1].name, "Accept Edits");
+        assert_eq!(modes[2].name, "Auto");
 
         // The two agy explains itself, in agy's own words, plus the sentinel:
         // a mode whose consequence is invisible must say what it does.
-        for id in ["accept-edits", "plan", "yolo"] {
+        for id in ["accept-edits", "auto", "plan", "yolo"] {
             let m = modes.iter().find(|m| m.id == id).unwrap();
             assert!(m.description.is_some(), "{id} needs a description");
         }

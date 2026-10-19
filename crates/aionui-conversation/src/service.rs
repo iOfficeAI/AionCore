@@ -15,7 +15,7 @@ use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
 use aionui_api_types::{
-    ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
+    ASSISTANT_MCP_BINDING_CHANGED_EVENT, AgentErrorCode, ApprovalCheckResponse, AssistantConversationOverridesRequest,
     AssistantMcpBindingChanged, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
     ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
     ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
@@ -390,6 +390,7 @@ pub struct ConversationAgentTurnOutcome {
     pub turn_id: String,
     pub status: ConversationAgentTurnStatus,
     pub error_message: Option<String>,
+    pub error_code: Option<AgentErrorCode>,
     pub runtime: ConversationRuntimeSummary,
 }
 
@@ -4142,6 +4143,7 @@ impl ConversationService {
                     turn_id,
                     status: ConversationAgentTurnStatus::Failed,
                     error_message: Some(send_error_display_message(&send_error)),
+                    error_code: send_error.code(),
                     runtime: self.runtime_summary_for(&request.conversation_id).await,
                 });
             }
@@ -4175,6 +4177,7 @@ impl ConversationService {
                 ConversationTurnStatus::Failed => ConversationAgentTurnStatus::Failed,
             },
             error_message: result.error_message,
+            error_code: result.error_code,
         })
     }
 

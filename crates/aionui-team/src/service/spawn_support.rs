@@ -10,6 +10,7 @@ use crate::prompts::AvailableAssistant;
 use crate::provisioning::PersistSpawnedAgentRequest;
 
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
+pub(crate) const TEAM_FULL_AUTO_MODE: &str = "full_auto";
 
 pub(crate) fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
     let quoted = format!("\"{backend}\"");
@@ -76,6 +77,125 @@ pub(crate) fn session_mode_for_backend(
         return yolo_id.to_owned();
     }
     agent_type.full_auto_mode_id(Some(backend)).to_owned()
+}
+
+pub(crate) fn is_team_full_auto_mode(mode: &str) -> bool {
+    mode.trim().eq_ignore_ascii_case(TEAM_FULL_AUTO_MODE)
+}
+
+/// Normalize the lead's native full-auto id before storing a Team-wide choice.
+/// AionFork forwards its selected lead mode unchanged to the Team session-mode
+/// API (verified: `~/AionFork/packages/desktop/src/renderer/pages/team/hooks/TeamPermissionContext.tsx:40-48`
+/// and `~/AionFork/packages/desktop/src/renderer/pages/conversation/platforms/acp/AcpSendBox.tsx:201-214,850-866`).
+pub(crate) fn normalize_team_mode_from_lead(
+    requested_mode: &str,
+    lead_backend: &str,
+    lead_agent_type: AgentType,
+    lead_metadata: Option<&AgentMetadataRow>,
+) -> String {
+    let requested_mode = requested_mode.trim();
+    let lead_full_auto_mode = session_mode_for_backend(lead_backend, lead_agent_type, lead_metadata);
+    if is_team_full_auto_mode(requested_mode) || requested_mode == lead_full_auto_mode {
+        TEAM_FULL_AUTO_MODE.to_owned()
+    } else {
+        requested_mode.to_owned()
+    }
+}
+
+/// Resolve a Team-level mode into this member's native session-mode id.
+///
+/// Team stores `full_auto` as a semantic choice, not as the lead backend's
+/// native id. A member's metadata maps that choice to its own full-auto id.
+/// Other native ids pass through only when the member advertises them.
+pub(crate) fn team_mode_for_backend(
+    team_mode: Option<&str>,
+    backend: &str,
+    agent_type: AgentType,
+    metadata: Option<&AgentMetadataRow>,
+) -> Option<String> {
+    let default_mode = || session_mode_for_backend(backend, agent_type, metadata);
+    match team_mode.map(str::trim).filter(|mode| !mode.is_empty()) {
+        None => Some(default_mode()),
+        Some(mode) if is_team_full_auto_mode(mode) => Some(default_mode()),
+        Some(mode) if metadata_advertises_mode(metadata, mode) => Some(mode.to_owned()),
+        Some(_) => None,
+    }
+}
+
+/// New Team members inherit the semantic Team setting. An unsupported native
+/// id is not inherited; it falls back to this member's full-auto mode instead.
+pub(crate) fn inherited_team_mode_for_backend(
+    team_mode: Option<&str>,
+    backend: &str,
+    agent_type: AgentType,
+    metadata: Option<&AgentMetadataRow>,
+) -> String {
+    team_mode_for_backend(team_mode, backend, agent_type, metadata)
+        .unwrap_or_else(|| session_mode_for_backend(backend, agent_type, metadata))
+}
+
+/// Only selectable option values count; `current_value` may be stale after an invalid seed.
+pub(crate) fn config_options_advertise_mode(options: &GetConfigOptionsResponse, mode: &str) -> bool {
+    options.config_options.iter().any(|option| {
+        (option.category.as_deref() == Some("mode") || option.id == "mode")
+            && option.options.iter().any(|value| value.value == mode)
+    })
+}
+
+pub(crate) fn metadata_advertises_mode(metadata: Option<&AgentMetadataRow>, mode: &str) -> bool {
+    metadata.is_some_and(|metadata| {
+        json_available_modes_advertise_mode(metadata.available_modes.as_deref(), mode)
+            || json_config_options_advertise_mode(metadata.config_options.as_deref(), mode)
+    })
+}
+
+// These persisted handshake fields have separate payloads: `available_modes`
+// carries mode ids, while `config_options` carries option records and their
+// selectable values (verified: `crates/aionui-ai-agent/src/registry.rs:166-195`
+// and `crates/aionui-ai-agent/src/manager/acp/catalog_forwarder.rs:60-75`).
+fn json_available_modes_advertise_mode(raw: Option<&str>, mode: &str) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+
+    let available_modes = value
+        .get("available_modes")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array());
+    available_modes.is_some_and(|modes| {
+        modes.iter().any(|entry| {
+            entry.as_str() == Some(mode) || entry.get("id").and_then(serde_json::Value::as_str) == Some(mode)
+        })
+    })
+}
+
+fn json_config_options_advertise_mode(raw: Option<&str>, mode: &str) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    value
+        .get("config_options")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|options| {
+            options.iter().any(|option| {
+                (option.get("category").and_then(serde_json::Value::as_str) == Some("mode")
+                    || option.get("id").and_then(serde_json::Value::as_str) == Some("mode"))
+                    && option
+                        .get("options")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|values| {
+                            values
+                                .iter()
+                                .any(|value| value.get("value").and_then(serde_json::Value::as_str) == Some(mode))
+                        })
+            })
+        })
 }
 
 pub(crate) async fn resolve_runtime_backend(
@@ -248,7 +368,7 @@ impl TeamSessionService {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::test_utils::workspace_harness::{
         force_team_workspace, setup_with_factory_metadata_team_repo_and_conversation_repo, single_agent_team_request,
@@ -261,7 +381,7 @@ mod tests {
     };
     use std::sync::Arc;
 
-    fn agent_metadata_row(backend: &str, yolo_id: Option<&str>) -> AgentMetadataRow {
+    pub(crate) fn agent_metadata_row(backend: &str, yolo_id: Option<&str>) -> AgentMetadataRow {
         AgentMetadataRow {
             id: format!("agent-{backend}"),
             user_id: None,
@@ -678,8 +798,14 @@ mod tests {
         }
     }
 
-    struct RowsAgentMetadataRepo {
+    pub(crate) struct RowsAgentMetadataRepo {
         rows: Vec<AgentMetadataRow>,
+    }
+
+    impl RowsAgentMetadataRepo {
+        pub(crate) fn new(rows: Vec<AgentMetadataRow>) -> Self {
+            Self { rows }
+        }
     }
 
     #[async_trait::async_trait]
@@ -944,6 +1070,144 @@ mod tests {
             session_mode_for_backend("codex", AgentType::Acp, None),
             "agent-full-access"
         );
+    }
+
+    #[test]
+    fn team_full_auto_resolves_per_backend_from_metadata_and_agent_type() {
+        // These are existing per-backend helper values sourced from AgentType's
+        // mapping and metadata `yolo_id` (verified: `crates/aionui-common/src/enums.rs:127-153`
+        // and `crates/aionui-db/src/models/agent_metadata.rs:41-51`).
+        let codex = agent_metadata_row("codex", Some("agent-full-access"));
+        let claude = agent_metadata_row("claude", Some("bypassPermissions"));
+        let mut agy = agent_metadata_row("antigravity", Some("yolo"));
+        agy.agent_type = AgentType::Antigravity.serde_name().to_owned();
+
+        assert_eq!(
+            team_mode_for_backend(Some("full_auto"), "codex", AgentType::Acp, Some(&codex)).as_deref(),
+            Some("agent-full-access")
+        );
+        assert_eq!(
+            team_mode_for_backend(Some("full_auto"), "claude", AgentType::Acp, Some(&claude)).as_deref(),
+            Some("bypassPermissions")
+        );
+        assert_eq!(
+            team_mode_for_backend(Some("full_auto"), "antigravity", AgentType::Antigravity, Some(&agy)).as_deref(),
+            Some("yolo")
+        );
+    }
+
+    #[test]
+    fn lead_native_full_auto_ids_normalize_before_heterogeneous_propagation() {
+        let codex = agent_metadata_row("codex", Some("agent-full-access"));
+        let claude = agent_metadata_row("claude", Some("bypassPermissions"));
+        let mut agy = agent_metadata_row("antigravity", Some("yolo"));
+        agy.agent_type = AgentType::Antigravity.serde_name().to_owned();
+
+        let claude_team_mode =
+            normalize_team_mode_from_lead("bypassPermissions", "claude", AgentType::Acp, Some(&claude));
+        assert_eq!(claude_team_mode, TEAM_FULL_AUTO_MODE);
+        assert_eq!(
+            team_mode_for_backend(
+                Some(&claude_team_mode),
+                "antigravity",
+                AgentType::Antigravity,
+                Some(&agy)
+            )
+            .as_deref(),
+            Some("yolo")
+        );
+
+        let codex_team_mode = normalize_team_mode_from_lead("agent-full-access", "codex", AgentType::Acp, Some(&codex));
+        assert_eq!(codex_team_mode, TEAM_FULL_AUTO_MODE);
+        assert_eq!(
+            team_mode_for_backend(Some(&codex_team_mode), "claude", AgentType::Acp, Some(&claude)).as_deref(),
+            Some("bypassPermissions")
+        );
+        assert_eq!(
+            normalize_team_mode_from_lead("plan", "claude", AgentType::Acp, Some(&claude)),
+            "plan"
+        );
+    }
+
+    #[test]
+    fn team_native_mode_is_applied_or_inherited_only_when_advertised() {
+        let mut row = agent_metadata_row("claude", Some("bypassPermissions"));
+        row.available_modes =
+            Some(r#"{"current_mode_id":"default","available_modes":[{"id":"default"},{"id":"plan"}]}"#.to_owned());
+
+        assert_eq!(
+            team_mode_for_backend(Some("plan"), "claude", AgentType::Acp, Some(&row)).as_deref(),
+            Some("plan")
+        );
+        assert_eq!(
+            team_mode_for_backend(Some("not-advertised"), "claude", AgentType::Acp, Some(&row)),
+            None
+        );
+        assert_eq!(
+            inherited_team_mode_for_backend(Some("not-advertised"), "claude", AgentType::Acp, Some(&row)),
+            "bypassPermissions"
+        );
+    }
+
+    #[test]
+    fn flat_metadata_available_modes_advertise_only_listed_ids() {
+        let mut row = agent_metadata_row("claude", Some("bypassPermissions"));
+        row.available_modes = Some(r#"[{"id":"code","name":"Code"},{"id":"plan","name":"Plan"}]"#.to_owned());
+
+        assert_eq!(
+            team_mode_for_backend(Some("code"), "claude", AgentType::Acp, Some(&row)).as_deref(),
+            Some("code")
+        );
+        assert_eq!(
+            team_mode_for_backend(Some("stale-mode"), "claude", AgentType::Acp, Some(&row)),
+            None
+        );
+        assert_eq!(
+            inherited_team_mode_for_backend(Some("stale-mode"), "claude", AgentType::Acp, Some(&row)),
+            "bypassPermissions"
+        );
+    }
+
+    #[test]
+    fn live_config_options_advertise_only_their_mode_values() {
+        let options = GetConfigOptionsResponse {
+            config_options: vec![aionui_api_types::AcpConfigOptionDto {
+                id: "mode".to_owned(),
+                name: None,
+                label: None,
+                description: None,
+                category: Some("mode".to_owned()),
+                option_type: "select".to_owned(),
+                current_value: Some("stale-mode".to_owned()),
+                options: vec![aionui_api_types::AcpConfigSelectOptionDto {
+                    value: "default".to_owned(),
+                    name: None,
+                    label: None,
+                    description: None,
+                }],
+            }],
+        };
+
+        assert!(config_options_advertise_mode(&options, "default"));
+        assert!(!config_options_advertise_mode(&options, "plan"));
+        assert!(!config_options_advertise_mode(&options, "stale-mode"));
+        assert!(!config_options_advertise_mode(&options, "mode"));
+    }
+
+    #[test]
+    fn metadata_config_option_current_value_and_option_id_do_not_advertise_modes() {
+        let mut row = agent_metadata_row("claude", Some("bypassPermissions"));
+        row.config_options = Some(
+            r#"{"config_options":[{"id":"mode","category":"mode","current_value":"stale-mode","options":[{"value":"plan"}]}]}"#.to_owned(),
+        );
+
+        assert!(metadata_advertises_mode(Some(&row), "plan"));
+        assert!(!metadata_advertises_mode(Some(&row), "stale-mode"));
+        assert!(!metadata_advertises_mode(Some(&row), "mode"));
+
+        row.config_options = Some(r#"[{"id":"mode","category":"mode","options":[{"value":"plan"}]}]"#.to_owned());
+        assert!(!metadata_advertises_mode(Some(&row), "mode"));
+        assert!(!metadata_advertises_mode(Some(&row), "plan"));
     }
 
     #[test]

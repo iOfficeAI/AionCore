@@ -442,6 +442,15 @@ pub(crate) mod workspace_harness {
                 .and_then(|c| serde_json::from_str(&c.extra).ok())
         }
 
+        pub(crate) fn set_extra(&self, id: &str, extra: serde_json::Value) {
+            let mut conversations = self.conversations.lock().unwrap();
+            let conversation = conversations
+                .iter_mut()
+                .find(|conversation| conversation.id == id)
+                .expect("conversation exists");
+            conversation.extra = serde_json::to_string(&extra).unwrap();
+        }
+
         pub(crate) fn mark_runtime_not_ready(&self, id: &str) {
             self.set_extra_flag(id, "runtime_not_ready");
         }
@@ -1696,6 +1705,7 @@ pub(crate) mod workspace_harness {
                 conversation_id: request.conversation_id,
                 turn_id: "turn-test".into(),
                 status: AgentTurnStatus::Completed,
+                error_code: None,
                 runtime: None,
             })
         }
@@ -1742,6 +1752,13 @@ pub(crate) mod workspace_harness {
     pub(crate) fn setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(
         task_manager: Arc<dyn IWorkerTaskManager>,
     ) -> ServiceHarness {
+        setup_with_agent_metadata_repo_and_task_manager(Arc::new(EmptyAgentMetadataRepo), task_manager)
+    }
+
+    pub(crate) fn setup_with_agent_metadata_repo_and_task_manager(
+        agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+        task_manager: Arc<dyn IWorkerTaskManager>,
+    ) -> ServiceHarness {
         let team_repo = Arc::new(FullMockTeamRepo::new());
         let team_repo_dyn: Arc<dyn ITeamRepository> = team_repo.clone();
         let conv_repo = Arc::new(MockConversationRepo::new());
@@ -1752,7 +1769,7 @@ pub(crate) mod workspace_harness {
         let projection_store: Arc<dyn TeamProjectionMessageStore> = conversation_ports.clone();
         let svc = TeamSessionService::new(
             team_repo_dyn,
-            Arc::new(EmptyAgentMetadataRepo),
+            agent_metadata_repo,
             Arc::new(EmptyTeamAssistantCatalog),
             Arc::new(EmptyAssistantDefinitionRepo),
             Arc::new(EmptyAssistantOverlayRepo),

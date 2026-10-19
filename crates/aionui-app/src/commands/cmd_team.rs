@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 use aionui_api_types::{
@@ -9,6 +9,7 @@ use aionui_api_types::{
 use serde_json::{Value, json};
 
 use crate::cli::{TeamArgs, TeamCommand, TeamTaskCommand};
+use crate::commands::json_input::{JsonInputArgs, JsonInputError, JsonInputFailure, JsonInputSource, read_json_input};
 use crate::commands::team_capabilities;
 
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
@@ -17,14 +18,15 @@ const ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
 const ENV_RUNTIME_TOKEN: &str = "AIONUI_RUNTIME_TOKEN";
 
 pub(crate) async fn run_team(args: TeamArgs) -> ExitCode {
-    match run_team_inner(args).await {
+    let input = args.json_input;
+    match run_team_inner(args.command, &input).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(code) => code,
     }
 }
 
-async fn run_team_inner(args: TeamArgs) -> Result<(), ExitCode> {
-    match args.command {
+async fn run_team_inner(command: TeamCommand, input: &JsonInputArgs) -> Result<(), ExitCode> {
+    match command {
         TeamCommand::Capabilities => print_json(&TeamToolCliEnvelope::success(
             team_capabilities::data(),
             Some("team capabilities".to_owned()),
@@ -44,27 +46,27 @@ async fn run_team_inner(args: TeamArgs) -> Result<(), ExitCode> {
                 .map_err(|error| runtime_error("team context", "TEAM_CLI_HTTP_BRIDGE_FAILED", error.to_string()))?;
             print_response(response).await
         }
-        TeamCommand::Members => call_tool(vec!["members"]).await,
-        TeamCommand::ReadMessages => call_tool(vec!["read-messages"]).await,
-        TeamCommand::SendMessage => call_tool(vec!["send-message"]).await,
-        TeamCommand::InterruptAgent => call_tool(vec!["interrupt-agent"]).await,
+        TeamCommand::Members => call_tool(vec!["members"], input).await,
+        TeamCommand::ReadMessages => call_tool(vec!["read-messages"], input).await,
+        TeamCommand::SendMessage => call_tool(vec!["send-message"], input).await,
+        TeamCommand::InterruptAgent => call_tool(vec!["interrupt-agent"], input).await,
         TeamCommand::Task(task) => match task.command {
-            TeamTaskCommand::Create => call_tool(vec!["task", "create"]).await,
-            TeamTaskCommand::Update => call_tool(vec!["task", "update"]).await,
-            TeamTaskCommand::List => call_tool(vec!["task", "list"]).await,
+            TeamTaskCommand::Create => call_tool(vec!["task", "create"], input).await,
+            TeamTaskCommand::Update => call_tool(vec!["task", "update"], input).await,
+            TeamTaskCommand::List => call_tool(vec!["task", "list"], input).await,
             TeamTaskCommand::Unknown(path) => Err(unknown_command("team task", path, "unknown team task command")),
         },
-        TeamCommand::ListAssistants => call_tool(vec!["list-assistants"]).await,
-        TeamCommand::DescribeAssistant => call_tool(vec!["describe-assistant"]).await,
-        TeamCommand::SpawnAgent => call_tool(vec!["spawn-agent"]).await,
-        TeamCommand::RenameAgent => call_tool(vec!["rename-agent"]).await,
-        TeamCommand::ClearAgentContext => call_tool(vec!["clear-agent-context"]).await,
-        TeamCommand::ShutdownAgent => call_tool(vec!["shutdown-agent"]).await,
+        TeamCommand::ListAssistants => call_tool(vec!["list-assistants"], input).await,
+        TeamCommand::DescribeAssistant => call_tool(vec!["describe-assistant"], input).await,
+        TeamCommand::SpawnAgent => call_tool(vec!["spawn-agent"], input).await,
+        TeamCommand::RenameAgent => call_tool(vec!["rename-agent"], input).await,
+        TeamCommand::ClearAgentContext => call_tool(vec!["clear-agent-context"], input).await,
+        TeamCommand::ShutdownAgent => call_tool(vec!["shutdown-agent"], input).await,
         TeamCommand::Unknown(path) => Err(unknown_command("team", path, "unknown team command")),
     }
 }
 
-async fn call_tool(path: Vec<&'static str>) -> Result<(), ExitCode> {
+async fn call_tool(path: Vec<&'static str>, input: &JsonInputArgs) -> Result<(), ExitCode> {
     let command = format!("team {}", path.join(" "));
     let env = runtime_env(&command)?;
     let tool =
@@ -75,7 +77,7 @@ async fn call_tool(path: Vec<&'static str>) -> Result<(), ExitCode> {
                 TeamToolErrorPayload::new(TeamToolErrorCode::UnknownTool, "unknown team command"),
             )
         })?;
-    let arguments = read_stdin_json_object(&command, tool)?;
+    let arguments = read_stdin_json_object(&command, tool, input)?;
     let url = format!("{}/api/runtime/team-tools/call", env.base_url.trim_end_matches('/'));
     let response = reqwest::Client::new()
         .post(url)
@@ -130,27 +132,28 @@ fn required_env(command: &str, name: &'static str) -> Result<String, ExitCode> {
     })
 }
 
-fn read_stdin_json_object(command: &str, tool: TeamToolName) -> Result<Value, ExitCode> {
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input).map_err(|error| {
+fn read_stdin_json_object(command: &str, tool: TeamToolName, input: &JsonInputArgs) -> Result<Value, ExitCode> {
+    let document = read_json_input(input).map_err(|error| {
+        let code = json_input_error_code(&error);
         print_failure(
             command,
-            "TEAM_CLI_STDIN_READ_FAILED",
-            TeamToolErrorPayload::new(TeamToolErrorCode::SchemaValidationFailed, error.to_string()),
+            code,
+            TeamToolErrorPayload::new(TeamToolErrorCode::SchemaValidationFailed, error.failure.message())
+                .with_details(error.metadata.details()),
         )
     })?;
-    let value = if input.trim().is_empty() {
-        json!({})
-    } else {
-        serde_json::from_str(&input).map_err(|error| {
-            print_failure(
-                command,
-                "TEAM_CLI_STDIN_JSON_INVALID",
-                TeamToolErrorPayload::new(TeamToolErrorCode::SchemaValidationFailed, error.to_string()),
-            )
-        })?
-    };
-    validate_against_descriptor(command, tool, value)
+    validate_against_descriptor(command, tool, document.value)
+}
+
+fn json_input_error_code(error: &JsonInputError) -> &'static str {
+    match (error.failure, error.metadata.source) {
+        (JsonInputFailure::ReadTimeout, JsonInputSource::Stdin) => "TEAM_CLI_STDIN_TIMEOUT",
+        (JsonInputFailure::ReadTimeout, _) => "TEAM_CLI_JSON_INPUT_TIMEOUT",
+        (JsonInputFailure::ReadFailed, _) => "TEAM_CLI_JSON_INPUT_READ_FAILED",
+        (JsonInputFailure::TooLarge, _) => "TEAM_CLI_JSON_INPUT_TOO_LARGE",
+        (JsonInputFailure::InvalidEncoding, _) => "TEAM_CLI_JSON_INPUT_ENCODING_INVALID",
+        (JsonInputFailure::InvalidJson, _) => "TEAM_CLI_JSON_INPUT_INVALID",
+    }
 }
 
 fn validate_against_descriptor(command: &str, tool: TeamToolName, value: Value) -> Result<Value, ExitCode> {
@@ -160,7 +163,7 @@ fn validate_against_descriptor(command: &str, tool: TeamToolName, value: Value) 
             "TEAM_CLI_SCHEMA_VALIDATION_FAILED",
             TeamToolErrorPayload::new(
                 TeamToolErrorCode::SchemaValidationFailed,
-                "stdin JSON must be an object",
+                "JSON input must be an object",
             ),
         ));
     };
@@ -176,7 +179,7 @@ fn validate_against_descriptor(command: &str, tool: TeamToolName, value: Value) 
                 "TEAM_CLI_SCHEMA_VALIDATION_FAILED",
                 TeamToolErrorPayload::new(
                     TeamToolErrorCode::SchemaValidationFailed,
-                    format!("unknown stdin field: {key}"),
+                    format!("unknown JSON input field: {key}"),
                 )
                 .with_details(json!({ "expected_schema": descriptor.input_schema })),
             ));
@@ -190,7 +193,7 @@ fn validate_against_descriptor(command: &str, tool: TeamToolName, value: Value) 
                     "TEAM_CLI_SCHEMA_VALIDATION_FAILED",
                     TeamToolErrorPayload::new(
                         TeamToolErrorCode::SchemaValidationFailed,
-                        format!("missing required stdin field: {key}"),
+                        format!("missing required JSON input field: {key}"),
                     )
                     .with_details(json!({ "expected_schema": descriptor.input_schema })),
                 ));
@@ -256,4 +259,24 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<(), ExitCode> {
         .write_all(rendered.as_bytes())
         .and_then(|_| stdout.write_all(b"\n"))
         .map_err(|_| ExitCode::from(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::json_input::JsonInputMetadata;
+
+    #[test]
+    fn a_stalled_stdin_uses_the_stable_team_timeout_code() {
+        let error = JsonInputError {
+            failure: JsonInputFailure::ReadTimeout,
+            metadata: JsonInputMetadata {
+                source: JsonInputSource::Stdin,
+                bytes_read: 1,
+                prefix_hex: "7b".to_owned(),
+            },
+        };
+        assert_eq!(json_input_error_code(&error), "TEAM_CLI_STDIN_TIMEOUT");
+        assert_eq!(error.metadata.details().as_object().unwrap().len(), 3);
+    }
 }

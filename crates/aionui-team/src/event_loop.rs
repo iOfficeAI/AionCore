@@ -16,7 +16,7 @@ use crate::ports::{
     AgentTurnStartedCallback,
 };
 use crate::scheduler::TeammateManager;
-use crate::session::{PrepareBatchResult, TeamSession, WakeInput};
+use crate::session::{DeliveryFailureClassification, PrepareBatchResult, TeamSession, WakeInput};
 use crate::team_run::target_role_for;
 use crate::types::TeammateStatus;
 use crate::work_coordinator::{BatchFailureResult, CommitResult, StartCommitResult, WorkBatch};
@@ -323,15 +323,19 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                 finalize_scheduler_turn(ctx).await;
                 return ExecuteResult::ContinueDraining;
             }
+            let classification = DeliveryFailureClassification::from_start_error(&error);
             warn!(
                 team_id = %ctx.team_id,
                 slot_id = %ctx.slot_id,
                 batch_id = %batch.batch_id,
-                error = %error,
+                error_classification = classification.as_str(),
                 "agent turn start failed"
             );
-            let failure = ctx.session.work_coordinator().fail_batch(&batch, "turn_start_failed");
-            finalize_failed_delivery(ctx, &batch, &failure).await;
+            let failure = ctx
+                .session
+                .work_coordinator()
+                .fail_batch(&batch, classification.as_str());
+            finalize_failed_delivery(ctx, &batch, &failure, classification, None).await;
             let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
             return ExecuteResult::ContinueDraining;
         }
@@ -350,8 +354,13 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
             completion.team_run_ids,
         )
     } else {
-        let failure = ctx.session.work_coordinator().fail_batch(&batch, "turn_failed");
-        finalize_failed_delivery(ctx, &batch, &failure).await;
+        let classification = DeliveryFailureClassification::from_turn_status(outcome.status)
+            .expect("non-success outcome has a failed or skipped status");
+        let failure = ctx
+            .session
+            .work_coordinator()
+            .fail_batch(&batch, classification.as_str());
+        finalize_failed_delivery(ctx, &batch, &failure, classification, outcome.error_code).await;
         let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
         (
             (failure.commit_result == CommitResult::Committed).then_some(TeamRunStatus::Failed),
@@ -409,7 +418,13 @@ async fn finalize_scheduler_turn(ctx: &AgentLoopContext) {
     }
 }
 
-async fn finalize_failed_delivery(ctx: &AgentLoopContext, batch: &WorkBatch, failure: &BatchFailureResult) {
+async fn finalize_failed_delivery(
+    ctx: &AgentLoopContext,
+    batch: &WorkBatch,
+    failure: &BatchFailureResult,
+    classification: DeliveryFailureClassification,
+    error_code: Option<aionui_api_types::AgentErrorCode>,
+) {
     if failure.exhausted_message_ids.is_empty() {
         return;
     }
@@ -417,15 +432,29 @@ async fn finalize_failed_delivery(ctx: &AgentLoopContext, batch: &WorkBatch, fai
         team_id = %ctx.team_id,
         slot_id = %ctx.slot_id,
         batch_id = %batch.batch_id,
+        error_classification = classification.as_str(),
+        normalized_error_code = ?error_code,
         exhausted_message_count = failure.exhausted_message_ids.len(),
         "team batch delivery retry limit reached; messages abandoned and slot paused"
     );
     mark_message_ids_read(ctx, batch, &failure.exhausted_message_ids).await;
     // The slot is now paused and only a user or lead intervention can resume it,
     // so the lead has to hear about it or it will wait on a teammate forever.
+    // Conversation-level recovery has visible-output, tool-side-effect, and
+    // persisted-output flags (`crates/aionui-conversation/src/stream_relay.rs`),
+    // but AgentTurnOutcome does not carry TurnAttemptSummary into Team
+    // (`crates/aionui-team/src/ports.rs`). Its own replay policy uses these flags
+    // to block unsafe replay (`crates/aionui-conversation/src/turn_recovery_policy.rs`).
+    // Keep mailbox retries unchanged until that signal is propagated; do not
+    // infer an ack from provider text when a failed turn may have side effects.
     if let Err(error) = ctx
         .session
-        .notify_leader_delivery_exhausted(&ctx.slot_id, failure.exhausted_message_ids.len())
+        .notify_leader_delivery_exhausted(
+            &ctx.slot_id,
+            failure.exhausted_message_ids.len(),
+            classification,
+            error_code,
+        )
         .await
     {
         warn!(
