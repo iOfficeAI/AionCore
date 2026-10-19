@@ -1239,3 +1239,49 @@ fn command_during_running_batch_queues_without_preemption() {
     assert!(second.is_command);
     assert_eq!(second.mailbox_message_ids, vec!["c2"]);
 }
+
+#[test]
+fn lead_transfer_hold_blocks_new_claims_until_released() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::TeamMembershipChanged, "handoff");
+
+    assert!(coordinator.begin_transfer_hold(&["lead-1".to_owned()]).is_ok());
+    assert_eq!(
+        coordinator.next("lead-1"),
+        ReconcileDecision::Quiescent,
+        "a held slot must not claim a batch while the handoff commits"
+    );
+
+    coordinator.end_transfer_hold(&["lead-1".to_owned()]);
+    assert!(
+        matches!(coordinator.next("lead-1"), ReconcileDecision::Claim(_)),
+        "releasing the hold must let the preserved work run"
+    );
+}
+
+#[test]
+fn lead_transfer_hold_reports_busy_slots_without_leaving_a_hold() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::UserMessage, "in-flight");
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("the in-flight message must be claimable");
+    };
+
+    let busy = coordinator
+        .begin_transfer_hold(&["lead-1".to_owned()])
+        .expect_err("an active batch must block the handoff");
+    assert_eq!(busy.len(), 1);
+    assert_eq!(busy[0].slot_id, "lead-1");
+    assert_eq!(
+        busy[0].turn_id, None,
+        "a claimed but unstarted batch has no cancellable turn id yet"
+    );
+
+    coordinator.complete_batch_with_ack(&batch);
+    assert!(
+        coordinator.begin_transfer_hold(&["lead-1".to_owned()]).is_ok(),
+        "a refused hold attempt must not leave a hold behind"
+    );
+}

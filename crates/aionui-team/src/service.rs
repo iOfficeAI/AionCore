@@ -33,11 +33,12 @@ use crate::activity_mapping::{
     mailbox_row_to_response, message_row_to_activity_item, sort_activity_items, task_row_to_activity_item,
     task_to_response,
 };
-use crate::error::TeamError;
+use crate::error::{BusyMember, TeamError};
 use crate::event_loop::{AgentLoopContext, EventLoopRegistrationError};
 use crate::events::{
     TEAM_CREATED_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT, TEAM_SESSION_STATUS_CHANGED_EVENT, TeamEventEmitter,
 };
+use crate::mailbox::Mailbox;
 use crate::member_runtime::{
     AttachLease, AttachOutcome, AttachWaiter, BeginRemove, MemberRuntimeFailure, MemberRuntimeSnapshot, ReserveAttach,
 };
@@ -1175,6 +1176,259 @@ impl TeamSessionService {
         }
 
         Ok(())
+    }
+
+    /// Reassign the team lead to an existing member, in place.
+    ///
+    /// Roles, `lead_agent_id`, and lead-first roster order commit in one
+    /// `update_team`; both conversations' `extra.role`, the live scheduler
+    /// roles, queued mail, and the coordinator's view follow. The old lead is
+    /// demoted without being woken; the new lead gets a role notice and a wake.
+    pub async fn set_team_lead(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<TeamResponse, TeamError> {
+        let lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        let mut team = self.load_owned_team(user_id, team_id).await?;
+        let target = team
+            .agents
+            .iter()
+            .find(|agent| agent.slot_id == slot_id)
+            .cloned()
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        // A single-member team has no other member to promote; this edge wins
+        // over the already-lead no-op.
+        if team.agents.len() < 2 {
+            return Err(TeamError::InvalidRequest("no other member".into()));
+        }
+        let current_lead_slot = team
+            .lead_agent_id
+            .clone()
+            .or_else(|| {
+                team.agents
+                    .iter()
+                    .find(|agent| agent.role == TeammateRole::Lead)
+                    .map(|agent| agent.slot_id.clone())
+            })
+            .ok_or_else(|| TeamError::InvalidRequest("team has no lead".into()))?;
+        if current_lead_slot == target.slot_id {
+            // Already the lead: a deliberate no-op, with no event. The response
+            // still goes through the shared builder so icons, pending
+            // confirmations, and context-reset capabilities match `get_team`.
+            return self.build_team_response(user_id, &team).await;
+        }
+        if let Some(starting) = team
+            .agents
+            .iter()
+            .find(|agent| self.member_runtime_is_starting(team_id, &agent.slot_id))
+        {
+            return Err(Self::member_runtime_starting_error(team_id, starting));
+        }
+        let old_lead = team
+            .agents
+            .iter()
+            .find(|agent| agent.slot_id == current_lead_slot)
+            .cloned()
+            .ok_or_else(|| TeamError::InvalidRequest("team lead not found".into()))?;
+
+        let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+        let hold_slots = vec![old_lead.slot_id.clone(), target.slot_id.clone()];
+        if let Some(session) = &session
+            && let Err(busy) = session.begin_lead_transfer_hold(&hold_slots)
+        {
+            let busy_members = busy
+                .into_iter()
+                .map(|member| BusyMember {
+                    conversation_id: team
+                        .agents
+                        .iter()
+                        .find(|agent| agent.slot_id == member.slot_id)
+                        .map(|agent| agent.conversation_id.clone())
+                        .unwrap_or_default(),
+                    slot_id: member.slot_id,
+                    turn_id: member.turn_id,
+                })
+                .collect();
+            return Err(TeamError::LeadTransferBusy {
+                team_id: team_id.to_owned(),
+                busy_members,
+            });
+        }
+
+        // Take the exclusive routing barrier after the coordinator hold is
+        // secured and hold it through the initial mailbox preparation, the
+        // roster/conversation role commit, the live role swap, and the hold
+        // release (success or compensation). This guarantees no lead-directed
+        // writer is in flight when the live roles change, so no late row can
+        // land on or wake the demoted lead; mail that arrived before this point
+        // is moved by the handoff's own preparation. Lock order stays
+        // membership (`add_agent_locks`) -> routing barrier.
+        let _routing_guard = match &session {
+            Some(session) => Some(session.scheduler().lead_routing_write().await),
+            None => None,
+        };
+
+        // From here every failure compensates the roster so a retry starts from
+        // the previous lead instead of a half-applied swap (the "already lead"
+        // branch above would otherwise mask it).
+        let previous_agents = serde_json::to_string(&team.agents)?;
+        let committed = self
+            .commit_team_lead(user_id, team_id, &mut team, &old_lead, &target, session.as_ref())
+            .await;
+        if let Err(error) = committed {
+            // Keep the hold through the rollback so no coordinator claim can
+            // slip in while the roster and live state are being restored.
+            self.compensate_lead_swap(user_id, team_id, &old_lead, &target, &previous_agents)
+                .await;
+            if let Some(session) = &session {
+                let notify = vec![old_lead.slot_id.clone(), target.slot_id.clone()];
+                session.end_lead_transfer_hold(&hold_slots, &notify);
+            }
+            return Err(error);
+        }
+        if let Some(session) = &session {
+            // Only the new lead is re-notified: the demoted old lead must not
+            // be woken, and its handoff notice is settled read.
+            session.end_lead_transfer_hold(&hold_slots, std::slice::from_ref(&target.slot_id));
+        }
+        // The live swap and hold release are complete; release the routing
+        // barrier before building the response so writers are not blocked on
+        // an unrelated read.
+        drop(_routing_guard);
+
+        info!(
+            team_id,
+            old_lead = %old_lead.slot_id,
+            new_lead = %target.slot_id,
+            strategy = "in_place",
+            "team lead reassigned"
+        );
+        self.broadcast_team_list_changed(user_id, team_id, "updated");
+
+        let row = self.load_owned_team_row(user_id, team_id).await?;
+        let team = Team::from_row(&row)?;
+        self.build_team_response(user_id, &team).await
+    }
+
+    /// Commit the roster swap and its runtime consequences. Split out so the
+    /// caller can compensate on failure while the transfer hold is still held.
+    async fn commit_team_lead(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        team: &mut Team,
+        old_lead: &TeamAgent,
+        new_lead: &TeamAgent,
+        session: Option<&Arc<TeamSession>>,
+    ) -> Result<(), TeamError> {
+        for agent in team.agents.iter_mut() {
+            if agent.slot_id == new_lead.slot_id {
+                agent.role = TeammateRole::Lead;
+            } else if agent.slot_id == old_lead.slot_id {
+                agent.role = TeammateRole::Teammate;
+            }
+        }
+        team.lead_agent_id = Some(new_lead.slot_id.clone());
+        if let Some(position) = team.agents.iter().position(|agent| agent.slot_id == new_lead.slot_id) {
+            let lead = team.agents.remove(position);
+            team.agents.insert(0, lead);
+        }
+        let agents_json = serde_json::to_string(&team.agents)?;
+        self.repo
+            .update_team(
+                user_id,
+                team_id,
+                &UpdateTeamParams {
+                    agents: Some(agents_json),
+                    lead_agent_id: Some(new_lead.slot_id.clone()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        self.conversation_port
+            .patch_runtime_config(&new_lead.conversation_id, serde_json::json!({ "role": "lead" }))
+            .await?;
+        self.conversation_port
+            .patch_runtime_config(&old_lead.conversation_id, serde_json::json!({ "role": "teammate" }))
+            .await?;
+
+        // Fallible mail preparation happens while the caller can still roll the
+        // roster back; the live swap that follows is in-memory and cannot fail,
+        // so no partial live state can outlive a failed request.
+        match session {
+            Some(session) => {
+                let preparation = session.prepare_lead_handoff(old_lead, new_lead).await?;
+                session.commit_lead_handoff(old_lead, new_lead, &preparation).await;
+            }
+            None => {
+                // A stopped team still gets the durable mail handoff in one
+                // transaction (mail move, forwarded reports, and both role
+                // notices): the next ensure_session must find the pending work
+                // on the new lead, and no runtime is started here.
+                let mailbox = Mailbox::new_for_user(self.repo.clone(), user_id.to_owned());
+                let member_slots = team.agents.iter().map(|agent| agent.slot_id.clone()).collect();
+                mailbox
+                    .apply_lead_handoff_mail(team_id, &member_slots, old_lead, new_lead, true)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Best-effort rollback of a failed lead swap: the roster returns to the
+    /// previous lead and both conversation roles are re-pointed, so a retry
+    /// re-applies the whole swap instead of silently keeping a partial one.
+    async fn compensate_lead_swap(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        old_lead: &TeamAgent,
+        new_lead: &TeamAgent,
+        previous_agents_json: &str,
+    ) {
+        if let Err(error) = self
+            .conversation_port
+            .patch_runtime_config(&new_lead.conversation_id, serde_json::json!({ "role": "teammate" }))
+            .await
+        {
+            warn!(
+                team_id,
+                conversation_id = %new_lead.conversation_id,
+                error = %error,
+                "lead swap compensation could not restore the new lead's conversation role"
+            );
+        }
+        if let Err(error) = self
+            .conversation_port
+            .patch_runtime_config(&old_lead.conversation_id, serde_json::json!({ "role": "lead" }))
+            .await
+        {
+            warn!(
+                team_id,
+                conversation_id = %old_lead.conversation_id,
+                error = %error,
+                "lead swap compensation could not restore the old lead's conversation role"
+            );
+        }
+        if let Err(error) = self
+            .repo
+            .update_team(
+                user_id,
+                team_id,
+                &UpdateTeamParams {
+                    agents: Some(previous_agents_json.to_owned()),
+                    lead_agent_id: Some(old_lead.slot_id.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            warn!(team_id, error = %error, "lead swap compensation could not restore the roster");
+        }
     }
 
     pub async fn rename_agent(&self, user_id: &str, team_id: &str, slot_id: &str, name: &str) -> Result<(), TeamError> {
@@ -3268,7 +3522,7 @@ mod tests {
         setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager,
         single_agent_team_request,
     };
-    use crate::types::MailboxMessageType;
+    use crate::types::{MailboxMessageType, TeamAgent, TeammateRole};
     use crate::work_coordinator::{CausalBinding, EnqueueRequest, ReconcileDecision, RuntimeConstraint};
     use crate::work_source::WorkSource;
     use crate::{TeamError, TeamSession};
@@ -4775,6 +5029,279 @@ mod tests {
         assert_eq!(
             extra.get("session_mode").and_then(serde_json::Value::as_str),
             Some("full_auto")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_team_lead_swaps_roles_and_orders_the_new_lead_first() {
+        let (svc, repo, _task_manager, conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Lead Transfer"))
+            .await
+            .unwrap();
+        let old_lead = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "lead")
+            .expect("lead")
+            .clone();
+        let added = svc
+            .add_agent(
+                "user-test",
+                &created.id,
+                AddAgentRequest {
+                    name: "Promoted".to_owned(),
+                    role: "teammate".to_owned(),
+                    backend: Some("acp".to_owned()),
+                    model: "claude".to_owned(),
+                    assistant_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let response = svc
+            .set_team_lead("user-test", &created.id, &added.slot_id)
+            .await
+            .unwrap();
+
+        assert_eq!(response.leader_assistant_id.as_deref(), Some(added.slot_id.as_str()));
+        assert_eq!(
+            response.assistants.first().unwrap().slot_id,
+            added.slot_id,
+            "the new lead must lead the roster"
+        );
+        assert_eq!(response.assistants.first().unwrap().role, "lead");
+        let demoted = response
+            .assistants
+            .iter()
+            .find(|agent| agent.slot_id == old_lead.slot_id)
+            .expect("demoted lead");
+        assert_eq!(demoted.role, "teammate");
+
+        let row = repo
+            .get_team("user-test", &created.id)
+            .await
+            .unwrap()
+            .expect("team row");
+        assert_eq!(row.lead_agent_id.as_deref(), Some(added.slot_id.as_str()));
+        let agents: Vec<TeamAgent> = serde_json::from_str(&row.agents).unwrap();
+        assert_eq!(agents.first().unwrap().slot_id, added.slot_id);
+        assert_eq!(agents.first().unwrap().role, TeammateRole::Lead);
+        assert_eq!(
+            conv_repo.get_extra(&added.conversation_id).unwrap()["role"],
+            "lead",
+            "the promoted conversation must carry the lead role"
+        );
+        assert_eq!(
+            conv_repo.get_extra(&old_lead.conversation_id).unwrap()["role"],
+            "teammate",
+            "the demoted conversation must carry the teammate role"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_team_lead_rejects_an_unknown_slot() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Lead Transfer"))
+            .await
+            .unwrap();
+
+        let error = svc
+            .set_team_lead("user-test", &created.id, "no-such-slot")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TeamError::AgentNotFound(slot) if slot == "no-such-slot"));
+    }
+
+    #[tokio::test]
+    async fn set_team_lead_rejects_a_single_member_team_even_for_the_lead() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Lead Transfer"))
+            .await
+            .unwrap();
+        let lead_slot = created.assistants.first().unwrap().slot_id.clone();
+
+        let error = svc
+            .set_team_lead("user-test", &created.id, &lead_slot)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, TeamError::InvalidRequest(message) if message.contains("no other member")),
+            "a single-member team must fail the edge before the already-lead no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_team_lead_is_a_noop_for_the_sitting_lead() {
+        let (svc, repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Lead Transfer"))
+            .await
+            .unwrap();
+        let _added = svc
+            .add_agent(
+                "user-test",
+                &created.id,
+                AddAgentRequest {
+                    name: "Worker".to_owned(),
+                    role: "teammate".to_owned(),
+                    backend: Some("acp".to_owned()),
+                    model: "claude".to_owned(),
+                    assistant_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let lead_slot = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "lead")
+            .expect("lead")
+            .slot_id
+            .clone();
+        let before = repo
+            .get_team("user-test", &created.id)
+            .await
+            .unwrap()
+            .expect("team row");
+
+        let response = svc.set_team_lead("user-test", &created.id, &lead_slot).await.unwrap();
+        assert_eq!(response.leader_assistant_id.as_deref(), Some(lead_slot.as_str()));
+
+        let after = repo
+            .get_team("user-test", &created.id)
+            .await
+            .unwrap()
+            .expect("team row");
+        assert_eq!(
+            after.updated_at, before.updated_at,
+            "a no-op must not rewrite the team row"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_team_lead_is_scoped_to_the_owner() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Lead Transfer"))
+            .await
+            .unwrap();
+
+        let error = svc
+            .set_team_lead("other-user", &created.id, "any-slot")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TeamError::TeamNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn removing_the_demoted_lead_is_allowed_after_the_swap() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Lead Transfer"))
+            .await
+            .unwrap();
+        let old_lead = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "lead")
+            .expect("lead")
+            .clone();
+        let added = svc
+            .add_agent(
+                "user-test",
+                &created.id,
+                AddAgentRequest {
+                    name: "Promoted".to_owned(),
+                    role: "teammate".to_owned(),
+                    backend: Some("acp".to_owned()),
+                    model: "claude".to_owned(),
+                    assistant_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let guard = svc
+            .remove_agent("user-test", &created.id, &old_lead.slot_id)
+            .await
+            .expect_err("the sitting lead must stay protected");
+        assert!(matches!(guard, TeamError::InvalidRequest(message) if message.contains("cannot remove the team lead")));
+
+        svc.set_team_lead("user-test", &created.id, &added.slot_id)
+            .await
+            .unwrap();
+        svc.remove_agent("user-test", &created.id, &old_lead.slot_id)
+            .await
+            .expect("the demoted lead must be removable");
+    }
+
+    #[tokio::test]
+    async fn set_team_lead_hands_mail_over_without_a_live_session() {
+        let (svc, repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Lead Transfer"))
+            .await
+            .unwrap();
+        let old_lead = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "lead")
+            .expect("lead")
+            .clone();
+        let added = svc
+            .add_agent(
+                "user-test",
+                &created.id,
+                AddAgentRequest {
+                    name: "Promoted".to_owned(),
+                    role: "teammate".to_owned(),
+                    backend: Some("acp".to_owned()),
+                    model: "claude".to_owned(),
+                    assistant_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // No session is running: the handoff must still be durable.
+        let mailbox = crate::mailbox::Mailbox::new_for_user(repo.clone(), "user-test");
+        mailbox
+            .write(
+                &created.id,
+                &old_lead.slot_id,
+                "user",
+                MailboxMessageType::Message,
+                "pending for the lead",
+                None,
+            )
+            .await
+            .unwrap();
+
+        svc.set_team_lead("user-test", &created.id, &added.slot_id)
+            .await
+            .unwrap();
+
+        let new_unread = mailbox.peek_unread(&created.id, &added.slot_id).await.unwrap();
+        let contents: Vec<&str> = new_unread.iter().map(|message| message.content.as_str()).collect();
+        assert!(
+            contents.contains(&"pending for the lead"),
+            "the next ensure must find the pending mail on the new lead: {contents:?}"
+        );
+        assert!(
+            contents
+                .iter()
+                .any(|content| content.contains("You are now the team lead")),
+            "the new lead must find its role notice: {contents:?}"
+        );
+
+        let old_unread = mailbox.peek_unread(&created.id, &old_lead.slot_id).await.unwrap();
+        assert!(
+            old_unread.is_empty(),
+            "the demoted lead must have no unread mail: {old_unread:?}"
         );
     }
 

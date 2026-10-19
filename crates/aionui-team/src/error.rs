@@ -1,6 +1,19 @@
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use aionui_api_types::TeamContextResetAvailability;
+
+/// A member that blocks a lead handoff because it has an active batch.
+///
+/// `turn_id` is `None` while a batch is claimed but the backend turn has not
+/// started yet; a non-null id is the exact value the UI passes to the existing
+/// conversation cancel endpoint before retrying the handoff.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BusyMember {
+    pub slot_id: String,
+    pub conversation_id: String,
+    pub turn_id: Option<String>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TeamError {
@@ -57,6 +70,12 @@ pub enum TeamError {
         team_id: String,
         slot_id: String,
         conversation_id: String,
+    },
+
+    #[error("Team lead transfer is blocked by busy members")]
+    LeadTransferBusy {
+        team_id: String,
+        busy_members: Vec<BusyMember>,
     },
 
     #[error("Team member does not support context reset: {slot_id}")]

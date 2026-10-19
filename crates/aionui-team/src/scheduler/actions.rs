@@ -39,7 +39,14 @@ impl TeammateManager {
     /// Finalizes an agent turn by marking the slot idle. The leader re-wake and
     /// idle-notification bookkeeping live in [`mark_idle`](Self::mark_idle).
     pub async fn finalize_turn(&self, slot_id: &str) -> Result<Option<String>, TeamError> {
-        self.mark_idle(slot_id, None).await
+        let _routing = self.lead_routing_read().await;
+        self.finalize_turn_locked(slot_id).await
+    }
+
+    /// [`Self::finalize_turn`] assuming the caller already holds the shared
+    /// lead-routing read guard.
+    pub(crate) async fn finalize_turn_locked(&self, slot_id: &str) -> Result<Option<String>, TeamError> {
+        self.mark_idle_locked(slot_id, None).await
     }
 
     pub async fn request_shutdown_agent(

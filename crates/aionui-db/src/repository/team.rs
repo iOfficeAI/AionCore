@@ -110,6 +110,23 @@ pub trait ITeamRepository: Send + Sync {
     /// Marks the given message IDs as read. IDs that don't exist are silently ignored.
     async fn mark_read_batch(&self, user_id: &str, team_id: &str, ids: &[String]) -> Result<(), DbError>;
 
+    /// Apply the persistent mail half of a lead handoff in ONE transaction:
+    /// move `reroute_ids` to `to_agent_id`, insert `inserts`, and mark
+    /// `settle_ids` read.
+    ///
+    /// Narrow on purpose: either the whole handoff's mail change lands or none
+    /// of it does, so a retry can never leave a report settled without its
+    /// forwarded notice.
+    async fn apply_lead_handoff_mail(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        reroute_ids: &[String],
+        to_agent_id: &str,
+        inserts: &[MailboxMessageRow],
+        settle_ids: &[String],
+    ) -> Result<(), DbError>;
+
     /// Returns message history for an agent, optionally limited.
     /// Messages are ordered by `created_at` ascending.
     async fn get_history(

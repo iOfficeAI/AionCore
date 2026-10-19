@@ -320,6 +320,69 @@ impl ITeamRepository for SqliteTeamRepository {
         Ok(())
     }
 
+    async fn apply_lead_handoff_mail(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        reroute_ids: &[String],
+        to_agent_id: &str,
+        inserts: &[MailboxMessageRow],
+        settle_ids: &[String],
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        for chunk in reroute_ids.chunks(500) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE mailbox SET to_agent_id = ? \
+                 WHERE team_id = ? AND id IN ({placeholders}) \
+                   AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?)"
+            );
+            let mut query = sqlx::query(&sql);
+            query = query.bind(to_agent_id).bind(team_id);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            query = query.bind(user_id);
+            query.execute(&mut *tx).await?;
+        }
+        for row in inserts {
+            sqlx::query(
+                "INSERT INTO mailbox \
+                    (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&row.id)
+            .bind(&row.team_id)
+            .bind(&row.to_agent_id)
+            .bind(&row.from_agent_id)
+            .bind(&row.msg_type)
+            .bind(&row.content)
+            .bind(&row.summary)
+            .bind(&row.files)
+            .bind(row.read)
+            .bind(row.created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for chunk in settle_ids.chunks(500) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE mailbox SET read = 1 \
+                 WHERE team_id = ? AND id IN ({placeholders}) \
+                   AND EXISTS (SELECT 1 FROM teams t WHERE t.id = mailbox.team_id AND t.user_id = ?)"
+            );
+            let mut query = sqlx::query(&sql);
+            query = query.bind(team_id);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            query = query.bind(user_id);
+            query.execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn get_history(
         &self,
         user_id: &str,

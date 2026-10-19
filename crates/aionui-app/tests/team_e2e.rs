@@ -1,7 +1,8 @@
 mod common;
 
 use aionui_db::{IConversationRepository, MessagePageDirection, MessagePageParams};
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tower::ServiceExt;
@@ -526,6 +527,13 @@ async fn team_api_rejects_cross_user_access() {
         ),
         json_with_token(
             "POST",
+            &format!("/api/teams/{team_id}/lead"),
+            json!({ "slot_id": slot_id }),
+            &other_token,
+            &other_csrf,
+        ),
+        json_with_token(
+            "POST",
             &format!("/api/teams/{team_id}/agents/{slot_id}/context/reset"),
             json!({}),
             &other_token,
@@ -558,6 +566,53 @@ async fn team_api_rejects_cross_user_access() {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
+}
+
+/// Lead reassignment: the new endpoint swaps roles, keeps the new lead first,
+/// and requires CSRF like every other mutating team route.
+#[tokio::test]
+async fn lead_reassignment_swaps_roles_and_requires_csrf() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap().to_owned();
+    let target_slot = data["assistants"][1]["slot_id"].as_str().unwrap().to_owned();
+
+    // CSRF: the mutating route rejects a request with no CSRF header/cookie.
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/teams/{team_id}/lead"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "slot_id": target_slot })).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "CSRF_INVALID");
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/lead"),
+        json!({ "slot_id": target_slot }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(
+        json["data"]["leader_assistant_id"].as_str(),
+        Some(target_slot.as_str()),
+        "the response must name the new lead"
+    );
+    assert_eq!(
+        json["data"]["assistants"][0]["slot_id"],
+        json["data"]["leader_assistant_id"]
+    );
+    assert_eq!(json["data"]["assistants"][0]["role"], "lead");
 }
 
 #[tokio::test]

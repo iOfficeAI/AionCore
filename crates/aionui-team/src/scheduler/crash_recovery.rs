@@ -43,6 +43,16 @@ impl TeammateManager {
         reason: CrashReason,
         last_message: Option<&str>,
     ) -> Result<Option<String>, TeamError> {
+        let _routing = self.lead_routing_read().await;
+        self.handle_agent_crash_locked(slot_id, reason, last_message).await
+    }
+
+    async fn handle_agent_crash_locked(
+        &self,
+        slot_id: &str,
+        reason: CrashReason,
+        last_message: Option<&str>,
+    ) -> Result<Option<String>, TeamError> {
         let (agent_name, is_lead) = {
             let slots = self.slots.lock().await;
             let slot = slots
@@ -51,7 +61,7 @@ impl TeammateManager {
             (slot.agent.name.clone(), slot.agent.role == TeammateRole::Lead)
         };
 
-        self.write_crash_testament(slot_id, &agent_name, &reason, last_message)
+        self.write_crash_testament_locked(slot_id, &agent_name, &reason, last_message)
             .await?;
 
         self.set_status(slot_id, TeammateStatus::Error).await?;
@@ -66,6 +76,7 @@ impl TeammateManager {
     }
 
     pub async fn handle_inactivity_timeout(&self, slot_id: &str) -> Result<Option<String>, TeamError> {
+        let _routing = self.lead_routing_read().await;
         let (agent_name, is_lead) = {
             let slots = self.slots.lock().await;
             let slot = slots
@@ -109,6 +120,18 @@ impl TeammateManager {
         reason: &CrashReason,
         last_message: Option<&str>,
     ) -> Result<(), TeamError> {
+        let _routing = self.lead_routing_read().await;
+        self.write_crash_testament_locked(slot_id, agent_name, reason, last_message)
+            .await
+    }
+
+    async fn write_crash_testament_locked(
+        &self,
+        slot_id: &str,
+        agent_name: &str,
+        reason: &CrashReason,
+        last_message: Option<&str>,
+    ) -> Result<(), TeamError> {
         let Some(lead_slot_id) = self.find_lead_slot_id().await else {
             return Ok(());
         };
@@ -130,6 +153,7 @@ impl TeammateManager {
     }
 
     pub async fn notify_shutdown_rejected(&self, from_slot_id: &str, reason: &str) -> Result<(), TeamError> {
+        let _routing = self.lead_routing_read().await;
         let Some(lead_slot_id) = self.find_lead_slot_id().await else {
             return Ok(());
         };

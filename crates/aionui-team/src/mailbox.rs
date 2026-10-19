@@ -9,7 +9,7 @@ use tracing::debug;
 use crate::activity_mapping::mailbox_row_to_response;
 use crate::error::TeamError;
 use crate::events::TeamEventEmitter;
-use crate::types::{MailboxMessage, MailboxMessageType};
+use crate::types::{MailboxMessage, MailboxMessageType, TeamAgent};
 
 pub struct Mailbox {
     repo: Arc<dyn ITeamRepository>,
@@ -18,6 +18,52 @@ pub struct Mailbox {
     /// [`Mailbox::new`] directly.
     events: Option<Arc<TeamEventEmitter>>,
     user_id: String,
+}
+
+/// What [`Mailbox::apply_lead_handoff_mail`] stored, so the live-session caller
+/// can project (and wake for) the rows. The stopped-team caller ignores it: the
+/// rows are already durable.
+pub(crate) struct LeadMailHandoff {
+    /// Full attributed copies of the new lead's own reports that were settled,
+    /// one per original report.
+    pub(crate) forwarded_reports: Vec<MailboxMessage>,
+    /// The new lead's role notice, when this call wrote the notices.
+    pub(crate) new_lead_notice: Option<MailboxMessage>,
+    /// The old lead's role notice (already read), when this call wrote it.
+    pub(crate) old_lead_notice: Option<MailboxMessage>,
+}
+
+/// Role notice texts for a lead handoff, shared by the live-session path and
+/// the stopped-team path so both write the same durable mail.
+fn lead_handoff_notice_contents(new_lead: &TeamAgent) -> (String, String) {
+    let new_content = format!(
+        "You are now the team lead (slot_id={}). Call team_members for the latest roster, then continue the team's work.",
+        new_lead.slot_id
+    );
+    let old_content = format!(
+        "The team lead role was reassigned to '{}' (slot_id={}). You are now a teammate.",
+        new_lead.name, new_lead.slot_id
+    );
+    (new_content, old_content)
+}
+
+/// Build the mailbox row for a notice or forwarded report.
+fn notice_row(message: &MailboxMessage) -> MailboxMessageRow {
+    MailboxMessageRow {
+        id: message.id.clone(),
+        team_id: message.team_id.clone(),
+        to_agent_id: message.to_agent_id.clone(),
+        from_agent_id: message.from_agent_id.clone(),
+        msg_type: message.msg_type.to_string(),
+        content: message.content.clone(),
+        summary: message.summary.clone(),
+        files: message
+            .files
+            .as_ref()
+            .map(|files| serde_json::to_string(files).unwrap_or_default()),
+        read: message.read,
+        created_at: message.created_at,
+    }
 }
 
 impl Mailbox {
@@ -164,6 +210,122 @@ impl Mailbox {
             }
         }
         Ok(())
+    }
+
+    /// Persistent mail half of a lead handoff, in ONE transaction: move the
+    /// eligible unread lead-directed rows to the new lead, forward the new
+    /// lead's own pending reports in full (one attributed copy each), write both
+    /// role notices when asked, and settle the originals read.
+    ///
+    /// Shared by the live-session path, the late-mail catch-up, and the
+    /// stopped-team path so all apply the same algorithm; ids, read state, and
+    /// history are preserved, and only user/current-teammate senders are
+    /// forwarded. Either all of it lands or none of it does, so a report can
+    /// never be acknowledged before its forward is durable.
+    pub(crate) async fn apply_lead_handoff_mail(
+        &self,
+        team_id: &str,
+        member_slots: &std::collections::HashSet<String>,
+        old_lead: &TeamAgent,
+        new_lead: &TeamAgent,
+        with_notices: bool,
+    ) -> Result<LeadMailHandoff, TeamError> {
+        let unread = self.peek_unread(team_id, &old_lead.slot_id).await?;
+        let mut reroute_ids = Vec::new();
+        let mut settle_ids = Vec::new();
+        let mut forwarded_reports = Vec::new();
+        for message in unread {
+            if !matches!(
+                message.msg_type,
+                MailboxMessageType::Message | MailboxMessageType::IdleNotification
+            ) {
+                continue;
+            }
+            if message.from_agent_id == new_lead.slot_id {
+                // The new lead's own rows cannot be delivered back to their
+                // author (both batch preparation and peek filter self-authored
+                // rows). Forward a full attributed copy through the normal
+                // mailbox path and settle the original in the same transaction.
+                settle_ids.push(message.id.clone());
+                if message.msg_type == MailboxMessageType::Message {
+                    forwarded_reports.push(MailboxMessage {
+                        id: generate_id(),
+                        team_id: team_id.to_owned(),
+                        to_agent_id: new_lead.slot_id.clone(),
+                        from_agent_id: "team_system".to_owned(),
+                        msg_type: MailboxMessageType::Message,
+                        content: message.content.clone(),
+                        summary: Some(format!(
+                            "Forwarded report from {} ({})",
+                            new_lead.name, new_lead.slot_id
+                        )),
+                        files: message.files.clone(),
+                        read: false,
+                        created_at: now_ms(),
+                    });
+                }
+                continue;
+            }
+            // Only user mail and actual teammates are handed over; a system or
+            // control author, or the old lead's own rows, stay with the slot
+            // they addressed.
+            let eligible = message.from_agent_id == "user"
+                || (member_slots.contains(&message.from_agent_id) && message.from_agent_id != old_lead.slot_id);
+            if eligible {
+                reroute_ids.push(message.id);
+            }
+        }
+
+        let (new_lead_notice, old_lead_notice) = if with_notices {
+            let (new_content, old_content) = lead_handoff_notice_contents(new_lead);
+            let notice = |to: &str, content: String, read: bool| MailboxMessage {
+                id: generate_id(),
+                team_id: team_id.to_owned(),
+                to_agent_id: to.to_owned(),
+                from_agent_id: "team_system".to_owned(),
+                msg_type: MailboxMessageType::Message,
+                content,
+                summary: None,
+                files: None,
+                read,
+                created_at: now_ms(),
+            };
+            // The old lead's notice is stored READ: a demoted, out-of-credits
+            // member must never be woken by it.
+            (
+                Some(notice(&new_lead.slot_id, new_content, false)),
+                Some(notice(&old_lead.slot_id, old_content, true)),
+            )
+        } else {
+            (None, None)
+        };
+
+        let mut inserts = forwarded_reports.iter().map(notice_row).collect::<Vec<_>>();
+        inserts.extend(new_lead_notice.iter().map(notice_row));
+        inserts.extend(old_lead_notice.iter().map(notice_row));
+
+        self.repo
+            .apply_lead_handoff_mail(
+                &self.user_id,
+                team_id,
+                &reroute_ids,
+                &new_lead.slot_id,
+                &inserts,
+                &settle_ids,
+            )
+            .await?;
+        debug!(
+            team_id,
+            rerouted = reroute_ids.len(),
+            settled = settle_ids.len(),
+            forwarded = forwarded_reports.len(),
+            "team mailbox handoff applied"
+        );
+        Ok(LeadMailHandoff {
+            forwarded_reports,
+            new_lead_notice,
+            old_lead_notice,
+        })
     }
 
     /// Runtime-only cancel helper: mark currently unread mailbox rows as read

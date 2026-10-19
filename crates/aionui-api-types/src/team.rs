@@ -180,6 +180,16 @@ impl<'de> Deserialize<'de> for AddAgentRequest {
     }
 }
 
+/// Request body for `POST /api/teams/:id/lead`.
+///
+/// Reassigns the team lead to an existing member, identified by `slot_id`
+/// (`slotId` is accepted as a compatibility alias).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetTeamLeadRequest {
+    #[serde(alias = "slotId")]
+    pub slot_id: String,
+}
+
 /// Request body for `PATCH /api/teams/:id/agents/:slotId/name`.
 #[derive(Debug, Deserialize)]
 pub struct RenameAgentRequest {

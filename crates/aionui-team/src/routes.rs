@@ -13,7 +13,7 @@ use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
     GetConfigOptionsResponse, InterruptTeamAgentRequest, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest,
     SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
-    SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
+    SetModelRequest, SetTeamLeadRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
     TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse,
     TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
 };
@@ -109,6 +109,15 @@ impl From<TeamError> for ApiError {
                     "conversation_id": conversation_id,
                 })),
             ),
+            TeamError::LeadTransferBusy { team_id, busy_members } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TEAM_LEAD_TRANSFER_BUSY",
+                "Team lead transfer is blocked by busy members",
+                Some(serde_json::json!({
+                    "team_id": team_id,
+                    "busy_members": busy_members,
+                })),
+            ),
             TeamError::MemberUnsupported {
                 team_id,
                 slot_id,
@@ -186,6 +195,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams/{id}/activity", get(list_activity))
         .route("/api/teams/{id}/name", axum::routing::patch(rename_team))
         .route("/api/teams/{id}/agents", post(add_agent))
+        .route("/api/teams/{id}/lead", post(set_team_lead))
         .route("/api/teams/{id}/agents/{slot_id}", axum::routing::delete(remove_agent))
         .route(
             "/api/teams/{id}/agents/{slot_id}/name",
@@ -433,6 +443,17 @@ async fn remove_agent(
         .remove_agent(&user.id, &params.id, &params.slot_id)
         .await?;
     Ok(Json(ApiResponse::success()))
+}
+
+async fn set_team_lead(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<SetTeamLeadRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TeamResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let team = state.service.set_team_lead(&user.id, &id, &req.slot_id).await?;
+    Ok(Json(ApiResponse::ok(team)))
 }
 
 async fn rename_agent(
@@ -852,6 +873,38 @@ mod tests {
                 "team_id": "team-1",
                 "slot_id": "slot-2",
                 "conversation_id": "conv-2",
+            }))
+        );
+    }
+
+    #[test]
+    fn lead_transfer_busy_maps_to_coded_conflict_with_turn_ids() {
+        let err: ApiError = TeamError::LeadTransferBusy {
+            team_id: "team-1".into(),
+            busy_members: vec![
+                crate::error::BusyMember {
+                    slot_id: "slot-2".into(),
+                    conversation_id: "conv-2".into(),
+                    turn_id: Some("turn-9".into()),
+                },
+                crate::error::BusyMember {
+                    slot_id: "slot-3".into(),
+                    conversation_id: "conv-3".into(),
+                    turn_id: None,
+                },
+            ],
+        }
+        .into();
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.error_code(), "TEAM_LEAD_TRANSFER_BUSY");
+        assert_eq!(
+            err.error_details(),
+            Some(json!({
+                "team_id": "team-1",
+                "busy_members": [
+                    { "slot_id": "slot-2", "conversation_id": "conv-2", "turn_id": "turn-9" },
+                    { "slot_id": "slot-3", "conversation_id": "conv-3", "turn_id": null },
+                ],
             }))
         );
     }

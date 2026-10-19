@@ -44,6 +44,18 @@ impl TeammateManager {
     }
 
     pub async fn mark_idle(&self, slot_id: &str, summary: Option<&str>) -> Result<Option<String>, TeamError> {
+        let _routing = self.lead_routing_read().await;
+        self.mark_idle_locked(slot_id, summary).await
+    }
+
+    /// [`Self::mark_idle`] assuming the caller already holds the shared
+    /// lead-routing read guard (e.g. the event loop spans it across the settle
+    /// enqueue). Never acquire the guard here: the read side is not reentrant.
+    pub(crate) async fn mark_idle_locked(
+        &self,
+        slot_id: &str,
+        summary: Option<&str>,
+    ) -> Result<Option<String>, TeamError> {
         self.set_status(slot_id, TeammateStatus::Idle).await?;
 
         let is_lead = {

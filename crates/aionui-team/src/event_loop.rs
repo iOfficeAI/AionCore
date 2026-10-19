@@ -383,7 +383,11 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
 }
 
 async fn finalize_scheduler_turn(ctx: &AgentLoopContext) {
-    match ctx.scheduler.finalize_turn(&ctx.slot_id).await {
+    // Hold the shared lead-routing guard across BOTH the idle transition and
+    // the settle enqueue below, so the lead selected for the settle signal
+    // cannot be swapped out from under us between the two.
+    let _routing = ctx.scheduler.lead_routing_read().await;
+    match ctx.scheduler.finalize_turn_locked(&ctx.slot_id).await {
         Ok(Some(wake_target)) if wake_target != ctx.slot_id => {
             if let Err(error) = ctx
                 .session

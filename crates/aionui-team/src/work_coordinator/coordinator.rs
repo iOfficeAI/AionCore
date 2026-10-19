@@ -22,6 +22,16 @@ pub(super) struct ActiveBatch {
     pub(super) started_at_ms: Option<aionui_common::TimestampMs>,
 }
 
+/// A slot with an active batch that blocks a lead handoff.
+///
+/// `turn_id` is `None` while a batch is claimed but its backend turn has not
+/// started; the exact non-null value is what the UI cancels before retrying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BusySlot {
+    pub(crate) slot_id: String,
+    pub(crate) turn_id: Option<String>,
+}
+
 #[derive(Debug)]
 pub(super) struct SlotState {
     pub(super) role: TeamRunTargetRole,
@@ -32,6 +42,10 @@ pub(super) struct SlotState {
     pub(super) background: VecDeque<String>,
     pub(super) active: Option<ActiveBatch>,
     pub(super) paused: bool,
+    /// Set while a lead handoff is committing. New batches for this slot are
+    /// held back so a swap cannot race a coordinator claim; the handoff clears
+    /// it and re-notifies the slot.
+    pub(super) transfer_hold: bool,
     pub(super) runtime_constraint: RuntimeConstraint,
     known_unread_message_ids: HashSet<String>,
     delivery_failure_counts: HashMap<String, u8>,
@@ -51,6 +65,7 @@ impl SlotState {
             background: VecDeque::new(),
             active: None,
             paused: false,
+            transfer_hold: false,
             runtime_constraint: RuntimeConstraint::Starting { operation_id: 0 },
             known_unread_message_ids: HashSet::new(),
             delivery_failure_counts: HashMap::new(),
@@ -460,6 +475,11 @@ impl SlotWorkCoordinator {
             return ReconcileDecision::Blocked(slot.runtime_constraint.clone());
         }
         if slot.paused {
+            return ReconcileDecision::Quiescent;
+        }
+        if slot.transfer_hold {
+            // A lead handoff is committing for this slot. Claiming a batch now
+            // could race the swap; the handoff clears the hold and re-notifies.
             return ReconcileDecision::Quiescent;
         }
 
@@ -1133,6 +1153,18 @@ impl SlotWorkCoordinator {
         }
     }
 
+    /// Clear a slot's pause without touching anything else.
+    ///
+    /// Used by an explicit lead promotion: a member paused after delivery
+    /// failures must not stay permanently paused once it is the lead, while the
+    /// demoted slot's own pause is preserved.
+    pub(crate) fn clear_slot_pause(&self, slot_id: &str) {
+        let mut state = self.lock_state();
+        if let Some(slot) = state.slots.get_mut(slot_id) {
+            slot.paused = false;
+        }
+    }
+
     pub(crate) fn set_runtime_constraint(
         &self,
         slot_id: &str,
@@ -1452,6 +1484,46 @@ impl SlotWorkCoordinator {
 
     pub(crate) fn slot_snapshot(&self, slot_id: &str) -> Option<SlotWorkSnapshot> {
         Self::slot_snapshot_locked(&self.lock_state(), slot_id)
+    }
+
+    /// Check `slot_ids` for active batches and, when all are clear, set a
+    /// transfer hold on each so no new batch can be claimed while a lead swap
+    /// commits. Returns the busy slots (with their turn ids) without holding
+    /// anything when at least one is active.
+    pub(crate) fn begin_transfer_hold(&self, slot_ids: &[String]) -> Result<(), Vec<BusySlot>> {
+        let mut state = self.lock_state();
+        let busy = slot_ids
+            .iter()
+            .filter_map(|slot_id| {
+                state.slots.get(slot_id).and_then(|slot| {
+                    slot.active.as_ref().map(|active| BusySlot {
+                        slot_id: slot_id.clone(),
+                        turn_id: active.turn_id.clone(),
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        if !busy.is_empty() {
+            return Err(busy);
+        }
+        for slot_id in slot_ids {
+            state
+                .slots
+                .entry(slot_id.clone())
+                .or_insert_with(|| SlotState::new(TeamRunTargetRole::Teammate))
+                .transfer_hold = true;
+        }
+        Ok(())
+    }
+
+    /// Release a hold set by [`Self::begin_transfer_hold`].
+    pub(crate) fn end_transfer_hold(&self, slot_ids: &[String]) {
+        let mut state = self.lock_state();
+        for slot_id in slot_ids {
+            if let Some(slot) = state.slots.get_mut(slot_id) {
+                slot.transfer_hold = false;
+            }
+        }
     }
 
     pub(crate) fn snapshot(&self) -> CoordinatorSnapshot {

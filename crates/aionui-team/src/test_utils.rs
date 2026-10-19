@@ -157,6 +157,30 @@ impl ITeamRepository for MockTeamRepo {
         Ok(())
     }
 
+    async fn apply_lead_handoff_mail(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        reroute_ids: &[String],
+        to_agent_id: &str,
+        inserts: &[MailboxMessageRow],
+        settle_ids: &[String],
+    ) -> Result<(), DbError> {
+        let mut state = self.state.lock().unwrap();
+        for msg in &mut state.messages {
+            if msg.team_id == team_id && reroute_ids.contains(&msg.id) {
+                msg.to_agent_id = to_agent_id.to_owned();
+            }
+        }
+        state.messages.extend(inserts.iter().cloned());
+        for msg in &mut state.messages {
+            if msg.team_id == team_id && settle_ids.contains(&msg.id) {
+                msg.read = true;
+            }
+        }
+        Ok(())
+    }
+
     async fn get_history(
         &self,
         _user_id: &str,
@@ -762,6 +786,30 @@ pub(crate) mod workspace_harness {
         async fn mark_read_batch(&self, _user_id: &str, team_id: &str, ids: &[String]) -> Result<(), DbError> {
             for message in self.messages.lock().unwrap().iter_mut() {
                 if message.team_id == team_id && ids.contains(&message.id) {
+                    message.read = true;
+                }
+            }
+            Ok(())
+        }
+
+        async fn apply_lead_handoff_mail(
+            &self,
+            _user_id: &str,
+            team_id: &str,
+            reroute_ids: &[String],
+            to_agent_id: &str,
+            inserts: &[aionui_db::models::MailboxMessageRow],
+            settle_ids: &[String],
+        ) -> Result<(), DbError> {
+            let mut messages = self.messages.lock().unwrap();
+            for message in messages.iter_mut() {
+                if message.team_id == team_id && reroute_ids.contains(&message.id) {
+                    message.to_agent_id = to_agent_id.to_owned();
+                }
+            }
+            messages.extend(inserts.iter().cloned());
+            for message in messages.iter_mut() {
+                if message.team_id == team_id && settle_ids.contains(&message.id) {
                     message.read = true;
                 }
             }

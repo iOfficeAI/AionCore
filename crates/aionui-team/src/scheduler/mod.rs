@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use aionui_realtime::EventBroadcaster;
 use dashmap::{DashMap, DashSet};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::error::TeamError;
 use crate::events::TeamEventEmitter;
@@ -124,6 +124,16 @@ pub struct TeammateManager {
     // and double-write the IdleNotification (aionui-audit 4.3, 8 #3).
     pub(crate) finalized_turns: Arc<DashMap<String, Instant>>,
     pub(crate) wake_timeouts: Arc<DashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Shared lead-routing barrier.
+    ///
+    /// Lead-directed writers take the read side for the whole span from
+    /// "select the current lead" through the durable mailbox write / lease
+    /// commit. The lead swap takes the write side, so an in-flight writer can
+    /// never still be holding a pre-swap lead selection when the live roles
+    /// change: no late row can land on (or wake) the demoted lead. It is a
+    /// plain lock, not an epoch/redirect mechanism, and is never held across a
+    /// model turn.
+    pub(crate) routing_barrier: RwLock<()>,
 }
 
 impl TeammateManager {
@@ -158,7 +168,20 @@ impl TeammateManager {
             active_wakes: DashSet::new(),
             finalized_turns: Arc::new(DashMap::new()),
             wake_timeouts: Arc::new(DashMap::new()),
+            routing_barrier: RwLock::new(()),
         }
+    }
+
+    /// Shared side of the lead-routing barrier: hold from lead selection through
+    /// the durable write/lease commit. The role swap takes the write side.
+    pub(crate) async fn lead_routing_read(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.routing_barrier.read().await
+    }
+
+    /// Exclusive side of the lead-routing barrier: held by the live role swap
+    /// so no lead-directed write can be mid-flight while roles change.
+    pub(crate) async fn lead_routing_write(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.routing_barrier.write().await
     }
 
     pub async fn get_agent(&self, slot_id: &str) -> Result<TeamAgent, TeamError> {
@@ -184,5 +207,24 @@ impl TeammateManager {
             .values()
             .find(|s| s.agent.role == TeammateRole::Lead)
             .map(|s| s.agent.slot_id.clone())
+    }
+
+    /// Swap the lead and teammate roles in ONE lock, so idle routing can never
+    /// observe a two-lead or no-lead roster, and arm both role prompts so the
+    /// next wake re-injects the prompt for the new role.
+    pub(crate) async fn swap_lead_roles(&self, old_lead_slot: &str, new_lead_slot: &str) {
+        // Callers hold the exclusive routing barrier (the service path in
+        // `set_team_lead`, or a direct-unit handoff caller); no read-guarded
+        // lead-directed writer can be mid-flight here.
+        let mut slots = self.slots.lock().await;
+        for slot in slots.values_mut() {
+            if slot.agent.slot_id == new_lead_slot {
+                slot.agent.role = TeammateRole::Lead;
+                slot.needs_role_prompt = true;
+            } else if slot.agent.slot_id == old_lead_slot {
+                slot.agent.role = TeammateRole::Teammate;
+                slot.needs_role_prompt = true;
+            }
+        }
     }
 }
