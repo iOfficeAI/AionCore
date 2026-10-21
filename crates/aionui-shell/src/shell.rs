@@ -370,38 +370,61 @@ mod tests {
 
     #[test]
     fn linux_show_item_uses_filemanager1_when_gdbus_available() {
-        let path = Path::new("/home/user/Downloads/AionUi.deb");
-        let (program, args) = linux_show_item_command(path, true);
+        // The Linux command builder can be tested on every host, but URL path
+        // conversion still requires that host's absolute filesystem syntax.
+        let (path, expected_uri_arg) = if cfg!(windows) {
+            (
+                "C:/home/user/Downloads/AionUi.deb",
+                "['file:///C:/home/user/Downloads/AionUi.deb']",
+            )
+        } else {
+            (
+                "/home/user/Downloads/AionUi.deb",
+                "['file:///home/user/Downloads/AionUi.deb']",
+            )
+        };
+        let (program, args) = linux_show_item_command(Path::new(path), true);
         assert_eq!(program, "gdbus");
         assert_eq!(args[0], "call");
         assert!(args.iter().any(|a| a == "org.freedesktop.FileManager1"));
         assert!(args.iter().any(|a| a == "org.freedesktop.FileManager1.ShowItems"));
         // The file URI must target the file itself (so it gets highlighted),
         // not the parent directory, wrapped as a GVariant array literal.
-        assert!(args.contains(&"['file:///home/user/Downloads/AionUi.deb']".to_owned()));
+        assert_eq!(args[8], expected_uri_arg);
         // Trailing empty startup-id GVariant string.
         assert_eq!(args.last().unwrap(), "");
     }
 
     #[test]
     fn linux_show_item_percent_encodes_spaces_in_uri() {
-        let path = Path::new("/home/user/My Downloads/AionUi.deb");
-        let (program, args) = linux_show_item_command(path, true);
+        let (path, expected_uri_arg) = if cfg!(windows) {
+            (
+                "C:/home/user/My Downloads/AionUi.deb",
+                "['file:///C:/home/user/My%20Downloads/AionUi.deb']",
+            )
+        } else {
+            (
+                "/home/user/My Downloads/AionUi.deb",
+                "['file:///home/user/My%20Downloads/AionUi.deb']",
+            )
+        };
+        let (program, args) = linux_show_item_command(Path::new(path), true);
         assert_eq!(program, "gdbus");
-        assert!(
-            args.contains(&"['file:///home/user/My%20Downloads/AionUi.deb']".to_owned()),
-            "space must be percent-encoded, got: {args:?}"
-        );
+        assert_eq!(args[8], expected_uri_arg, "space must be percent-encoded");
     }
 
     #[test]
     fn linux_show_item_falls_back_to_parent_dir_without_gdbus() {
-        let path = Path::new("/home/user/Downloads/AionUi.deb");
-        let (program, args) = linux_show_item_command(path, false);
+        let (path, expected_parent) = if cfg!(windows) {
+            ("C:/home/user/Downloads/AionUi.deb", "C:/home/user/Downloads")
+        } else {
+            ("/home/user/Downloads/AionUi.deb", "/home/user/Downloads")
+        };
+        let (program, args) = linux_show_item_command(Path::new(path), false);
         assert_eq!(program, "xdg-open");
         // Fallback opens the parent directory, never the file (whose MIME
         // handler may be a text editor) — that was the original bug.
-        assert_eq!(args, vec!["/home/user/Downloads".to_owned()]);
+        assert_eq!(args, vec![expected_parent.to_owned()]);
     }
 
     #[tokio::test]

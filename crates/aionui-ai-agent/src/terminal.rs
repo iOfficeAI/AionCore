@@ -365,6 +365,10 @@ impl TerminalRegistry {
 }
 
 #[cfg(test)]
+#[path = "../../aionui-runtime/tests/support/native_fixture.rs"]
+mod native_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -376,6 +380,10 @@ mod tests {
             cwd: None,
             output_byte_limit: None,
         }
+    }
+
+    fn native_params(args: &[&str]) -> CreateTerminalParams {
+        params(native_fixture::executable().to_str().unwrap(), args)
     }
 
     /// `wait_for_exit` returns as soon as the direct child is reaped, but the
@@ -399,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn create_runs_command_and_reports_output_and_exit() {
         let reg = TerminalRegistry::new("conv-t", None);
-        let id = reg.create(params("echo", &["hello_term"])).await.unwrap();
+        let id = reg.create(native_params(&["echo", "hello_term"])).await.unwrap();
         let exit = reg.wait_for_exit(&id).await.unwrap();
         assert_eq!(exit.exit_code, Some(0));
         assert!(!exit.signaled);
@@ -412,7 +420,7 @@ mod tests {
     #[tokio::test]
     async fn output_byte_limit_truncates_from_front() {
         let reg = TerminalRegistry::new("conv-t", None);
-        let mut p = params("sh", &["-c", "printf 'AAAA'; printf 'BBBB'"]);
+        let mut p = native_params(&["print", "AAAA", "BBBB"]);
         p.output_byte_limit = Some(4);
         let id = reg.create(p).await.unwrap();
         reg.wait_for_exit(&id).await.unwrap();
@@ -424,10 +432,11 @@ mod tests {
     #[tokio::test]
     async fn kill_terminates_long_command_with_signal() {
         let reg = TerminalRegistry::new("conv-t", None);
-        let id = reg.create(params("sleep", &["30"])).await.unwrap();
+        let id = reg.create(native_params(&["sleep", "30000"])).await.unwrap();
         assert!(reg.kill(&id, "test").await);
         let exit = reg.wait_for_exit(&id).await.unwrap();
-        assert!(exit.signaled || exit.exit_code.is_none() || exit.exit_code != Some(0));
+        assert!(exit.signaled);
+        assert_eq!(exit.exit_code, None);
         // Still queryable until release.
         assert!(reg.output(&id).await.is_some());
         assert!(reg.release(&id).await);
@@ -437,8 +446,8 @@ mod tests {
     #[tokio::test]
     async fn release_is_idempotent_and_kill_all_clears() {
         let reg = TerminalRegistry::new("conv-t", None);
-        let id1 = reg.create(params("sleep", &["30"])).await.unwrap();
-        let _id2 = reg.create(params("sleep", &["30"])).await.unwrap();
+        let id1 = reg.create(native_params(&["sleep", "30000"])).await.unwrap();
+        let _id2 = reg.create(native_params(&["sleep", "30000"])).await.unwrap();
         assert!(reg.release(&id1).await);
         assert!(!reg.release(&id1).await);
         reg.kill_all().await;
@@ -457,31 +466,57 @@ mod tests {
     #[tokio::test]
     async fn bare_compound_command_runs_through_shell() {
         let reg = TerminalRegistry::new("conv-t", None);
-        let mut p = params("true && echo shell_interpreted", &[]);
-        p.args = vec![];
+        let p = params("echo first_command && echo shell_interpreted", &[]);
         let id = reg.create(p).await.unwrap();
         let exit = reg.wait_for_exit(&id).await.unwrap();
         assert_eq!(exit.exit_code, Some(0));
         let snap = wait_for_output_contains(&reg, &id, "shell_interpreted").await;
-        assert!(snap.output.contains("shell_interpreted"), "got: {}", snap.output);
+        assert_eq!(
+            snap.output.lines().map(str::trim).collect::<Vec<_>>(),
+            ["first_command", "shell_interpreted"],
+            "both sides of && must run through the platform shell"
+        );
     }
 
     #[tokio::test]
     async fn background_child_holding_stdout_does_not_hang_exit() {
-        // B6: `sh -c 'sleep 30 &'` — the parent exits immediately but the
-        // backgrounded child inherits the stdout pipe, so the read side never
-        // sees EOF. Waiting on stream close alone would hang forever.
+        // The native parent exits after its child confirms that it inherited
+        // stdout. Keep that pipe open until after the exit assertion.
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let release = dir.path().join("release");
+        let completed = dir.path().join("completed");
         let reg = TerminalRegistry::new("conv-t", None);
         let id = reg
-            .create(params("sh", &["-c", "sleep 30 & echo parent_done"]))
+            .create(native_params(&[
+                "background",
+                ready.to_str().unwrap(),
+                release.to_str().unwrap(),
+                completed.to_str().unwrap(),
+            ]))
             .await
             .unwrap();
-        let exit = tokio::time::timeout(std::time::Duration::from_secs(5), reg.wait_for_exit(&id))
-            .await
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(5), reg.wait_for_exit(&id)).await;
+        let snap = wait_for_output_contains(&reg, &id, "parent_done").await;
+        std::fs::write(&release, b"release").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !completed.is_file() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background child must acknowledge release before its directory is removed");
+        assert_eq!(std::fs::read_to_string(&completed).unwrap(), "released");
+        let exit = exit
             .expect("exit must be reported once the direct child exits, not when the pipe closes")
             .unwrap();
         assert_eq!(exit.exit_code, Some(0));
-        let snap = wait_for_output_contains(&reg, &id, "parent_done").await;
+        assert!(ready.is_file(), "background child must have started");
+        assert!(
+            snap.output.contains("child_ready"),
+            "child must inherit stdout: {}",
+            snap.output
+        );
         assert!(snap.output.contains("parent_done"), "got: {}", snap.output);
     }
 
@@ -492,18 +527,17 @@ mod tests {
         // process on the machine, which made this test flaky.
         let dir = tempfile::TempDir::new().unwrap();
         let reg = TerminalRegistry::new("conv-t", Some(dir.path().to_path_buf()));
-        let id = reg.create(params("pwd", &[])).await.unwrap();
-        reg.wait_for_exit(&id).await.unwrap();
-        // `pwd` prints the resolved path (on macOS temp_dir lives under
-        // /var -> /private/var), so compare against the canonicalized full path
-        // rather than only the trailing directory name.
+        let command = if cfg!(windows) { "cd" } else { "pwd" };
+        let id = reg.create(params(command, &[])).await.unwrap();
+        assert_eq!(reg.wait_for_exit(&id).await.unwrap().exit_code, Some(0));
+        // Compare filesystem identity: Unix may resolve /var to /private/var,
+        // and Windows canonical paths include a verbatim prefix absent in cd.
         let canonical = std::fs::canonicalize(dir.path()).unwrap();
-        let expected = canonical.to_str().unwrap();
-        let snap = wait_for_output_contains(&reg, &id, expected).await;
+        let snap = wait_for_output_contains(&reg, &id, dir.path().file_name().unwrap().to_str().unwrap()).await;
         assert_eq!(
-            snap.output.trim(),
-            expected,
-            "pwd should report the default cwd; output: {}",
+            std::fs::canonicalize(snap.output.trim()).unwrap(),
+            canonical,
+            "shell should report the default cwd; output: {}",
             snap.output
         );
     }
@@ -514,8 +548,10 @@ mod tests {
         // the frontend's terminal-id-keyed card collides with a stale one.
         let a = TerminalRegistry::new("conv-a", None);
         let b = TerminalRegistry::new("conv-b", None);
-        let id_a = a.create(params("true", &[])).await.unwrap();
-        let id_b = b.create(params("true", &[])).await.unwrap();
+        let id_a = a.create(native_params(&["echo", "terminal_a"])).await.unwrap();
+        let id_b = b.create(native_params(&["echo", "terminal_b"])).await.unwrap();
         assert_ne!(id_a, id_b);
+        assert_eq!(a.wait_for_exit(&id_a).await.unwrap().exit_code, Some(0));
+        assert_eq!(b.wait_for_exit(&id_b).await.unwrap().exit_code, Some(0));
     }
 }

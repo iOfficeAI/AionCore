@@ -124,6 +124,19 @@ impl FileService {
     }
 }
 
+/// Serialize workspace-relative API paths consistently across host platforms.
+/// Backslashes are valid filename characters on Unix, so only convert Windows separators.
+fn relative_api_path(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        path.to_string_lossy().replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().into_owned()
+    }
+}
+
 /// Synchronous directory tree builder (runs in blocking thread pool).
 fn build_dir_tree_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileError> {
     let entries = std::fs::read_dir(dir)
@@ -142,7 +155,7 @@ fn build_dir_tree_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileEr
         let name = entry.file_name().to_string_lossy().into_owned();
 
         let full_path = strip_verbatim_prefix(&path.to_string_lossy());
-        let relative_path = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+        let relative_path = relative_api_path(path.strip_prefix(root).unwrap_or(&path));
 
         let is_dir = metadata.is_dir();
 
@@ -189,7 +202,7 @@ fn read_children_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileErr
         let name = entry.file_name().to_string_lossy().into_owned();
 
         let full_path = strip_verbatim_prefix(&path.to_string_lossy());
-        let relative_path = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+        let relative_path = relative_api_path(path.strip_prefix(root).unwrap_or(&path));
 
         children.push(DirOrFile {
             name,
@@ -246,7 +259,7 @@ fn list_workspace_files_sync(root: &Path) -> Result<Vec<WorkspaceFlatFile>, File
             .unwrap_or_default();
 
         let full_path = strip_verbatim_prefix(&path.to_string_lossy());
-        let relative_path = path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned();
+        let relative_path = relative_api_path(path.strip_prefix(root).unwrap_or(path));
 
         files.push(WorkspaceFlatFile {
             name,
@@ -737,11 +750,11 @@ impl crate::traits::IFileService for FileService {
 
         // Compute relative path from workspace
         let workspace_path = Path::new(workspace);
-        let relative_path = canonical
-            .strip_prefix(std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf()))
-            .unwrap_or(&canonical)
-            .to_string_lossy()
-            .into_owned();
+        let relative_path = relative_api_path(
+            canonical
+                .strip_prefix(std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf()))
+                .unwrap_or(&canonical),
+        );
 
         // Build and broadcast contentUpdate event
         let content = String::from_utf8(data.to_vec()).ok();
@@ -1099,6 +1112,10 @@ mod tests {
 
         assert_eq!(result[0].relative_path, "folder");
         assert_eq!(result[0].children[0].relative_path, "folder/file.txt");
+
+        let nested = build_dir_tree_sync(&sub, dir.path()).unwrap();
+        assert_eq!(nested[0].relative_path, "folder/file.txt");
+        assert_eq!(Path::new(&nested[0].full_path), sub.join("file.txt"));
     }
 
     #[test]
@@ -1163,6 +1180,21 @@ mod tests {
         let main_file = files.iter().find(|f| f.name == "main.rs").unwrap();
 
         assert_eq!(main_file.relative_path, "src/main.rs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_relative_paths_preserve_literal_backslashes_in_unix_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("src");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join(r"literal\name.rs"), "fn main() {}").unwrap();
+
+        let files = list_workspace_files_sync(dir.path()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].relative_path, r"src/literal\name.rs");
+        let tree = build_dir_tree_sync(dir.path(), dir.path()).unwrap();
+        assert_eq!(tree[0].children[0].relative_path, r"src/literal\name.rs");
     }
 
     /// Regression for ELECTRON-3TG: production canonicalizes the workspace root

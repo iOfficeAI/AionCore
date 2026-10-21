@@ -15,6 +15,9 @@ use aionui_mcp::McpConnectionTestService;
 use aionui_mcp::McpServerTransport;
 use aionui_realtime::BroadcastEventBus;
 
+#[path = "../../aionui-runtime/tests/support/native_fixture.rs"]
+mod native_fixture;
+
 fn make_service() -> McpConnectionTestService {
     McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)))
 }
@@ -170,11 +173,11 @@ async fn sse_401_returns_needs_auth() {
 
 #[tokio::test]
 async fn stdio_timeout_returns_timeout_error() {
-    // Use `sleep` which produces no stdout — our protocol read will block
+    // A native process holds stdout open without responding to initialize.
     let svc = make_service_with_timeout(Duration::from_secs(1));
     let transport = McpServerTransport::Stdio {
-        command: "sleep".into(),
-        args: vec!["60".into()],
+        command: native_fixture::executable().to_str().unwrap().into(),
+        args: vec!["sleep".into(), "60000".into()],
         env: HashMap::new(),
     };
 
@@ -183,6 +186,7 @@ async fn stdio_timeout_returns_timeout_error() {
     assert!(!result.success);
     let error = result.error.as_deref().unwrap();
     assert!(error.contains("timed out"), "expected timeout in: {error}");
+    assert_eq!(result.code, Some(aionui_api_types::McpConnectionTestErrorCode::Timeout));
 }
 
 // ---------------------------------------------------------------------------
@@ -286,20 +290,26 @@ async fn http_custom_headers_are_sent() {
 
 #[tokio::test]
 async fn stdio_with_args_spawns_correctly() {
-    // Use echo as a simple command that exits immediately
-    // Since echo doesn't speak MCP, we expect a protocol error (not a spawn error)
+    // The native fixture accepts the initialize request, emits the requested
+    // non-JSON text, then closes stdout without an MCP response.
+    let dir = tempfile::tempdir().unwrap();
+    let received_arg = dir.path().join("received-arg");
     let svc = make_service_with_timeout(Duration::from_secs(3));
     let transport = McpServerTransport::Stdio {
-        command: "echo".into(),
-        args: vec!["hello".into()],
+        command: native_fixture::executable().to_str().unwrap().into(),
+        args: vec!["non-mcp".into(), "hello".into(), received_arg.to_str().unwrap().into()],
         env: HashMap::new(),
     };
 
-    let result = svc.test_connection("echo-server", &transport).await;
+    let result = svc.test_connection("non-mcp-server", &transport).await;
 
-    // echo outputs "hello\n" then exits — not valid JSON-RPC
     assert!(!result.success);
     let error = result.error.as_deref().unwrap();
-    // Should be a protocol error, not a spawn error
-    assert!(!error.contains("Command not found"), "echo should be found");
+    assert_eq!(
+        result.code,
+        Some(aionui_api_types::McpConnectionTestErrorCode::ProtocolError)
+    );
+    assert_eq!(error, "initialize response: Server closed stdout before responding");
+    assert_eq!(result.details.as_ref().unwrap()["stage"], "initialize_response");
+    assert_eq!(std::fs::read_to_string(received_arg).unwrap(), "hello");
 }

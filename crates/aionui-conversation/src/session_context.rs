@@ -1264,9 +1264,7 @@ mod tests {
         let user = "user_019f8de8-3537-7c73-8d92-3bfde17eb1ee";
         let new_path = expected_auto_workspace_path(root, user, "conv-1", &AgentType::Acp, None);
         assert!(
-            new_path
-                .to_string_lossy()
-                .contains("/conversations/users/019f8de8-3537-7c73-8d92-3bfde17eb1ee/"),
+            new_path.starts_with(root.join("conversations/users/019f8de8-3537-7c73-8d92-3bfde17eb1ee")),
             "new workspace must be under conversations/users/{{dir}}/: {}",
             new_path.display()
         );

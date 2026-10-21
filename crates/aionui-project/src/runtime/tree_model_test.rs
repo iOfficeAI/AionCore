@@ -222,7 +222,7 @@ async fn apply_is_idempotent_when_nothing_changed() {
 }
 
 #[tokio::test]
-async fn apply_synthesizes_rename_for_same_inode() {
+async fn apply_reconciles_renamed_file() {
     let (mut tree, dir) = real_tree();
     std::fs::write(dir.path().join("old.txt"), b"x").unwrap();
     let c = canon(dir.path());
@@ -231,6 +231,9 @@ async fn apply_synthesizes_rename_for_same_inode() {
     std::fs::rename(dir.path().join("old.txt"), dir.path().join("new.txt")).unwrap();
 
     let delta = tree.apply(c.as_str(), Hint::All).await.unwrap().expect("changes");
+    // Unix supplies a stable inode. Other local providers deliberately report
+    // inode 0, so the same real rename is represented as an exact add/remove pair.
+    #[cfg(unix)]
     assert_eq!(
         delta.changes,
         vec![Change::Renamed {
@@ -238,6 +241,21 @@ async fn apply_synthesizes_rename_for_same_inode() {
             to: "new.txt".to_owned()
         }]
     );
+    #[cfg(not(unix))]
+    assert_eq!(
+        delta.changes,
+        vec![
+            Change::Added {
+                name: "new.txt".to_owned(),
+                kind: Kind::File,
+            },
+            Change::Removed {
+                name: "old.txt".to_owned(),
+            },
+        ]
+    );
+    assert_eq!(names(&tree.snapshot(c.as_str()).unwrap().entries), vec!["new.txt"]);
+    assert!(tree.apply(c.as_str(), Hint::All).await.unwrap().is_none());
 }
 
 #[tokio::test]

@@ -699,7 +699,7 @@ async fn repositories_changed_stops_after_the_session_disconnects() {
     );
 }
 
-/// A folder whose directory basename is blank (literally named "   ") must not
+/// A folder whose directory basename is whitespace-only must not
 /// yield a blank label. The derived `default_display_name` has to filter blanks
 /// the same way the scm seam does, or `display_name || default_display_name ||
 /// pe_id` renders whitespace. Reverting `build_folder_dto` to a non-trim filter
@@ -708,9 +708,10 @@ async fn repositories_changed_stops_after_the_session_disconnects() {
 async fn a_blank_basename_folder_does_not_become_a_blank_label() {
     let fx = fixture().await;
 
-    // A git repo whose own directory name is three spaces.
+    // EM SPACE is whitespace to Rust's trim() and a valid filename on Windows,
+    // which strips trailing ASCII spaces from ordinary filesystem paths.
     let base = tempfile::tempdir().expect("tempdir");
-    let blank_dir = base.path().join("   ");
+    let blank_dir = base.path().join("\u{2003}\u{2003}\u{2003}");
     std::fs::create_dir(&blank_dir).expect("mkdir blank");
     init_committed_repo(&blank_dir);
 
@@ -726,6 +727,18 @@ async fn a_blank_basename_folder_does_not_become_a_blank_label() {
         )
         .await
         .expect("attach");
+    let detail = fx
+        .service
+        .get_project("system_default_user", &fx.project_id)
+        .await
+        .expect("project detail");
+    let entry = detail
+        .explorer
+        .entries
+        .iter()
+        .find(|entry| entry.pe_id == row.pe_id)
+        .unwrap();
+    assert_eq!(entry.folder.default_display_name, None);
 
     let listed = fx
         .call(90, "scm/listRepositories", json!({ "project_id": fx.project_id }))
@@ -740,6 +753,7 @@ async fn a_blank_basename_folder_does_not_become_a_blank_label() {
         !label.trim().is_empty(),
         "a whitespace-basename folder must not yield a blank label, got {label:?}"
     );
+    assert_eq!(label, row.pe_id, "blank folder names must fall back to the explorer id");
 }
 
 /// Silence the unused-field warnings for handles kept only to own their lifetime.

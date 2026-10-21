@@ -102,42 +102,48 @@ impl IProviderRepository for SqliteProviderRepository {
     }
 
     async fn update(&self, user_id: &str, id: &str, params: UpdateProviderParams<'_>) -> Result<Provider, DbError> {
-        let existing = self
-            .find_by_id(user_id, id)
-            .await?
-            .ok_or_else(|| DbError::NotFound(format!("Provider '{id}' not found")))?;
-
-        let merged = merge_update(existing, params);
-
-        sqlx::query(
+        // Merge against the row at write time, not a previously read snapshot.
+        // The presence flag distinguishes clearing nullable fields from omission.
+        sqlx::query_as::<_, Provider>(
             "UPDATE providers SET \
-                platform = ?, name = ?, base_url = ?, api_key_encrypted = ?, \
-                models = ?, enabled = ?, capabilities = ?, context_limit = ?, \
-                model_protocols = ?, model_enabled = ?, model_health = ?, \
-                model_settings = ?, bedrock_config = ?, is_full_url = ?, updated_at = ? \
-             WHERE user_id = ? AND id = ?",
+                platform = COALESCE(?, platform), name = COALESCE(?, name), \
+                base_url = COALESCE(?, base_url), api_key_encrypted = COALESCE(?, api_key_encrypted), \
+                models = COALESCE(?, models), enabled = COALESCE(?, enabled), \
+                capabilities = COALESCE(?, capabilities), \
+                context_limit = CASE WHEN ? THEN ? ELSE context_limit END, \
+                model_protocols = CASE WHEN ? THEN ? ELSE model_protocols END, \
+                model_enabled = CASE WHEN ? THEN ? ELSE model_enabled END, \
+                model_health = CASE WHEN ? THEN ? ELSE model_health END, \
+                model_settings = COALESCE(?, model_settings), \
+                bedrock_config = CASE WHEN ? THEN ? ELSE bedrock_config END, \
+                is_full_url = COALESCE(?, is_full_url), updated_at = ? \
+             WHERE user_id = ? AND id = ? RETURNING *",
         )
-        .bind(&merged.platform)
-        .bind(&merged.name)
-        .bind(&merged.base_url)
-        .bind(&merged.api_key_encrypted)
-        .bind(&merged.models)
-        .bind(merged.enabled)
-        .bind(&merged.capabilities)
-        .bind(merged.context_limit)
-        .bind(&merged.model_protocols)
-        .bind(&merged.model_enabled)
-        .bind(&merged.model_health)
-        .bind(&merged.model_settings)
-        .bind(&merged.bedrock_config)
-        .bind(merged.is_full_url)
-        .bind(merged.updated_at)
+        .bind(params.platform)
+        .bind(params.name)
+        .bind(params.base_url)
+        .bind(params.api_key_encrypted)
+        .bind(params.models)
+        .bind(params.enabled)
+        .bind(params.capabilities)
+        .bind(params.context_limit.is_some())
+        .bind(params.context_limit.flatten())
+        .bind(params.model_protocols.is_some())
+        .bind(params.model_protocols.flatten())
+        .bind(params.model_enabled.is_some())
+        .bind(params.model_enabled.flatten())
+        .bind(params.model_health.is_some())
+        .bind(params.model_health.flatten())
+        .bind(params.model_settings)
+        .bind(params.bedrock_config.is_some())
+        .bind(params.bedrock_config.flatten())
+        .bind(params.is_full_url)
+        .bind(aionui_common::now_ms())
         .bind(user_id)
         .bind(id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(merged)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::NotFound(format!("Provider '{id}' not found")))
     }
 
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
@@ -158,42 +164,6 @@ impl IProviderRepository for SqliteProviderRepository {
 /// Detect SQLite UNIQUE constraint violation (codes 2067 / 1555).
 fn is_unique_violation(err: &dyn sqlx::error::DatabaseError) -> bool {
     err.code().is_some_and(|c| c == "2067" || c == "1555")
-}
-
-/// Merge partial update params into an existing provider, returning a new instance.
-fn merge_update(existing: Provider, params: UpdateProviderParams<'_>) -> Provider {
-    let now = aionui_common::now_ms();
-    Provider {
-        id: existing.id,
-        user_id: existing.user_id,
-        platform: params.platform.unwrap_or(&existing.platform).to_string(),
-        name: params.name.unwrap_or(&existing.name).to_string(),
-        base_url: params.base_url.unwrap_or(&existing.base_url).to_string(),
-        api_key_encrypted: params
-            .api_key_encrypted
-            .unwrap_or(&existing.api_key_encrypted)
-            .to_string(),
-        models: params.models.unwrap_or(&existing.models).to_string(),
-        enabled: params.enabled.unwrap_or(existing.enabled),
-        capabilities: params.capabilities.unwrap_or(&existing.capabilities).to_string(),
-        context_limit: params.context_limit.unwrap_or(existing.context_limit),
-        model_protocols: params
-            .model_protocols
-            .map_or(existing.model_protocols, |v| v.map(String::from)),
-        model_enabled: params
-            .model_enabled
-            .map_or(existing.model_enabled, |v| v.map(String::from)),
-        model_health: params
-            .model_health
-            .map_or(existing.model_health, |v| v.map(String::from)),
-        model_settings: params.model_settings.unwrap_or(&existing.model_settings).to_string(),
-        bedrock_config: params
-            .bedrock_config
-            .map_or(existing.bedrock_config, |v| v.map(String::from)),
-        is_full_url: params.is_full_url.unwrap_or(existing.is_full_url),
-        created_at: existing.created_at,
-        updated_at: now,
-    }
 }
 
 #[cfg(test)]

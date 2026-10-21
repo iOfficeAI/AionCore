@@ -195,6 +195,7 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("cannot resolve"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn validate_path_resolves_symlink_within_sandbox() {
         let dir = tempfile::tempdir().unwrap();
@@ -202,18 +203,13 @@ mod tests {
         fs::write(&real_file, "content").unwrap();
 
         let link = dir.path().join("link.txt");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&real_file, &link).unwrap();
-        #[cfg(not(unix))]
-        {
-            // Skip on non-unix
-            return;
-        }
 
         let result = validate_path(link.to_str().unwrap(), &[dir.path()]);
         assert!(result.is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn validate_path_rejects_symlink_escaping_sandbox() {
         let sandbox = tempfile::tempdir().unwrap();
@@ -222,12 +218,7 @@ mod tests {
         fs::write(&secret, "secret").unwrap();
 
         let link = sandbox.path().join("escape");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&secret, &link).unwrap();
-        #[cfg(not(unix))]
-        {
-            return;
-        }
 
         let result = validate_path(link.to_str().unwrap(), &[sandbox.path()]);
         assert!(result.is_err());

@@ -1,6 +1,6 @@
 use aionui_common::{CommandSpec, ErrorChain};
 use aionui_runtime::Builder as CmdBuilder;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -130,7 +130,9 @@ mod tests {
     use super::*;
     use aionui_common::EnvVar;
     use std::time::Duration;
+    #[cfg(unix)]
     use tokio::io::AsyncReadExt;
+    #[cfg(unix)]
     use tokio::time::timeout;
 
     // ── SDK mode tests ───────────────────────────────────────────────

@@ -468,6 +468,7 @@ mod tests {
         String::from_utf8(buffer.lock().expect("lock").clone()).expect("utf8")
     }
 
+    #[cfg(unix)]
     fn write_executable(path: &std::path::Path, body: &str) {
         fs::write(path, body).expect("write executable");
         #[cfg(unix)]
@@ -480,21 +481,22 @@ mod tests {
     }
 
     fn fake_managed_runtime(root: &std::path::Path) -> ResolvedNodeRuntime {
-        let bin = root.join("bin");
-        fs::create_dir_all(&bin).expect("create runtime bin");
-        write_executable(&bin.join("node"), "#!/bin/sh\necho v24.11.0\n");
-        write_executable(&bin.join("npm"), "#!/bin/sh\necho 24.11.0\n");
-        write_executable(&bin.join("npx"), "#!/bin/sh\necho 24.11.0\n");
+        let node = crate::test_support::write_node_runtime(root);
+        let npm_bin = root.join(if cfg!(windows) {
+            "node_modules/npm/bin"
+        } else {
+            "lib/node_modules/npm/bin"
+        });
 
         ResolvedNodeRuntime {
             source: ResolvedNodeSource::Managed,
             root: root.to_path_buf(),
             version: semver::Version::new(0, 0, 0),
-            node_path: bin.join("node"),
-            npm_path: bin.join("npm"),
-            npm_args_prefix: vec![],
-            npx_path: bin.join("npx"),
-            npx_args_prefix: vec![],
+            node_path: node.clone(),
+            npm_path: node.clone(),
+            npm_args_prefix: vec![npm_bin.join("npm-cli.js").into_os_string()],
+            npx_path: node,
+            npx_args_prefix: vec![npm_bin.join("npx-cli.js").into_os_string()],
             env: vec![],
         }
     }

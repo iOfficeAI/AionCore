@@ -12,6 +12,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+rusqlite = { workspace = true, features = ["backup"] }
+tempfile.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

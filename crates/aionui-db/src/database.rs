@@ -1,7 +1,8 @@
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use sqlx::migrate::Migrator;
@@ -144,7 +145,17 @@ pub async fn init_database_staged_with_options(
         })?;
     }
 
-    match try_init_file_staged(path).await {
+    // Hold the startup lock through any authorized recovery, so another
+    // bootstrap cannot open the old path while its files are being archived.
+    let lock_path = migrate_lock_path(path);
+    let guard = MigrateLockGuard::acquire(&lock_path).map_err(|e| {
+        DatabaseInitError::new(
+            "database.open",
+            DbError::Init(format!("Could not acquire database startup lock: {e}")),
+        )
+    })?;
+    ensure_no_interrupted_recovery(path).map_err(|error| DatabaseInitError::new("database.recovery", error))?;
+    let result = match try_init_file_staged(path).await {
         Ok(db) => Ok(db),
         Err(e) if path.exists() && options.recover_corrupted_database && should_attempt_recovery(e.source()) => {
             warn!(
@@ -166,7 +177,9 @@ pub async fn init_database_staged_with_options(
             ))
         }
         Err(e) => Err(e),
-    }
+    };
+    drop(guard);
+    result
 }
 
 /// Initialize an in-memory SQLite database (for testing).
@@ -194,12 +207,14 @@ pub async fn init_database_memory() -> Result<Database, DbError> {
     Ok(Database { pool })
 }
 
-/// Copy the legacy `aionui.db` to the new target path if the target does not exist.
+/// Snapshot the legacy `aionui.db` to the new target path if it does not exist.
 ///
 /// This enables safe upgrades: the old database remains untouched and the backend
-/// operates exclusively on the copy. The copy is atomic (write to `.tmp`, then rename)
-/// so a crash mid-copy leaves no half-written target file.
+/// operates exclusively on the snapshot. SQLite's backup API includes committed
+/// WAL transactions. The validated snapshot is published without replacing an
+/// existing target, so a crash during copying leaves no half-written target.
 pub fn maybe_copy_legacy_database(target: &Path) -> Result<(), DbError> {
+    ensure_no_interrupted_recovery(target)?;
     if target.exists() {
         return Ok(());
     }
@@ -210,65 +225,94 @@ pub fn maybe_copy_legacy_database(target: &Path) -> Result<(), DbError> {
     }
 
     let lock_path = migrate_lock_path(target);
-    let _guard = match MigrateLockGuard::acquire(&lock_path) {
-        Ok(guard) => Some(guard),
-        Err(e) => {
-            warn!(
-                lock = %lock_path.display(),
-                error = %e,
-                "Could not acquire legacy database copy lock; continuing without it"
-            );
-            None
-        }
-    };
+    let _guard = MigrateLockGuard::acquire(&lock_path)
+        .map_err(|e| DbError::Init(format!("Failed to lock legacy database snapshot: {e}")))?;
+    ensure_no_interrupted_recovery(target)?;
     if target.exists() {
         return Ok(());
     }
 
-    let tmp = target.with_extension("db.tmp");
-    retry_startup_file_op("copy legacy database", &legacy, || std::fs::copy(&legacy, &tmp))
-        .map_err(|e| DbError::Init(format!("Failed to copy legacy database: {e}")))?;
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let snapshot = tempfile::Builder::new()
+        .prefix(".aionui-legacy-")
+        .suffix(".db")
+        .tempfile_in(parent)
+        .map_err(|e| DbError::Init(format!("Failed to create legacy snapshot: {e}")))?;
+    snapshot_legacy_database(&legacy, snapshot.path())?;
+    snapshot
+        .as_file()
+        .sync_all()
+        .map_err(|e| DbError::Init(format!("Failed to sync legacy snapshot: {e}")))?;
     if target.exists() {
-        let _ = std::fs::remove_file(&tmp);
         return Ok(());
     }
-    match retry_startup_file_op("rename temp database", &tmp, || std::fs::rename(&tmp, target)) {
-        Ok(()) => {}
-        Err(e) if target.exists() => {
-            warn!(
-                target = %target.display(),
-                tmp = %tmp.display(),
-                error = %e,
-                "Legacy database target appeared after rename failed; using existing target"
-            );
-            let _ = std::fs::remove_file(&tmp);
-        }
-        Err(e) => return Err(DbError::Init(format!("Failed to rename temp database: {e}"))),
-    }
 
-    let _ = std::fs::remove_file(target.with_extension("db-wal"));
-    let _ = std::fs::remove_file(target.with_extension("db-shm"));
+    // Orphan sidecars cannot belong to the new snapshot. Preserve them for
+    // inspection instead of silently discarding a previous database's WAL.
+    let archived_sidecars = ["-wal", "-shm", "-journal"]
+        .iter()
+        .any(|suffix| database_sidecar(target, suffix).exists());
+    if archived_sidecars {
+        archive_database_files(target, false)
+            .map_err(|e| DbError::Init(format!("Failed to preserve legacy target sidecars: {e}")))?;
+    }
+    match snapshot.persist_noclobber(target) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists && !archived_sidecars => return Ok(()),
+        Err(error) => {
+            return Err(DbError::Init(format!(
+                "Failed to publish legacy snapshot: {}",
+                error.error
+            )));
+        }
+    }
+    if archived_sidecars {
+        std::fs::remove_file(database_sidecar(target, ".recovery-in-progress"))
+            .map_err(|error| DbError::Init(format!("Failed to finalize legacy snapshot: {error}")))?;
+    }
 
     info!("Copied legacy database {} -> {}", legacy.display(), target.display());
     Ok(())
 }
 
-async fn try_init_file_staged(path: &Path) -> Result<Database, DatabaseInitError> {
-    // Serialize the whole file-backed startup path, not only the sqlx
-    // migrator. Opening a fresh SQLite file also runs connection-level PRAGMAs
-    // such as WAL setup, which can race before migrations start.
-    let lock_path = migrate_lock_path(path);
-    let _guard = match MigrateLockGuard::acquire(&lock_path) {
-        Ok(guard) => Some(guard),
-        Err(e) => {
-            // Don't fail startup if flock isn't available (e.g. on some
-            // network filesystems) - fall back to SQLite busy-timeout and
-            // retry-on-conflict behavior below.
-            warn!("Could not acquire database startup lock {}: {e}", lock_path.display());
-            None
+fn snapshot_legacy_database(source: &Path, target: &Path) -> Result<(), DbError> {
+    let snapshot = || -> Result<(), rusqlite::Error> {
+        let source = rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        source.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        let mut destination = rusqlite::Connection::open(target)?;
+        {
+            let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if backup.step(256)? == rusqlite::backup::StepResult::Done {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                        Some("legacy snapshot timed out".into()),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
+        let check: String = destination.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        if check != "ok" {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                Some("legacy snapshot failed integrity validation".into()),
+            ));
+        }
+        destination.close().map_err(|(_, error)| error)?;
+        Ok(())
     };
+    snapshot().map_err(|error| DbError::Init(format!("Failed to snapshot legacy database: {error}")))
+}
 
+async fn try_init_file_staged(path: &Path) -> Result<Database, DatabaseInitError> {
     let opts = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
@@ -282,7 +326,10 @@ async fn try_init_file_staged(path: &Path) -> Result<Database, DatabaseInitError
         .await
         .map_err(|e| DatabaseInitError::new("database.open", DbError::Query(e)))?;
 
-    run_migrations_staged(&pool).await?;
+    if let Err(error) = run_migrations_staged(&pool).await {
+        pool.close().await;
+        return Err(error);
+    }
 
     // Discard the bootstrap pool and reconnect on a FRESH pool before any
     // business query runs. Migrations DROP+rebuild tables (e.g. 030 rebuilt
@@ -302,9 +349,10 @@ async fn try_init_file_staged(path: &Path) -> Result<Database, DatabaseInitError
         .await
         .map_err(|e| DatabaseInitError::new("database.reopen", DbError::Query(e)))?;
 
-    ensure_system_user(&pool)
-        .await
-        .map_err(|e| DatabaseInitError::new("database.seed", e))?;
+    if let Err(error) = ensure_system_user(&pool).await {
+        pool.close().await;
+        return Err(DatabaseInitError::new("database.seed", error));
+    }
 
     info!("Database initialized at {}", path.display());
     Ok(Database { pool })
@@ -695,11 +743,113 @@ async fn ensure_system_user(pool: &SqlitePool) -> Result<(), DbError> {
     Ok(())
 }
 
-async fn recover_and_retry(path: &Path, original_error: DbError) -> Result<Database, DatabaseInitError> {
-    let backup_path = format!("{}.backup.{}", path.display(), aionui_common::now_ms());
-    warn!("Backing up corrupted database to: {backup_path}");
+fn database_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
 
-    std::fs::rename(path, &backup_path).map_err(|e| {
+fn ensure_no_interrupted_recovery(path: &Path) -> Result<(), DbError> {
+    let marker = database_sidecar(path, ".recovery-in-progress");
+    match std::fs::symlink_metadata(&marker) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DbError::Init(format!(
+            "Failed to check database recovery state: {error}"
+        ))),
+        Ok(_) => Err(DbError::Init(format!(
+            "An interrupted database recovery requires inspection before startup; archive location recorded in {}",
+            marker.display(),
+        ))),
+    }
+}
+
+/// Preserve a quiescent database's complete file set before removing any part
+/// of it. Callers hold the startup lock and have closed their SQLite pools.
+fn archive_database_files(path: &Path, require_database: bool) -> std::io::Result<PathBuf> {
+    archive_database_files_with_removal(path, require_database, |original| {
+        retry_startup_file_op("remove archived database component", original, || {
+            std::fs::remove_file(original)
+        })
+    })
+}
+
+fn archive_database_files_with_removal(
+    path: &Path,
+    require_database: bool,
+    mut remove: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
+    let mut originals = Vec::new();
+    // Remove the main file last. Any failure leaves the complete archive and
+    // prevents initialization from attaching leftover WAL to a new database.
+    for suffix in ["-wal", "-shm", "-journal", ""] {
+        if suffix.is_empty() && !require_database {
+            continue;
+        }
+        let original = database_sidecar(path, suffix);
+        match std::fs::symlink_metadata(&original) {
+            Ok(metadata) if metadata.file_type().is_file() => originals.push(original),
+            Ok(_) => return Err(std::io::Error::other("database component is not a regular file")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !(suffix.is_empty() && require_database) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let prefix = format!("{}.backup.", path.file_name().unwrap_or_default().to_string_lossy());
+    let archive = tempfile::Builder::new().prefix(&prefix).tempdir_in(parent)?;
+    for original in &originals {
+        let mut source = std::fs::File::open(original)?;
+        let mut destination = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(archive.path().join(original.file_name().unwrap_or_default()))?;
+        std::io::copy(&mut source, &mut destination)?;
+        destination.sync_all()?;
+    }
+    // Keep completed evidence even if removing an original subsequently fails.
+    let archive = archive.keep();
+    info!(backup_path = %archive.display(), "Database and journal files archived before rebuild");
+    // Persist intent before the first removal. A crash or failed rollback must
+    // never allow the next ordinary startup to open a main file missing its WAL.
+    let marker = database_sidecar(path, ".recovery-in-progress");
+    let mut marker_file = OpenOptions::new().write(true).create_new(true).open(&marker)?;
+    writeln!(marker_file, "{}", archive.display())?;
+    marker_file.sync_all()?;
+    drop(marker_file);
+    let mut removed = Vec::<&Path>::new();
+    for original in &originals {
+        if let Err(error) = remove(original) {
+            let restored = removed.iter().try_for_each(|removed_path| -> std::io::Result<()> {
+                let saved = archive.join(removed_path.file_name().unwrap_or_default());
+                let mut source = std::fs::File::open(saved)?;
+                // Refuse to overwrite anything unexpectedly created meanwhile.
+                let mut destination = OpenOptions::new().write(true).create_new(true).open(removed_path)?;
+                std::io::copy(&mut source, &mut destination)?;
+                destination.sync_all()
+            });
+            let resolution = match restored {
+                Ok(()) => match std::fs::remove_file(&marker) {
+                    Ok(()) => "removed components restored",
+                    Err(_) => "components restored; marker cleanup failed, startup remains blocked",
+                },
+                Err(_) => "component restoration failed; startup remains blocked",
+            };
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("{resolution}; archive retained at {}: {error}", archive.display()),
+            ));
+        }
+        removed.push(original);
+    }
+    // The caller clears the marker only after a valid replacement has been
+    // published. A crash between removing files and rebuilding remains blocked.
+    Ok(archive)
+}
+
+async fn recover_and_retry(path: &Path, original_error: DbError) -> Result<Database, DatabaseInitError> {
+    let backup_path = archive_database_files(path, true).map_err(|e| {
         DatabaseInitError::new(
             "database.recovery",
             DbError::Init(format!(
@@ -711,10 +861,19 @@ async fn recover_and_retry(path: &Path, original_error: DbError) -> Result<Datab
 
     match try_init_file_staged(path).await {
         Ok(db) => {
+            if let Err(error) = std::fs::remove_file(database_sidecar(path, ".recovery-in-progress")) {
+                db.close().await;
+                return Err(DatabaseInitError::new(
+                    "database.recovery",
+                    DbError::Init(format!(
+                        "Recovery replacement is valid but finalization failed: {error}"
+                    )),
+                ));
+            }
             warn!(
                 code = "BOOTSTRAP_RECOVERED_DATABASE_CORRUPTION",
                 stage = "database.recovery",
-                backup_path = %backup_path,
+                backup_path = %backup_path.display(),
                 "Database recovered after corruption-like startup failure"
             );
             Ok(db)
@@ -754,6 +913,127 @@ fn is_corruption_like_error(err: &DbError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_removal_failure_restores_already_removed_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recover.db");
+        for (suffix, contents) in [("", "main"), ("-wal", "committed-wal"), ("-shm", "index")] {
+            std::fs::write(database_sidecar(&path, suffix), contents).unwrap();
+        }
+        let mut attempts = 0;
+        let result = archive_database_files_with_removal(&path, true, |component| {
+            attempts += 1;
+            if attempts == 2 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected sharing violation",
+                ))
+            } else {
+                std::fs::remove_file(component)
+            }
+        });
+        assert!(result.unwrap_err().to_string().contains("restored"));
+        for (suffix, contents) in [("", "main"), ("-wal", "committed-wal"), ("-shm", "index")] {
+            assert_eq!(
+                std::fs::read(database_sidecar(&path, suffix)).unwrap(),
+                contents.as_bytes()
+            );
+        }
+        assert!(!database_sidecar(&path, ".recovery-in-progress").exists());
+    }
+
+    #[tokio::test]
+    async fn incomplete_recovery_restoration_blocks_normal_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recover.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE retained(value TEXT)").unwrap();
+        drop(connection);
+        std::fs::write(database_sidecar(&path, "-wal"), b"committed-wal").unwrap();
+        std::fs::write(database_sidecar(&path, "-shm"), b"index").unwrap();
+        let mut attempts = 0;
+        archive_database_files_with_removal(&path, true, |component| {
+            attempts += 1;
+            if attempts == 2 {
+                // Make restoring the removed WAL fail without replacing an
+                // unexpected new path created by another actor.
+                std::fs::create_dir(database_sidecar(&path, "-wal")).unwrap();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected sharing violation",
+                ))
+            } else {
+                std::fs::remove_file(component)
+            }
+        })
+        .unwrap_err();
+        assert!(database_sidecar(&path, ".recovery-in-progress").exists());
+        let error = init_database(&path).await.unwrap_err();
+        assert!(error.to_string().contains("interrupted database recovery"));
+    }
+
+    #[tokio::test]
+    async fn recovery_archive_retains_the_complete_wal_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("fixture.db");
+        let path = dir.path().join("recover.db");
+        let connection = rusqlite::Connection::open(&fixture).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE retained(value TEXT); INSERT INTO retained VALUES ('checkpointed');
+                 PRAGMA wal_checkpoint(TRUNCATE); INSERT INTO retained VALUES ('wal-commit');",
+            )
+            .unwrap();
+        // Capture a quiescent crash image while a connection retains its WAL.
+        // This test calls the real authorized recovery operation directly;
+        // corruption recognition is covered by the lifecycle integration tests.
+        for suffix in ["", "-wal", "-shm"] {
+            std::fs::copy(
+                format!("{}{suffix}", fixture.display()),
+                format!("{}{suffix}", path.display()),
+            )
+            .unwrap();
+        }
+        drop(connection);
+        let original_wal = std::fs::read(format!("{}-wal", path.display())).unwrap();
+        let db = recover_and_retry(&path, DbError::Init("synthetic corruption".into()))
+            .await
+            .unwrap();
+        db.close().await;
+        let archive = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|entry| entry.file_name().unwrap().to_string_lossy().contains(".backup."))
+            .unwrap();
+        let archived_db = if archive.is_dir() {
+            archive.join("recover.db")
+        } else {
+            archive
+        };
+        let archived_wal = std::fs::read(format!("{}-wal", archived_db.display()))
+            .expect("recovery must archive the WAL with the same database basename");
+        assert_eq!(archived_wal, original_wal);
+        let saved = rusqlite::Connection::open(&archived_db).unwrap();
+        let count: i64 = saved
+            .query_row("SELECT count(*) FROM retained", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn recovery_archive_failure_does_not_replace_original_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recover.db");
+        std::fs::write(&path, b"preserve original malformed database").unwrap();
+        std::fs::create_dir(format!("{}-wal", path.display())).unwrap();
+        let error = recover_and_retry(&path, DbError::Init("synthetic corruption".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.stage(), "database.recovery");
+        assert_eq!(std::fs::read(&path).unwrap(), b"preserve original malformed database");
+    }
 
     #[test]
     fn recovery_skips_migration_version_mismatch() {

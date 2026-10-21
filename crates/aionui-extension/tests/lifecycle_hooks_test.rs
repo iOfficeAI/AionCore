@@ -6,29 +6,17 @@
 //! and graceful handling of missing scripts.
 
 use std::fs;
-use std::path::Path;
 
 use aionui_extension::{HookKind, LifecycleHooks, execute_hook, needs_install_hook, resolve_hook_path};
 use tempfile::TempDir;
 
+#[path = "support/lifecycle_hook.rs"]
+mod lifecycle_hook;
+use lifecycle_hook::write_script;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Create a shell script at `dir/path` with the given body and make it executable.
-fn write_script(dir: &Path, rel_path: &str, body: &str) {
-    let full = dir.join(rel_path);
-    if let Some(parent) = full.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-    let content = format!("#!/bin/sh\n{body}\n");
-    fs::write(&full, content).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&full, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-}
 
 fn setup_ext_dir() -> TempDir {
     tempfile::tempdir().unwrap()
@@ -42,14 +30,15 @@ fn setup_ext_dir() -> TempDir {
 async fn lh1_first_install_executes_on_install() {
     let dir = setup_ext_dir();
     let marker = dir.path().join("installed.marker");
-    write_script(
+    let hook = write_script(
         dir.path(),
-        "scripts/install.sh",
-        &format!("touch '{}'", marker.display()),
+        "scripts/install",
+        "touch installed.marker",
+        "type nul > installed.marker",
     );
 
     let hooks = LifecycleHooks {
-        on_install: Some("scripts/install.sh".into()),
+        on_install: Some(hook),
         ..Default::default()
     };
 
@@ -58,7 +47,7 @@ async fn lh1_first_install_executes_on_install() {
 
     let hook_path = resolve_hook_path(&hooks, HookKind::OnInstall).unwrap();
     let result = execute_hook(dir.path(), hook_path, HookKind::OnInstall, "test-ext").await;
-    assert!(result.is_ok());
+    assert!(result.is_ok(), "{result:?}");
     assert!(marker.exists(), "onInstall marker file should be created");
 }
 
@@ -70,14 +59,15 @@ async fn lh1_first_install_executes_on_install() {
 async fn lh2_version_change_executes_on_install() {
     let dir = setup_ext_dir();
     let marker = dir.path().join("upgraded.marker");
-    write_script(
+    let hook = write_script(
         dir.path(),
-        "scripts/install.sh",
-        &format!("touch '{}'", marker.display()),
+        "scripts/install",
+        "touch upgraded.marker",
+        "type nul > upgraded.marker",
     );
 
     let hooks = LifecycleHooks {
-        on_install: Some("scripts/install.sh".into()),
+        on_install: Some(hook),
         ..Default::default()
     };
 
@@ -86,7 +76,7 @@ async fn lh2_version_change_executes_on_install() {
 
     let hook_path = resolve_hook_path(&hooks, HookKind::OnInstall).unwrap();
     let result = execute_hook(dir.path(), hook_path, HookKind::OnInstall, "test-ext").await;
-    assert!(result.is_ok());
+    assert!(result.is_ok(), "{result:?}");
     assert!(marker.exists(), "onInstall marker should be created on upgrade");
 }
 
@@ -108,14 +98,15 @@ async fn lh3_activate_executes_on_activate() {
     let dir = setup_ext_dir();
     let counter_file = dir.path().join("activate_count.txt");
     // Append a line on each activation to count calls
-    write_script(
+    let hook = write_script(
         dir.path(),
-        "scripts/activate.sh",
-        &format!("echo 'activated' >> '{}'", counter_file.display()),
+        "scripts/activate",
+        "echo activated >> activate_count.txt",
+        "echo activated>> activate_count.txt",
     );
 
     let hooks = LifecycleHooks {
-        on_activate: Some("scripts/activate.sh".into()),
+        on_activate: Some(hook),
         ..Default::default()
     };
 
@@ -131,7 +122,11 @@ async fn lh3_activate_executes_on_activate() {
 
     let content = fs::read_to_string(&counter_file).unwrap();
     let lines: Vec<&str> = content.lines().collect();
-    assert_eq!(lines.len(), 2, "onActivate should run on each activation");
+    assert_eq!(
+        lines,
+        ["activated", "activated"],
+        "onActivate should run on each activation"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -142,20 +137,21 @@ async fn lh3_activate_executes_on_activate() {
 async fn lh4_deactivate_executes_on_deactivate() {
     let dir = setup_ext_dir();
     let marker = dir.path().join("deactivated.marker");
-    write_script(
+    let hook = write_script(
         dir.path(),
-        "scripts/deactivate.sh",
-        &format!("touch '{}'", marker.display()),
+        "scripts/deactivate",
+        "touch deactivated.marker",
+        "type nul > deactivated.marker",
     );
 
     let hooks = LifecycleHooks {
-        on_deactivate: Some("scripts/deactivate.sh".into()),
+        on_deactivate: Some(hook),
         ..Default::default()
     };
 
     let hook_path = resolve_hook_path(&hooks, HookKind::OnDeactivate).unwrap();
     let result = execute_hook(dir.path(), hook_path, HookKind::OnDeactivate, "test-ext").await;
-    assert!(result.is_ok());
+    assert!(result.is_ok(), "{result:?}");
     assert!(marker.exists(), "onDeactivate marker should be created");
 }
 
@@ -166,22 +162,24 @@ async fn lh4_deactivate_executes_on_deactivate() {
 #[tokio::test]
 async fn lh5_hook_timeout() {
     let dir = setup_ext_dir();
-    // Script that sleeps for a long time
-    write_script(dir.path(), "scripts/slow.sh", "sleep 120");
+    // Builtins keep the hook running without spawning a sleeping descendant.
+    let hook = write_script(dir.path(), "scripts/slow", "while :; do :; done", ":wait\ngoto wait");
 
     // We can't easily override the built-in timeout constants in the public API,
     // so we test the timeout mechanism by using tokio::time::timeout directly
     // to simulate what execute_hook does internally with a very short deadline.
-    let script_path = dir.path().join("scripts/slow.sh");
+    let script_path = dir.path().join(&hook);
     assert!(script_path.exists());
 
-    let child_future = tokio::process::Command::new(&script_path)
-        .current_dir(dir.path())
-        .kill_on_drop(true)
-        .output();
-
-    let result = tokio::time::timeout(std::time::Duration::from_millis(200), child_future).await;
-    assert!(result.is_err(), "should time out before script completes");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        execute_hook(dir.path(), &hook, HookKind::OnActivate, "slow-ext"),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "should time out before script completes, got {result:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -232,9 +230,14 @@ fn resolve_hook_path_none_when_not_declared() {
 #[tokio::test]
 async fn hook_nonzero_exit_returns_hook_failed() {
     let dir = setup_ext_dir();
-    write_script(dir.path(), "scripts/fail.sh", "echo 'setup failed' >&2; exit 42");
+    let hook = write_script(
+        dir.path(),
+        "scripts/fail",
+        "echo 'setup failed' >&2\nexit 42",
+        "echo setup failed 1>&2\nexit /b 42",
+    );
 
-    let result = execute_hook(dir.path(), "scripts/fail.sh", HookKind::OnInstall, "failing-ext").await;
+    let result = execute_hook(dir.path(), &hook, HookKind::OnInstall, "failing-ext").await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -258,11 +261,11 @@ async fn hook_nonzero_exit_returns_hook_failed() {
 
 #[tokio::test]
 async fn hook_working_directory_is_ext_dir() {
-    let dir = setup_ext_dir();
-    write_script(dir.path(), "check_dir.sh", "pwd > cwd_out.txt");
+    let dir = tempfile::Builder::new().prefix("lifecycle hook ").tempdir().unwrap();
+    let hook = write_script(dir.path(), "check dir", "pwd > cwd_out.txt", "cd > cwd_out.txt");
 
-    let result = execute_hook(dir.path(), "check_dir.sh", HookKind::OnActivate, "cwd-ext").await;
-    assert!(result.is_ok());
+    let result = execute_hook(dir.path(), &hook, HookKind::OnActivate, "cwd-ext").await;
+    assert!(result.is_ok(), "{result:?}");
 
     let cwd_file = dir.path().join("cwd_out.txt");
     assert!(cwd_file.exists());

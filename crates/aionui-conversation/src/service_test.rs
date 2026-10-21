@@ -2025,11 +2025,12 @@ fn create_team_temp_workspace_uses_date_partition() {
 #[tokio::test]
 async fn create_rejects_unavailable_workspace_with_trailing_whitespace_in_request() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
-    let dir = std::env::temp_dir().join(format!("aionui-test-{}", aionui_common::generate_short_id()));
-    std::fs::create_dir(&dir).unwrap();
-    let workspace = dir.join("workspace");
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let workspace_with_trailing_space = format!("{} ", workspace.to_string_lossy());
+    // EM SPACE is whitespace to trim(), but Windows does not silently strip it
+    // from filenames. Looking up a trimmed path must not accept this missing one.
+    let workspace_with_trailing_space = format!("{}\u{2003}", workspace.to_string_lossy());
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
@@ -2042,7 +2043,6 @@ async fn create_rejects_unavailable_workspace_with_trailing_whitespace_in_reques
         ConversationError::WorkspacePathUnavailable { path }
             if path == workspace_with_trailing_space
     ));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

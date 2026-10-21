@@ -77,9 +77,9 @@ impl std::fmt::Debug for Builder {
     }
 }
 
-/// Renders the configured spawn as a shell-style preview (`cd … && env -u
-/// X K=V <prog> <args>…`) suitable for logs and error messages. Format
-/// comes for free from `std::process::Command`'s `Debug` impl.
+/// Renders the configured spawn using `std::process::Command`'s platform
+/// preview. Unix includes cwd and environment changes; Windows displays the
+/// program and arguments. This is a diagnostic preview, not a shell command.
 impl std::fmt::Display for Builder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self.inner.as_std(), f)
@@ -366,6 +366,8 @@ fn resolve_program(program: &OsStr) -> OsString {
 mod tests {
     use super::*;
     use crate::ResolvedCommand;
+    use crate::test_support::native_fixture;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     #[tokio::test]
@@ -381,38 +383,39 @@ mod tests {
 
         // Ask the child to print NODE_OPTIONS + CLAUDECODE; Builder must
         // have removed them.
-        let mut b = Builder::clean_cli("sh");
-        b.arg("-c")
-            .arg("echo \"NO:${NODE_OPTIONS:-unset} CC:${CLAUDECODE:-unset}\"");
+        let mut b = Builder::clean_cli(native_fixture::executable());
+        b.args(["env", "NODE_OPTIONS", "CLAUDECODE"]);
         let output = b.output().await.unwrap();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("NO:unset"), "got: {stdout}");
-        assert!(stdout.contains("CC:unset"), "got: {stdout}");
+        assert!(stdout.contains("NODE_OPTIONS:unset"), "got: {stdout}");
+        assert!(stdout.contains("CLAUDECODE:unset"), "got: {stdout}");
         assert!(output.status.success());
     }
 
     #[tokio::test]
     async fn clean_cli_sets_no_color_and_term_dumb() {
-        let mut b = Builder::clean_cli("sh");
-        b.arg("-c").arg("echo \"NC:${NO_COLOR:-unset} TERM:${TERM:-unset}\"");
+        let mut b = Builder::clean_cli(native_fixture::executable());
+        b.args(["env", "NO_COLOR", "TERM"]);
         let output = b.output().await.unwrap();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("NC:1"), "got: {stdout}");
+        assert!(stdout.contains("NO_COLOR:1"), "got: {stdout}");
         assert!(stdout.contains("TERM:dumb"), "got: {stdout}");
+        assert!(output.status.success());
     }
 
     #[tokio::test]
     async fn agent_allows_stdio_override() {
         // agent() defaults to inherit. Override to piped, then verify
         // we can capture output.
-        let mut b = Builder::new("sh");
-        b.arg("-c").arg("echo hello").stdout(Stdio::piped());
+        let mut b = Builder::new(native_fixture::executable());
+        b.args(["echo", "hello"]).stdout(Stdio::piped());
         let output = b.output().await.unwrap();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(stdout.trim(), "hello");
+        assert!(output.status.success());
     }
 
     #[tokio::test]
@@ -423,65 +426,74 @@ mod tests {
             return;
         }
 
-        let mut b = Builder::new("sh");
-        b.arg("-c")
-            .arg("echo \"NI:${NODE_INSPECT:-unset} ND:${NODE_DEBUG:-unset}\"")
-            .stdout(Stdio::piped());
+        let mut b = Builder::new(native_fixture::executable());
+        b.args(["env", "NODE_INSPECT", "NODE_DEBUG"]).stdout(Stdio::piped());
         let output = b.output().await.unwrap();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("NI:unset"), "got: {stdout}");
-        assert!(stdout.contains("ND:unset"), "got: {stdout}");
+        assert!(stdout.contains("NODE_INSPECT:unset"), "got: {stdout}");
+        assert!(stdout.contains("NODE_DEBUG:unset"), "got: {stdout}");
+        assert!(output.status.success());
     }
 
     #[tokio::test]
     async fn spawn_returns_child_with_pid() {
-        let mut b = Builder::new("sh");
-        b.arg("-c").arg("sleep 0.05");
+        let mut b = Builder::new(native_fixture::executable());
+        b.args(["sleep", "50"]);
         let mut child = b.spawn().unwrap();
         assert!(child.id().is_some());
         let status = child.wait().await.unwrap();
         assert!(status.success());
     }
 
-    #[test]
-    fn resolved_command_builder_applies_prefix_and_env() {
+    #[tokio::test]
+    async fn resolved_command_builder_applies_prefix_and_env() {
         let resolved = ResolvedCommand {
-            program: "/bin/echo".into(),
-            args_prefix: vec!["hello".into()],
-            env: vec![("NO_COLOR".into(), "1".into())],
+            program: native_fixture::executable().into(),
+            args_prefix: vec!["env".into()],
+            env: vec![("AIONUI_RESOLVED_TEST_VALUE".into(), "hello from resolved".into())],
         };
 
-        let builder = Builder::from_resolved(&resolved);
-        let preview = builder.to_string();
-        assert!(
-            preview.contains("hello"),
-            "preview should include args prefix: {preview}"
+        let mut builder = Builder::from_resolved(&resolved);
+        builder.arg("AIONUI_RESOLVED_TEST_VALUE").stdout(Stdio::piped());
+        let output = builder.output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "AIONUI_RESOLVED_TEST_VALUE:hello from resolved"
         );
-        assert!(preview.contains("NO_COLOR=\"1\"") || preview.contains("NO_COLOR=1"));
     }
 
     #[test]
-    fn display_renders_shell_style_command() {
+    fn display_renders_platform_command_preview() {
         let mut b = Builder::new("/usr/local/bin/node");
         b.current_dir("/tmp/work dir")
             .env("FOO", "bar baz")
             .args(["x", "--flag", "with space"]);
 
         let preview = format!("{b}");
-        // Format inherited from std Command Debug: `cd "..." && env -u X K=V "prog" "args"...`
-        assert!(
-            preview.starts_with(r#"cd "/tmp/work dir" &&"#),
-            "missing cwd prefix: {preview}"
-        );
-        assert!(preview.contains("env "), "expected env section: {preview}");
-        assert!(preview.contains(r#"FOO="bar baz""#), "FOO missing: {preview}");
-        // strip_pollution unsets these
-        assert!(
-            preview.contains("-u NODE_OPTIONS"),
-            "missing -u NODE_OPTIONS: {preview}"
-        );
-        assert!(preview.contains("-u CLAUDECODE"), "missing -u CLAUDECODE: {preview}");
+        // std's Windows preview omits cwd/environment. Inspect those settings
+        // directly, and retain Unix's additional display assertions there.
+        let command = b.inner.as_std();
+        assert_eq!(command.get_current_dir(), Some(Path::new("/tmp/work dir")));
+        let env: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(env.get(OsStr::new("FOO")), Some(&Some(OsStr::new("bar baz"))));
+        assert_eq!(env.get(OsStr::new("NODE_OPTIONS")), Some(&None));
+        assert_eq!(env.get(OsStr::new("CLAUDECODE")), Some(&None));
+        #[cfg(unix)]
+        {
+            assert!(
+                preview.starts_with(r#"cd "/tmp/work dir" &&"#),
+                "missing cwd: {preview}"
+            );
+            assert!(preview.contains("env "), "expected env section: {preview}");
+            assert!(preview.contains(r#"FOO="bar baz""#), "FOO missing: {preview}");
+            assert!(
+                preview.contains("-u NODE_OPTIONS"),
+                "missing -u NODE_OPTIONS: {preview}"
+            );
+            assert!(preview.contains("-u CLAUDECODE"), "missing -u CLAUDECODE: {preview}");
+        }
         assert!(
             preview.contains(r#""/usr/local/bin/node""#),
             "program missing: {preview}"

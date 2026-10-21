@@ -484,7 +484,7 @@ mod tests {
         );
         let nvm_bins: Vec<_> = bins
             .iter()
-            .filter(|p| p.to_string_lossy().contains(".nvm/versions/node/"))
+            .filter(|p| p.starts_with(home.join(".nvm/versions/node")))
             .collect();
         assert_eq!(nvm_bins.len(), 2);
         assert!(

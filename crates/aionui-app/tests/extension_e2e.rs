@@ -1429,10 +1429,14 @@ async fn skill_batch_import_reports_partial_failures_without_rolling_back_succes
         .await
         .unwrap()
         .expect("imported skill row should exist for the importing user");
-    assert!(
-        alpha_row.path.contains("/skills/users/"),
-        "import must use user-scoped storage: {}",
-        alpha_row.path
+    assert_eq!(
+        std::path::Path::new(&alpha_row.path),
+        paths
+            .user_skills_dir
+            .join("users")
+            .join(aionui_common::user_dir_name(&user.id).unwrap())
+            .join("sample-alpha"),
+        "import must use the importing user's scoped storage"
     );
     assert!(std::path::Path::new(&alpha_row.path).join("SKILL.md").exists());
     assert!(!paths.user_skills_dir.join("sample-alpha").exists());

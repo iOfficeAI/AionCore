@@ -222,21 +222,23 @@ async fn persistent_npm_version_failure_still_reports_bundled_resource_invalid()
 async fn managed_runtime_validation_uses_real_commands() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("node-v24.11.0-test");
-    let bin = root.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-
-    let node = bin.join("node");
-    std::fs::write(&node, "#!/bin/sh\necho v24.11.0\n").unwrap();
+    crate::test_support::write_node_runtime(&root);
+    // The entrypoint exists but its --version probe must fail. This exercises
+    // execution, not merely the missing-file check in runtime_from_root.
+    let npm = managed_npm_cli_path_for_layout(&root, current_managed_node_archive_layout());
+    std::fs::rename(&npm, npm.with_extension("invalid")).unwrap();
+    let wrapper = managed_wrapper_path_for_layout(&root, current_managed_node_archive_layout(), "npm");
+    #[cfg(windows)]
+    std::fs::write(&wrapper, "@exit /b 7\r\n").unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&node).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&node, perms).unwrap();
+        std::fs::write(&wrapper, "#!/bin/sh\nexit 7\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     let err = validate_managed_runtime(&root, None).await.unwrap_err();
-    assert!(err.to_string().to_ascii_lowercase().contains("npm"));
+    assert!(err.to_string().starts_with("npm exited with "), "{err}");
 }
 
 #[test]
@@ -461,11 +463,7 @@ fn managed_runtime_checksum_verification_detects_mismatch() {
 fn managed_runtime_injects_npm_state_under_runtime_root() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("node-v24.11.0-test");
-    let bin = root.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    std::fs::write(bin.join("node"), b"").unwrap();
-    std::fs::write(bin.join("npm"), b"").unwrap();
-    std::fs::write(bin.join("npx"), b"").unwrap();
+    crate::test_support::write_node_runtime(&root);
 
     let runtime = runtime_from_root(&root, ResolvedNodeSource::Managed).expect("runtime");
     let env: std::collections::HashMap<_, _> = runtime

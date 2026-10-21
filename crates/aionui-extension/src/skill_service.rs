@@ -1050,6 +1050,19 @@ async fn replace_existing_path(path: &Path) -> Result<(), ExtensionError> {
         Err(e) => return Err(e.into()),
     };
 
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+
+        // Directory symlinks and junctions require RemoveDirectory, even when
+        // their target is missing. Inspect the link itself and never recurse
+        // into its target while replacing it.
+        if metadata.file_type().is_symlink_dir() {
+            tokio::fs::remove_dir(path).await?;
+            return Ok(());
+        }
+    }
+
     if metadata.file_type().is_symlink() || metadata.is_file() {
         tokio::fs::remove_file(path).await?;
     } else {
@@ -2711,6 +2724,97 @@ mod tests {
         let user_root = default_user_skill_root(&paths);
         assert!(!user_root.join("too-large").exists());
         assert!(!has_import_staging_dirs(&user_root));
+    }
+
+    #[tokio::test]
+    async fn replace_existing_path_removes_regular_file() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("existing-file");
+        std::fs::write(&target, "replace this file").unwrap();
+
+        replace_existing_path(&target).await.unwrap();
+
+        assert_eq!(
+            std::fs::symlink_metadata(&target).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replace_existing_path_removes_file_link_without_touching_target() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source.txt");
+        let target = tmp.path().join("link");
+        std::fs::write(&source, "keep target contents").unwrap();
+        create_symlink(&source, &target).await.unwrap();
+
+        replace_existing_path(&target).await.unwrap();
+
+        assert_eq!(
+            std::fs::symlink_metadata(&target).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "keep target contents");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replace_existing_path_removes_dangling_file_link() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source.txt");
+        let target = tmp.path().join("link");
+        std::fs::write(&source, "old target").unwrap();
+        create_symlink(&source, &target).await.unwrap();
+        std::fs::remove_file(&source).unwrap();
+
+        replace_existing_path(&target).await.unwrap();
+
+        assert_eq!(
+            std::fs::symlink_metadata(&target).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!source.exists());
+    }
+
+    #[tokio::test]
+    async fn replace_existing_path_removes_live_directory_link_without_touching_target() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("link");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("nested/keep.txt"), "keep target contents").unwrap();
+        create_symlink(&source, &target).await.unwrap();
+
+        replace_existing_path(&target).await.unwrap();
+
+        assert_eq!(
+            std::fs::symlink_metadata(&target).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("nested/keep.txt")).unwrap(),
+            "keep target contents"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_existing_path_removes_dangling_directory_link() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("link");
+        std::fs::create_dir(&source).unwrap();
+        create_symlink(&source, &target).await.unwrap();
+        std::fs::remove_dir(&source).unwrap();
+        assert!(std::fs::symlink_metadata(&target).unwrap().file_type().is_symlink());
+
+        replace_existing_path(&target).await.unwrap();
+
+        assert_eq!(
+            std::fs::symlink_metadata(&target).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!source.exists());
     }
 
     #[tokio::test]

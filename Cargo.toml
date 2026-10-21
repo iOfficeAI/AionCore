@@ -35,6 +35,11 @@ version = "0.2.2"
 edition = "2024"
 license = "MIT"
 
+# Keep the SQLx 0.8 / rusqlite 0.32 ABI while compiling the official SQLite
+# WAL-reset fix. See vendor/libsqlite3-sys/AIONUI-PATCH.md for provenance.
+[patch.crates-io]
+libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
+
 [workspace.dependencies]
 # Internal crates
 aionui-common = { path = "crates/aionui-common" }
