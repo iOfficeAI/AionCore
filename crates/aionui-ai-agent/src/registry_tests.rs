@@ -788,3 +788,72 @@ async fn background_recheck_marks_corrupted_install_offline() {
             .is_some_and(|message| message.contains("native binary missing"))
     );
 }
+
+/// Mirrors the row `services/custom.rs` writes for a user-created custom ACP
+/// agent: `backend` is NULL and `behavior_policy.supports_team` is false.
+fn upsert_custom_acp_agent_params<'a>(
+    id: &'a str,
+    agent_capabilities: Option<&'a str>,
+) -> UpsertAgentMetadataParams<'a> {
+    UpsertAgentMetadataParams {
+        id,
+        icon: None,
+        name: "Custom ACP",
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: None,
+        agent_type: "acp",
+        agent_source: "custom",
+        agent_source_info: Some(r#"{"binary_name":"custom-acp"}"#),
+        enabled: true,
+        command: Some("custom-acp"),
+        args: Some("[]"),
+        env: Some("[]"),
+        native_skills_dirs: None,
+        skill_delivery: None,
+        behavior_policy: Some(r#"{"supports_side_question":false,"supports_team":false}"#),
+        yolo_id: None,
+        agent_capabilities,
+        auth_methods: None,
+        config_options: None,
+        available_modes: None,
+        available_models: None,
+        available_commands: None,
+        sort_order: 1500,
+    }
+}
+
+#[tokio::test]
+async fn custom_acp_agent_without_backend_is_team_capable() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let mcp_caps = r#"{"load_session":true,"mcp_capabilities":{"http":true,"sse":true}}"#;
+    let no_mcp_caps = r#"{"load_session":true,"mcp_capabilities":{"http":false,"sse":false}}"#;
+    let no_shell_caps = r#"{"shell":false,"mcp_capabilities":{"http":false,"sse":false}}"#;
+    for (id, caps) in [
+        ("custom-unprobed", None),
+        ("custom-mcp", Some(mcp_caps)),
+        ("custom-no-mcp", Some(no_mcp_caps)),
+        ("custom-no-shell", Some(no_shell_caps)),
+    ] {
+        repo.upsert(&upsert_custom_acp_agent_params(id, caps)).await.unwrap();
+    }
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+
+    // A NULL backend resolves to the `acp` runtime backend, so Team membership
+    // falls through to the same MCP / CLI-fallback inference as any ACP agent.
+    for id in ["custom-unprobed", "custom-mcp", "custom-no-mcp"] {
+        let meta = registry.get(id).await.expect("custom agent hydrated");
+        assert!(meta.backend.is_none());
+        assert!(!meta.behavior_policy.supports_team);
+        assert!(meta.team_capable, "{id} should be team capable");
+    }
+
+    // An agent that explicitly declares it cannot run shell commands has no
+    // Team transport at all and stays excluded.
+    let no_shell = registry.get("custom-no-shell").await.expect("custom agent hydrated");
+    assert!(!no_shell.team_capable);
+}

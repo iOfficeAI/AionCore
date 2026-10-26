@@ -794,7 +794,6 @@ fn decode_row(
     let behavior_policy =
         decode_json_field(row.behavior_policy.as_deref(), "behavior_policy").unwrap_or_else(BehaviorPolicy::default);
 
-    let persisted_backend = row.backend.as_deref().unwrap_or("");
     let runtime_backend = aionui_db::runtime_backend_for_agent(&row);
     let persisted_agent_capabilities = parse_json(row.agent_capabilities.as_deref(), "agent_capabilities");
     let handshake = AgentHandshake {
@@ -816,12 +815,14 @@ fn decode_row(
     // There is deliberately no veto flag on this path: a stored "false" could not
     // be lifted once an agent proved itself, since builtin rows reject metadata
     // edits through the agent API.
+    // Infer from the runtime backend, not the persisted column: custom ACP agents
+    // are stored with a NULL backend, which `is_team_capable` rejects outright.
     let descriptor_team_capable = aionui_session::backend_capability_descriptor(&runtime_backend)
         .map(aionui_session::BackendCapabilityDescriptor::resolved)
         .is_some_and(|capabilities| capabilities.mcp.stdio || capabilities.cli_fallback);
     let team_capable = behavior_policy.supports_team
         || descriptor_team_capable
-        || aionui_common::constants::is_team_capable(persisted_backend, handshake.agent_capabilities.as_ref());
+        || aionui_common::constants::is_team_capable(&runtime_backend, handshake.agent_capabilities.as_ref());
 
     let mut meta = AgentMetadata {
         id: row.id,
