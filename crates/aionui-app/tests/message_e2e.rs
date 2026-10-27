@@ -805,6 +805,111 @@ async fn t2_1b_send_message_legacy_workspace_with_whitespace_succeeds() {
 }
 
 #[tokio::test]
+async fn workspace_move_patch_keeps_two_message_turns_on_new_workspace() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let workspace_a = dir.path().join("workspace-a");
+    let workspace_b = dir.path().join("workspace-b");
+    std::fs::create_dir(&workspace_a).unwrap();
+
+    let create = common::json_with_token(
+        "POST",
+        "/api/conversations",
+        json!({
+            "type": "acp",
+            "name": "Moved Workspace",
+            "extra": {
+                "backend": "gemini",
+                "workspace": workspace_a.to_string_lossy()
+            }
+        }),
+        &token,
+        &csrf,
+    );
+    let create_response = app.clone().oneshot(create).await.unwrap();
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let create_json = body_json(create_response).await;
+    let conv_id = create_json["data"]["id"].as_str().unwrap().to_owned();
+    let owner_user_id = services
+        .conversation_repo
+        .owner_user_id(&conv_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let ensure = common::json_with_token(
+        "POST",
+        &format!("/api/conversations/{conv_id}/runtime/ensure"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let ensure_response = app.clone().oneshot(ensure).await.unwrap();
+    assert_eq!(ensure_response.status(), StatusCode::OK);
+    assert_eq!(
+        services.worker_task_manager.get_task(&conv_id).unwrap().workspace(),
+        workspace_a.to_string_lossy()
+    );
+
+    std::fs::rename(&workspace_a, &workspace_b).unwrap();
+    let patch = common::json_with_token(
+        "PATCH",
+        &format!("/api/conversations/{conv_id}"),
+        json!({ "extra": { "workspace": workspace_b.to_string_lossy() } }),
+        &token,
+        &csrf,
+    );
+    let patch_response = app.clone().oneshot(patch).await.unwrap();
+    assert_eq!(patch_response.status(), StatusCode::OK);
+    assert!(services.worker_task_manager.get_task(&conv_id).is_none());
+
+    for content in ["first turn after move", "second turn after move"] {
+        let send = common::json_with_token(
+            "POST",
+            &format!("/api/conversations/{conv_id}/messages"),
+            json!({ "content": content }),
+            &token,
+            &csrf,
+        );
+        let send_response = app.clone().oneshot(send).await.unwrap();
+        assert_eq!(send_response.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            services.conversation_runtime_state.wait_until_unclaimed(&conv_id),
+        )
+        .await
+        .expect("mock turn should complete");
+
+        let row = services
+            .conversation_repo
+            .get(&owner_user_id, &conv_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+        assert_eq!(extra["workspace"], workspace_b.to_string_lossy().to_string());
+        assert_eq!(
+            services.worker_task_manager.get_task(&conv_id).unwrap().workspace(),
+            workspace_b.to_string_lossy()
+        );
+    }
+
+    let messages = app
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{conv_id}/messages"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let messages_json = body_json(messages).await;
+    assert!(
+        !messages_json.to_string().contains("WORKSPACE_PATH_RUNTIME_UNAVAILABLE"),
+        "moved workspace must remain usable across both turns"
+    );
+}
+
+#[tokio::test]
 async fn t2_1c_send_message_missing_workspace_persists_message_and_failure_tip() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
