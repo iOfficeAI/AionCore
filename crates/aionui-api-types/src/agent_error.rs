@@ -73,6 +73,10 @@ pub enum AgentErrorResolutionKind {
     CheckProviderBilling,
     CheckProviderBaseUrl,
     ChangeModel,
+    /// The resolved context window is what decides when compaction fires, so a
+    /// window configured smaller (or larger) than the model's real one is the
+    /// first thing to check before asking the user to trim messages.
+    AdjustContextWindow,
     ReduceContext,
     SendFeedback,
 }

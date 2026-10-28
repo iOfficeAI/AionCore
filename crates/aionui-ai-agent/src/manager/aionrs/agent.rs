@@ -39,6 +39,7 @@ use crate::types::{AionrsResolvedConfig, SendMessageData};
 
 use super::content::build_content_blocks;
 use super::error::{aionrs_engine_error_to_send_error, aionrs_runtime_error_summary};
+use super::compact_window::apply_engine_compact_window;
 
 fn resolve_aionui_config(cli_args: &CliArgs) -> Result<Config, AgentError> {
     let mut config =
@@ -195,6 +196,12 @@ impl AionrsAgentManager {
         };
 
         let mut config = resolve_aionui_config(&cli_args)?;
+
+        // The engine compacts before every provider call using its own
+        // thresholds, which default to a 200K window. Point them at the window
+        // the user configured for this provider, otherwise long conversations
+        // overflow a smaller model long before the engine reacts.
+        apply_engine_compact_window(&mut config.compact, config_extra.context_limit);
 
         // Backend-specific overrides
         config.bedrock = config_extra.bedrock_config;

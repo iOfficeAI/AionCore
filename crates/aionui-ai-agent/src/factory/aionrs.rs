@@ -193,6 +193,7 @@ pub(super) async fn build(
         max_tool_call_malformed_turns: overrides.max_tool_call_malformed_turns,
         max_tool_call_failure_turns: overrides.max_tool_call_failure_turns,
         compat_overrides,
+        context_limit: row.context_limit,
         session_directory,
         session_mode: overrides.session_mode,
         skills: resolved_skills,

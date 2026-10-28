@@ -19,13 +19,17 @@ pub(super) fn aionrs_engine_error_to_send_error(error: &AionrsAgentError) -> Age
             Some(AgentErrorResolutionTarget::ProviderSettings),
         ),
         AionrsAgentError::ToolCallFailures { .. } => tool_call_failure_send_error(detail),
+        // The engine blocks before the provider call once the estimated context
+        // reaches `context_window - emergency_buffer`. That number is derived
+        // from the provider row's `context_limit`, so the actionable advice is
+        // to check that setting (and to compact) rather than to trim messages.
         AionrsAgentError::ContextTooLong { .. } => provider_send_error(
             "The request is too large for the configured model context window",
             AgentErrorCode::UserLlmProviderContextTooLarge,
             detail,
             false,
-            AgentErrorResolutionKind::ReduceContext,
-            None,
+            AgentErrorResolutionKind::AdjustContextWindow,
+            Some(AgentErrorResolutionTarget::ProviderSettings),
         ),
         AionrsAgentError::ApiError(_) => unknown_upstream_send_error(detail),
         AionrsAgentError::UserAborted => unknown_upstream_send_error(detail),

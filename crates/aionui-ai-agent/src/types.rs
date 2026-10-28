@@ -102,13 +102,45 @@ pub const AIONUI_BASE_URL_ENV: &str = "AIONUI_BASE_URL";
 pub const AIONUI_RUNTIME_TOKEN_ENV: &str = "AIONUI_RUNTIME_TOKEN";
 pub const CONVERSATION_RUNTIME_CONTEXT_VERSION: u32 = 2;
 
+/// Context window a task was built for, as resolved from the provider row.
+///
+/// A live agent's compaction thresholds are frozen when it is built
+/// (`apply_engine_compact_window`), so a later edit to the provider's
+/// `context_limit` only takes effect after the task is rebuilt — comparing this
+/// value is what turns that edit into a rebuild.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ContextWindowCapability {
+    /// The caller could not resolve a provider row, so the window is unknown and
+    /// never forces a rebuild.
+    #[default]
+    Untracked,
+    /// `None` means the provider has no configured limit; that is a value worth
+    /// comparing against a configured one, so clearing the field also rebuilds.
+    Known(Option<i64>),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeCapabilities {
     pub conversation_runtime_context_version: Option<u32>,
+    /// See [`ContextWindowCapability`].
+    pub context_window: ContextWindowCapability,
 }
 
 impl RuntimeCapabilities {
     pub fn satisfies(&self, requested: &Self) -> bool {
+        if !self.version_satisfies(requested) {
+            return false;
+        }
+        match (self.context_window, requested.context_window) {
+            // Only enforce the window when both sides know it: an untracked
+            // agent (built on a path that never stamped the value) must not be
+            // torn down on every turn.
+            (ContextWindowCapability::Known(actual), ContextWindowCapability::Known(expected)) => actual == expected,
+            _ => true,
+        }
+    }
+
+    fn version_satisfies(&self, requested: &Self) -> bool {
         match requested.conversation_runtime_context_version {
             Some(version) => self
                 .conversation_runtime_context_version
@@ -151,6 +183,12 @@ pub struct AionrsResolvedConfig {
     pub max_tool_call_failure_turns: Option<usize>,
     /// Provider-specific compat overrides.
     pub compat_overrides: AionrsCompatOverrides,
+    /// Context window (tokens) configured for this provider, when known.
+    ///
+    /// Drives both the resume-time compaction pass and the engine's own
+    /// per-call compaction thresholds; `None` lets each fall back to its
+    /// conservative default.
+    pub context_limit: Option<i64>,
     /// Directory for aionrs session persistence files.
     pub session_directory: PathBuf,
     /// Session mode (default, auto_edit, yolo).
@@ -172,6 +210,50 @@ mod tests {
     use super::*;
     use aionui_api_types::{AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, SlashCommandItem};
     use serde_json::json;
+
+    fn capabilities(version: Option<u32>, window: ContextWindowCapability) -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            conversation_runtime_context_version: version,
+            context_window: window,
+        }
+    }
+
+    fn known(limit: Option<i64>) -> ContextWindowCapability {
+        ContextWindowCapability::Known(limit)
+    }
+
+    #[test]
+    fn runtime_capabilities_keep_agent_when_context_window_is_unchanged() {
+        let built = capabilities(Some(2), known(Some(131_072)));
+        let requested = capabilities(Some(2), known(Some(131_072)));
+        assert!(built.satisfies(&requested));
+    }
+
+    #[test]
+    fn runtime_capabilities_rebuild_agent_when_context_window_changes() {
+        let built = capabilities(Some(2), known(Some(100_000)));
+        let requested = capabilities(Some(2), known(Some(131_072)));
+        assert!(!built.satisfies(&requested));
+
+        // Configuring a window on a provider that had none is a change too.
+        let built = capabilities(Some(2), known(None));
+        assert!(!built.satisfies(&requested));
+    }
+
+    #[test]
+    fn runtime_capabilities_ignore_an_untracked_window() {
+        // Agents built on paths that never resolved a provider row must not be
+        // torn down on every turn.
+        let built = capabilities(Some(2), ContextWindowCapability::Untracked);
+        assert!(built.satisfies(&capabilities(Some(2), known(Some(131_072)))));
+        assert!(built.satisfies(&capabilities(Some(2), known(None))));
+    }
+
+    #[test]
+    fn runtime_capabilities_still_gate_on_context_version() {
+        let built = capabilities(Some(1), known(Some(131_072)));
+        assert!(!built.satisfies(&capabilities(Some(2), known(Some(131_072)))));
+    }
 
     #[test]
     fn acp_build_extra_accepts_payload_without_skills() {

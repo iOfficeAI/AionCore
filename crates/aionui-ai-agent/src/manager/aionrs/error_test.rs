@@ -144,6 +144,16 @@ fn aionrs_context_too_long_is_provider_context_error() {
     assert_eq!(send_error.code(), Some(AgentErrorCode::UserLlmProviderContextTooLarge));
     assert_eq!(send_error.ownership(), Some(AgentErrorOwnership::UserLlmProvider));
     assert_eq!(send_error.stream_error().retryable, Some(false));
+    // The engine's block limit is `context_window - emergency_buffer`, i.e. it
+    // is derived from the provider row, so the hint points at that setting
+    // instead of telling the user to trim messages.
+    assert_eq!(
+        send_error.stream_error().resolution,
+        Some(AgentErrorResolution::new(
+            AgentErrorResolutionKind::AdjustContextWindow,
+            Some(AgentErrorResolutionTarget::ProviderSettings),
+        ))
+    );
 }
 
 #[test]

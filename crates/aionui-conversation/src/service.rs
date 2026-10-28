@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
-use aionui_ai_agent::types::BuildTaskOptions;
+use aionui_ai_agent::types::{BuildTaskOptions, ContextWindowCapability};
 use aionui_ai_agent::{
     ActiveLeaseRegistry, AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager,
     RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
@@ -62,6 +62,7 @@ use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder}
 use crate::session_mentions;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
+use crate::task_options::provider_model_from_conversation_row;
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
 use std::sync::RwLock;
 
@@ -4808,9 +4809,12 @@ impl ConversationService {
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let seed = self.load_aionrs_permission_seed(row).await?;
-        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options(row, seed)
-            .await
+        let mut options =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+                .build_options(row, seed)
+                .await?;
+        self.stamp_provider_context_window(row, &mut options).await;
+        Ok(options)
     }
 
     pub async fn build_task_options_for_runtime(
@@ -4820,9 +4824,57 @@ impl ConversationService {
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let seed = self.load_aionrs_permission_seed(row).await?;
-        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options_with_workspace_override(row, workspace_override, seed)
-            .await
+        let mut options =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+                .build_options_with_workspace_override(row, workspace_override, seed)
+                .await?;
+        self.stamp_provider_context_window(row, &mut options).await;
+        Ok(options)
+    }
+
+    /// Record which provider context window this task is being built for.
+    ///
+    /// The engine's compaction thresholds are derived from `context_limit`
+    /// exactly once, when the agent is created (`apply_engine_compact_window`),
+    /// so an edited window would otherwise stay dormant until the conversation
+    /// was restarted by hand. Stamping the value onto the options lets
+    /// `WorkerTaskManagerImpl::get_or_build_task` notice the mismatch on the
+    /// next turn and rebuild the task, which re-reads the provider row and
+    /// re-runs the resume-time compaction against the new window.
+    async fn stamp_provider_context_window(
+        &self,
+        row: &aionui_db::models::ConversationRow,
+        options: &mut BuildTaskOptions,
+    ) {
+        let model = provider_model_from_conversation_row(row);
+        if model.provider_id.is_empty() {
+            // No provider selected (yet) — leave the window untracked so the
+            // comparison never forces a rebuild.
+            return;
+        }
+        let Some(provider_repo) = self.provider_repo() else {
+            return;
+        };
+        match provider_repo.find_by_id(&row.user_id, &model.provider_id).await {
+            Ok(Some(provider)) => {
+                options.runtime_capabilities.context_window = ContextWindowCapability::Known(provider.context_limit);
+            }
+            Ok(None) => {
+                debug!(
+                    conversation_id = %row.id,
+                    provider_id = %model.provider_id,
+                    "provider row is gone; leaving the context window untracked"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    conversation_id = %row.id,
+                    provider_id = %model.provider_id,
+                    error = %error,
+                    "failed to read the provider context window; leaving it untracked"
+                );
+            }
+        }
     }
 
     /// Re-read the persisted resume anchor into a turn's `BuildTaskOptions`

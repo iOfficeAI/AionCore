@@ -98,6 +98,7 @@ impl ProviderHealthCheckService {
             max_tool_call_malformed_turns: Some(1),
             max_tool_call_failure_turns: Some(1),
             compat_overrides,
+            context_limit: row.context_limit,
             session_directory: self.data_dir.join("aionrs-health-check-sessions"),
             session_mode: None,
             skills: Vec::new(),
