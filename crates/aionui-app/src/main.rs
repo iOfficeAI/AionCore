@@ -92,6 +92,13 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
         Some(Command::Secret(ref args)) => Ok(commands::run_secret(&cli, args).await?),
         Some(Command::PrepareManagedResources(args)) => Ok(commands::run_prepare_managed_resources(args).await?),
         None => {
+            bootstrap::validate_headless_bind(bootstrap::HeadlessBindRequest {
+                headless: cli.headless,
+                host: &cli.host,
+                local: cli.local || matches!(cli.identity_mode, cli::IdentityModeArg::Local),
+                allow_non_loopback_bind: cli.allow_non_loopback_bind,
+            })?;
+
             let mut env = bootstrap::init_environment(&cli, &merged_path)?;
 
             // Acquire the data-dir process-level guard before binding a port or
@@ -148,6 +155,10 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
             };
 
             let listener = commands::bind_http_listener(&mut env.config).await?;
+            if cli.headless {
+                // Stable machine-readable banner for SSH tunnel / smoke scripts.
+                println!("{}", bootstrap::headless_ready_line(&env.config.host, env.config.port));
+            }
             let database = bootstrap::init_data_layer(&env.config).await?;
             let services = AppServices::from_config(database, &env.config).await.map_err(|error| {
                 bootstrap::BootstrapError::new(

@@ -71,6 +71,15 @@ pub(crate) struct Cli {
     #[arg(long, value_enum, default_value_t = ManagedResourcesModeArg::Download)]
     pub managed_resources_mode: ManagedResourcesModeArg,
 
+    /// Run as a headless remote Host (E14). No GUI assumptions; requires real
+    /// auth (rejects `--local`); binds loopback unless `--allow-non-loopback-bind`.
+    #[arg(long)]
+    pub headless: bool,
+
+    /// Allow `--headless` to bind a non-loopback address (explicit opt-in; D14-1).
+    #[arg(long)]
+    pub allow_non_loopback_bind: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

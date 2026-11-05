@@ -338,7 +338,7 @@ pub use usage::{
     ContextBreakdownResponse, ContextBreakdownSegment, ContextSegmentSource, UsageCostAmount, UsageEventDto,
     UsageGroupBy, UsageListQuery, UsageListResponse, UsageSummaryGroup, UsageSummaryQuery, UsageSummaryResponse,
 };
-pub use websocket::WebSocketMessage;
+pub use websocket::{EventCursor, WebSocketMessage};
 
 #[cfg(test)]
 mod public_contract_tests {
