@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [0.4.0](https://github.com/suoak/AionCore/compare/v0.2.20...v0.4.0) (2026-11-05)
 
 ### Behavior Changes
 
@@ -10,6 +10,86 @@
 * **security/team:** 未绑定助手的团队成员不再挂载用户全局 MCP。此前此类成员会继承所有已启用的用户 MCP 及内置 MCP；现在只按所绑定助手的 MCP 白名单（`mcp_ids`）挂载，未绑定则默认不挂任何用户/内置 MCP。团队自身的 aionui-team 工具服务器不受影响。如需给成员使用 MCP，请为其绑定助手并在助手中勾选。（M7 E1 遗留①）
 * **security/team:** Agent 令牌访问 `/api/teams` 时只能看到自身会话所属的团队；`GET /api/teams` 结果被过滤，读取无关或不存在的团队（含 `/tasks`、`/mailbox`、`/activity`、`/run-state` 等子路由）返回 403 `AGENT_SCOPE_DENIED`。用户会话不受影响。（M7 E1 遗留②）
 * **security/session:** `@@` 跨会话投递授权改为持久化（新表 `session_mention_grants`，迁移 068），重启后仍然有效，无需用户重新 `@@`。只信任服务端写入的授权记录，不会从历史文本中重新解析；删除会话时双向清除；加载失败则从空开始（fail closed）。（M7 E1 遗留③）
+* **m8:** 新迁移 072–080（任务看板、技能来源/版本、Squad 模板、工作项、批量任务、Autopilot、设备、审计账本、角色/策略），从 0.2.20 升级时一次性执行；降级回 0.2.20 会被拒绝启动（`BOOTSTRAP_DATA_INIT_FAILED`，`database.newer_than_app`）。
+* **governance:** 新增角色（owner/admin/member，仅 WebUI 多用户模式生效，桌面单机默认 owner）与启动策略开关 `no_yolo`、`mcp_strict_only`、`banned_backends`、`force_sandbox`，全部默认关闭；`no_yolo` 打开后 Autopilot 的 full-auto 也会被拦截。
+* **audit:** 新增只追加、哈希链式的审计账本（`/api/audit/events`、`/verify`、`/export.csv`）；密钥只记录指纹，记录永久保留。
+* **mobile:** 新增手机设备配对与 `wmd_` 设备令牌；审批与阻塞项可推送到已配对设备，任务结束或被取代时相关审批自动关闭。
+* **skills:** 待审核或被拒绝的技能不再进入会话；恢复旧版本会先把当前内容存成新版本；团队技能库按整个安装视为一个团队，仅多用户模式可见。
+* **board:** GitHub Issue 只读导入依赖本机已登录的 `gh`，仅手动触发。
+
+
+### Features
+
+* **approvals:** flag truncated agent-approval summaries (M8 E9-5) ([#214](https://github.com/suoak/AionCore/issues/214)) ([cafb00b](https://github.com/suoak/AionCore/commit/cafb00bb987652c927bd373f4ca733e24147b0a6))
+* **approvals:** report who decided a task approval and link inbox items (M8 E9-3) ([#213](https://github.com/suoak/AionCore/issues/213)) ([4ee717d](https://github.com/suoak/AionCore/commit/4ee717da0e704c5e4d25bd703784c63445b39f71))
+* **audit:** append-only hash-chained audit ledger + /api/audit (M8 E12-2) ([#216](https://github.com/suoak/AionCore/issues/216)) ([c3bc742](https://github.com/suoak/AionCore/commit/c3bc7421744a3810678f17371b5079891b3a3c1c))
+* **audit:** route-level audit write points and device ledger backfill (M8 E12-4) ([#218](https://github.com/suoak/AionCore/issues/218)) ([88167b8](https://github.com/suoak/AionCore/commit/88167b89c7b98cb1e0dfdb391d0fd3449257ea99))
+* **auth:** accept desktop keychain encryption root over stdin (M8 E12-6a) ([#219](https://github.com/suoak/AionCore/issues/219)) ([a00dd0f](https://github.com/suoak/AionCore/commit/a00dd0fd8f94ad21607253098c0fb4769bfb59fe))
+* **auth:** device list/rename/revoke API and websocket kick on revoke (M8 E9-2) ([#210](https://github.com/suoak/AionCore/issues/210)) ([34e1822](https://github.com/suoak/AionCore/commit/34e1822f9ebcd21554cdc6b0c2696198151e8cbb))
+* **auth:** mobile device pairing and scoped device tokens (M8 E9-1) ([#209](https://github.com/suoak/AionCore/issues/209)) ([574651e](https://github.com/suoak/AionCore/commit/574651e48a8661d962883f1b46757f7c403c330a))
+* **auth:** narrow helper runtime token scopes to installed skills (B-15) ([#181](https://github.com/suoak/AionCore/issues/181)) ([3f593d5](https://github.com/suoak/AionCore/commit/3f593d5120c79d0f6fedd048ceee10e9f5364e34))
+* **batch:** /api/batch routes and app wiring — executor, worktrees, realtime, boot recovery (M8 E8-4) ([#205](https://github.com/suoak/AionCore/issues/205)) ([cd4efb5](https://github.com/suoak/AionCore/commit/cd4efb5cc3b40e4918349d2fb21e23e1da272237))
+* **batch:** aionui-batch crate, artifact checks, job validation (M8 E8-2) ([#203](https://github.com/suoak/AionCore/issues/203)) ([e63151c](https://github.com/suoak/AionCore/commit/e63151cb59e2a03071b5c3a05f9e9075d3db42ac))
+* **batch:** BatchRunner and BatchService — trial gate, concurrency, timeouts, retry/cancel (M8 E8-3) ([#204](https://github.com/suoak/AionCore/issues/204)) ([a4501c6](https://github.com/suoak/AionCore/commit/a4501c664a20d56294a0a1504c557ab8634ac832))
+* **batch:** one Inbox summary per batch job when it ends (M8 E8) ([#208](https://github.com/suoak/AionCore/issues/208)) ([45a1e49](https://github.com/suoak/AionCore/commit/45a1e49401abca9e55c8eb6d53db09793a121e2e))
+* **board:** E6-3 board service, state machine, review gate and HTTP API; ADR 0001 ([#184](https://github.com/suoak/AionCore/issues/184)) ([594e5c0](https://github.com/suoak/AionCore/commit/594e5c012d42980fdd897a701c52cd0ac760678a))
+* **board:** push task.board.updated / task.comment.* events and optional expected_updated_at lock on PATCH ([#185](https://github.com/suoak/AionCore/issues/185)) ([c3373e0](https://github.com/suoak/AionCore/commit/c3373e02cc1ddca83a0ea57aba78ddebd5773a58))
+* **board:** read-only GitHub Issue import (M8 E6-7) ([#227](https://github.com/suoak/AionCore/issues/227)) ([6189a50](https://github.com/suoak/AionCore/commit/6189a50e8571c70c621802417ad23a9cd8afc295))
+* **context:** claude context categories writer + tool/skill estimates (M7 E5-3b) ([#174](https://github.com/suoak/AionCore/issues/174)) ([b6b2ce6](https://github.com/suoak/AionCore/commit/b6b2ce6ebb1755ac92eb5cb423a12fcdef7f6c18))
+* **conversation:** raise Plan/Goal approvals to Inbox and emit task.approval.changed (M8 E9-7a) ([#212](https://github.com/suoak/AionCore/issues/212)) ([db34b06](https://github.com/suoak/AionCore/commit/db34b06c43167cd53c72c95e23b72df181ac9f52))
+* **cron:** deliver Autopilot results to IM and Inbox (E8-6, part 2) ([#207](https://github.com/suoak/AionCore/issues/207)) ([20ae7bf](https://github.com/suoak/AionCore/commit/20ae7bf28a11738488abf515dcf37a78ff40f04e))
+* **cron:** E8-6 Autopilot guardrails and migration 077 ([#206](https://github.com/suoak/AionCore/issues/206)) ([94f0466](https://github.com/suoak/AionCore/commit/94f04661888ff7f9700a4bfa18a62fc26a5d5335))
+* **db:** batch_jobs/items data layer (M8 E8-1, migration 076) ([#197](https://github.com/suoak/AionCore/issues/197)) ([3dfed0f](https://github.com/suoak/AionCore/commit/3dfed0f93d069a844856a4c9d93e2c9037478020))
+* **db:** task board data model on task_sessions (M8 E6-2) ([#182](https://github.com/suoak/AionCore/issues/182)) ([153b389](https://github.com/suoak/AionCore/commit/153b389769d1e2b1364dae3acdce0a98769cb894))
+* **governance:** apply no_yolo to Autopilot full-auto (M8 E12) ([#225](https://github.com/suoak/AionCore/issues/225)) ([3cf72d4](https://github.com/suoak/AionCore/commit/3cf72d4bc1ef01a8e1c1c35982ccd19f1466e594))
+* **governance:** roles, agent run permissions and launch policies (M8 E12-3) ([#217](https://github.com/suoak/AionCore/issues/217)) ([2e581d2](https://github.com/suoak/AionCore/commit/2e581d2dd092ff46d774bdc963cae08bb229cbc6))
+* **inbox:** close invalidated approval items and add GET /api/inbox/{id} (M8 E9-7) ([#215](https://github.com/suoak/AionCore/issues/215)) ([56f3a49](https://github.com/suoak/AionCore/commit/56f3a490f50ac16a65c2e14ee224bae14933f123))
+* **inbox:** inbox items (M7 E5-4) [WIP] ([#175](https://github.com/suoak/AionCore/issues/175)) ([c2c751c](https://github.com/suoak/AionCore/commit/c2c751ccb8f3a9f9cd8808d46d9a3be77d550774))
+* **m7/e1:** gemini managed MCP isolation + honest ACP/antigravity tool surface ([#156](https://github.com/suoak/AionCore/issues/156)) ([0814ce2](https://github.com/suoak/AionCore/commit/0814ce239ac4c76353a6c05afe3405fb953ba357))
+* **m7/e3-1:** managed git worktree service (aionui-worktree, migration 066) ([#158](https://github.com/suoak/AionCore/issues/158)) ([98ebccd](https://github.com/suoak/AionCore/commit/98ebccd567085b8fcedc5f0cf0c701063b3b104e))
+* **m7/e3-2:** bind conversations to managed worktrees (worktree_id, workspace lock, unbind on delete, managed_worktree_id, diff routes) ([#162](https://github.com/suoak/AionCore/issues/162)) ([ce9e641](https://github.com/suoak/AionCore/commit/ce9e641790b51510289d7cd4f08a6eb6f8981a43))
+* **m7/e3-4:** FanoutService and /api/fanout-groups* ([#165](https://github.com/suoak/AionCore/issues/165)) ([2db0206](https://github.com/suoak/AionCore/commit/2db020631219784b6f9441109a6fcd1c9f0f0c84))
+* **m7/e4-1:** review threads (diff annotations) — migration 065, aionui-review crate, /api/review-threads* ([#159](https://github.com/suoak/AionCore/issues/159)) ([e868207](https://github.com/suoak/AionCore/commit/e8682075fd8ce8175815215dcbef3c7bbbd9c80d))
+* **m7/e4-2:** review scm scopes by project-explorer ref (pe:{pe_id}[/{rel}]) ([#160](https://github.com/suoak/AionCore/issues/160)) ([d4cde05](https://github.com/suoak/AionCore/commit/d4cde05c5ea0622fdba7955dcc21f3a5d8f477c2))
+* **m7/e4-3:** review batches — send annotations to the agent as one [[AION_REVIEW]] block ([#161](https://github.com/suoak/AionCore/issues/161)) ([752e248](https://github.com/suoak/AionCore/commit/752e248d4f7c66c38cfaf610fd5932bf5684b1d3))
+* **m7/e4-4:** scm/commit, scm/push, scm/remoteInfo and scm/progress over GitCli ([#163](https://github.com/suoak/AionCore/issues/163)) ([3a2c885](https://github.com/suoak/AionCore/commit/3a2c885493e39ccee21d04810769667d29a0ed61))
+* **m8:** Q9 agent backlog work-item proposals via approval + Squad board projection e2e ([#202](https://github.com/suoak/AionCore/issues/202)) ([beae0db](https://github.com/suoak/AionCore/commit/beae0db0f111b682648549cee1accc98e4ece9c0))
+* **review:** PR delivery via gh/glab with task evidence (M7 E4-5) ([#164](https://github.com/suoak/AionCore/issues/164)) ([db773eb](https://github.com/suoak/AionCore/commit/db773ebd1c7de2e4df071f634d952ae367cd5ae3))
+* **security:** short-lived tokens for extension settings-tab assets (E1 tail ④) ([#171](https://github.com/suoak/AionCore/issues/171)) ([dfada0c](https://github.com/suoak/AionCore/commit/dfada0c8c47560cc433b8000eccbb1e7ef2d1fd4))
+* **skills:** E10-2 import/refresh/review/visibility APIs + secure git/url fetch ([#187](https://github.com/suoak/AionCore/issues/187)) ([386f0fe](https://github.com/suoak/AionCore/commit/386f0fef0012f3c3cfa16781d116a10d6db8bc64))
+* **skills:** E10-2b api-types for governance, legacy import records versions, skill_id on list ([#188](https://github.com/suoak/AionCore/issues/188)) ([497dcd6](https://github.com/suoak/AionCore/commit/497dcd62d31615b0c93bcaf0243b9b18b143f9de))
+* **skills:** E10-5 installation team skill library (publish, use, copy to private) ([#223](https://github.com/suoak/AionCore/issues/223)) ([6c43ec2](https://github.com/suoak/AionCore/commit/6c43ec29f5d5924f9e18c9fb9fec515fb9259582))
+* **skills:** E10-6 feed E4/E6 review signals into skill evolution as evidence ([#221](https://github.com/suoak/AionCore/issues/221)) ([450bfd7](https://github.com/suoak/AionCore/commit/450bfd7b738263864bc50ce4fb2ddd36257d5e5b))
+* **skills:** M8 E10-1 skill sources + append-only versions + script review gate (migration 073) ([#186](https://github.com/suoak/AionCore/issues/186)) ([7ebcf6a](https://github.com/suoak/AionCore/commit/7ebcf6a2dddf95e8b5fec9372a5f5637ff13e2e9))
+* **skills:** version diff/restore routes and review gate in the resolver (M8 E10-3) ([#220](https://github.com/suoak/AionCore/issues/220)) ([4c19064](https://github.com/suoak/AionCore/commit/4c1906494bf07233b9bf025fa573533793273048))
+* **squad:** E7-2 squad instantiate + preview, runtime no-spawn rule ([#190](https://github.com/suoak/AionCore/issues/190)) ([6758efd](https://github.com/suoak/AionCore/commit/6758efd90564fdbac3614ba4258b5eb4a100c4bc))
+* **squad:** E7-3 runtime route_only Leader tool enforcement ([#191](https://github.com/suoak/AionCore/issues/191)) ([895fa2b](https://github.com/suoak/AionCore/commit/895fa2bedc3b57916a7d41a7865f047fef0ef2db))
+* **squad:** E7-4 backend native tool exclusion + router prompt + stdio tools/list ([#192](https://github.com/suoak/AionCore/issues/192)) ([9700ab7](https://github.com/suoak/AionCore/commit/9700ab796e2832b690d6bdfa18c15575721f471e))
+* **squad:** E7-5 GET /api/teams/{id}/squad-run ([#193](https://github.com/suoak/AionCore/issues/193)) ([c363705](https://github.com/suoak/AionCore/commit/c3637055c1e54d55d19389f53d520e74a55c65eb))
+* **squad:** one shared worktree per work item (M8 Q12) ([#201](https://github.com/suoak/AionCore/issues/201)) ([c03f5d7](https://github.com/suoak/AionCore/commit/c03f5d7e643df58ca56e960c9cbcfeaab9c78b5a))
+* **squad:** push task.board.updated on Squad run-state change (M8 E7-6c) ([#196](https://github.com/suoak/AionCore/issues/196)) ([e226a97](https://github.com/suoak/AionCore/commit/e226a973a917f1fa30cfb5802cad1001a7fbb1ca))
+* **squad:** squad_run on board cards via work-item link (M8 E7-6b) ([#195](https://github.com/suoak/AionCore/issues/195)) ([b845954](https://github.com/suoak/AionCore/commit/b845954ace7d9cc8857474ddf2dacd2310f3f537))
+* **squads:** E7-1 squad templates — migration 074, repo, CRUD /api/squads, agent_scope ([#189](https://github.com/suoak/AionCore/issues/189)) ([8eba155](https://github.com/suoak/AionCore/commit/8eba1553d8ae8d8f5565ad66e26b75ad90b9a625))
+* **task:** bounded retry + timeout for approved execution runs (M7 E5-5) ([#176](https://github.com/suoak/AionCore/issues/176)) ([1277520](https://github.com/suoak/AionCore/commit/127752045426547c7113e7181fe149520c5d767d))
+* **task:** paged run replay and unavailable usage rows (M7 E5-2) ([#172](https://github.com/suoak/AionCore/issues/172)) ([76404e7](https://github.com/suoak/AionCore/commit/76404e74e515f42df9d104df520285480b9aaa1e))
+* **task:** push task.trace.appended on every persisted trace event (M7 E5) ([#177](https://github.com/suoak/AionCore/issues/177)) ([1364679](https://github.com/suoak/AionCore/commit/1364679e221625238491f76920c999b2a280f12e))
+* **team:** squad_run / leader mode / role titles on team responses (M8 E7-6a) ([#194](https://github.com/suoak/AionCore/issues/194)) ([1bc3a28](https://github.com/suoak/AionCore/commit/1bc3a28388cfa8b5fe85afa15de40f17242c932d))
+* **usage:** context-ring breakdown endpoint (M7 E5-3) ([#173](https://github.com/suoak/AionCore/issues/173)) ([d7d30a7](https://github.com/suoak/AionCore/commit/d7d30a7a5bcc3ff9b7dd5b414429a1f0c19cb0cd))
+* **usage:** task-linked usage ledger and /api/usage/summary (E5-1) ([#168](https://github.com/suoak/AionCore/issues/168)) ([08f8eca](https://github.com/suoak/AionCore/commit/08f8eca51f6c61fa0e2cb0e3c42ceeb8df422268))
+* **worktree:** disk estimate endpoint and 3-slot branch_only fan-out flow test (E3-5/E3-6) ([#166](https://github.com/suoak/AionCore/issues/166)) ([7e19aa1](https://github.com/suoak/AionCore/commit/7e19aa1dc611639e75324201692476bb9b26aac3))
+* E6-5: assign Agent auto-start + completed→in_review ([#198](https://github.com/suoak/AionCore/issues/198)) ([f4e8f64](https://github.com/suoak/AionCore/commit/f4e8f642e237d00646eb2e14e7d495508006a4d7))
+* E7-4: Squad trigger rules (self-reject / dispatch dedup / backlog pause) ([#199](https://github.com/suoak/AionCore/issues/199)) ([df63b92](https://github.com/suoak/AionCore/commit/df63b9262f5ebb5d994266c3e5b4dcd7e3b6766d))
+* E7-5-timeline: Leader eval writes work-item timeline ([#200](https://github.com/suoak/AionCore/issues/200)) ([9ccdda3](https://github.com/suoak/AionCore/commit/9ccdda339389eb93962a9b501c057813b896cb86))
+* push approval/blocked inbox items to paired devices over IM (M8 E9-6) ([#211](https://github.com/suoak/AionCore/issues/211)) ([8121887](https://github.com/suoak/AionCore/commit/81218872484d84adabe29b6d6ac292f785994cb2))
+
+### Bug Fixes
+
+* **deps:** bump calamine 0.37 → 0.38 (RUSTSEC-2026-0436 CFB/OLE2 panic/OOM) ([#229](https://github.com/suoak/AionCore/issues/229)) ([2c3089d](https://github.com/suoak/AionCore/commit/2c3089dc76e64e1e8a8dd965a588b767c85a00a2))
+* **cron:** buffer Autopilot reports until the notifier is installed (M8) ([#226](https://github.com/suoak/AionCore/issues/226)) ([6d849e3](https://github.com/suoak/AionCore/commit/6d849e36ff023e4cec2169934ce2238976caff0c))
+* **security:** persist @@ session delivery grants across restarts (E1 tail ③) ([#170](https://github.com/suoak/AionCore/issues/170)) ([d3ee378](https://github.com/suoak/AionCore/commit/d3ee378268b38914a9c9cafd9b932f9d3b957c07))
+* **security:** scope /api/teams reads for agent tokens to own teams (E1 tail ②) ([#169](https://github.com/suoak/AionCore/issues/169)) ([ddcf8c1](https://github.com/suoak/AionCore/commit/ddcf8c1b00e8e6ff1a5a13f6d3e3c2c137bdf924))
+* **security:** unbound team members mount no user MCP by default (E1 tail ①) ([#167](https://github.com/suoak/AionCore/issues/167)) ([6eb1827](https://github.com/suoak/AionCore/commit/6eb18271a28f95c93ed770d9d37a88ab66704dec))
+* **task:** user cancel stops retry chain; hard cap for unresponsive agents (E5-5 follow-up) ([#178](https://github.com/suoak/AionCore/issues/178)) ([e2f9108](https://github.com/suoak/AionCore/commit/e2f9108cdaf67e2466338d0f052427b5e02184ad))
 
 ## [0.2.20](https://github.com/suoak/AionCore/compare/v0.2.19...v0.2.20) (2026-10-22)
 
