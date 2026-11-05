@@ -9,6 +9,7 @@ pub mod acp_adapter;
 pub mod agent;
 pub mod assistant;
 pub mod channel_plugin;
+pub mod contract_v1;
 pub mod i18n;
 pub mod mcp_server;
 pub mod model_provider;
@@ -45,6 +46,11 @@ pub fn resolve_extension_contributions(ext: &LoadedExtension) -> ResolvedContrib
         webui: webui::resolve_webui_contributions(&contributes.webui, ext_name, ext_dir),
         settings_tabs: settings_tab::resolve_settings_tabs(&contributes.settings_tabs, ext_name, ext_dir),
         model_providers: model_provider::resolve_model_providers(&contributes.model_providers, ext_name),
+        commands: contract_v1::resolve_commands(&contributes.commands, ext_name),
+        panels: contract_v1::resolve_panels(&contributes.panels, ext_name, ext_dir),
+        work_panel_views: contract_v1::resolve_work_panel_views(&contributes.work_panel_views, ext_name, ext_dir),
+        agent_tools: contract_v1::resolve_agent_tools(&contributes.agent_tools, ext_name),
+        background_services: contract_v1::resolve_background_services(&contributes.background_services, ext_name),
         // i18n is resolved separately via resolve_i18n_for_locale()
         // because it requires a locale parameter at query time.
         i18n: std::collections::HashMap::new(),
@@ -94,6 +100,11 @@ fn merge_contributions(target: &mut ResolvedContributions, source: ResolvedContr
     target.webui.extend(source.webui);
     target.settings_tabs.extend(source.settings_tabs);
     target.model_providers.extend(source.model_providers);
+    target.commands.extend(source.commands);
+    target.panels.extend(source.panels);
+    target.work_panel_views.extend(source.work_panel_views);
+    target.agent_tools.extend(source.agent_tools);
+    target.background_services.extend(source.background_services);
     target.i18n.extend(source.i18n);
 }
 

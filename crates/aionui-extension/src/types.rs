@@ -743,6 +743,70 @@ pub struct ResolvedModelProvider {
 }
 
 // ---------------------------------------------------------------------------
+// H'. Plugin Contract v1 resolved contributions (M9 E13)
+// ---------------------------------------------------------------------------
+
+/// Resolved command-palette entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResolvedCommand {
+    pub extension_name: String,
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keybinding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+}
+
+/// Resolved standalone panel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResolvedPanel {
+    pub extension_name: String,
+    pub id: String,
+    pub title: String,
+    /// Asset URL under `/api/extensions/{name}/assets/...` or remote URL.
+    pub entry_point: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+}
+
+/// Resolved work-panel / sidebar view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResolvedWorkPanelView {
+    pub extension_name: String,
+    pub id: String,
+    pub title: String,
+    pub entry_point: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+}
+
+/// Resolved agent tool; `plan_safe_actions` defaults false at parse time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResolvedAgentTool {
+    pub extension_name: String,
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub plan_safe_actions: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler: Option<String>,
+}
+
+/// Resolved background service declaration (not spawned by this slice).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResolvedBackgroundService {
+    pub extension_name: String,
+    pub id: String,
+    pub entry_point: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // H. Resolved contributions container
 // ---------------------------------------------------------------------------
 
@@ -759,6 +823,21 @@ pub struct ResolvedContributions {
     pub webui: Vec<WebuiContribution>,
     pub settings_tabs: Vec<ResolvedSettingsTab>,
     pub model_providers: Vec<ResolvedModelProvider>,
+    /// Command-palette entries (Plugin Contract v1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<ResolvedCommand>,
+    /// Standalone panels (Plugin Contract v1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub panels: Vec<ResolvedPanel>,
+    /// Work-panel views (Plugin Contract v1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_panel_views: Vec<ResolvedWorkPanelView>,
+    /// Agent tools (Plugin Contract v1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_tools: Vec<ResolvedAgentTool>,
+    /// Background services (Plugin Contract v1; declaration only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_services: Vec<ResolvedBackgroundService>,
     /// i18n data keyed by extension name, then by message key.
     pub i18n: HashMap<String, HashMap<String, String>>,
 }

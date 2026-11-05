@@ -19,8 +19,9 @@ use crate::resolvers::{resolve_all_contributions, resolve_i18n_for_all};
 use crate::state::ExtensionStateStore;
 use crate::types::{
     ExtensionLifecyclePayload, ExtensionState, ExtensionSystemEvent, LoadedExtension, ResolvedAcpAdapter,
-    ResolvedAgent, ResolvedAssistant, ResolvedChannelPlugin, ResolvedContributions, ResolvedModelProvider,
-    ResolvedSettingsTab, ResolvedSkill, ResolvedTheme, WebuiContribution,
+    ResolvedAgent, ResolvedAgentTool, ResolvedAssistant, ResolvedBackgroundService, ResolvedChannelPlugin,
+    ResolvedCommand, ResolvedContributions, ResolvedModelProvider, ResolvedPanel, ResolvedSettingsTab, ResolvedSkill,
+    ResolvedTheme, ResolvedWorkPanelView, WebuiContribution,
 };
 
 // Re-export ExtensionSummary from registry_helpers so that
@@ -435,6 +436,46 @@ impl ExtensionRegistry {
 
     pub async fn get_model_providers_for_user(&self, user_id: &str) -> Vec<ResolvedModelProvider> {
         self.get_contributions_for_user(user_id).await.model_providers
+    }
+
+    pub async fn get_commands(&self) -> Vec<ResolvedCommand> {
+        self.get_commands_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    pub async fn get_commands_for_user(&self, user_id: &str) -> Vec<ResolvedCommand> {
+        self.get_contributions_for_user(user_id).await.commands
+    }
+
+    pub async fn get_panels(&self) -> Vec<ResolvedPanel> {
+        self.get_panels_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    pub async fn get_panels_for_user(&self, user_id: &str) -> Vec<ResolvedPanel> {
+        self.get_contributions_for_user(user_id).await.panels
+    }
+
+    pub async fn get_work_panel_views(&self) -> Vec<ResolvedWorkPanelView> {
+        self.get_work_panel_views_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    pub async fn get_work_panel_views_for_user(&self, user_id: &str) -> Vec<ResolvedWorkPanelView> {
+        self.get_contributions_for_user(user_id).await.work_panel_views
+    }
+
+    pub async fn get_agent_tools(&self) -> Vec<ResolvedAgentTool> {
+        self.get_agent_tools_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    pub async fn get_agent_tools_for_user(&self, user_id: &str) -> Vec<ResolvedAgentTool> {
+        self.get_contributions_for_user(user_id).await.agent_tools
+    }
+
+    pub async fn get_background_services(&self) -> Vec<ResolvedBackgroundService> {
+        self.get_background_services_for_user(SYSTEM_DEFAULT_USER_ID).await
+    }
+
+    pub async fn get_background_services_for_user(&self, user_id: &str) -> Vec<ResolvedBackgroundService> {
+        self.get_contributions_for_user(user_id).await.background_services
     }
 
     /// Resolve i18n data for a given locale across all enabled extensions.

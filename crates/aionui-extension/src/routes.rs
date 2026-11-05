@@ -170,6 +170,11 @@ pub fn extension_routes(state: ExtensionRouterState) -> Router {
         .route("/api/extensions/skills", get(get_skills))
         .route("/api/extensions/channel-plugins", get(get_channel_plugins))
         .route("/api/extensions/settings-tabs", get(get_settings_tabs))
+        .route("/api/extensions/commands", get(get_commands))
+        .route("/api/extensions/panels", get(get_panels))
+        .route("/api/extensions/work-panel-views", get(get_work_panel_views))
+        .route("/api/extensions/agent-tools", get(get_agent_tools))
+        .route("/api/extensions/background-services", get(get_background_services))
         .route(
             "/api/extensions/{extension_name}/assets/{*asset_path}",
             get(get_extension_asset),
@@ -472,6 +477,51 @@ async fn get_settings_tabs(
     let tabs = state.registry.get_settings_tabs_for_user(&user.id).await;
     let value = serde_json::to_value(&tabs).unwrap_or_default();
     Ok(Json(ApiResponse::ok(value)))
+}
+
+/// `GET /api/extensions/commands` — Plugin Contract v1 command contributions.
+async fn get_commands(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let items = state.registry.get_commands_for_user(&user.id).await;
+    Ok(Json(ApiResponse::ok(serde_json::to_value(&items).unwrap_or_default())))
+}
+
+/// `GET /api/extensions/panels` — Plugin Contract v1 panel contributions.
+async fn get_panels(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let items = state.registry.get_panels_for_user(&user.id).await;
+    Ok(Json(ApiResponse::ok(serde_json::to_value(&items).unwrap_or_default())))
+}
+
+/// `GET /api/extensions/work-panel-views` — Plugin Contract v1 work-panel views.
+async fn get_work_panel_views(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let items = state.registry.get_work_panel_views_for_user(&user.id).await;
+    Ok(Json(ApiResponse::ok(serde_json::to_value(&items).unwrap_or_default())))
+}
+
+/// `GET /api/extensions/agent-tools` — Plugin Contract v1 agent tools.
+async fn get_agent_tools(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let items = state.registry.get_agent_tools_for_user(&user.id).await;
+    Ok(Json(ApiResponse::ok(serde_json::to_value(&items).unwrap_or_default())))
+}
+
+/// `GET /api/extensions/background-services` — Plugin Contract v1 background services (declaration only).
+async fn get_background_services(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let items = state.registry.get_background_services_for_user(&user.id).await;
+    Ok(Json(ApiResponse::ok(serde_json::to_value(&items).unwrap_or_default())))
 }
 
 /// `GET /api/extensions/{extension_name}/assets/{*asset_path}` — serve an
