@@ -191,6 +191,9 @@ fn normalize_contributes(value: &mut Value) {
     move_key(obj, "channelPlugins", "channel_plugins");
     move_key(obj, "settingsTabs", "settings_tabs");
     move_key(obj, "modelProviders", "model_providers");
+    move_key(obj, "workPanelViews", "work_panel_views");
+    move_key(obj, "agentTools", "agent_tools");
+    move_key(obj, "backgroundServices", "background_services");
 
     normalize_array_entries(obj.get_mut("acp_adapters"), normalize_acp_adapter);
     normalize_array_entries(obj.get_mut("mcp_servers"), normalize_mcp_server);
@@ -201,10 +204,47 @@ fn normalize_contributes(value: &mut Value) {
     normalize_array_entries(obj.get_mut("themes"), normalize_theme);
     normalize_array_entries(obj.get_mut("settings_tabs"), normalize_settings_tab);
     normalize_array_entries(obj.get_mut("model_providers"), normalize_model_provider);
+    normalize_array_entries(obj.get_mut("commands"), normalize_command);
+    normalize_array_entries(obj.get_mut("panels"), normalize_panel);
+    normalize_array_entries(obj.get_mut("work_panel_views"), normalize_work_panel_view);
+    normalize_array_entries(obj.get_mut("agent_tools"), normalize_agent_tool);
+    normalize_array_entries(obj.get_mut("background_services"), normalize_background_service);
 
     if let Some(webui) = obj.get_mut("webui") {
         normalize_webui(webui);
     }
+}
+
+fn normalize_command(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    move_key(obj, "keyBinding", "keybinding");
+}
+
+fn normalize_panel(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    move_key(obj, "entryPoint", "entry_point");
+}
+
+fn normalize_work_panel_view(value: &mut Value) {
+    normalize_panel(value);
+}
+
+fn normalize_agent_tool(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    move_key(obj, "planSafeActions", "plan_safe_actions");
+}
+
+fn normalize_background_service(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    move_key(obj, "entryPoint", "entry_point");
 }
 
 fn normalize_array_entries(value: Option<&mut Value>, normalize_item: fn(&mut Value)) {

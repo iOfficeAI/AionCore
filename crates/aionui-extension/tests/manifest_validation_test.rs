@@ -144,3 +144,89 @@ fn validate_manifest_directly() {
     };
     assert!(validate_manifest(&manifest).is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// Plugin Contract v1 contribution points
+// ---------------------------------------------------------------------------
+
+#[test]
+fn contract_v1_parses_new_contribution_points_camel_case() {
+    let json = r#"{
+        "name": "contract-demo",
+        "version": "1.0.0",
+        "contributes": {
+            "commands": [
+                { "id": "demo.hello", "title": "Hello", "keybinding": "ctrl+h" }
+            ],
+            "panels": [
+                { "id": "demo.panel", "title": "Demo", "entryPoint": "panels/main.html" }
+            ],
+            "workPanelViews": [
+                { "id": "demo.work", "title": "Work", "entryPoint": "views/work.html", "placement": "secondary" }
+            ],
+            "agentTools": [
+                {
+                    "id": "demo.summarize",
+                    "name": "Summarize",
+                    "description": "Read-only",
+                    "planSafeActions": true,
+                    "handler": "tools/summarize.js"
+                },
+                {
+                    "id": "demo.write",
+                    "name": "Write",
+                    "planSafeActions": false
+                }
+            ],
+            "backgroundServices": [
+                { "id": "demo.sync", "entryPoint": "services/sync.js", "description": "Sync" }
+            ]
+        }
+    }"#;
+
+    let manifest = parse_manifest(json.as_bytes()).expect("parse");
+    let c = manifest.contributes.expect("contributes");
+    assert_eq!(c.commands.len(), 1);
+    assert_eq!(c.commands[0].id, "demo.hello");
+    assert_eq!(c.commands[0].keybinding.as_deref(), Some("ctrl+h"));
+    assert_eq!(c.panels.len(), 1);
+    assert_eq!(c.panels[0].entry_point, "panels/main.html");
+    assert_eq!(c.work_panel_views.len(), 1);
+    assert_eq!(c.work_panel_views[0].placement.as_deref(), Some("secondary"));
+    assert_eq!(c.agent_tools.len(), 2);
+    assert!(c.agent_tools[0].plan_safe_actions);
+    assert!(!c.agent_tools[1].plan_safe_actions);
+    assert_eq!(c.background_services.len(), 1);
+    assert_eq!(c.background_services[0].entry_point, "services/sync.js");
+}
+
+#[test]
+fn contract_v1_agent_tool_defaults_plan_safe_actions_to_false() {
+    let json = r#"{
+        "name": "contract-demo",
+        "version": "1.0.0",
+        "contributes": {
+            "agent_tools": [
+                { "id": "demo.x", "name": "X" }
+            ]
+        }
+    }"#;
+    let manifest = parse_manifest(json.as_bytes()).expect("parse");
+    let tool = &manifest.contributes.unwrap().agent_tools[0];
+    assert!(!tool.plan_safe_actions);
+}
+
+#[test]
+fn contract_v1_unknown_contribute_keys_are_ignored() {
+    let json = r#"{
+        "name": "contract-demo",
+        "version": "1.0.0",
+        "contributes": {
+            "futureThing": [{ "id": "x" }],
+            "commands": [{ "id": "demo.ok", "title": "Ok" }]
+        }
+    }"#;
+    let manifest = parse_manifest(json.as_bytes()).expect("parse");
+    let c = manifest.contributes.unwrap();
+    assert_eq!(c.commands.len(), 1);
+}

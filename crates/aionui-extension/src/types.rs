@@ -279,6 +279,72 @@ pub struct ExtModelProvider {
     pub models: Vec<String>,
 }
 
+/// Command-palette entry contributed by an extension (Plugin Contract v1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExtCommand {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keybinding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+}
+
+/// Standalone panel contribution (Plugin Contract v1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExtPanel {
+    pub id: String,
+    pub title: String,
+    #[serde(alias = "entryPoint")]
+    pub entry_point: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+}
+
+/// Work-panel / sidebar view contribution (Plugin Contract v1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExtWorkPanelView {
+    pub id: String,
+    pub title: String,
+    #[serde(alias = "entryPoint")]
+    pub entry_point: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+}
+
+fn default_plan_safe_actions() -> bool {
+    false
+}
+
+/// Agent tool contribution (Plugin Contract v1).
+///
+/// `plan_safe_actions` defaults to `false` when omitted at runtime so unsure
+/// authors stay on the approval path. The public JSON Schema still requires
+/// the field so curated plugins decide explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExtAgentTool {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default = "default_plan_safe_actions", alias = "planSafeActions")]
+    pub plan_safe_actions: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler: Option<String>,
+}
+
+/// Background service contribution (Plugin Contract v1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExtBackgroundService {
+    pub id: String,
+    #[serde(alias = "entryPoint")]
+    pub entry_point: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// All contributions declared by an extension.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ExtContributes {
@@ -302,6 +368,21 @@ pub struct ExtContributes {
     pub settings_tabs: Vec<ExtSettingsTab>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_providers: Vec<ExtModelProvider>,
+    /// Command-palette entries (Plugin Contract v1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<ExtCommand>,
+    /// Standalone panels (Plugin Contract v1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub panels: Vec<ExtPanel>,
+    /// Work-panel views (Plugin Contract v1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "workPanelViews")]
+    pub work_panel_views: Vec<ExtWorkPanelView>,
+    /// Agent tools; see [`ExtAgentTool::plan_safe_actions`] (Plugin Contract v1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "agentTools")]
+    pub agent_tools: Vec<ExtAgentTool>,
+    /// Background services (Plugin Contract v1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "backgroundServices")]
+    pub background_services: Vec<ExtBackgroundService>,
 }
 
 // ---------------------------------------------------------------------------
