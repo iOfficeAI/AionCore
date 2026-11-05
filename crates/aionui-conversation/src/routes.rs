@@ -152,6 +152,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
     Router::new()
         .route("/api/task-sessions", post(create_task_session).get(list_task_sessions))
         .route("/api/task-sessions/board", get(get_task_board))
+        .route("/api/task-sessions/import/github", post(import_github_issues))
         .route("/api/task-sessions/{id}/board", patch(update_task_board))
         .route(
             "/api/task-sessions/{id}/comments",
@@ -382,6 +383,23 @@ async fn get_task_board(
 ) -> Result<Json<ApiResponse<aionui_api_types::TaskBoardResponse>>, ApiError> {
     let board = state.service.task_board(&user.id, query).await?;
     Ok(Json(ApiResponse::ok(board)))
+}
+
+/// M8 E6-7: manual, read-only GitHub Issue import. User-only: the agent
+/// scope already denies it; the explicit check keeps that true if the scope
+/// list ever widens.
+async fn import_github_issues(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    agent: Option<Extension<AgentPrincipal>>,
+    body: Result<Json<aionui_api_types::ImportGithubIssuesRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_api_types::ImportGithubIssuesResponse>>, ApiError> {
+    if agent.is_some() {
+        return Err(ApiError::Forbidden("Agents cannot import GitHub issues.".to_owned()));
+    }
+    let Json(request) = body.map_err(ApiError::from)?;
+    let response = state.service.import_github_issues(&user.id, request).await?;
+    Ok(Json(ApiResponse::ok(response)))
 }
 
 /// Board routes are user-only: agent runtime tokens are denied on

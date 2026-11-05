@@ -12876,3 +12876,198 @@ async fn autopilot_full_auto_turn_is_refused_by_no_yolo_and_audited() {
     let outcome = service.run_agent_turn(turn(false)).await.unwrap();
     assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
 }
+
+// ---- M8 E6-7: read-only GitHub Issue import ----
+
+struct FakeIssueSource {
+    issues: std::sync::Mutex<Vec<crate::board::github_import::GithubIssue>>,
+    error: std::sync::Mutex<Option<crate::board::github_import::GithubIssueSourceError>>,
+    calls: std::sync::Mutex<Vec<(String, Option<String>, u32)>>,
+}
+
+impl FakeIssueSource {
+    fn new(issues: Vec<crate::board::github_import::GithubIssue>) -> Arc<Self> {
+        Arc::new(Self {
+            issues: std::sync::Mutex::new(issues),
+            error: std::sync::Mutex::new(None),
+            calls: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::board::github_import::GithubIssueSource for FakeIssueSource {
+    async fn list_open_issues(
+        &self,
+        repo: &str,
+        query: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::board::github_import::GithubIssue>, crate::board::github_import::GithubIssueSourceError>
+    {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((repo.to_owned(), query.map(str::to_owned), limit));
+        if let Some(error) = self.error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        Ok(self.issues.lock().unwrap().clone())
+    }
+}
+
+fn gh_issue(number: u64, title: &str, labels: &[&str]) -> crate::board::github_import::GithubIssue {
+    crate::board::github_import::GithubIssue {
+        number,
+        title: title.to_owned(),
+        body: format!("body of {number}"),
+        labels: labels.iter().map(|l| (*l).to_owned()).collect(),
+        url: format!("https://github.com/Acme/Widgets/issues/{number}"),
+    }
+}
+
+#[tokio::test]
+async fn github_import_creates_backlog_items_and_reimport_only_refreshes_content() {
+    use crate::board::BoardActor;
+    use aionui_api_types::{
+        ImportGithubIssuesRequest, ImportedIssueOutcome, TaskAssignee, TaskAssigneeKind, TaskBoardStatus,
+        UpdateTaskBoardRequest,
+    };
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let source = FakeIssueSource::new(vec![
+        gh_issue(1, "Crash on save", &["bug", " ui "]),
+        gh_issue(2, "Docs", &[]),
+    ]);
+    service.with_github_issue_source(source.clone());
+
+    let request = ImportGithubIssuesRequest {
+        repo: "https://github.com/Acme/Widgets.git".into(),
+        query: Some(" label:bug ".into()),
+        limit: None,
+    };
+    let first = service.import_github_issues("user_1", request.clone()).await.unwrap();
+    assert_eq!(first.repo, "acme/widgets");
+    assert_eq!((first.created, first.updated, first.unchanged), (2, 0, 0));
+    assert_eq!(
+        source.calls.lock().unwrap()[0],
+        ("acme/widgets".to_owned(), Some("label:bug".to_owned()), 30)
+    );
+    let one = first.items.iter().find(|i| i.number == 1).unwrap();
+    assert_eq!(one.external_ref, "github:acme/widgets#1");
+
+    let board = service.task_board("user_1", Default::default()).await.unwrap();
+    let items: Vec<_> = board.columns.iter().flat_map(|c| c.items.iter()).collect();
+    let item = items.iter().find(|i| i.id == one.task_session_id).unwrap();
+    assert_eq!(item.board_status, TaskBoardStatus::Backlog);
+    assert_eq!(item.title, "Crash on save");
+    assert_eq!(item.labels, vec!["bug".to_owned(), "ui".to_owned()]);
+    assert_eq!(item.external_ref.as_deref(), Some("github:acme/widgets#1"));
+    let session = service.get_task_session("user_1", &one.task_session_id).await.unwrap();
+    assert!(session.objective.starts_with("body of 1"));
+    assert!(session.objective.ends_with("https://github.com/Acme/Widgets/issues/1"));
+    let comments = service
+        .list_task_comments("user_1", &one.task_session_id)
+        .await
+        .unwrap();
+    assert!(
+        comments
+            .iter()
+            .any(|c| c.body.contains("acme/widgets#1") && c.body.contains("只读")),
+        "{comments:?}"
+    );
+
+    // The user triages the card; the issue then changes upstream.
+    service
+        .update_task_board(
+            "user_1",
+            &one.task_session_id,
+            BoardActor::User,
+            UpdateTaskBoardRequest {
+                board_status: Some(TaskBoardStatus::Todo),
+                assignee: Some(Some(TaskAssignee {
+                    kind: TaskAssigneeKind::Squad,
+                    id: "sq1".into(),
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    *source.issues.lock().unwrap() = vec![
+        gh_issue(1, "Crash on save (Windows)", &["bug"]),
+        gh_issue(2, "Docs", &[]),
+    ];
+
+    let second = service.import_github_issues("user_1", request).await.unwrap();
+    assert_eq!((second.created, second.updated, second.unchanged), (0, 1, 1));
+    let again = second.items.iter().find(|i| i.number == 1).unwrap();
+    assert_eq!(again.task_session_id, one.task_session_id);
+    assert_eq!(again.outcome, ImportedIssueOutcome::Updated);
+    let board = service.task_board("user_1", Default::default()).await.unwrap();
+    let items: Vec<_> = board.columns.iter().flat_map(|c| c.items.iter()).collect();
+    assert_eq!(items.len(), 2, "no duplicates");
+    let item = items.iter().find(|i| i.id == one.task_session_id).unwrap();
+    assert_eq!(item.title, "Crash on save (Windows)");
+    assert_eq!(item.labels, vec!["bug".to_owned()]);
+    assert_eq!(item.board_status, TaskBoardStatus::Todo, "column untouched");
+    assert_eq!(
+        item.assignee.as_ref().map(|a| a.id.as_str()),
+        Some("sq1"),
+        "assignee untouched"
+    );
+}
+
+#[tokio::test]
+async fn github_import_validates_input_and_maps_source_errors() {
+    use crate::board::github_import::GithubIssueSourceError;
+    use aionui_api_types::ImportGithubIssuesRequest;
+
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let service = board_service(&db);
+    let request = |repo: &str, limit: Option<u32>| ImportGithubIssuesRequest {
+        repo: repo.into(),
+        query: None,
+        limit,
+    };
+
+    // Not wired: internal error, not a silent no-op.
+    assert!(matches!(
+        service.import_github_issues("user_1", request("a/b", None)).await,
+        Err(ConversationError::Internal { .. })
+    ));
+
+    let source = FakeIssueSource::new(vec![]);
+    service.with_github_issue_source(source.clone());
+    for (repo, limit) in [
+        ("not-a-repo", None),
+        ("a/b/c", None),
+        ("a/b", Some(0)),
+        ("a/b", Some(101)),
+    ] {
+        assert!(
+            matches!(
+                service.import_github_issues("user_1", request(repo, limit)).await,
+                Err(ConversationError::BadRequest { .. })
+            ),
+            "{repo} {limit:?}"
+        );
+    }
+    assert!(
+        source.calls.lock().unwrap().is_empty(),
+        "invalid input never reaches gh"
+    );
+
+    *source.error.lock().unwrap() = Some(GithubIssueSourceError::CliMissing);
+    match service.import_github_issues("user_1", request("a/b", Some(100))).await {
+        Err(ConversationError::Unprocessable { reason }) => assert!(reason.starts_with("github_cli_missing")),
+        other => panic!("unexpected {other:?}"),
+    }
+    *source.error.lock().unwrap() = Some(GithubIssueSourceError::RepoNotFound("a/b".into()));
+    assert!(matches!(
+        service.import_github_issues("user_1", request("a/b", None)).await,
+        Err(ConversationError::NotFoundReason { .. })
+    ));
+}

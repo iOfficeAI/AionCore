@@ -897,6 +897,8 @@ pub struct ConversationService {
     /// Squad run lookup for board cards (M8 E7-6). `None` until the
     /// composition layer wires the team service; cards then omit `squad_run`.
     board_squad_run: Arc<RwLock<Option<Arc<dyn crate::board::BoardSquadRunPort>>>>,
+    /// M8 E6-7: read-only GitHub Issue source (the app wires `gh`).
+    pub(crate) github_issue_source: Arc<RwLock<Option<Arc<dyn crate::board::github_import::GithubIssueSource>>>>,
     /// Managed worktree port (M7 E3-2). `None` until the composition layer
     /// wires it; `worktree_id` creates are then refused.
     worktree_binding: Arc<RwLock<Option<Arc<dyn crate::worktree_binding::IWorktreeBinding>>>>,
@@ -1065,6 +1067,7 @@ impl ConversationService {
             task_board_repo: Arc::new(RwLock::new(None)),
             evolution_evidence_repo: Arc::new(RwLock::new(None)),
             board_squad_run: Arc::new(RwLock::new(None)),
+            github_issue_source: Arc::new(RwLock::new(None)),
             worktree_binding: Arc::new(RwLock::new(None)),
             governance: Arc::new(RwLock::new(None)),
             input_queue_locks: Arc::new(dashmap::DashMap::new()),

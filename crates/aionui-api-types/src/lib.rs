@@ -292,10 +292,11 @@ pub use system::{
 };
 pub use task_board::{
     CreateTaskCommentRequest, EVENT_TASK_BOARD_UPDATED, EVENT_TASK_COMMENT_CREATED, EVENT_TASK_COMMENT_UPDATED,
-    EditTaskCommentRequest, TASK_BOARD_COLUMNS, TaskAssignee, TaskAssigneeKind, TaskBoardChange,
-    TaskBoardColumnResponse, TaskBoardItemResponse, TaskBoardQuery, TaskBoardResponse, TaskBoardReviewDecision,
-    TaskBoardReviewRequest, TaskBoardReviewResponse, TaskBoardStatus, TaskBoardUpdatedEvent, TaskCommentEvent,
-    TaskCommentKind, TaskCommentResponse, UpdateTaskBoardRequest,
+    EditTaskCommentRequest, ImportGithubIssuesRequest, ImportGithubIssuesResponse, ImportedIssueItem,
+    ImportedIssueOutcome, TASK_BOARD_COLUMNS, TaskAssignee, TaskAssigneeKind, TaskBoardChange, TaskBoardColumnResponse,
+    TaskBoardItemResponse, TaskBoardQuery, TaskBoardResponse, TaskBoardReviewDecision, TaskBoardReviewRequest,
+    TaskBoardReviewResponse, TaskBoardStatus, TaskBoardUpdatedEvent, TaskCommentEvent, TaskCommentKind,
+    TaskCommentResponse, UpdateTaskBoardRequest,
 };
 pub use task_session::{
     AcceptanceCriterionResponse, AcceptanceCriterionStatus, AcceptanceEvidence, AcceptanceEvidenceKind,

@@ -299,3 +299,21 @@ async fn agent_cannot_move_assign_review_or_comment_on_work_items() {
     assert_eq!(row, ("backlog".to_owned(), None, "Add retry to export".to_owned()));
     h.services.database.close().await;
 }
+
+/// M8 E6-7: GitHub Issue import is a user-only, manual action.
+#[tokio::test]
+async fn agent_cannot_import_github_issues() {
+    let h = harness().await;
+    let (status, json) = h
+        .send(h.agent_request(
+            "POST",
+            "/api/task-sessions/import/github",
+            &json!({ "repo": "acme/widgets" }),
+            None,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+    assert_eq!(json["code"], "AGENT_SCOPE_DENIED", "{json}");
+    assert_eq!(h.work_item_count().await, 0);
+    h.services.database.close().await;
+}

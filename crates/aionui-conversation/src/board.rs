@@ -36,6 +36,8 @@
 //! otherwise the call fails with 409 `board_item_stale`. Omitted, the update
 //! stays last-write-wins.
 
+pub mod github_import;
+
 use aionui_api_types::{
     EVENT_TASK_BOARD_UPDATED, EVENT_TASK_COMMENT_CREATED, EVENT_TASK_COMMENT_UPDATED, SquadRunPayload, TaskBoardChange,
     TaskBoardUpdatedEvent, TaskCommentEvent, WebSocketMessage,
@@ -380,7 +382,7 @@ impl ConversationService {
             .inspect(|row| self.publish_comment(EVENT_TASK_COMMENT_CREATED, user_id, comment_response(row.clone())))
     }
 
-    fn publish_board_updated(
+    pub(crate) fn publish_board_updated(
         &self,
         user_id: &str,
         change: TaskBoardChange,
@@ -402,7 +404,7 @@ impl ConversationService {
         }
     }
 
-    fn publish_comment(&self, name: &str, user_id: &str, comment: TaskCommentResponse) {
+    pub(crate) fn publish_comment(&self, name: &str, user_id: &str, comment: TaskCommentResponse) {
         let event = TaskCommentEvent {
             user_id: user_id.to_owned(),
             task_session_id: comment.task_session_id.clone(),

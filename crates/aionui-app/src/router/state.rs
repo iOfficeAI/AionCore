@@ -484,6 +484,10 @@ pub async fn build_module_states(
         .with_board_squad_run_port(Arc::new(TeamBoardSquadRun {
             teams: Arc::downgrade(&states.team.service),
         }));
+    // M8 E6-7: read-only GitHub Issue import through the user's `gh` login.
+    services
+        .conversation_service
+        .with_github_issue_source(Arc::new(crate::github_issue_source::GhCliIssueSource::new()));
     // M8 E7-5: Leader eval comments on the linked work-item timeline.
     states
         .team

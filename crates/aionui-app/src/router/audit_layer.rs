@@ -421,6 +421,14 @@ const AUDIT_RULES: &[AuditRule] = &[
         NONE,
     ),
     // Scheduled tasks
+    // M8 E6-7: manual read-only GitHub Issue import into the backlog.
+    rule(
+        "POST",
+        "/api/task-sessions/import/github",
+        "task.import.github",
+        "task_board",
+        NONE,
+    ),
     rule("POST", "/api/cron/jobs", "config.cron.create", "cron_job", NONE),
     rule("PUT", "/api/cron/jobs/{id}", "config.cron.update", "cron_job", ID),
     rule("DELETE", "/api/cron/jobs/{id}", "config.cron.delete", "cron_job", ID),
@@ -790,6 +798,13 @@ mod tests {
         assert!(find_rule(&Method::POST, "/api/providers/fetch-models").is_none());
         assert!(find_rule(&Method::POST, "/api/skills/assistant-rule/read").is_none());
         assert!(find_rule(&Method::GET, "/api/providers").is_none());
+        assert_eq!(
+            find_rule(&Method::POST, "/api/task-sessions/import/github")
+                .unwrap()
+                .rule
+                .action,
+            "task.import.github"
+        );
         // `import` is a literal segment, not an `{id}`.
         assert_eq!(
             find_rule(&Method::POST, "/api/mcp/servers/import").unwrap().rule.action,

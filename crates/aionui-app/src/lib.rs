@@ -6,6 +6,7 @@
 //! submodules. All logic lives in the modules below.
 
 mod config;
+mod github_issue_source;
 mod router;
 mod services;
 mod skill_evolution_adapters;

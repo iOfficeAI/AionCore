@@ -168,6 +168,56 @@ pub enum TaskBoardChange {
     /// M8 E7-6: the linked Squad instance's `squad_run` changed state; the
     /// card did not move (`from_board_status == item.board_status`).
     SquadRun,
+    /// M8 E6-7: created or refreshed by a read-only GitHub Issue import.
+    Import,
+}
+
+/// `POST /api/task-sessions/import/github` (M8 E6-7, D6-6): one manual,
+/// read-only import of GitHub Issues into the backlog.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportGithubIssuesRequest {
+    /// `owner/name`.
+    pub repo: String,
+    /// GitHub issue search qualifiers (`label:bug`, `milestone:"v2"`, …).
+    /// Only open issues are imported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// Maximum issues to fetch (1–100, default 30).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// What an import did to one issue.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportedIssueOutcome {
+    /// New backlog work item.
+    Created,
+    /// Existing item refreshed (title / body / labels only).
+    Updated,
+    /// Existing item already matched the issue.
+    Unchanged,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportedIssueItem {
+    /// `github:owner/name#123`.
+    pub external_ref: String,
+    pub task_session_id: String,
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub outcome: ImportedIssueOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportGithubIssuesResponse {
+    /// Normalized `owner/name`.
+    pub repo: String,
+    pub created: u32,
+    pub updated: u32,
+    pub unchanged: u32,
+    pub items: Vec<ImportedIssueItem>,
 }
 
 /// `task.board.updated` payload: the item after the change.
