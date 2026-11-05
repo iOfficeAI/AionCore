@@ -47,6 +47,7 @@ fn default_state() -> (WsHandlerState, Arc<WebSocketManager>) {
                 .and_then(|s| s.strip_prefix("Bearer "))
                 .map(|s| s.to_owned())
         }),
+        event_log: None,
     };
     (state, manager)
 }
@@ -409,6 +410,7 @@ async fn unknown_message_routed_to_message_router() {
                 .and_then(|s| s.strip_prefix("Bearer "))
                 .map(|s| s.to_owned())
         }),
+        event_log: None,
     };
 
     let addr = start_server(state).await;

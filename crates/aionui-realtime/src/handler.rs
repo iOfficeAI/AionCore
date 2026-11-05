@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::{future::Future, pin::Pin};
 
-use aionui_api_types::WebSocketMessage;
+use aionui_api_types::{EventCursor, WebSocketMessage};
 use axum::extract::WebSocketUpgrade;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use axum::http::HeaderMap;
@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
+use crate::event_log::{EventLog, ResumeStatus};
 use crate::manager::{TokenValidator, WebSocketManager};
 use crate::router::MessageRouter;
 use crate::types::{ConnectionId, PER_CONNECTION_BUFFER, RealtimeError, WebSocketCloseCode, WsOutbound};
@@ -32,6 +33,8 @@ pub struct WsHandlerState {
     pub token_validator: TokenValidator,
     pub token_user_resolver: TokenUserResolver,
     pub token_extractor: TokenExtractor,
+    /// Optional E14 resume ring shared with [`crate::BroadcastEventBus`].
+    pub event_log: Option<Arc<EventLog>>,
 }
 
 /// Axum handler for HTTP → WebSocket upgrade.
@@ -210,6 +213,9 @@ fn handle_text_message(conn_id: ConnectionId, user_id: &str, text: &str, state: 
         "subscribe-show-open" => {
             handle_subscribe_show_open(state, conn_id, msg.data);
         }
+        "resume" => {
+            handle_resume(state, conn_id, msg.cursor);
+        }
         name => {
             if !state.router.route(conn_id, user_id, name, msg.data) {
                 send_realtime_error(state, conn_id, RealtimeError::UnsupportedMessage);
@@ -225,6 +231,46 @@ fn send_error_response(state: &WsHandlerState, conn_id: ConnectionId) {
 
 fn send_realtime_error(state: &WsHandlerState, conn_id: ConnectionId, error: RealtimeError) {
     state.manager.send_to(conn_id, error.into_event());
+}
+
+/// E14: replay retained live events after the client's last acknowledged cursor.
+///
+/// Missing `event_log` or missing cursor → `resume.complete` with `status=unavailable`
+/// / zero replay when the Host has no ring; epoch mismatch uses `status=gap`.
+fn handle_resume(state: &WsHandlerState, conn_id: ConnectionId, cursor: Option<EventCursor>) {
+    let Some(log) = state.event_log.as_ref() else {
+        let msg = WebSocketMessage::new(
+            "resume.complete",
+            json!({
+                "status": "unavailable",
+                "replayed": 0,
+            }),
+        );
+        state.manager.send_to(conn_id, msg);
+        return;
+    };
+
+    let after = cursor.unwrap_or_default();
+    let slice = log.events_after(after);
+    let replayed = slice.events.len();
+    for event in slice.events {
+        state.manager.send_to(conn_id, event);
+    }
+    let status = match slice.status {
+        ResumeStatus::Ok => "ok",
+        ResumeStatus::Gap => "gap",
+    };
+    let complete = WebSocketMessage::new(
+        "resume.complete",
+        json!({
+            "status": status,
+            "replayed": replayed,
+            "epoch": slice.current.epoch,
+            "sequence": slice.current.sequence,
+        }),
+    )
+    .with_cursor(slice.current);
+    state.manager.send_to(conn_id, complete);
 }
 
 /// Handle `subscribe-show-open`: reply with `show-open-request`.
@@ -275,6 +321,7 @@ mod tests {
             token_validator: Arc::new(|_| true),
             token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".into()) })),
             token_extractor: Arc::new(|_| None),
+            event_log: None,
         }
     }
 
@@ -521,6 +568,7 @@ mod tests {
             token_validator: Arc::new(|_| true),
             token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".into()) })),
             token_extractor: Arc::new(|_| None),
+            event_log: None,
         };
 
         handle_text_message(
@@ -568,5 +616,58 @@ mod tests {
         // Should not panic — client will be removed
         send_error_response(&state, conn_id);
         assert_eq!(manager.client_count(), 0);
+    }
+
+    #[test]
+    fn resume_replays_and_completes() {
+        use crate::event_log::EventLog;
+        use aionui_api_types::EventCursor;
+        let manager = Arc::new(WebSocketManager::new());
+        let (tx, mut rx) = mpsc::channel(PER_CONNECTION_BUFFER);
+        let conn_id = manager.add_client("tok".into(), tx);
+
+        let log = Arc::new(EventLog::new(16));
+        log.record(WebSocketMessage::new("a", json!({"n": 1})));
+        log.record(WebSocketMessage::new("b", json!({"n": 2})));
+        log.record(WebSocketMessage::new("c", json!({"n": 3})));
+
+        let mut state = test_state(manager);
+        state.event_log = Some(log);
+
+        let resume =
+            serde_json::to_string(&WebSocketMessage::new("resume", json!({})).with_cursor(EventCursor::new(1, 1)))
+                .unwrap();
+        handle_text_message(conn_id, "user-1", &resume, &state);
+
+        // expect b, c, then resume.complete
+        let mut names = Vec::new();
+        while let Ok(out) = rx.try_recv() {
+            match out {
+                WsOutbound::Text(t) => {
+                    let v: Value = serde_json::from_str(&t).unwrap();
+                    names.push(v["name"].as_str().unwrap().to_string());
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(names, vec!["b", "c", "resume.complete"]);
+    }
+
+    #[test]
+    fn resume_without_log_is_unavailable() {
+        let manager = Arc::new(WebSocketManager::new());
+        let (tx, mut rx) = mpsc::channel(PER_CONNECTION_BUFFER);
+        let conn_id = manager.add_client("tok".into(), tx);
+        let state = test_state(manager);
+        handle_text_message(conn_id, "user-1", r#"{"name":"resume","data":{}}"#, &state);
+        let out = rx.try_recv().unwrap();
+        match out {
+            WsOutbound::Text(t) => {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                assert_eq!(v["name"], "resume.complete");
+                assert_eq!(v["data"]["status"], "unavailable");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

@@ -1660,6 +1660,7 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
         // the desktop user.
         return WsHandlerState {
             manager: services.ws_manager.clone(),
+            event_log: Some(services.event_bus.event_log()),
             router,
             token_validator: Arc::new(|_| true),
             token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".to_owned()) })),
@@ -1733,6 +1734,7 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
 
     WsHandlerState {
         manager: services.ws_manager.clone(),
+        event_log: Some(services.event_bus.event_log()),
         router: Arc::new(crate::router::device_ws::DeviceInboundGuard {
             inner: router,
             manager: services.ws_manager.clone(),

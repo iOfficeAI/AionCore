@@ -39,12 +39,23 @@ The tunnel is opaque transport; auth remains WorkMate workspace credentials.
 Optional reverse tunnel (Host reaches client services) is out of scope for the
 first PR — document only when needed.
 
-## Resume cursors (contract)
+## Resume cursors (E14)
 
-Realtime envelopes may carry an optional `cursor: { epoch, sequence }`
-(`aionui_api_types::EventCursor`). Clients should store the last acknowledged
-cursor and send it on reconnect. Full event-log replay is a follow-up; the
-type is stable for forward compatibility.
+Realtime envelopes carry an optional `cursor: { epoch, sequence }`
+(`aionui_api_types::EventCursor`). The Host stamps every event-bus broadcast
+and retains a bounded in-memory ring (default 512).
+
+On reconnect the client sends:
+
+```json
+{ "name": "resume", "data": {}, "cursor": { "epoch": 1, "sequence": 42 } }
+```
+
+Semantics (`after_sequence`): the Host replays retained events with
+`sequence > cursor.sequence` in the **same epoch**, then emits
+`resume.complete` with `status` `ok` | `gap` | `unavailable` and the current
+cursor. A **gap** means the Host restarted (new epoch) or the ring evicted
+events — fall back to HTTP journal hydrate; the ring is not durable storage.
 
 ## Smoke
 
