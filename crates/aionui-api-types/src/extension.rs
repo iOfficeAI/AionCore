@@ -40,6 +40,13 @@ pub struct HubExtensionListItem {
     pub tags: Vec<String>,
     #[serde(default)]
     pub bundled: bool,
+    /// Enterprise curated marketplace entry (M9 E13).
+    #[serde(default)]
+    pub curated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<String>,
+    #[serde(default)]
+    pub signed: bool,
     pub status: String,
 }
 
@@ -154,6 +161,9 @@ mod tests {
             icon: None,
             tags: vec!["tools".into()],
             bundled: false,
+            curated: true,
+            integrity: None,
+            signed: false,
             status: "installed".into(),
         };
         let json = serde_json::to_value(&item).unwrap();

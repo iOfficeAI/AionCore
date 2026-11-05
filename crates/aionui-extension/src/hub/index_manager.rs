@@ -49,6 +49,18 @@ pub(crate) struct HubIndexEntry {
     /// Optional download URL for remote extensions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub download_url: Option<String>,
+    /// Enterprise curated marketplace flag (M9 E13). Non-bundled installs require this.
+    #[serde(default)]
+    pub curated: bool,
+    /// Optional SRI `sha512-<base64>` over `aion-extension.json` bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<String>,
+    /// Optional ed25519 signature (hex) over `name\nversion\nintegrity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// Key id into `WORKMATE_HUB_SIGNING_PUBKEYS` for `signature`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pubkey_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +149,9 @@ impl HubIndexManager {
                     icon: entry.icon,
                     tags: entry.tags,
                     bundled: entry.bundled,
+                    curated: entry.curated,
+                    integrity: entry.integrity.clone(),
+                    signed: entry.signature.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false),
                     status,
                 }
             })
@@ -218,6 +233,10 @@ mod tests {
             tags: Vec::new(),
             bundled: true,
             download_url: None,
+            curated: false,
+            integrity: None,
+            signature: None,
+            pubkey_id: None,
         };
         let installed = HashMap::new();
         assert_eq!(resolve_status(&entry, &installed), HubExtensionStatus::Installed);
@@ -235,6 +254,10 @@ mod tests {
             tags: Vec::new(),
             bundled: false,
             download_url: None,
+            curated: false,
+            integrity: None,
+            signature: None,
+            pubkey_id: None,
         };
         let installed = HashMap::new();
         assert_eq!(resolve_status(&entry, &installed), HubExtensionStatus::NotInstalled);
@@ -252,6 +275,10 @@ mod tests {
             tags: Vec::new(),
             bundled: false,
             download_url: None,
+            curated: false,
+            integrity: None,
+            signature: None,
+            pubkey_id: None,
         };
         let installed = HashMap::from([("my-ext".into(), "1.0.0".into())]);
         assert_eq!(resolve_status(&entry, &installed), HubExtensionStatus::Installed);
@@ -269,6 +296,10 @@ mod tests {
             tags: Vec::new(),
             bundled: false,
             download_url: None,
+            curated: false,
+            integrity: None,
+            signature: None,
+            pubkey_id: None,
         };
         let installed = HashMap::from([("my-ext".into(), "1.0.0".into())]);
         assert_eq!(resolve_status(&entry, &installed), HubExtensionStatus::UpdateAvailable);
@@ -286,6 +317,10 @@ mod tests {
             tags: Vec::new(),
             bundled: false,
             download_url: None,
+            curated: false,
+            integrity: None,
+            signature: None,
+            pubkey_id: None,
         };
         let installed = HashMap::from([("my-ext".into(), "2.0.0".into())]);
         // Installed version is newer — still "installed", not "update_available".
@@ -328,6 +363,10 @@ mod tests {
                 tags: vec!["tools".into()],
                 bundled: false,
                 download_url: Some("https://example.com/test-ext-1.0.0.tar.gz".into()),
+                curated: false,
+                integrity: None,
+                signature: None,
+                pubkey_id: None,
             }],
         };
         let path = tmp.path().join("index.json");

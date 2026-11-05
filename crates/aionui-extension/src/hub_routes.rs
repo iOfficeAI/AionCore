@@ -67,6 +67,9 @@ async fn get_hub_extensions(
                 icon: e.icon,
                 tags: e.tags,
                 bundled: e.bundled,
+                curated: e.curated,
+                integrity: e.integrity.clone(),
+                signed: e.signed,
                 status: status_str,
             }
         })

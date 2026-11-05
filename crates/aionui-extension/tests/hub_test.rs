@@ -87,6 +87,7 @@ async fn hm1_load_index_with_entries() {
                 "display_name": "Alpha Extension",
                 "tags": ["tools"],
                 "bundled": false,
+                "curated": true,
             }),
             json!({
                 "name": "ext-beta",
@@ -119,6 +120,7 @@ async fn hm2_install_extension_with_valid_directory() {
         &[json!({
             "name": "my-ext",
             "version": "1.0.0",
+            "curated": true,
         })],
     );
     write_extension_manifest(&h.hub_dir.path().join("my-ext"), "my-ext", "1.0.0");
@@ -172,6 +174,7 @@ async fn hm4_retry_install_succeeds_after_directory_created() {
         &[json!({
             "name": "retry-ext",
             "version": "1.0.0",
+            "curated": true,
         })],
     );
 
@@ -248,6 +251,7 @@ async fn hm6_update_extension() {
         &[json!({
             "name": "upd-ext",
             "version": "2.0.0",
+            "curated": true,
         })],
     );
     // Extension directory exists with a valid manifest.
@@ -394,4 +398,29 @@ async fn index_merge_shows_installed_when_same_version() {
     let list = h.index_manager.load_index().await;
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].status, HubExtensionStatus::Installed);
+}
+
+// ---------------------------------------------------------------------------
+// M9 E13 curated marketplace gate
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn hm_curated_rejects_non_curated() {
+    let h = setup();
+    write_hub_index(
+        h.hub_dir.path(),
+        &[json!({
+            "name": "wild-ext",
+            "version": "1.0.0",
+            "curated": false,
+        })],
+    );
+    write_extension_manifest(&h.hub_dir.path().join("wild-ext"), "wild-ext", "1.0.0");
+
+    let result = h.installer.install("wild-ext").await;
+    assert!(!result.success);
+    assert!(
+        result.msg.unwrap().contains("not curated"),
+        "expected curated gate error"
+    );
 }

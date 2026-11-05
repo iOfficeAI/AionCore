@@ -461,6 +461,9 @@ fn test_hub_extension_with_status_roundtrip() {
         icon: None,
         tags: vec!["productivity".into()],
         bundled: false,
+        curated: false,
+        integrity: None,
+        signed: false,
         status: HubExtensionStatus::Installed,
     };
     let json_str = serde_json::to_string(&ext).unwrap();
@@ -479,6 +482,9 @@ fn test_hub_extension_bundled_status() {
         icon: None,
         tags: vec![],
         bundled: true,
+        curated: true,
+        integrity: None,
+        signed: false,
         status: HubExtensionStatus::Installed,
     };
     let json = serde_json::to_value(&ext).unwrap();

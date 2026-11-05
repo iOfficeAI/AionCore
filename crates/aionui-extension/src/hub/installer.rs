@@ -13,6 +13,7 @@ use crate::registry::ExtensionRegistry;
 use crate::resolvers::resolve_extension_contributions;
 use crate::types::{ExtensionSource, ExtensionState, LoadedExtension};
 
+use super::curated::evaluate_install;
 use super::index_manager::HubIndexManager;
 
 // ---------------------------------------------------------------------------
@@ -107,6 +108,15 @@ impl HubInstaller {
             return HubResult::err(error);
         }
 
+        // M9 E13 curated marketplace gate (D13-1): curated/allowlist + optional sign.
+        let manifest_path = ext_dir.join(EXTENSION_MANIFEST_FILE);
+        let manifest_bytes = std::fs::read(&manifest_path).ok();
+        if let Err(gate) = evaluate_install(&entry, manifest_bytes.as_deref()) {
+            let error = gate.to_string();
+            self.broadcast_state_changed(name, "failed", Some(error.clone()));
+            return HubResult::err(error);
+        }
+
         if let Err(e) = self.verify_installation(&ext_dir) {
             let error = format!("Installation verification failed: {e}");
             self.broadcast_state_changed(name, "failed", Some(error.clone()));
@@ -149,6 +159,14 @@ impl HubInstaller {
 
         if !ext_dir.exists() {
             let error = format!("Extension not installed: {}", ext_dir.display());
+            self.broadcast_state_changed(name, "failed", Some(error.clone()));
+            return HubResult::err(error);
+        }
+
+        let manifest_path = ext_dir.join(EXTENSION_MANIFEST_FILE);
+        let manifest_bytes = std::fs::read(&manifest_path).ok();
+        if let Err(gate) = evaluate_install(&entry, manifest_bytes.as_deref()) {
+            let error = gate.to_string();
             self.broadcast_state_changed(name, "failed", Some(error.clone()));
             return HubResult::err(error);
         }

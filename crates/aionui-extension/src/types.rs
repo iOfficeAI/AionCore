@@ -548,6 +548,14 @@ pub struct HubExtensionWithStatus {
     pub tags: Vec<String>,
     #[serde(default)]
     pub bundled: bool,
+    /// Enterprise curated (M9 E13 marketplace).
+    #[serde(default)]
+    pub curated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<String>,
+    /// True when index entry carries a signature blob.
+    #[serde(default)]
+    pub signed: bool,
     pub status: HubExtensionStatus,
 }
 
