@@ -383,6 +383,7 @@ async fn fixture_with_tool_executor(tool_executor: Option<Arc<dyn AgentWorkflowT
     service.bootstrap_assistant_storage().await.unwrap();
     states.assistant = AssistantRouterState {
         service: service.clone(),
+        governance: None,
     };
     let center_repo: Arc<dyn IAssistantAgentCenterRepository> = Arc::new(SqliteAssistantAgentCenterRepository::new(
         services.database.pool().clone(),
@@ -408,6 +409,7 @@ async fn fixture_with_tool_executor(tool_executor: Option<Arc<dyn AgentWorkflowT
             calls: cancelled_agent_executions.clone(),
             fail_next: fail_next_agent_cancellation.clone(),
         })),
+        governance: None,
     };
     // Rewire the skill-router dispatcher so assistant-rule / assistant-skill
     // endpoints route through the test-configured service.

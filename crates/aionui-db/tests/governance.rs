@@ -283,3 +283,69 @@ async fn no_yolo_refuses_confirmed_full_auto_without_a_mode() {
     svc.check_launch("u1", &facts).await.unwrap();
     assert_eq!(actions(&audit).await.iter().filter(|a| *a == "policy.deny").count(), 1);
 }
+
+#[tokio::test]
+async fn catalog_filter_hides_restricted_assistants_for_members() {
+    let (webui, _) = service(true).await;
+    webui
+        .set_agent_run_permission(
+            BOOTSTRAP_OWNER_USER_ID,
+            "assistant",
+            "asst-secret",
+            Some(&[UserRole::Owner, UserRole::Admin]),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(webui.catalog_filter_active("u2").await.unwrap());
+    assert!(!webui.catalog_filter_active(BOOTSTRAP_OWNER_USER_ID).await.unwrap());
+    assert!(!webui.may_see_assistant("u2", "asst-secret", None, None).await.unwrap());
+    assert!(
+        webui
+            .may_see_assistant(BOOTSTRAP_OWNER_USER_ID, "asst-secret", None, None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        webui.may_see_assistant("u2", "asst-open", None, None).await.unwrap(),
+        "unlisted assistants stay visible"
+    );
+}
+
+#[tokio::test]
+async fn catalog_filter_respects_agent_type_rows() {
+    let (webui, _) = service(true).await;
+    webui
+        .set_agent_run_permission(
+            BOOTSTRAP_OWNER_USER_ID,
+            "agent_type",
+            "codex",
+            Some(&[UserRole::Owner]),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !webui
+            .may_see_assistant("u2", "asst-1", Some(AgentType::Acp), Some("codex"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        webui
+            .may_see_assistant("u2", "asst-1", Some(AgentType::Acp), Some("claude"))
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn catalog_filter_inactive_on_desktop() {
+    let (desktop, _) = service(false).await;
+    desktop
+        .set_agent_run_permission("u1", "assistant", "x", Some(&[UserRole::Admin]), None)
+        .await
+        .unwrap();
+    assert!(!desktop.catalog_filter_active("u1").await.unwrap());
+    assert!(desktop.may_see_assistant("u1", "x", None, None).await.unwrap());
+}

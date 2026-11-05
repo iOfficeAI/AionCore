@@ -629,6 +629,88 @@ impl GovernanceService {
         Ok(row)
     }
 
+    /// Members in multi-user mode get a narrowed assistant / agent catalog.
+    /// Owner/admin and single-user mode always see the full catalog.
+    pub async fn catalog_filter_active(&self, user_id: &str) -> Result<bool, DbError> {
+        if !self.roles_active {
+            return Ok(false);
+        }
+        Ok(self.role_of(user_id).await? == UserRole::Member)
+    }
+
+    /// Whether `user_id` may run (and therefore see) one permission subject.
+    ///
+    /// Mirrors [`Self::check_run_permission`] for a single `(kind, id)`:
+    /// missing row or `allowed_roles = null` means unrestricted.
+    pub async fn is_run_subject_allowed(
+        &self,
+        user_id: &str,
+        subject_kind: &str,
+        subject_id: &str,
+    ) -> Result<bool, DbError> {
+        if !self.roles_active {
+            return Ok(true);
+        }
+        let id = subject_id.trim();
+        if id.is_empty() {
+            return Ok(true);
+        }
+        let id = if subject_kind == "agent_type" {
+            id.to_ascii_lowercase()
+        } else {
+            id.to_owned()
+        };
+        let role = self.role_of(user_id).await?;
+        if matches!(role, UserRole::Owner | UserRole::Admin) {
+            return Ok(true);
+        }
+        let Some(row) = self.repo.get_agent_run_permission(subject_kind, &id).await? else {
+            return Ok(true);
+        };
+        let Some(raw) = row.allowed_roles else {
+            return Ok(true);
+        };
+        let allowed: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+        Ok(allowed.iter().any(|name| name == role.as_str()))
+    }
+
+    /// Catalog visibility for an assistant, including its bound agent type /
+    /// ACP backend when present (same subjects `check_launch` consults).
+    pub async fn may_see_assistant(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+        agent_type: Option<AgentType>,
+        backend: Option<&str>,
+    ) -> Result<bool, DbError> {
+        if !self.catalog_filter_active(user_id).await? {
+            return Ok(true);
+        }
+        if !self.is_run_subject_allowed(user_id, "assistant", assistant_id).await? {
+            return Ok(false);
+        }
+        if let Some(backend) = backend.filter(|b| !b.trim().is_empty())
+            && !self.is_run_subject_allowed(user_id, "agent_type", backend).await?
+        {
+            return Ok(false);
+        }
+        if let Some(agent_type) = agent_type {
+            let name = agent_type_name(agent_type);
+            if !self.is_run_subject_allowed(user_id, "agent_type", &name).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// User-facing denial when a member GETs an assistant outside their scope.
+    pub fn catalog_deny_message(&self, role: UserRole, subject_kind: &str, subject_id: &str) -> String {
+        format!(
+            "Your role ({}) may not start {subject_kind} `{subject_id}`.",
+            role.as_str()
+        )
+    }
+
     async fn check_run_permission(
         &self,
         user_id: &str,

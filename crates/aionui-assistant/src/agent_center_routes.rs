@@ -18,6 +18,7 @@ use aionui_api_types::{
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
+use aionui_db::GovernanceService;
 
 use crate::agent_center_service::AgentCenterService;
 
@@ -25,6 +26,8 @@ use crate::agent_center_service::AgentCenterService;
 pub struct AgentCenterRouterState {
     pub service: Arc<AgentCenterService>,
     pub agent_execution_canceller: Option<Arc<dyn AgentWorkflowAgentExecutionCancellationPort>>,
+    /// Optional governance for M9 E12 member catalog filtering.
+    pub governance: Option<Arc<GovernanceService>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +73,74 @@ pub fn agent_center_routes(state: AgentCenterRouterState) -> Router {
         .with_state(state)
 }
 
+async fn filter_agent_center_items(
+    governance: Option<&Arc<GovernanceService>>,
+    user_id: &str,
+    items: Vec<AgentCenterListItem>,
+) -> Result<Vec<AgentCenterListItem>, ApiError> {
+    let Some(gov) = governance else {
+        return Ok(items);
+    };
+    let active = gov.catalog_filter_active(user_id).await.map_err(|err| {
+        tracing::warn!(error = %err, "governance catalog filter failed; returning empty");
+        ApiError::Internal("Governance policy could not be read; try again.".into())
+    })?;
+    if !active {
+        return Ok(items);
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let agent = item.assistant.agent.as_ref();
+        let allowed = gov
+            .may_see_assistant(
+                user_id,
+                &item.assistant.id,
+                agent.map(|a| a.r#type),
+                agent.and_then(|a| a.acp_backend.as_deref()),
+            )
+            .await
+            .map_err(|err| {
+                tracing::warn!(error = %err, "governance catalog filter failed; returning empty");
+                ApiError::Internal("Governance policy could not be read; try again.".into())
+            })?;
+        if allowed {
+            out.push(item);
+        }
+    }
+    Ok(out)
+}
+
+async fn ensure_may_see_assistant(
+    governance: Option<&Arc<GovernanceService>>,
+    user_id: &str,
+    assistant_id: &str,
+    agent_type: Option<aionui_common::AgentType>,
+    backend: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(gov) = governance else {
+        return Ok(());
+    };
+    let allowed = gov
+        .may_see_assistant(user_id, assistant_id, agent_type, backend)
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, "governance catalog check failed");
+            ApiError::Internal("Governance policy could not be read; try again.".into())
+        })?;
+    if allowed {
+        return Ok(());
+    }
+    let role = gov.role_of(user_id).await.map_err(|err| {
+        tracing::warn!(error = %err, "governance role lookup failed");
+        ApiError::Internal("Governance policy could not be read; try again.".into())
+    })?;
+    Err(ApiError::Forbidden(gov.catalog_deny_message(
+        role,
+        "assistant",
+        assistant_id,
+    )))
+}
+
 async fn list_agents(
     State(state): State<AgentCenterRouterState>,
     Extension(current_user): Extension<CurrentUser>,
@@ -79,6 +150,14 @@ async fn list_agents(
         .service
         .list_for_user(&current_user.id, &query.scope, query.team_id.as_deref())
         .await?;
+    let items = match filter_agent_center_items(state.governance.as_ref(), &current_user.id, items).await {
+        Ok(items) => items,
+        Err(ApiError::Internal(_)) => {
+            // D12-p2-4: fail closed to empty catalog for members on storage errors.
+            Vec::new()
+        }
+        Err(other) => return Err(other),
+    };
     Ok(Json(ApiResponse::ok(items)))
 }
 
@@ -98,6 +177,15 @@ async fn get_agent(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<AgentCenterDetailResponse>>, ApiError> {
     let detail = state.service.get_detail_for_user(&current_user.id, &id, None).await?;
+    let agent = detail.assistant.engine.agent.as_ref();
+    ensure_may_see_assistant(
+        state.governance.as_ref(),
+        &current_user.id,
+        &detail.assistant.id,
+        agent.map(|a| a.r#type),
+        agent.and_then(|a| a.acp_backend.as_deref()),
+    )
+    .await?;
     Ok(Json(ApiResponse::ok(detail)))
 }
 

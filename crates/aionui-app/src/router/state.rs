@@ -863,7 +863,10 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
         },
         services.data_dir.clone(),
     ));
-    AssistantRouterState { service }
+    AssistantRouterState {
+        service,
+        governance: Some(services.governance.clone()),
+    }
 }
 
 /// Build Agent Center router state on top of the shared AssistantService.
@@ -894,6 +897,7 @@ pub fn build_agent_center_state(services: &AppServices, assistant: &AssistantRou
     AgentCenterRouterState {
         service,
         agent_execution_canceller: Some(agent_execution_canceller),
+        governance: Some(services.governance.clone()),
     }
 }
 

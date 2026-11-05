@@ -52,11 +52,86 @@ impl From<AssistantError> for ApiError {
     }
 }
 
+async fn filter_assistants(
+    state: &AssistantRouterState,
+    user_id: &str,
+    items: Vec<AssistantResponse>,
+) -> Vec<AssistantResponse> {
+    let Some(gov) = state.governance.as_ref() else {
+        return items;
+    };
+    let active = match gov.catalog_filter_active(user_id).await {
+        Ok(active) => active,
+        Err(err) => {
+            tracing::warn!(error = %err, "governance catalog filter failed; returning empty");
+            return Vec::new();
+        }
+    };
+    if !active {
+        return items;
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let agent = item.agent.as_ref();
+        let allowed = match gov
+            .may_see_assistant(
+                user_id,
+                &item.id,
+                agent.map(|a| a.r#type),
+                agent.and_then(|a| a.acp_backend.as_deref()),
+            )
+            .await
+        {
+            Ok(allowed) => allowed,
+            Err(err) => {
+                tracing::warn!(error = %err, "governance catalog filter failed; returning empty");
+                return Vec::new();
+            }
+        };
+        if allowed {
+            out.push(item);
+        }
+    }
+    out
+}
+
+async fn ensure_assistant_visible(
+    state: &AssistantRouterState,
+    user_id: &str,
+    assistant_id: &str,
+    agent_type: Option<aionui_common::AgentType>,
+    backend: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(gov) = state.governance.as_ref() else {
+        return Ok(());
+    };
+    let allowed = gov
+        .may_see_assistant(user_id, assistant_id, agent_type, backend)
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, "governance catalog check failed");
+            ApiError::Internal("Governance policy could not be read; try again.".into())
+        })?;
+    if allowed {
+        return Ok(());
+    }
+    let role = gov.role_of(user_id).await.map_err(|err| {
+        tracing::warn!(error = %err, "governance role lookup failed");
+        ApiError::Internal("Governance policy could not be read; try again.".into())
+    })?;
+    Err(ApiError::Forbidden(gov.catalog_deny_message(
+        role,
+        "assistant",
+        assistant_id,
+    )))
+}
+
 async fn list(
     State(state): State<AssistantRouterState>,
     Extension(current_user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<AssistantResponse>>>, ApiError> {
     let items = state.service.list_for_user(&current_user.id).await?;
+    let items = filter_assistants(&state, &current_user.id, items).await;
     Ok(Json(ApiResponse::ok(items)))
 }
 
@@ -80,6 +155,15 @@ async fn get_one(
         .service
         .get_detail_for_user(&current_user.id, &id, query.locale.as_deref())
         .await?;
+    let agent = detail.engine.agent.as_ref();
+    ensure_assistant_visible(
+        &state,
+        &current_user.id,
+        &detail.id,
+        agent.map(|a| a.r#type),
+        agent.and_then(|a| a.acp_backend.as_deref()),
+    )
+    .await?;
     Ok(Json(ApiResponse::ok(detail)))
 }
 
