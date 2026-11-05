@@ -66,11 +66,25 @@ pub struct CronService {
     data_dir: PathBuf,
     instance_id: String,
     /// E8-6 guardrail 6: delivery port for Autopilot run results. Wired
-    /// late by the app because channels are built after cron.
-    autopilot_notifier: Arc<std::sync::RwLock<Option<Arc<dyn AutopilotNotifier>>>>,
+    /// late by the app because channels are built after cron; reports from
+    /// runs that finish before that are buffered (bounded) and delivered once
+    /// the notifier is installed.
+    autopilot_notifier: Arc<std::sync::Mutex<AutopilotNotifySlot>>,
     /// M8 E12-3: governance policy gate. Wired late by the app; `None`
     /// (tests, headless tools) means no policy is enforced.
     governance: Arc<std::sync::RwLock<Option<Arc<aionui_db::GovernanceService>>>>,
+}
+
+/// Upper bound on Autopilot reports held before the notifier is installed.
+/// Only the startup window should ever fill this; headless runs that never
+/// install a notifier keep at most this many.
+const MAX_PENDING_AUTOPILOT_REPORTS: usize = 64;
+
+/// Autopilot notifier plus reports produced before it was installed.
+#[derive(Default)]
+struct AutopilotNotifySlot {
+    notifier: Option<Arc<dyn AutopilotNotifier>>,
+    pending: std::collections::VecDeque<AutopilotRunReport>,
 }
 
 pub struct CronServiceDeps {
@@ -98,7 +112,7 @@ impl CronService {
             emitter: deps.emitter,
             data_dir: deps.data_dir,
             instance_id: generate_prefixed_id("cron-owner"),
-            autopilot_notifier: Arc::new(std::sync::RwLock::new(None)),
+            autopilot_notifier: Arc::new(std::sync::Mutex::new(AutopilotNotifySlot::default())),
             governance: Arc::new(std::sync::RwLock::new(None)),
         }
     }
@@ -155,18 +169,37 @@ impl CronService {
     }
 
     /// Install the Autopilot result notifier (IM + Inbox delivery).
+    ///
+    /// Reports buffered during the startup window (runs that finished before
+    /// the channels were built) are delivered now, in order.
     pub fn set_autopilot_notifier(&self, notifier: Arc<dyn AutopilotNotifier>) {
-        let mut slot = self
-            .autopilot_notifier
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *slot = Some(notifier);
+        let pending: Vec<AutopilotRunReport> = {
+            let mut slot = self
+                .autopilot_notifier
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.notifier = Some(Arc::clone(&notifier));
+            slot.pending.drain(..).collect()
+        };
+        if pending.is_empty() {
+            return;
+        }
+        info!(
+            count = pending.len(),
+            "Delivering Autopilot reports buffered during startup"
+        );
+        tokio::spawn(async move {
+            for report in pending {
+                notifier.notify(report).await;
+            }
+        });
     }
 
     fn autopilot_notifier(&self) -> Option<Arc<dyn AutopilotNotifier>> {
         self.autopilot_notifier
-            .read()
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .notifier
             .clone()
     }
 
@@ -194,9 +227,6 @@ impl CronService {
         if !job.autopilot {
             return;
         }
-        let Some(notifier) = self.autopilot_notifier() else {
-            return;
-        };
         let report = AutopilotRunReport {
             user_id: owner_user_id.unwrap_or(&job.user_id).to_owned(),
             job_id: job.id.clone(),
@@ -205,6 +235,29 @@ impl CronService {
             outcome,
             conversation_id: conversation_id.filter(|id| !id.is_empty()),
             error,
+        };
+        let notifier = {
+            let mut slot = self
+                .autopilot_notifier
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match slot.notifier.clone() {
+                Some(notifier) => notifier,
+                None => {
+                    // Startup window: hold the report until the app wires
+                    // the notifier (set_autopilot_notifier drains it).
+                    if slot.pending.len() >= MAX_PENDING_AUTOPILOT_REPORTS
+                        && let Some(dropped) = slot.pending.pop_front()
+                    {
+                        warn!(
+                            job_id = %dropped.job_id,
+                            "Autopilot report buffer full before notifier was installed; dropping oldest"
+                        );
+                    }
+                    slot.pending.push_back(report);
+                    return;
+                }
+            }
         };
         tokio::spawn(async move { notifier.notify(report).await });
     }

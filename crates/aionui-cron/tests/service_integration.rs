@@ -4002,3 +4002,33 @@ async fn autopilot_scheduled_run_reports_result_and_plain_jobs_do_not() {
         aionui_cron::notify::AutopilotOutcome::Error => assert!(report.error.is_some()),
     }
 }
+
+/// Startup window: a run that finishes before the app wires the notifier
+/// (channels are built after cron) is buffered and delivered on install.
+#[tokio::test]
+async fn autopilot_report_before_notifier_install_is_delivered_on_install() {
+    let (svc, _, _) = setup().await;
+
+    let mut req = make_create_req("Early Autopilot", every_60s());
+    req.autopilot = true;
+    req.notify_channel_id = Some("session_ok".into());
+    let job = svc.add_job("u1", req).await.unwrap();
+    svc.tick(&job.id, job.next_run_at.unwrap()).await;
+
+    let notifier = recording_notifier(&["session_ok"]);
+    svc.set_autopilot_notifier(notifier.clone());
+    wait_for_reports(&notifier, 1).await;
+    let reports = notifier.reports.lock().unwrap().clone();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0].job_id, job.id);
+    assert_eq!(reports[0].notify_channel_id.as_deref(), Some("session_ok"));
+
+    // Runs after install go straight to the notifier, without replaying.
+    let mut req = make_create_req("Later Autopilot", every_60s());
+    req.autopilot = true;
+    let later = svc.add_job("u1", req).await.unwrap();
+    svc.tick(&later.id, later.next_run_at.unwrap()).await;
+    wait_for_reports(&notifier, 2).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(notifier.reports.lock().unwrap().len(), 2);
+}
