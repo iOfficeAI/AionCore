@@ -280,7 +280,13 @@ impl AppServices {
         let encryption_key = derive_encryption_key(&encryption_secret);
 
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
-        let event_bus = Arc::new(BroadcastEventBus::new(256));
+        // E14: durable event journal under `{data_dir}/realtime` so WS resume
+        // keeps the same epoch across Host process restarts when events remain.
+        let event_log = Arc::new(aionui_realtime::EventLog::open_durable_or_memory(
+            data_dir.join("realtime"),
+            aionui_realtime::DEFAULT_EVENT_LOG_CAPACITY,
+        ));
+        let event_bus = Arc::new(BroadcastEventBus::with_event_log(256, event_log));
         let agent_approvals = Arc::new(aionui_auth::AgentActionApprovals::new());
         {
             let event_bus = event_bus.clone();

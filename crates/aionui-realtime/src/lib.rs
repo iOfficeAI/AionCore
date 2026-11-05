@@ -2,6 +2,7 @@
 
 //! WebSocket connection manager, event broadcasting, and token-validated upgrade handler.
 pub mod broadcaster;
+pub mod event_journal;
 pub mod event_log;
 pub mod handler;
 pub mod manager;
@@ -9,6 +10,7 @@ pub mod router;
 pub mod types;
 
 pub use broadcaster::{BroadcastEventBus, EventBroadcaster};
+pub use event_journal::{EventJournal, JournalSnapshot};
 pub use event_log::{DEFAULT_EVENT_LOG_CAPACITY, EventLog, ResumeSlice, ResumeStatus};
 pub use handler::{TokenExtractor, TokenUserResolver, WsHandlerState, ws_upgrade_handler};
 pub use manager::{TokenValidator, WebSocketManager};

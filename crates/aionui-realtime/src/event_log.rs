@@ -1,13 +1,19 @@
-//! In-memory epoch/sequence event ring for headless Host reconnect (E14).
+//! Epoch/sequence event ring for headless Host reconnect (E14).
 //!
-//! Brand: CSBU WorkMate. No AGPL. Bounded RAM only — not durable journal replay.
+//! Brand: CSBU WorkMate. No AGPL.
+//! Optional durable NDJSON journal keeps the same epoch across Host restarts
+//! so clients can resume without a gap when events are still retained.
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aionui_api_types::{EventCursor, WebSocketMessage};
 use serde_json::Value;
+use tracing::warn;
+
+use crate::event_journal::EventJournal;
 
 /// Default ring capacity (recent live events only).
 pub const DEFAULT_EVENT_LOG_CAPACITY: usize = 512;
@@ -17,7 +23,8 @@ pub const DEFAULT_EVENT_LOG_CAPACITY: usize = 512;
 pub enum ResumeStatus {
     /// Same epoch; events with `sequence > after.sequence` were available.
     Ok,
-    /// Client cursor epoch differs from the Host (restart / rotation).
+    /// Client cursor epoch differs from the Host (restart without journal /
+    /// rotation), or the ring/journal evicted needed events.
     Gap,
 }
 
@@ -29,18 +36,20 @@ pub struct ResumeSlice {
 }
 
 /// Process-local ring of recently broadcast WebSocket envelopes, stamped with
-/// [`EventCursor`]. Epoch is fixed for the Host process lifetime (bumps only
-/// when a new [`EventLog`] is constructed — i.e. Host restart).
+/// [`EventCursor`]. When opened via [`EventLog::open_durable`], the epoch is
+/// reused across Host restarts and recent events are rehydrated from disk.
 pub struct EventLog {
     epoch: u64,
     next_sequence: AtomicU64,
     capacity: usize,
     ring: Mutex<VecDeque<WebSocketMessage<Value>>>,
+    journal: Option<Mutex<EventJournal>>,
 }
 
 impl EventLog {
     /// Create a log with `capacity` slots. Epoch starts at `1` (0 reserved for
-    /// "unset / legacy client").
+    /// "unset / legacy client"). In-memory only — Host restart starts a new
+    /// epoch unless [`Self::open_durable`] is used.
     pub fn new(capacity: usize) -> Self {
         Self::with_epoch(1, capacity)
     }
@@ -52,11 +61,62 @@ impl EventLog {
             next_sequence: AtomicU64::new(1),
             capacity,
             ring: Mutex::new(VecDeque::with_capacity(capacity)),
+            journal: None,
+        }
+    }
+
+    /// Open a durable log under `dir` (`epoch` + `events.ndjson`). Reuses the
+    /// stored epoch and rehydrates up to `capacity` events so WS resume can
+    /// succeed after Host process restart.
+    pub fn open_durable(dir: impl AsRef<Path>, capacity: usize) -> std::io::Result<Self> {
+        let capacity = capacity.max(1);
+        let journal = EventJournal::open(dir.as_ref(), capacity)?;
+        let snap = journal.load_snapshot()?;
+        let epoch = snap.epoch.max(1);
+        let next_sequence = snap
+            .events
+            .last()
+            .and_then(|e| e.cursor)
+            .map(|c| c.sequence.saturating_add(1))
+            .unwrap_or(1)
+            .max(1);
+        let mut ring = VecDeque::with_capacity(capacity);
+        for ev in snap.events {
+            if ring.len() >= capacity {
+                ring.pop_front();
+            }
+            ring.push_back(ev);
+        }
+        Ok(Self {
+            epoch,
+            next_sequence: AtomicU64::new(next_sequence),
+            capacity,
+            ring: Mutex::new(ring),
+            journal: Some(Mutex::new(journal)),
+        })
+    }
+
+    /// Best-effort durable open: falls back to an in-memory log on I/O errors.
+    pub fn open_durable_or_memory(dir: impl AsRef<Path>, capacity: usize) -> Self {
+        match Self::open_durable(dir.as_ref(), capacity) {
+            Ok(log) => log,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    path = %dir.as_ref().display(),
+                    "Failed to open durable event journal; using in-memory EventLog"
+                );
+                Self::new(capacity)
+            }
         }
     }
 
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    pub fn is_durable(&self) -> bool {
+        self.journal.is_some()
     }
 
     /// Last assigned cursor (sequence 0 when nothing has been published yet).
@@ -66,10 +126,18 @@ impl EventLog {
     }
 
     /// Stamp `event` with the next Host cursor (always Host-owned), append a
-    /// clone to the ring, and return the stamped envelope for broadcast.
+    /// clone to the ring (and durable journal when configured), and return the
+    /// stamped envelope for broadcast.
     pub fn record(&self, mut event: WebSocketMessage<Value>) -> WebSocketMessage<Value> {
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         event.cursor = Some(EventCursor::new(self.epoch, sequence));
+        // Best-effort durable append; never fail the in-memory publish path.
+        if let Some(journal) = &self.journal
+            && let Ok(mut j) = journal.lock()
+            && let Err(err) = j.append(&event)
+        {
+            warn!(error = %err, "Failed to append event to durable journal");
+        }
         {
             let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
             if ring.len() >= self.capacity {
@@ -130,6 +198,7 @@ impl EventLog {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
 
     #[test]
     fn record_stamps_monotonic_sequence() {
@@ -200,5 +269,33 @@ mod tests {
         assert_eq!(out.cursor, Some(EventCursor::new(1, 1)));
         let auto = log.record(WebSocketMessage::new("auto", json!({})));
         assert_eq!(auto.cursor, Some(EventCursor::new(1, 2)));
+    }
+
+    #[test]
+    fn durable_reuses_epoch_across_reopen() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "workmate-event-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log = EventLog::open_durable(&dir, 8).unwrap();
+        assert!(log.is_durable());
+        log.record(WebSocketMessage::new("a", json!({})));
+        log.record(WebSocketMessage::new("b", json!({})));
+        let cursor = log.current_cursor();
+        drop(log);
+
+        let log2 = EventLog::open_durable(&dir, 8).unwrap();
+        assert_eq!(log2.epoch(), cursor.epoch);
+        assert_eq!(log2.current_cursor(), cursor);
+        let slice = log2.events_after(EventCursor::new(cursor.epoch, 1));
+        assert_eq!(slice.status, ResumeStatus::Ok);
+        assert_eq!(slice.events.len(), 1);
+        assert_eq!(slice.events[0].name, "b");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
