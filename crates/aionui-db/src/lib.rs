@@ -38,20 +38,23 @@ pub use models::{
     BatchItemRow, BatchJobRow, ContextSnapshotArtifactRow, ContextSnapshotRow, ConversationArtifactRow,
     ConversationAssistantSnapshotRow, ConversationCapabilitySnapshotRow, ConversationInputRow,
     CreateAgentWorkflowRunParams, CreateAssistantDefinitionRevisionParams, CreateAssistantParams,
-    CreateExperienceArticleParams, CreateSkillEvolutionProposalParams, ExperienceArticleRow, ExternalUserProjection,
-    FolderRow, InboxItemRow, JournalProjectionCheckpointRow, OrderItemType, OrderScene, ProjectExplorerRow,
-    ProjectKind, ProjectRow, Role, SkillEvolutionProposalRow, SkillEvolutionSettingsRow, SkillGovernanceRow,
-    SkillImportRecordRow, SkillRegistryInstallRow, SkillRow, SkillSourceRow, SkillVersionRow,
-    TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow, TaskEvidenceRow, TaskRunRow,
-    TaskSessionRow, TaskTraceEventRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
-    UpdateAssistantParams, UpdateSkillEvolutionProposalParams, UpsertAgentMetadataParams,
+    CreateExperienceArticleParams, CreateLocalKbDocumentParams, CreateLocalKbSourceParams,
+    CreateSkillEvolutionProposalParams, ExperienceArticleRow, ExternalUserProjection, FolderRow, InboxItemRow,
+    JournalProjectionCheckpointRow, LocalKbDocumentRow, LocalKbSettingsRow, LocalKbSourceRow, OrderItemType,
+    OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow, Role, SkillEvolutionProposalRow,
+    SkillEvolutionSettingsRow, SkillGovernanceRow, SkillImportRecordRow, SkillRegistryInstallRow, SkillRow,
+    SkillSourceRow, SkillVersionRow, TaskAcceptanceCriterionRow, TaskApprovalRow, TaskArtifactRow, TaskCheckpointRow,
+    TaskEvidenceRow, TaskRunRow, TaskSessionRow, TaskTraceEventRow, UpdateAgentAvailabilitySnapshotParams,
+    UpdateAgentHandshakeParams, UpdateAssistantParams, UpdateSkillEvolutionProposalParams, UpsertAgentMetadataParams,
     UpsertAssistantAgentCenterParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
-    UpsertConversationCapabilitySnapshotParams, UpsertJournalProjectionCheckpointParams, UpsertOverrideParams,
-    UpsertSkillEvolutionSettingsParams, UsageEventRow, UserOrderRow, UserStatus, UserType,
+    UpsertConversationCapabilitySnapshotParams, UpsertJournalProjectionCheckpointParams, UpsertLocalKbSettingsParams,
+    UpsertOverrideParams, UpsertSkillEvolutionSettingsParams, UsageEventRow, UserOrderRow, UserStatus, UserType,
     evolution_auto_apply_allowed, review_status_is_live,
 };
+pub use repository::ILocalKbRepository;
 pub use repository::SqliteAuditEventRepository;
+pub use repository::SqliteLocalKbRepository;
 pub use repository::SqliteUserDeviceRepository;
 pub use repository::audit_event::{
     AUDIT_LIST_DEFAULT_LIMIT, AUDIT_LIST_MAX_LIMIT, AuditActorKind, AuditChainVerification, AuditEventFilter,

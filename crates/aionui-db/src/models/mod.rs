@@ -9,6 +9,7 @@ mod conversation;
 mod conversation_artifact;
 mod cron_job;
 mod inbox_item;
+mod local_kb;
 mod mcp_server;
 mod message;
 mod oauth_token;
@@ -82,3 +83,8 @@ pub use usage_event::UsageEventRow;
 pub use user::{ExternalUserProjection, User, UserStatus, UserType};
 pub use user_device::UserDeviceRow;
 pub use user_order::{OrderItemType, OrderScene, UserOrderRow};
+
+pub use local_kb::{
+    CreateLocalKbDocumentParams, CreateLocalKbSourceParams, LocalKbDocumentRow, LocalKbSettingsRow, LocalKbSourceRow,
+    UpsertLocalKbSettingsParams,
+};

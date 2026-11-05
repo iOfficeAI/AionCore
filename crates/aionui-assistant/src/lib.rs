@@ -11,6 +11,8 @@ pub mod agent_center_routes;
 pub mod agent_center_service;
 pub mod builtin;
 pub mod error;
+pub mod local_kb_routes;
+pub mod local_kb_service;
 pub mod routes;
 pub mod service;
 pub mod skill_evolution_gate;
@@ -37,3 +39,6 @@ pub use skill_evolution_ports::{
 };
 pub use skill_evolution_routes::{SkillEvolutionRouterState, skill_evolution_routes};
 pub use skill_evolution_service::SkillEvolutionService;
+
+pub use local_kb_routes::{LocalKbRouterState, local_kb_routes};
+pub use local_kb_service::LocalKbService;

@@ -26,6 +26,7 @@ mod extension;
 mod file;
 mod inbox;
 mod lifecycle;
+mod local_kb;
 mod mcp;
 mod office;
 mod project;
@@ -256,6 +257,11 @@ pub use skill::{
     SkillSourceResponse, UpdateOfficialSkillRequest, WriteAssistantRuleRequest,
 };
 pub use skill_delivery::{SkillDelivery, SkillDeliveryMode, SkillDeliveryParse, parse_skill_delivery};
+
+pub use local_kb::{
+    CreateLocalKbSourceRequest, LocalKbSearchHit, LocalKbSearchRequest, LocalKbSettingsResponse, LocalKbSourceResponse,
+    UpdateLocalKbSettingsRequest,
+};
 pub use skill_evolution::{
     ApplySkillEvolutionRequest, ApplySkillEvolutionResponse, ApproveSkillEvolutionResponse,
     CreateExperienceArticleRequest, CreateSkillEvolutionProposalRequest, CrossModelTransferNoteResponse,

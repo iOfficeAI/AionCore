@@ -13,7 +13,7 @@ use aionui_assistant::{
     AgentCenterRouterState, AgentCenterService, AgentWorkflowAgentCancellationOutcome,
     AgentWorkflowAgentExecutionCancellationPort, AgentWorkflowToolExecutionPort, AgentWorkflowTurnResult,
     AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
-    SkillEvolutionRouterState, SkillEvolutionService,
+    LocalKbRouterState, LocalKbService, SkillEvolutionRouterState, SkillEvolutionService,
 };
 use aionui_auth::extract_token_from_ws_headers;
 use aionui_channel::ChannelRouterState;
@@ -29,9 +29,9 @@ use aionui_db::{
     SqliteAssistantDefinitionRepository, SqliteAssistantDefinitionRevisionRepository, SqliteAssistantOverlayRepository,
     SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
     SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteExperienceArticleRepository,
-    SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
-    SqliteSettingsRepository, SqliteSkillEvolutionProposalRepository, SqliteSkillEvolutionSettingsRepository,
-    SqliteTeamRepository,
+    SqliteFeedbackDiagnosticsRepository, SqliteLocalKbRepository, SqliteProviderRepository,
+    SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSkillEvolutionProposalRepository,
+    SqliteSkillEvolutionSettingsRepository, SqliteTeamRepository,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -166,6 +166,8 @@ pub struct ModuleStates {
     pub assistant: AssistantRouterState,
     pub agent_center: AgentCenterRouterState,
     pub skill_evolution: SkillEvolutionRouterState,
+    /// M9 E15 local-kb (`/api/local-kb*`). Default OFF; not KnowHub / experience.
+    pub local_kb: LocalKbRouterState,
     /// M7 E4 diff annotations (`/api/review-threads*`).
     pub review: ReviewRouterState,
     /// M7 E4-5 PR delivery (`/api/scm-deliveries*`).
@@ -409,6 +411,7 @@ pub async fn build_module_states(
     let skill_evolution = build_module_state_phase(&boot, "skill_evolution", || {
         build_skill_evolution_state(services, system.provider_service.clone(), agent_center.service.clone())
     });
+    let local_kb = build_module_state_phase(&boot, "local_kb", || build_local_kb_state(services));
     let mut states = ModuleStates {
         system,
         conversation: build_module_state_phase(&boot, "conversation", || {
@@ -459,6 +462,7 @@ pub async fn build_module_states(
         assistant: assistant.clone(),
         agent_center,
         skill_evolution,
+        local_kb,
         review: build_module_state_phase(&boot, "review", || build_review_state(services)),
         scm_delivery: build_module_state_phase(&boot, "scm_delivery", || build_delivery_state(services)),
         worktree,
@@ -929,6 +933,13 @@ pub fn build_delivery_state(services: &AppServices) -> DeliveryRouterState {
     DeliveryRouterState {
         service: Arc::new(DeliveryService::new(services.database.pool().clone(), resolver)),
     }
+}
+
+/// Build local-kb router state (M9 E15). Default OFF; not KnowHub / experience.
+pub fn build_local_kb_state(services: &AppServices) -> LocalKbRouterState {
+    let repo = Arc::new(SqliteLocalKbRepository::new(services.database.pool().clone()));
+    let service = Arc::new(LocalKbService::new(repo));
+    LocalKbRouterState { service }
 }
 
 /// Build Skill Evolution router state (经验库 / 技能提案 + Phase 2 evolve/apply).

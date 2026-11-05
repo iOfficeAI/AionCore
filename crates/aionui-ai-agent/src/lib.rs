@@ -53,6 +53,7 @@ pub use capability::context_provider::{
     validate_context_query,
 };
 pub use capability::context_resolver::{MAX_CONTEXT_RECOMMENDATIONS, resolve_context_sources};
+pub use capability::local_kb_provider::{LOCAL_KB_INSTANCE_ID, LOCAL_KB_PROVIDER_ID, LocalKbContextProvider};
 pub use capability::planning_policy::{
     AION_STRICT_PLANNING_ALLOWED_TOOLS, AionToolClassification, PlanningPolicy, PolicyContext,
     RuntimeEnforcementCapabilities, ToolPolicyRequest, audited_aion_strict_runtime_capabilities,

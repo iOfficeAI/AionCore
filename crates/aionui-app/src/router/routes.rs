@@ -18,7 +18,7 @@ use aionui_ai_agent::{
 };
 use aionui_api_types::{ErrorResponse, WebSocketMessage};
 use aionui_assets::{AssetRouterState, asset_routes};
-use aionui_assistant::{agent_center_routes, assistant_routes, skill_evolution_routes};
+use aionui_assistant::{agent_center_routes, assistant_routes, local_kb_routes, skill_evolution_routes};
 use aionui_auth::{
     AuthIdentityMode, AuthRouterState, AuthState, IRuntimeTokenVerifier, RefreshCoalescer,
     SystemDefaultFilesystemAdopter, auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
@@ -457,6 +457,11 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // M9 E15 local-kb. User identity only; default OFF. Not auto-injected into chat.
+    let local_kb_authenticated = local_kb_routes(states.local_kb)
+        .route_layer(from_fn_with_state(route_audit.clone(), route_audit_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // M7 E4 diff annotations. User identity only; agent tokens are denied by
     // the agent scope (prefix not allow-listed).
     let review_authenticated = review_routes(states.review)
@@ -559,6 +564,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(assistant_authenticated)
         .merge(agent_center_authenticated)
         .merge(skill_evolution_authenticated)
+        .merge(local_kb_authenticated)
         .merge(review_authenticated)
         .merge(delivery_authenticated)
         .merge(worktree_authenticated)
