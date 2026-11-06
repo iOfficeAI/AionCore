@@ -102,6 +102,16 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
 
+    /// The agent catalog row a member conversation runs on (`extra.agent_id`).
+    ///
+    /// Team tool transport is a property of the agent that actually runs, so
+    /// the capability lookup must be keyed by this row. `Ok(None)` falls back
+    /// to resolving by backend label alone, which for a shared label such as
+    /// `acp` picks the builtin row rather than the member's own agent.
+    async fn conversation_agent_id(&self, _conversation_id: &str) -> Result<Option<String>, TeamError> {
+        Ok(None)
+    }
+
     async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError>;
 
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError>;
@@ -606,7 +616,14 @@ impl TeamAgentProvisioner {
         user_id: &str,
         agent: &TeamAgent,
     ) -> Result<(TeamToolTransport, aionui_common::ResolvedBackendCapabilities), TeamError> {
-        let capabilities = self.capability_port.resolve(user_id, &agent.backend, None).await?;
+        let agent_id = self
+            .conversation_port
+            .conversation_agent_id(&agent.conversation_id)
+            .await?;
+        let capabilities = self
+            .capability_port
+            .resolve(user_id, &agent.backend, agent_id.as_deref())
+            .await?;
         if capabilities.mcp.stdio {
             return Ok((TeamToolTransport::Mcp, capabilities));
         }
@@ -1057,6 +1074,16 @@ mod tests {
             Ok(None)
         }
 
+        async fn conversation_agent_id(&self, _conversation_id: &str) -> Result<Option<String>, TeamError> {
+            Ok(self
+                .persisted_extra
+                .lock()
+                .unwrap()
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned))
+        }
+
         async fn create_team_temp_workspace(&self, _user_id: &str, _team_id: &str) -> Result<String, TeamError> {
             Err(TeamError::InvalidRequest("unused".into()))
         }
@@ -1327,14 +1354,29 @@ mod tests {
 
     struct TestCapabilityPort;
 
+    const TEST_MCP_ACP_AGENT_ID: &str = "custom-acp-with-mcp";
+
     #[async_trait]
     impl TeamToolCapabilityPort for TestCapabilityPort {
         async fn resolve(
             &self,
             _user_id: &str,
             backend: &str,
-            _agent_id: Option<&str>,
+            agent_id: Option<&str>,
         ) -> Result<aionui_common::ResolvedBackendCapabilities, TeamError> {
+            // Stands in for a custom ACP agent whose own handshake advertised MCP;
+            // resolving `acp` by backend alone must not see it.
+            if agent_id == Some(TEST_MCP_ACP_AGENT_ID) {
+                return Ok(aionui_common::ResolvedBackendCapabilities {
+                    mcp: aionui_common::McpTransportCapabilities {
+                        stdio: true,
+                        sse: true,
+                        streamable_http: true,
+                    },
+                    cli_fallback: true,
+                    origin: aionui_common::CapabilityOrigin::AcpHandshake,
+                });
+            }
             let direct = matches!(backend, "claude" | "codex" | "antigravity");
             let internal = backend == "aionrs";
             Ok(aionui_common::ResolvedBackendCapabilities {
@@ -1505,6 +1547,38 @@ mod tests {
         agent.backend = "custom-acp".into();
 
         let transport = provisioner.team_tool_transport("user-test", &agent).await.unwrap();
+
+        assert_eq!(transport, TeamToolTransport::CliAssumed);
+    }
+
+    #[tokio::test]
+    async fn team_tool_transport_resolves_the_member_conversation_agent() {
+        // Custom ACP agents share the `acp` backend label with the builtins, so
+        // only the conversation's bound agent row tells their capabilities apart.
+        let provisioner = test_provisioner_with_port_state(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+            None,
+            Arc::new(Mutex::new(serde_json::json!({ "agent_id": TEST_MCP_ACP_AGENT_ID }))),
+        );
+
+        let transport = provisioner
+            .team_tool_transport("user-test", &test_agent())
+            .await
+            .unwrap();
+
+        assert_eq!(transport, TeamToolTransport::Mcp);
+    }
+
+    #[tokio::test]
+    async fn team_tool_transport_without_bound_agent_keeps_backend_resolution() {
+        let provisioner = test_provisioner(Arc::new(Mutex::new(Vec::new())));
+
+        let transport = provisioner
+            .team_tool_transport("user-test", &test_agent())
+            .await
+            .unwrap();
 
         assert_eq!(transport, TeamToolTransport::CliAssumed);
     }

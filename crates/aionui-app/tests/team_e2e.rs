@@ -1244,6 +1244,117 @@ async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
     assert_eq!(stop_resp.status(), StatusCode::OK);
 }
 
+// ES-1b2: a custom ACP agent shares the `acp` backend label with the builtin
+// ACP rows, so Team transport must come from the member's own agent row. Its
+// handshake advertised MCP; the builtins' did not.
+#[tokio::test]
+async fn es1b2_custom_acp_member_uses_its_own_handshake_for_team_mcp() {
+    const CUSTOM_AGENT_ID: &str = "e2ecust1";
+    const CUSTOM_ASSISTANT_ID: &str = "team-e2e-custom-acp-assistant";
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let pool = services.database.pool();
+
+    sqlx::query(
+        "UPDATE agent_metadata SET agent_capabilities = '{\"mcp_capabilities\":{}}' \
+         WHERE agent_source = 'builtin' AND agent_type = 'acp'",
+    )
+    .execute(pool)
+    .await
+    .expect("builtin ACP rows advertise no MCP");
+
+    let command = std::env::current_exe()
+        .expect("test executable path")
+        .to_string_lossy()
+        .to_string();
+    let source_info = json!({ "binary_name": command }).to_string();
+    sqlx::query(
+        "INSERT INTO agent_metadata \
+            (id, agent_id, user_id, icon, name, name_i18n, description, description_i18n, \
+             backend, agent_type, agent_source, agent_source_info, \
+             enabled, command, args, env, native_skills_dirs, skill_delivery, \
+             behavior_policy, yolo_id, agent_capabilities, auth_methods, config_options, \
+             available_modes, available_models, available_commands, sort_order, created_at, updated_at) \
+         SELECT lower(hex(randomblob(16))), ?, NULL, icon, 'Team E2E Custom ACP', NULL, description, NULL, \
+             NULL, 'acp', 'custom', ?, 1, ?, '[]', '[]', native_skills_dirs, skill_delivery, \
+             '{\"supports_team\":true}', yolo_id, ?, auth_methods, config_options, \
+             available_modes, available_models, available_commands, 1500, created_at, updated_at \
+         FROM agent_metadata WHERE agent_id = ?",
+    )
+    .bind(CUSTOM_AGENT_ID)
+    .bind(&source_info)
+    .bind(&command)
+    .bind(json!({ "mcp_capabilities": { "http": true, "sse": true } }).to_string())
+    .bind(DEFAULT_TEAM_AGENT_ID)
+    .execute(pool)
+    .await
+    .expect("seed custom ACP agent");
+    services
+        .agent_registry
+        .reload_one(CUSTOM_AGENT_ID)
+        .await
+        .expect("reload custom ACP agent");
+
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/assistants",
+            json!({ "id": CUSTOM_ASSISTANT_ID, "name": "Custom ACP", "agent_id": CUSTOM_AGENT_ID }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let member = |name: &str, role: &str| json!({ "name": name, "role": role, "model": "default", "assistant_id": CUSTOM_ASSISTANT_ID });
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/teams",
+            json!({ "name": "Custom", "agents": [member("Lead", "lead"), member("Worker", "teammate")] }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let data = body_json(resp).await["data"].clone();
+    let team_id = data["id"].as_str().unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/teams/{team_id}/session"),
+            json!({}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let lead = &data["assistants"][0];
+    let extra = conversation_extra(&services, lead["conversation_id"].as_str().unwrap()).await;
+    assert_eq!(extra["agent_id"], CUSTOM_AGENT_ID);
+    let mcp_config: TeamMcpStdioConfig = serde_json::from_value(extra["team_mcp_stdio_config"].clone())
+        .unwrap_or_else(|error| panic!("custom ACP lead must get the Team MCP transport ({error}): {extra}"));
+    assert_eq!(mcp_config.slot_id, lead["slot_id"].as_str().unwrap());
+
+    let stop_resp = app
+        .oneshot(delete_with_token(
+            &format!("/api/teams/{team_id}/session"),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stop_resp.status(), StatusCode::OK);
+}
+
 // ES-1c: each member conversation carries only its assistant's explicit MCP
 // binding. A fixed empty binding must not inherit globally enabled servers.
 #[tokio::test]
