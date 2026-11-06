@@ -518,6 +518,24 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map(str::to_owned))
     }
 
+    async fn conversation_agent_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError> {
+        // Same identity source the conversation layer uses to pick the session's
+        // MCP support policy, so Team transport and injected servers agree.
+        let Some(user_id) = self.owner_user_id(conversation_id).await? else {
+            return Ok(None);
+        };
+        let Some(row) = self.conversation_repo.get(&user_id, conversation_id).await? else {
+            return Ok(None);
+        };
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        Ok(extra
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned))
+    }
+
     async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError> {
         self.conversation_service
             .create_team_temp_workspace(user_id, team_id)
