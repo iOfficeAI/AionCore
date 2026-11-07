@@ -82,3 +82,49 @@ rquickjs and its QuickJS-NG implementation carry MIT licenses; preserve their
 upstream [license notices](THIRD-PARTY-NOTICES.md) when distributing linked experimental builds. Default
 builds do not compile or link the engine; its optional packages still appear in
 Cargo.lock. No workflow or release configuration is changed.
+
+## Internal parent-client increment
+
+The app library now contains `extension_js_client::invoke`, compiled to an
+immediate `Unavailable` response unless the app's Linux experimental feature is
+enabled. Its production executable is always `current_exe()` with the sole
+private helper flag; no executable, argv, environment, cwd, user or handler path
+is accepted from the caller. This is **not wired to extension routes**.
+
+The internal client sets a two-second work-stage deadline from call entry, concurrent
+bounded stdin/stdout/stderr work (256 KiB protocol stdout, 8 KiB stderr), and an
+independent child owner. Explicit cancellation, closing the cancellation channel,
+or dropping the calling future asks that owner to kill and wait. All pipe
+futures close before cleanup; group-kill failures still attempt direct kill/wait.
+Input additionally has depth 64 and 32768-node limits and bounded serialization.
+A single strict JSON response is required; success includes an explicitly present
+`result` (including null), with a separately bounded 64 KiB serialized result.
+
+These guarantees require a live Tokio runtime. Parent death, runtime shutdown,
+kernel-uninterruptible waits and native interpreter vulnerabilities are **not**
+covered. Cleanup deliberately awaits reaping without an independent deadline; the
+two-second work budget is not an unconditional bound on total return time.
+There is no process-parent-death signal or source-file loader in this increment. Authorization, curated provenance, immutable source acquisition and
+production wiring remain separate work. The public fixed-current-exe entry
+requires a host with Core's private helper flag. A separate test-only re-exec host exercises that public entry and the real
+JS helper implementation, without adding production fixture modes or an
+executable override; this host is not the packaged Core application.
+Manual ignored process tests separately use a test-only `AIONCORE_TEST_BINARY` to exercise
+the same owner against the actual built Core; they do not override the public
+production executable selection. Unreachable fault injection (blocked writer,
+oversized helper stderr, runtime teardown) is not claimed as process-tested.
+
+Run the public entry test with:
+
+```sh
+cargo test -p aionui-app --no-default-features --features experimental-extension-js --test extension_js_client_process
+```
+
+To run the ignored owner tests, first build and retain separate enabled/disabled
+Core binaries, then point the two **test-only** variables at those snapshots:
+
+```sh
+AIONCORE_TEST_BINARY=/path/to/enabled/aioncore \
+AIONCORE_TEST_DEFAULT_BINARY=/path/to/disabled/aioncore \
+cargo test -p aionui-app --lib --no-default-features --features experimental-extension-js extension_js_client:: -- --include-ignored --test-threads=1
+```

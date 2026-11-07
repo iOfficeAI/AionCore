@@ -6,6 +6,8 @@
 //! submodules. All logic lives in the modules below.
 
 mod config;
+/// Experimental internal fixed-executable JS client; not connected to extension routes.
+pub mod extension_js_client;
 mod github_issue_source;
 mod router;
 mod services;

@@ -8,6 +8,13 @@ exclude = ["data/**"]
 name = "aioncore"
 path = "src/main.rs"
 
+# Re-exec host exists only as a test target, never as a production CLI mode.
+[[test]]
+name = "extension_js_client_process"
+path = "tests/extension_js_client_process.rs"
+harness = false
+required-features = ["experimental-extension-js"]
+
 [features]
 # Explicit Linux experiment only; never enabled by a release channel default.
 experimental-extension-js = ["dep:aionui-extension-js", "aionui-extension-js/engine"]
