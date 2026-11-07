@@ -10,6 +10,7 @@ pub mod dependency;
 pub mod error;
 pub mod external_paths;
 pub mod fs_adopt;
+pub mod host_runtime;
 pub mod hub;
 pub mod hub_routes;
 pub mod lifecycle;
@@ -53,6 +54,7 @@ pub use types::*;
 pub use watcher::ExtensionWatcher;
 
 pub use external_paths::ExternalPathsManager;
+pub use host_runtime::{BackgroundServiceManager, HostRuntime};
 pub use hub::{HubIndexManager, HubInstaller};
 pub use hub_routes::{HubRouterState, hub_routes};
 pub use routes::{ExtensionRouterState, extension_asset_session_routes, extension_routes};

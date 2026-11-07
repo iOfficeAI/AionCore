@@ -749,6 +749,7 @@ pub struct ResolvedModelProvider {
 /// Resolved command-palette entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedCommand {
+    #[serde(rename = "extensionName")]
     pub extension_name: String,
     pub id: String,
     pub title: String,
@@ -761,10 +762,12 @@ pub struct ResolvedCommand {
 /// Resolved standalone panel.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedPanel {
+    #[serde(rename = "extensionName")]
     pub extension_name: String,
     pub id: String,
     pub title: String,
     /// Asset URL under `/api/extensions/{name}/assets/...` or remote URL.
+    #[serde(rename = "entryPoint")]
     pub entry_point: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
@@ -773,9 +776,11 @@ pub struct ResolvedPanel {
 /// Resolved work-panel / sidebar view.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedWorkPanelView {
+    #[serde(rename = "extensionName")]
     pub extension_name: String,
     pub id: String,
     pub title: String,
+    #[serde(rename = "entryPoint")]
     pub entry_point: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<String>,
@@ -786,21 +791,25 @@ pub struct ResolvedWorkPanelView {
 /// Resolved agent tool; `plan_safe_actions` defaults false at parse time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedAgentTool {
+    #[serde(rename = "extensionName")]
     pub extension_name: String,
     pub id: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(rename = "planSafeActions")]
     pub plan_safe_actions: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handler: Option<String>,
 }
 
-/// Resolved background service declaration (not spawned by this slice).
+/// Resolved background service declaration (start/stop via Host runtime).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedBackgroundService {
+    #[serde(rename = "extensionName")]
     pub extension_name: String,
     pub id: String,
+    #[serde(rename = "entryPoint")]
     pub entry_point: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,

@@ -1,8 +1,8 @@
 //! Plugin Contract v1 contribution resolvers (M9 E13).
 //!
 //! Resolves commands / panels / workPanelViews / agentTools / backgroundServices
-//! into runtime-ready structs. Host wiring (palette invoke, panel iframe, tool
-//! dispatch, service spawn) remains follow-up; this slice exposes them via the
+//! into runtime-ready structs. Host list/resolve shipped; Host invoke / panel iframe / tool
+//! dispatch / service spawn live in `host_runtime` + routes; this slice exposes them via the
 //! registry and `/api/extensions/*` list routes.
 
 use std::path::Path;

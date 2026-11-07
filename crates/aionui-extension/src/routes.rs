@@ -21,6 +21,7 @@ use serde_json::json;
 
 use crate::asset_paths::normalize_relative_asset_path;
 use crate::error::ExtensionError;
+use crate::host_runtime::{self, AgentToolInvokeResult, CommandInvokeResult, HostRuntime};
 use crate::permission::{build_permission_summary, calculate_risk_level};
 use crate::registry::ExtensionRegistry;
 
@@ -139,6 +140,8 @@ pub struct ExtensionRouterState {
     pub registry: ExtensionRegistry,
     /// Short-lived settings-tab asset tokens (E1 tail ④).
     pub asset_tokens: std::sync::Arc<crate::asset_tokens::AssetTokenStore>,
+    /// Plugin Contract v1 Host invoke / background service handles (M9 E13).
+    pub host_runtime: HostRuntime,
 }
 
 impl ExtensionRouterState {
@@ -146,6 +149,7 @@ impl ExtensionRouterState {
         Self {
             registry,
             asset_tokens: std::sync::Arc::new(crate::asset_tokens::AssetTokenStore::new()),
+            host_runtime: HostRuntime::new(),
         }
     }
 }
@@ -175,6 +179,20 @@ pub fn extension_routes(state: ExtensionRouterState) -> Router {
         .route("/api/extensions/work-panel-views", get(get_work_panel_views))
         .route("/api/extensions/agent-tools", get(get_agent_tools))
         .route("/api/extensions/background-services", get(get_background_services))
+        .route(
+            "/api/extensions/background-services/status",
+            get(get_background_services_status),
+        )
+        .route("/api/extensions/commands/invoke", post(invoke_command))
+        .route("/api/extensions/agent-tools/invoke", post(invoke_agent_tool))
+        .route(
+            "/api/extensions/background-services/start",
+            post(start_background_service),
+        )
+        .route(
+            "/api/extensions/background-services/stop",
+            post(stop_background_service),
+        )
         .route(
             "/api/extensions/{extension_name}/assets/{*asset_path}",
             get(get_extension_asset),
@@ -524,6 +542,158 @@ async fn get_background_services(
     Ok(Json(ApiResponse::ok(serde_json::to_value(&items).unwrap_or_default())))
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InvokeCommandRequest {
+    id: String,
+    #[serde(default)]
+    extension_name: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InvokeAgentToolRequest {
+    id: String,
+    #[serde(default)]
+    extension_name: Option<String>,
+    /// Untrusted client hint; never authorizes non-plan-safe tool execution.
+    #[serde(default)]
+    plan_mode: bool,
+    #[serde(default)]
+    arguments: Option<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackgroundServiceActionRequest {
+    id: String,
+    #[serde(default)]
+    extension_name: Option<String>,
+}
+
+/// `POST /api/extensions/commands/invoke` — Host ack for a curated command; may hint a panel.
+async fn invoke_command(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<InvokeCommandRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let commands = state.registry.get_commands_for_user(&user.id).await;
+    let command = host_runtime::find_command(&commands, &req.id, req.extension_name.as_deref())
+        .cloned()
+        .ok_or_else(|| ApiError::NotFound(format!("Command not found: {}", req.id)))?;
+    let panels = state.registry.get_panels_for_user(&user.id).await;
+    let open_panel = host_runtime::panel_hint_for_command(&panels, &command).cloned();
+    tracing::info!(
+        user_id = %user.id,
+        command_id = %command.id,
+        extension = %command.extension_name,
+        open_panel = open_panel.as_ref().map(|p| p.id.as_str()),
+        "extension command invoked"
+    );
+    let result = CommandInvokeResult {
+        status: "accepted",
+        command,
+        open_panel,
+    };
+    Ok(Json(ApiResponse::ok(serde_json::to_value(result).unwrap_or_default())))
+}
+
+/// `POST /api/extensions/agent-tools/invoke` — gate planSafeActions; stub dispatch (curated).
+async fn invoke_agent_tool(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<InvokeAgentToolRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let tools = state.registry.get_agent_tools_for_user(&user.id).await;
+    let tool = host_runtime::find_agent_tool(&tools, &req.id, req.extension_name.as_deref())
+        .cloned()
+        .ok_or_else(|| ApiError::NotFound(format!("Agent tool not found: {}", req.id)))?;
+    // No authoritative session/run context is bound to this endpoint yet.
+    // Fail closed regardless of the client hint, including false or omission.
+    if let Err(err) = host_runtime::gate_plan_safe(&tool, true) {
+        return Err(ApiError::Forbidden(err.to_string()));
+    }
+    // v1 curated Host: record accept; JS/sandbox handler IPC is follow-up.
+    let _ = req.arguments;
+    tracing::info!(
+        user_id = %user.id,
+        tool_id = %tool.id,
+        extension = %tool.extension_name,
+        requested_plan_mode = req.plan_mode,
+        "extension agent tool invoke accepted"
+    );
+    let result = AgentToolInvokeResult {
+        status: "accepted",
+        tool,
+        dispatched: false,
+        reason: Some("handler_stub"),
+    };
+    Ok(Json(ApiResponse::ok(serde_json::to_value(result).unwrap_or_default())))
+}
+
+/// `GET /api/extensions/background-services/status` — declarations + running flags.
+async fn get_background_services_status(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let items = state.registry.get_background_services_for_user(&user.id).await;
+    let status = state.host_runtime.background.status_for(&user.id, &items).await;
+    Ok(Json(ApiResponse::ok(serde_json::to_value(&status).unwrap_or_default())))
+}
+
+/// `POST /api/extensions/background-services/start` — spawn curated relative entryPoint.
+async fn start_background_service(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<BackgroundServiceActionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let services = state.registry.get_background_services_for_user(&user.id).await;
+    let service = host_runtime::find_background_service(&services, &req.id, req.extension_name.as_deref())
+        .cloned()
+        .ok_or_else(|| ApiError::NotFound(format!("Background service not found: {}", req.id)))?;
+    let ext = state
+        .registry
+        .get_extension_by_name_for_user(&user.id, &service.extension_name)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("Extension not found: {}", service.extension_name)))?;
+    if !ext.state.enabled {
+        return Err(ApiError::BadRequest(format!(
+            "Extension disabled: {}",
+            service.extension_name
+        )));
+    }
+    let status = state
+        .host_runtime
+        .background
+        .start(&user.id, &ext, &service)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(serde_json::to_value(&status).unwrap_or_default())))
+}
+
+/// `POST /api/extensions/background-services/stop` — kill a previously started service.
+async fn stop_background_service(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<BackgroundServiceActionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let services = state.registry.get_background_services_for_user(&user.id).await;
+    let service = host_runtime::find_background_service(&services, &req.id, req.extension_name.as_deref())
+        .cloned()
+        .ok_or_else(|| ApiError::NotFound(format!("Background service not found: {}", req.id)))?;
+    let status = state
+        .host_runtime
+        .background
+        .stop(&user.id, &service.extension_name, &service.id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(serde_json::to_value(&status).unwrap_or_default())))
+}
+
 /// `GET /api/extensions/{extension_name}/assets/{*asset_path}` — serve an
 /// extension asset under the trusted extension root.
 async fn get_extension_asset(
@@ -831,17 +1001,19 @@ mod tests {
     }
 
     async fn make_state_with_extension() -> (ExtensionRouterState, tempfile::TempDir, PathBuf) {
+        make_state_with_manifest(serde_json::json!({"name": "hello", "version": "1.0.0"})).await
+    }
+
+    async fn make_state_with_manifest(
+        manifest: serde_json::Value,
+    ) -> (ExtensionRouterState, tempfile::TempDir, PathBuf) {
         let tmp = tempfile::TempDir::new().unwrap();
         let ext_root = tmp.path().join("extensions");
         let ext_dir = ext_root.join("hello");
         std::fs::create_dir_all(ext_dir.join("settings")).unwrap();
         std::fs::write(
             ext_dir.join("aion-extension.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "name": "hello",
-                "version": "1.0.0"
-            }))
-            .unwrap(),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
         std::fs::write(ext_dir.join("settings").join("index.html"), "<h1>Hello</h1>").unwrap();
@@ -858,6 +1030,45 @@ mod tests {
             .unwrap();
 
         (ExtensionRouterState::new(registry), tmp, ext_dir)
+    }
+
+    #[tokio::test]
+    async fn agent_tool_route_does_not_trust_client_plan_mode() {
+        let (state, _tmp, _ext_dir) = make_state_with_manifest(serde_json::json!({
+            "name": "hello",
+            "version": "1.0.0",
+            "contributes": {
+                "agentTools": [
+                    {"id": "demo.read", "name": "Read", "planSafeActions": true},
+                    {"id": "demo.write", "name": "Write", "planSafeActions": false}
+                ]
+            }
+        }))
+        .await;
+        let router = extension_routes(state).layer(Extension(CurrentUser::local_default()));
+        for plan_mode in [None, Some(false), Some(true)] {
+            for (action, expected) in [("read", StatusCode::OK), ("write", StatusCode::FORBIDDEN)] {
+                let mut payload = serde_json::json!({"id": format!("ext-hello-demo.{action}")});
+                if let Some(value) = plan_mode {
+                    payload["planMode"] = serde_json::json!(value);
+                }
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/extensions/agent-tools/invoke")
+                            .header("content-type", "application/json")
+                            .body(Body::from(payload.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                // The safe positive control also proves a missing fixture did
+                // not make every request fail with a misleading 404.
+                assert_eq!(response.status(), expected, "action={action}, plan_mode={plan_mode:?}");
+            }
+        }
     }
 
     #[tokio::test]
