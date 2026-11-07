@@ -212,7 +212,7 @@ pub(crate) fn evaluate_install_with(
             });
         };
         let actual = sri_sha512(bytes);
-        if !actual.eq_ignore_ascii_case(expected) {
+        if actual != expected {
             return Err(CuratedGateError::IntegrityMismatch {
                 name: entry.name.clone(),
             });
@@ -330,5 +330,60 @@ mod tests {
         e.pubkey_id = Some("enterprise".into());
         let policy = CuratedInstallPolicy::new(HashSet::new(), true, HashMap::from([("enterprise".into(), verifying)]));
         assert!(evaluate_install_with(&policy, &e, Some(manifest)).is_ok());
+    }
+
+    #[test]
+    fn integrity_exact_digest_accepted() {
+        let policy = CuratedInstallPolicy::new(HashSet::new(), false, HashMap::new());
+        let manifest = br#"{"name":"demo.plugin","version":"1.0.0"}"#;
+        let mut e = entry(true, false);
+        e.integrity = Some(sri_sha512(manifest));
+        assert_eq!(evaluate_install_with(&policy, &e, Some(manifest)), Ok(()));
+    }
+
+    #[test]
+    fn integrity_ordinary_mismatch_rejected() {
+        let policy = CuratedInstallPolicy::new(HashSet::new(), false, HashMap::new());
+        let manifest = br#"{"name":"demo.plugin","version":"1.0.0"}"#;
+        let mut e = entry(true, false);
+        e.integrity = Some(sri_sha512(b"different manifest"));
+        let err = evaluate_install_with(&policy, &e, Some(manifest)).unwrap_err();
+        assert!(matches!(err, CuratedGateError::IntegrityMismatch { .. }));
+    }
+
+    #[test]
+    fn integrity_case_mutated_digest_rejected() {
+        let policy = CuratedInstallPolicy::new(HashSet::new(), false, HashMap::new());
+        let manifest = br#"{"name":"demo.plugin","version":"1.0.0"}"#;
+        let original = sri_sha512(manifest);
+        let prefix = "sha512-";
+        assert!(original.starts_with(prefix));
+        let payload = &original[prefix.len()..];
+        let idx = payload
+            .char_indices()
+            .find(|(_, c)| c.is_ascii_alphabetic())
+            .map(|(i, _)| i)
+            .expect("base64 payload has an alphabetic character");
+        let mut mutated_payload: Vec<char> = payload.chars().collect();
+        let c = mutated_payload[idx];
+        mutated_payload[idx] = if c.is_ascii_uppercase() {
+            c.to_ascii_lowercase()
+        } else {
+            c.to_ascii_uppercase()
+        };
+        let mutated_payload: String = mutated_payload.into_iter().collect();
+        let mutated = format!("{prefix}{mutated_payload}");
+        assert_ne!(original, mutated);
+        assert!(original.eq_ignore_ascii_case(&mutated));
+        let b64 = base64::engine::general_purpose::STANDARD;
+        assert_ne!(b64.decode(payload).unwrap(), b64.decode(&mutated_payload).unwrap());
+
+        let mut e = entry(true, false);
+        e.integrity = Some(mutated);
+        let res = evaluate_install_with(&policy, &e, Some(manifest));
+        assert!(
+            matches!(res, Err(CuratedGateError::IntegrityMismatch { .. })),
+            "case-mutated digest must be rejected, got {res:?}"
+        );
     }
 }
