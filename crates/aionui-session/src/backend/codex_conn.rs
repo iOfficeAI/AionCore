@@ -102,13 +102,31 @@ impl CodexConnection {
     }
 }
 
+// Normalize only Codex's effective execution config. Keep persisted workspaces and
+// other adapters untouched; spawn, handshake, title and wake share this same cwd.
+async fn normalize_codex_cwd(cwd: Option<String>) -> Result<Option<String>, BackendError> {
+    let Some(cwd) = cwd else { return Ok(None) };
+    let unavailable = || BackendError::WorkspaceUnavailable(cwd.clone());
+    if cwd.is_empty() {
+        return Err(unavailable());
+    }
+    let resolved = tokio::fs::canonicalize(&cwd).await.map_err(|_| unavailable())?;
+    let metadata = tokio::fs::metadata(&resolved).await.map_err(|_| unavailable())?;
+    if !metadata.is_dir() {
+        return Err(unavailable());
+    }
+    let resolved = resolved.into_os_string().into_string().map_err(|_| unavailable())?;
+    Ok(Some(resolved))
+}
+
 #[async_trait::async_trait]
 impl BackendConnection for CodexConnection {
     async fn open_session(
         &self,
         spec: SessionSpec,
-        config: SessionConfig,
+        mut config: SessionConfig,
     ) -> Result<Arc<dyn SessionBackend>, BackendError> {
+        config.cwd = normalize_codex_cwd(config.cwd.take()).await?;
         // Live spawn: `codex app-server --stdio` via the INJECTED Spawner (S14,
         // never raw-spawn). The PARSE/reverse-RPC/dispatch contract (the real 007
         // risk) is fully hermetic-tested via build_with_io; this path adds the
@@ -8809,6 +8827,114 @@ mod tests {
         assert!(bare["params"].get("baseInstructions").is_none());
     }
 
+    #[tokio::test]
+    async fn codex_cwd_rejects_invalid_paths_before_spawn() {
+        use crate::testing::FakeSpawner;
+        assert_eq!(normalize_codex_cwd(None).await.unwrap(), None);
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("not-a-directory");
+        std::fs::write(&file, "fixture").unwrap();
+        let spawner = Arc::new(FakeSpawner::new());
+        let conn = CodexConnection::new(spawner.clone());
+        for cwd in [
+            String::new(),
+            root.path().join("missing").to_str().unwrap().to_owned(),
+            file.to_str().unwrap().to_owned(),
+        ] {
+            let result = conn
+                .open_session(
+                    SessionSpec::Fresh {
+                        session_id: "invalid-cwd".into(),
+                    },
+                    SessionConfig {
+                        cwd: Some(cwd.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(matches!(result, Err(BackendError::WorkspaceUnavailable(path)) if path == cwd));
+        }
+        assert_eq!(
+            spawner.call_count(),
+            0,
+            "invalid cwd must fail before any process spawn"
+        );
+        let result = conn
+            .open_session(
+                SessionSpec::Fresh {
+                    session_id: "no-cwd".into(),
+                },
+                SessionConfig::default(),
+            )
+            .await;
+        assert!(result.is_err(), "FakeSpawner cannot construct a process");
+        assert_eq!(spawner.call_count(), 1, "no explicit cwd still reaches spawner");
+        assert_eq!(spawner.last_command().await.unwrap().cwd, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_cwd_rejects_non_utf8_symlink_target() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join(std::ffi::OsString::from_vec(vec![0xff]));
+        std::fs::create_dir(&target).unwrap();
+        let alias = root.path().join("utf8-alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let requested = alias.to_str().unwrap().to_owned();
+        assert_eq!(
+            normalize_codex_cwd(Some(requested.clone())).await,
+            Err(BackendError::WorkspaceUnavailable(requested))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_cwd_symlink_with_spaces_matches_spawn_and_rpc() {
+        use crate::testing::FakeSpawner;
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("workspace with spaces");
+        std::fs::create_dir(&target).unwrap();
+        let alias = root.path().join("workspace-alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let canonical = target.canonicalize().unwrap().into_os_string().into_string().unwrap();
+        let requested = alias.to_str().unwrap().to_owned();
+        let config = SessionConfig {
+            cwd: normalize_codex_cwd(Some(requested.clone())).await.unwrap(),
+            ..Default::default()
+        };
+        for HandshakeParams(params) in [
+            thread_start_params(&config),
+            thread_resume_params(&config, "thread"),
+            thread_fork_params(&config, "parent", None),
+        ] {
+            assert_eq!(params["cwd"], json!(canonical));
+        }
+        let spawner = Arc::new(FakeSpawner::new());
+        let conn = CodexConnection::new(spawner.clone());
+        let result = conn
+            .open_session(
+                SessionSpec::Fresh {
+                    session_id: "symlink-cwd".into(),
+                },
+                SessionConfig {
+                    cwd: Some(requested),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(result.is_err(), "FakeSpawner cannot construct a process");
+        assert_eq!(spawner.call_count(), 1);
+        assert_eq!(
+            spawner.last_command().await.unwrap().cwd.as_deref(),
+            Some(canonical.as_str())
+        );
+        assert!(
+            alias.is_dir(),
+            "execution normalization must preserve old workspace aliases"
+        );
+    }
+
     /// R4 live spawn: open_session MUST route through the INJECTED Spawner (S14,
     /// never raw-spawn) with the right CommandSpec (`codex app-server`, cwd + any
     /// extra_args). FakeSpawner records the spec then Errs (it can't synthesize a
@@ -8820,13 +8946,15 @@ mod tests {
         use crate::testing::FakeSpawner;
         let spawner = std::sync::Arc::new(FakeSpawner::new());
         let conn = CodexConnection::new(spawner.clone());
+        let workspace = tempfile::tempdir().expect("workspace");
+        let canonical = workspace.path().canonicalize().expect("canonical workspace");
         let res = conn
             .open_session(
                 SessionSpec::Fresh {
                     session_id: "logical-1".into(),
                 },
                 SessionConfig {
-                    cwd: Some("/tmp/work".into()),
+                    cwd: Some(workspace.path().to_str().unwrap().into()),
                     extra_args: vec!["--flag".into()],
                     spawn_env: vec![aionui_common::EnvVar {
                         name: "AIONUI_CONVERSATION_ID".into(),
@@ -8857,7 +8985,7 @@ mod tests {
             ],
             "every app-server spawn must explicitly propagate the parent environment to commandExecution shells"
         );
-        assert_eq!(spec.cwd.as_deref(), Some("/tmp/work"), "cwd threaded (workspace)");
+        assert_eq!(spec.cwd.as_deref(), canonical.to_str(), "canonical workspace threaded");
         // #103 parity with claude_conn: the orchestration-filled spawn env
         // (AIONUI_* runtime context + per-agent overrides) reaches the process.
         assert_eq!(
@@ -8891,13 +9019,14 @@ mod tests {
         }
 
         let conn = CodexConnection::new(std::sync::Arc::new(WorkspaceGoneSpawner));
+        let workspace = tempfile::tempdir().expect("workspace exists before spawn");
         let res = conn
             .open_session(
                 SessionSpec::Fresh {
                     session_id: "logical-1".into(),
                 },
                 SessionConfig {
-                    cwd: Some("/gone/workspace".into()),
+                    cwd: Some(workspace.path().to_str().unwrap().into()),
                     ..Default::default()
                 },
             )
@@ -10150,11 +10279,29 @@ mod tests {
     async fn f4_suspend_then_wake_respawns_through_spawner() {
         use crate::testing::FakeSpawner;
         let spawner = Arc::new(FakeSpawner::new());
-        let backend = CodexSessionBackend::build_with_io_suspending(
-            "codex-resume-1",
+        let root = tempfile::tempdir().unwrap();
+        let canonical = root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .into_os_string()
+            .into_string()
+            .unwrap();
+        let config = SessionConfig {
+            cwd: Some(canonical.clone()),
+            ..Default::default()
+        };
+        let HandshakeParams(resume) = thread_resume_params(&config, "th-anchor-1");
+        assert_eq!(resume["cwd"], json!(canonical), "resume builder retains captured cwd");
+        let backend = CodexSessionBackend::spawn_with_wake(
+            "codex-resume-1".into(),
             Box::new(FakeAgentIo::never_exits(Vec::new())),
-            spawner.clone(),
-            40,
+            CodexWakeRecipe {
+                spawner: Some(spawner.clone()),
+                config,
+            },
+            Some(40),
+            Arc::new(TitleGen::new(false, Arc::new(NoTitleIo))),
         )
         .await;
         // The resume anchor that survives the suspend (live path binds it from
@@ -10186,6 +10333,11 @@ mod tests {
         assert_eq!(spawner.call_count(), 1, "wake routed through the injected spawner once");
         let spec = spawner.last_command().await.expect("a spawn was recorded");
         assert_eq!(spec.command.to_str(), Some("codex"), "wake re-spawns the codex binary");
+        assert_eq!(
+            spec.cwd.as_deref(),
+            Some(canonical.as_str()),
+            "wake spawn retains captured canonical cwd"
+        );
         assert_eq!(
             spec.args,
             [
