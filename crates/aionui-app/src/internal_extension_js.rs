@@ -40,7 +40,10 @@ pub(super) fn try_run(args: impl Iterator<Item = OsString>) -> Option<ExitCode> 
         Invocation::Run => {
             #[cfg(feature = "experimental-extension-js")]
             {
-                Some(aionui_extension_js::run_stdio())
+                match aionui_app::extension_js_client::prepare_child_parent_guard() {
+                    Ok(()) => Some(aionui_extension_js::run_stdio()),
+                    Err(error) => Some(reject(error)),
+                }
             }
             #[cfg(not(feature = "experimental-extension-js"))]
             {

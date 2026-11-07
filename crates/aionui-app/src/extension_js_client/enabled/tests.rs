@@ -20,6 +20,10 @@ fn bounded_request_and_strict_response() {
         decode(br#"{"ok":false,"error":"runner_unavailable"}"#, false, Some(2)),
         Err(HelperError::Unavailable)
     );
+    for error in ["supervision_required", "parent_exited", "parent_guard_unavailable"] {
+        let frame = serde_json::to_vec(&json!({"ok":false,"error":error})).unwrap();
+        assert_eq!(decode(&frame, false, Some(2)), Err(HelperError::ParentGuard));
+    }
     for response in [
         br#"{"ok":true}"#.as_slice(),
         br#"{"ok":false,"result":1}"#,
@@ -64,7 +68,11 @@ fn core_child() -> Child {
 fn core_child_from_env(variable: &str) -> Child {
     let exe = std::env::var_os(variable).expect("set the test-only variable to the actual Core binary");
     let mut command = Builder::clean_cli(exe);
-    command.env_clear().arg("--internal-extension-js").stdin(Stdio::piped());
+    command
+        .env_clear()
+        .env(PARENT_PID_ENV, std::process::id().to_string())
+        .arg("--internal-extension-js")
+        .stdin(Stdio::piped());
     command.spawn().unwrap()
 }
 async fn gone(pid: u32) {

@@ -2,6 +2,7 @@
 """Linux feasibility probe only; not production or cross-platform acceptance."""
 import argparse
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import subprocess
@@ -15,6 +16,8 @@ if not __debug__:
     raise SystemExit("Run without Python -O")
 runner = str(Path(options.runner).resolve())
 command = [runner] + (["--internal-extension-js"] if options.core else [])
+# Pass only host-owned metadata, never an inherited plugin environment.
+child_env = {"WORKMATE_EXTENSION_JS_PARENT_PID": str(os.getpid())} if options.core else {}
 cases = [
     ("async JSON", "export async function run(x) { return {sum: x.a + x.b}; }", {"a": 2, "b": 3}, {"sum": 5}),
     ("sync JSON", "export function run(x) { return x; }", [1, None, True], [1, None, True]),
@@ -55,7 +58,7 @@ for name, source, value, expected in cases:
     request = json.dumps({"source": source, "input": value}).encode()
     start = time.monotonic()
     # subprocess.run kills and waits for its child on timeout; no abandoned worker.
-    response = subprocess.run(command, input=request, capture_output=True, timeout=3, env={})
+    response = subprocess.run(command, input=request, capture_output=True, timeout=3, env=child_env)
     assert response.returncode == 0, (name, response.returncode, response.stderr[:1000])
     assert len(response.stdout) <= 65536 + 256, (name, "unbounded protocol output")
     payload = json.loads(response.stdout)
@@ -72,7 +75,7 @@ for name, source, value, expected in cases:
     checks += 1
     print(f"PASS {name}: {time.monotonic()-start:.3f}s {payload.get('error', 'result')}", flush=True)
 def raw_case(name, request, error):
-    result = subprocess.run(command, input=request, capture_output=True, timeout=3, env={})
+    result = subprocess.run(command, input=request, capture_output=True, timeout=3, env=child_env)
     assert result.returncode == 0, (name, result.stderr[:1000])
     assert json.loads(result.stdout) == {"ok": False, "error": error}, (name, result.stdout[:1000])
     print("PASS " + name, flush=True)
@@ -89,7 +92,7 @@ for name, request, error in [
 
 # A helper blocked on open stdin cannot hit the JS interrupt: exercise the real
 # parent kill+wait fallback, without claiming production cancellation is wired.
-child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={})
+child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env)
 try:
     try:
         child.wait(timeout=0.1)
@@ -107,7 +110,7 @@ print("PASS parent wall-time kill and wait for stdin-blocked helper", flush=True
 
 def isolated(index):
     request=json.dumps({"source":"export async function run(x){globalThis.stash=x;await 0;return globalThis.stash;}","input":{"request":index}}).encode()
-    result=subprocess.run(command,input=request,capture_output=True,timeout=3,env={})
+    result=subprocess.run(command,input=request,capture_output=True,timeout=3,env=child_env)
     assert result.returncode == 0 and json.loads(result.stdout)=={"ok":True,"result":{"request":index}}, (index,result.stdout[:1000])
 with ThreadPoolExecutor(max_workers=4) as pool:
     list(pool.map(isolated, range(4)))

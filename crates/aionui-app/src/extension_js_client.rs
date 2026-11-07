@@ -3,7 +3,7 @@
 //! Only an opt-in Linux Core can invoke its own private helper. The owning task
 //! reaps the direct child before returning, including after cancellation or a
 //! dropped caller. This requires the Tokio runtime to remain alive; host death
-//! and runtime shutdown are NOT covered. This is not an OS sandbox.
+//! and runtime shutdown require separate lifecycle handling. This is not an OS sandbox.
 use serde_json::Value;
 use tokio::sync::oneshot;
 
@@ -21,7 +21,26 @@ pub enum HelperError {
     ChildExit,
     Cleanup,
     OwnerStopped,
+    ParentGuard,
     Execution(String),
+}
+
+/// Fixed host-owned metadata, not an authorization token or plugin input.
+pub const PARENT_PID_ENV: &str = "WORKMATE_EXTENSION_JS_PARENT_PID";
+
+/// Arm Linux parent-death protection ONLY in the private helper's early entry,
+/// before reading stdin or evaluating JS. This changes this process's signal
+/// lifecycle; never call it in the hosting Core server. Missing/invalid metadata
+/// or a failed kernel operation rejects execution, rather than weakening it.
+pub fn prepare_child_parent_guard() -> Result<(), &'static str> {
+    #[cfg(all(feature = "experimental-extension-js", target_os = "linux"))]
+    {
+        enabled::prepare_child_parent_guard()
+    }
+    #[cfg(not(all(feature = "experimental-extension-js", target_os = "linux")))]
+    {
+        Err("runner_unavailable")
+    }
 }
 
 /// Compute from already validated source/arguments, never from a client-selected
@@ -119,6 +138,40 @@ mod enabled {
     fn cancelled(receiver: &mut oneshot::Receiver<()>) -> bool {
         !matches!(receiver.try_recv(), Err(oneshot::error::TryRecvError::Empty))
     }
+    pub(super) fn prepare_child_parent_guard() -> Result<(), &'static str> {
+        let expected: libc::pid_t = std::env::var(PARENT_PID_ENV)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|pid| *pid > 1)
+            .ok_or("supervision_required")?;
+        // SAFETY: getppid takes no arguments and has no memory preconditions.
+        if unsafe { libc::getppid() } != expected {
+            return Err("parent_exited");
+        }
+        // SAFETY: this prctl option takes a signal number, not pointers. All
+        // variadic arguments are explicitly the Linux unsigned-long ABI type.
+        let installed = unsafe {
+            libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
+        if installed != 0 {
+            return Err("parent_guard_unavailable");
+        }
+        // Covers parent-process death before/during installation: a signal is
+        // not retroactively delivered for a parent that died before prctl.
+        // Linux also signals on death of the creating THREAD; this is not a
+        // process-only availability guarantee, nor inherited by grandchildren.
+        // SAFETY: same argument-free getppid call as above.
+        if unsafe { libc::getppid() } != expected {
+            return Err("parent_exited");
+        }
+        Ok(())
+    }
     pub(super) async fn invoke(
         source: String,
         input: Value,
@@ -135,7 +188,11 @@ mod enabled {
         // No caller-controlled executable, argv, cwd, environment or feature flag.
         let exe = std::env::current_exe().map_err(|_| HelperError::Spawn)?;
         let mut command = Builder::clean_cli(exe);
-        command.env_clear().arg("--internal-extension-js").stdin(Stdio::piped());
+        command
+            .env_clear()
+            .env(PARENT_PID_ENV, std::process::id().to_string())
+            .arg("--internal-extension-js")
+            .stdin(Stdio::piped());
         let child = command.spawn().map_err(|_| HelperError::Spawn)?;
         wait_owned(child, request, cancel, deadline).await
     }
@@ -206,7 +263,7 @@ mod enabled {
                     wait,
                 )?;
                 let response = decode(&stdout, status.success(), status.code());
-                if matches!(response, Err(HelperError::Unavailable)) {
+                if matches!(response, Err(HelperError::Unavailable | HelperError::ParentGuard)) {
                     return response;
                 }
                 written.map_err(|_| HelperError::Io)?;
@@ -251,6 +308,15 @@ mod enabled {
             && error == "runner_unavailable"
         {
             return Err(HelperError::Unavailable);
+        }
+        if let Reply::Failure(Failure { ok: false, ref error }) = reply
+            && code == Some(2)
+            && matches!(
+                error.as_str(),
+                "supervision_required" | "parent_exited" | "parent_guard_unavailable"
+            )
+        {
+            return Err(HelperError::ParentGuard);
         }
         if !success {
             return Err(HelperError::ChildExit);

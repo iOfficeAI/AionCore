@@ -17,6 +17,7 @@ core=str(Path(options.core).resolve())
 with tempfile.TemporaryDirectory(prefix="core-js-startup-") as directory:
     root=Path(directory)
     env={key:directory for key in ("HOME","XDG_CONFIG_HOME","XDG_DATA_HOME","XDG_CACHE_HOME")}
+    env["WORKMATE_EXTENSION_JS_PARENT_PID"]=str(os.getpid())
     def early(args, error):
         child=subprocess.Popen([core,*args],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,cwd=root,env=env)
         try:

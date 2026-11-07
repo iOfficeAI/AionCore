@@ -13,6 +13,10 @@ fn main() -> ExitCode {
         if args.next().is_some() {
             return ExitCode::from(2);
         }
+        if let Err(error) = aionui_app::extension_js_client::prepare_child_parent_guard() {
+            println!("{}", serde_json::json!({"ok":false,"error":error}));
+            return ExitCode::from(2);
+        }
         return aionui_extension_js::run_stdio();
     }
     tokio::runtime::Builder::new_current_thread()

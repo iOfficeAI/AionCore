@@ -100,7 +100,8 @@ Input additionally has depth 64 and 32768-node limits and bounded serialization.
 A single strict JSON response is required; success includes an explicitly present
 `result` (including null), with a separately bounded 64 KiB serialized result.
 
-These guarantees require a live Tokio runtime. Parent death, runtime shutdown,
+The owner's explicit wait guarantees require a live Tokio runtime. The separate
+Linux early parent-death guard is described below; complete runtime shutdown,
 kernel-uninterruptible waits and native interpreter vulnerabilities are **not**
 covered. Cleanup deliberately awaits reaping without an independent deadline; the
 two-second work budget is not an unconditional bound on total return time.
@@ -127,4 +128,37 @@ Core binaries, then point the two **test-only** variables at those snapshots:
 AIONCORE_TEST_BINARY=/path/to/enabled/aioncore \
 AIONCORE_TEST_DEFAULT_BINARY=/path/to/disabled/aioncore \
 cargo test -p aionui-app --lib --no-default-features --features experimental-extension-js extension_js_client:: -- --include-ignored --test-threads=1
+```
+
+## Linux Core early parent-death guard
+
+The experimental Core private entry now requires host-owned
+`WORKMATE_EXTENSION_JS_PARENT_PID` metadata. The fixed-executable client sets it
+itself after clearing the environment; it is not a plugin option or authorization
+token. Before stdin/JS, the helper validates its parent PID, installs Linux
+`PR_SET_PDEATHSIG(SIGKILL)`, then rechecks the expected parent. Missing/invalid
+metadata, a parent mismatch or a failed kernel operation refuses execution.
+The standalone stdio example remains an unsupervised manual experiment; it does
+not supply this Core process-lifecycle guard. Core probe scripts supply their
+own parent PID explicitly.
+
+This protects this direct helper process, not descendants or the hosting
+application's complete runtime-shutdown lifecycle. Linux ties the signal to the
+creating **thread**: that thread's exit may terminate the helper even while other
+threads in the parent process remain alive. This is not an OS sandbox or a
+process-only availability guarantee. The PID checks cover parent-process
+replacement before/during installation; they do not prove every thread-death or
+PID-namespace interleaving. Bounded pipes, cancellation and explicit wait remain
+necessary. A dead parent cannot reap its child; normal OS reparenting/reaping
+still applies.
+
+The manual parent-death probe keeps a separate stdin writer open while killing
+the intermediary parent, preventing EOF from falsely appearing to prove this
+guard. The probe makes only its own Python process a Linux child subreaper so it
+can adopt and wait for these test helpers. It adds no Core fixture mode.
+
+Run the actual Core parent-death check after building the opt-in Linux Core:
+
+```sh
+python3 crates/aionui-extension-js/tests/check_parent_death.py /path/to/enabled/aioncore
 ```
