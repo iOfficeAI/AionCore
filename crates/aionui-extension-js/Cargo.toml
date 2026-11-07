@@ -1,0 +1,16 @@
+[package]
+name = "aionui-extension-js"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+engine = ["dep:rquickjs"]
+
+[dependencies]
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rquickjs = { version = "=0.14.0", optional = true, default-features = false, features = ["loader"] }

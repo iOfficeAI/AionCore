@@ -9,6 +9,8 @@ name = "aioncore"
 path = "src/main.rs"
 
 [features]
+# Explicit Linux experiment only; never enabled by a release channel default.
+experimental-extension-js = ["dep:aionui-extension-js", "aionui-extension-js/engine"]
 default = ["telegram", "lark", "dingtalk", "weixin", "slack", "discord"]
 telegram = ["aionui-channel/telegram"]
 lark = ["aionui-channel/lark"]
@@ -36,6 +38,7 @@ aionui-skill-runtime.workspace = true
 aionui-mcp.workspace = true
 aionui-conversation.workspace = true
 aionui-extension.workspace = true
+aionui-extension-js = { workspace = true, optional = true, default-features = false }
 aionui-channel.workspace = true
 aionui-team.workspace = true
 aionui-team-prompts.workspace = true

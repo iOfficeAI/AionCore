@@ -2,6 +2,7 @@ mod bootstrap;
 mod cli;
 mod commands;
 mod error;
+mod internal_extension_js;
 mod process_report;
 
 use std::process::ExitCode;
@@ -17,6 +18,10 @@ use crate::error::MainError;
 // MainError has been moved to src/error.rs
 
 fn main() -> ExitCode {
+    // Must precede clap, managed-runtime/PATH setup, Tokio, logging and databases.
+    if let Some(code) = internal_extension_js::try_run(std::env::args_os().skip(1)) {
+        return code;
+    }
     match run_main() {
         Ok(exit_code) => exit_code,
         Err(error) => {
