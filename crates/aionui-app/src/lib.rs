@@ -8,6 +8,7 @@
 mod config;
 /// Experimental internal fixed-executable JS client; not connected to extension routes.
 pub mod extension_js_client;
+pub mod extension_js_source;
 mod github_issue_source;
 mod router;
 mod services;

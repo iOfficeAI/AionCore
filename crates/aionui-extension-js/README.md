@@ -105,7 +105,8 @@ Linux early parent-death guard is described below; complete runtime shutdown,
 kernel-uninterruptible waits and native interpreter vulnerabilities are **not**
 covered. Cleanup deliberately awaits reaping without an independent deadline; the
 two-second work budget is not an unconditional bound on total return time.
-There is no process-parent-death signal or source-file loader in this increment. Authorization, curated provenance, immutable source acquisition and
+The initial client increment did not include parent-death protection or source-file reading;
+the independent additions below do not establish authorization. Curated provenance, immutable source acquisition and
 production wiring remain separate work. The public fixed-current-exe entry
 requires a host with Core's private helper flag. A separate test-only re-exec host exercises that public entry and the real
 JS helper implementation, without adding production fixture modes or an
@@ -161,4 +162,64 @@ Run the actual Core parent-death check after building the opt-in Linux Core:
 
 ```sh
 python3 crates/aionui-extension-js/tests/check_parent_death.py /path/to/enabled/aioncore
+```
+
+## Independent experimental source-byte reader
+
+The app library exports `extension_js_source::read_bounded_source(&File, &Path)`.
+It is independent of the client/dispatcher: no route invokes it, no handler is
+executed, and the existing canonical resolver is unchanged. Default/non-Linux
+builds immediately return `Unavailable`. The host, not this reader, must acquire
+and authorize the already-open root-directory `File`.
+
+On opt-in Linux, lexical checks reject empty, absolute, parent-traversing,
+NUL-containing and colon-containing (including URL-like) paths. `openat2` pins a
+relative inode with `O_PATH|O_CLOEXEC`, `RESOLVE_BENEATH|NO_SYMLINKS|NO_MAGICLINKS`
+and the deliberately tighter `NO_XDEV` (including bind/submount crossings).
+`fstat` must identify a regular file **before** any read-open: even a nonblocking
+read-open could activate a device. The pinned fd stays alive while a fixed
+host `/proc/self/fd` directory is opened and checked for procfs filesystem type.
+This requires a **trusted host `/proc` mount and mount namespace with no malicious
+mount substitution**, exposing this process's fd view. `fstatfs(PROC_SUPER_MAGIC)`
+proves only that the directory belongs to procfs, not that it is our current
+process's fd view. `O_NOFOLLOW` protects only the final path component. A
+privileged host could substitute another real procfs fd directory; reopening its
+numeric entry could activate a wrong target before the later identity comparison.
+This privileged mount-control threat is outside an ordinary handler-directory
+writer's scope; root trust acquisition also remains the host's responsibility.
+Under that host precondition, only the host-generated decimal fd magiclink is
+followed, never a caller-provided proc path. The read fd is rechecked as regular with matching device/inode, then that
+same fd supplies at most 65536 bytes plus one overflow-detection byte. Oversized
+or non-UTF-8 source is rejected. All errors have fixed non-sensitive categories.
+Missing/unsupported/denied `openat2`, unavailable proc access, a directory whose
+filesystem type is not procfs, and other detected failures are closed; there is
+no canonicalize/original-path fallback. This does not detect or reject every
+untrusted procfs substitution or establish ownership of a procfs fd view.
+
+This is synchronous finite-**bytes** reading, **not** a guaranteed I/O wall-clock
+bound. Filesystems can stall; content can change in place. The held inode/root
+checks protect path replacement, not immutable contents or hardlink provenance.
+No actual side-effecting device is opened in tests. Tests cover regular/nested
+files, byte/UTF-8 boundaries, invalid lexical paths, symlinks, directories/FIFO,
+and deterministic atomic replacement after pinning and replacement of the root
+pathname. Unavailable-openat2 tests only exercise errno mapping, not injected
+syscall failures; proc-unavailable/non-procfs fault injection is not tested.
+Privileged mount substitution is not mitigated or tested by this increment.
+No process-global seccomp, environment switch or production test hook is added.
+
+Registry `LoadedExtension` contains manifest, directory, `Local|Appdata|Env`
+source classification and state; that is not a curated handler-byte attestation.
+The per-user accessor overlays enabled state on a global installation registry;
+it does not establish installation owner isolation. Curated-install integrity
+binds the manifest only, not handler bytes. A successful read **never** authorizes
+execution or proves curation, user ownership or immutable content. Hardlinks,
+native-engine vulnerabilities, OS sandboxing, runtime shutdown and HTTP/user/
+plan-safe integration gaps remain. The parent PID/creating-thread semantics
+above are unchanged. This increment does not complete M9/E13.
+
+Focused checks:
+
+```sh
+cargo test -p aionui-app --lib --no-default-features --features experimental-extension-js extension_js_source::
+cargo test -p aionui-app --lib extension_js_source::
 ```
