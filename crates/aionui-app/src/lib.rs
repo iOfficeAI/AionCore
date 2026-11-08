@@ -9,6 +9,8 @@ mod config;
 pub mod extension_js_checked_source;
 /// Experimental internal fixed-executable JS client; not connected to extension routes.
 pub mod extension_js_client;
+/// Host composition: signed tool binding → checked handler source (no exec auth).
+pub mod extension_js_handler_source;
 pub mod extension_js_source;
 mod github_issue_source;
 mod router;

@@ -106,3 +106,6 @@ tower = { workspace = true, features = ["util"] }
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 wiremock = "0.6"
+# Fixture signing for extension_js_handler_source composition tests only.
+ed25519-dalek = { workspace = true }
+hex.workspace = true

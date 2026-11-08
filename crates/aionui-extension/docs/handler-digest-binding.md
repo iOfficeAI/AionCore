@@ -44,3 +44,11 @@ also:
 This document/PR alone does **not** complete a signed-manifest→handler chain,
 authorize execution, prove curation/owner/root, or change installer/routes/gates.
 No handler file IO is performed by these helpers. Not M9/E13 completion.
+
+## Host composition (app)
+
+`aionui_app::extension_js_handler_source::load_checked_handler_source_from_signed`
+composes this binder with `read_checked_source` against a Host-supplied trusted
+root. Missing integrity remains `NotPresent` (no unchecked fallback). Success
+returns the same owned verified source `String`. Still not execution auth,
+curation/owner/root proof, or M9/E13 completion.

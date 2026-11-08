@@ -38,9 +38,10 @@ impl IntegrityCheckedSource {
 /// Read once with the existing bounded reader and compare that exact snapshot.
 ///
 /// The expected hash is a trusted HOST input precondition, not proof of its own
-/// provenance. There is no handler-digest field in the current signed manifest
-/// contract. Matching this parameter alone does not bind a signed manifest to a
-/// script, authorize execution, or establish curation, owner or immutable files.
+/// provenance. Optional `handlerIntegrity` may declare an expected SRI inside a
+/// signed snapshot; Host composition (`load_checked_handler_source_from_signed`)
+/// wires that binding to this API. Matching this parameter alone still does not
+/// authorize execution or establish curation, owner or immutable files.
 ///
 /// Disabled/non-Linux builds immediately return Unavailable regardless of inputs.
 /// Enabled Linux validates canonical 95-byte SHA-512 SRI before file IO, then
