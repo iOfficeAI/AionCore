@@ -20,6 +20,10 @@ pub mod manager;
 /// shape the `SessionBackend` stack carries in `SessionConfig.init.mcp_servers`.
 pub mod mcp_resolve;
 pub mod media;
+/// Single-process shared `opencode serve` backend (opt-in via
+/// `AIONUI_OPENCODE_SHARED_SERVER`): one HTTP/SSE server hosts every opencode
+/// conversation instead of one `opencode acp` child per conversation.
+pub mod opencode_shared;
 pub(crate) mod persistence;
 pub mod protocol;
 pub mod registry;
