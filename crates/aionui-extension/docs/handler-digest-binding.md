@@ -52,3 +52,18 @@ composes this binder with `read_checked_source` against a Host-supplied trusted
 root. Missing integrity remains `NotPresent` (no unchecked fallback). Success
 returns the same owned verified source `String`. Still not execution auth,
 curation/owner/root proof, or M9/E13 completion.
+
+
+## Host invoke prep (app) + route refuse
+
+`aionui_app::extension_js_invoke_checked::prepare_checked_agent_tool_invoke`
+wraps the composition into a fail-closed invoke decision: Ok → non-executing
+ack tokens (`handler_integrity_checked`, `dispatched=false`) with Host-private
+source; Err → fixed refuse reasons (`handler_integrity_not_present`, …). Never
+`handler_stub` success on bind/check failure.
+
+HTTP `POST /api/extensions/agent-tools/invoke` cannot call that helper yet:
+`ExtensionRouterState` has no Host-held `SignatureCheckedManifest` or trusted
+root, and `aionui-extension` must not depend on `aionui-app`. The route therefore
+refuses with `integrity_binding_unavailable` after the existing planSafeActions
+gate rather than inventing trust or claiming stub dispatch. Not M9/E13 complete.

@@ -249,6 +249,25 @@ pub struct AgentToolInvokeResult {
     pub reason: Option<&'static str>,
 }
 
+/// Stable reason when Host cannot supply `SignatureCheckedManifest` + trusted root.
+/// Prefer app `prepare_checked_agent_tool_invoke` once those inputs exist.
+pub const INTEGRITY_BINDING_UNAVAILABLE_REASON: &str = "integrity_binding_unavailable";
+
+/// Refuse agent-tool invoke when integrity binding cannot be established.
+///
+/// `ExtensionRouterState` today holds only registry + host_runtime — no signed
+/// snapshot and no Host-trusted root. Do not invent those from extension
+/// directories or unsigned manifests. Never returns `handler_stub` success or
+/// `dispatched: true`. Not execution authorization.
+pub fn refuse_agent_tool_without_integrity_binding(tool: ResolvedAgentTool) -> AgentToolInvokeResult {
+    AgentToolInvokeResult {
+        status: "refused",
+        tool,
+        dispatched: false,
+        reason: Some(INTEGRITY_BINDING_UNAVAILABLE_REASON),
+    }
+}
+
 /// Resolve a command by full resolved id (`ext-name-local`) or local id + extension.
 pub fn find_command<'a>(
     commands: &'a [ResolvedCommand],
@@ -387,6 +406,25 @@ mod tests {
         assert!(find_command(&cmds, "ext-demo.ext-open", None).is_some());
         assert!(find_command(&cmds, "open", Some("demo.ext")).is_some());
         assert!(find_command(&cmds, "missing", None).is_none());
+    }
+
+    #[test]
+    #[test]
+    fn refuse_without_binding_is_not_dispatched_or_stub() {
+        let tool = ResolvedAgentTool {
+            extension_name: "demo.ext".into(),
+            id: "ext-demo.ext-read".into(),
+            name: "Read".into(),
+            description: None,
+            plan_safe_actions: true,
+            handler: None,
+        };
+        let result = refuse_agent_tool_without_integrity_binding(tool.clone());
+        assert_eq!(result.status, "refused");
+        assert!(!result.dispatched);
+        assert_eq!(result.reason, Some(INTEGRITY_BINDING_UNAVAILABLE_REASON));
+        assert_ne!(result.reason, Some("handler_stub"));
+        assert_eq!(result.tool, tool);
     }
 
     #[test]

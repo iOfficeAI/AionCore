@@ -21,7 +21,7 @@ use serde_json::json;
 
 use crate::asset_paths::normalize_relative_asset_path;
 use crate::error::ExtensionError;
-use crate::host_runtime::{self, AgentToolInvokeResult, CommandInvokeResult, HostRuntime};
+use crate::host_runtime::{self, CommandInvokeResult, HostRuntime};
 use crate::permission::{build_permission_summary, calculate_risk_level};
 use crate::registry::ExtensionRegistry;
 
@@ -599,7 +599,7 @@ async fn invoke_command(
     Ok(Json(ApiResponse::ok(serde_json::to_value(result).unwrap_or_default())))
 }
 
-/// `POST /api/extensions/agent-tools/invoke` — gate planSafeActions; stub dispatch (curated).
+/// `POST /api/extensions/agent-tools/invoke` — gate planSafeActions; refuse without integrity binding.
 async fn invoke_agent_tool(
     State(state): State<ExtensionRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -615,21 +615,19 @@ async fn invoke_agent_tool(
     if let Err(err) = host_runtime::gate_plan_safe(&tool, true) {
         return Err(ApiError::Forbidden(err.to_string()));
     }
-    // v1 curated Host: record accept; JS/sandbox handler IPC is follow-up.
+    // Host does not yet retain SignatureCheckedManifest + trusted root on this
+    // path (see ExtensionRouterState). Refuse rather than invent trust or claim
+    // handler_stub success. When plumbing exists, call app
+    // prepare_checked_agent_tool_invoke before any non-executing ack.
     let _ = req.arguments;
     tracing::info!(
         user_id = %user.id,
         tool_id = %tool.id,
         extension = %tool.extension_name,
         requested_plan_mode = req.plan_mode,
-        "extension agent tool invoke accepted"
+        "extension agent tool invoke refused: integrity binding unavailable"
     );
-    let result = AgentToolInvokeResult {
-        status: "accepted",
-        tool,
-        dispatched: false,
-        reason: Some("handler_stub"),
-    };
+    let result = host_runtime::refuse_agent_tool_without_integrity_binding(tool);
     Ok(Json(ApiResponse::ok(serde_json::to_value(result).unwrap_or_default())))
 }
 
@@ -1067,6 +1065,14 @@ mod tests {
                 // The safe positive control also proves a missing fixture did
                 // not make every request fail with a misleading 404.
                 assert_eq!(response.status(), expected, "action={action}, plan_mode={plan_mode:?}");
+                if expected == StatusCode::OK {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+                    assert_eq!(body["data"]["status"], "refused");
+                    assert_eq!(body["data"]["dispatched"], false);
+                    assert_eq!(body["data"]["reason"], "integrity_binding_unavailable");
+                    assert_ne!(body["data"]["reason"], "handler_stub");
+                }
             }
         }
     }

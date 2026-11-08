@@ -11,6 +11,8 @@ pub mod extension_js_checked_source;
 pub mod extension_js_client;
 /// Host composition: signed tool binding → checked handler source (no exec auth).
 pub mod extension_js_handler_source;
+/// Host invoke prep: checked load → non-executing ack or refuse (no fake route wiring).
+pub mod extension_js_invoke_checked;
 pub mod extension_js_source;
 mod github_issue_source;
 mod router;
