@@ -409,7 +409,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn refuse_without_binding_is_not_dispatched_or_stub() {
         let tool = ResolvedAgentTool {
             extension_name: "demo.ext".into(),
