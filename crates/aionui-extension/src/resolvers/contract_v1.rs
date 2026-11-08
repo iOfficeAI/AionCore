@@ -220,6 +220,7 @@ mod tests {
             description: None,
             plan_safe_actions: false,
             handler: Some("handlers/search.js".into()),
+            handler_integrity: None,
         }];
         let resolved = resolve_agent_tools(&tools, "demo.ext");
         assert_eq!(resolved.len(), 1);

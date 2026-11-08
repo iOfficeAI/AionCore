@@ -1,5 +1,6 @@
 use crate::constants::RESERVED_NAME_PREFIXES;
 use crate::error::ExtensionError;
+use crate::hub::is_canonical_sha512_sri;
 use crate::types::ExtensionManifest;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
@@ -9,6 +10,32 @@ use std::path::{Path, PathBuf};
 pub fn validate_manifest(manifest: &ExtensionManifest) -> Result<(), ExtensionError> {
     validate_name(&manifest.name)?;
     validate_version(&manifest.version)?;
+    validate_agent_tool_handler_digests(manifest)?;
+    Ok(())
+}
+
+/// Fail closed when an optional handler digest is present but malformed or unbound.
+///
+/// Missing/None remains allowed for back-compat and does **not** mean verified.
+fn validate_agent_tool_handler_digests(manifest: &ExtensionManifest) -> Result<(), ExtensionError> {
+    let Some(contributes) = manifest.contributes.as_ref() else {
+        return Ok(());
+    };
+    for tool in &contributes.agent_tools {
+        let Some(integrity) = tool.handler_integrity.as_deref() else {
+            continue;
+        };
+        if !is_canonical_sha512_sri(integrity) {
+            return Err(ExtensionError::ManifestValidation(
+                "agent tool handlerIntegrity must be a canonical sha512 SRI".into(),
+            ));
+        }
+        if tool.handler.as_deref().is_none_or(str::is_empty) {
+            return Err(ExtensionError::ManifestValidation(
+                "agent tool handlerIntegrity requires a non-empty handler path".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -238,6 +265,7 @@ fn normalize_agent_tool(value: &mut Value) {
         return;
     };
     move_key(obj, "planSafeActions", "plan_safe_actions");
+    move_key(obj, "handlerIntegrity", "handler_integrity");
 }
 
 fn normalize_background_service(value: &mut Value) {

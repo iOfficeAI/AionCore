@@ -333,6 +333,13 @@ pub struct ExtAgentTool {
     pub plan_safe_actions: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handler: Option<String>,
+    /// Optional expected handler-file SRI (`sha512-...`). Missing/None is NOT verified.
+    ///
+    /// When present it must be the canonical SHA-512 SRI string and a non-empty
+    /// `handler` path must also be present. Presence alone does not authorize
+    /// execution; Host must still bind/trust this digest and verify bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "handlerIntegrity")]
+    pub handler_integrity: Option<String>,
 }
 
 /// Background service contribution (Plugin Contract v1).

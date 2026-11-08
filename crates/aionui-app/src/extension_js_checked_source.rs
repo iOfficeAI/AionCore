@@ -71,25 +71,12 @@ pub fn read_checked_source(
 
 #[cfg(all(feature = "experimental-extension-js", target_os = "linux"))]
 fn validate_integrity(expected_sri: &str) -> Result<(), CheckedSourceError> {
-    let bytes = expected_sri.as_bytes();
-    // 7-byte prefix + 88-byte standard padded base64 encoding of a 64-byte hash.
-    // Check the length FIRST: no allocation or iteration over unbounded metadata.
-    if bytes.len() != 95 || !bytes.starts_with(b"sha512-") {
-        return Err(CheckedSourceError::InvalidIntegrity);
+    // Shared with extension handlerIntegrity validation; identical canonical rules.
+    if aionui_extension::hub::is_canonical_sha512_sri(expected_sri) {
+        Ok(())
+    } else {
+        Err(CheckedSourceError::InvalidIntegrity)
     }
-    // 64 = 21*3 + 1: exactly 86 data characters followed by '=='. The last
-    // sextet contains only two significant bits; its four padding bits MUST be
-    // zero, yielding A/Q/g/w. This rejects noncanonical encodings without a new
-    // base64 dependency, decoding allocation, trimming or algorithm fallback.
-    if bytes[93..] != *b"=="
-        || !bytes[7..93]
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || b"+/".contains(b))
-        || !matches!(bytes[92], b'A' | b'Q' | b'g' | b'w')
-    {
-        return Err(CheckedSourceError::InvalidIntegrity);
-    }
-    Ok(())
 }
 
 #[cfg(all(test, feature = "experimental-extension-js", target_os = "linux"))]
