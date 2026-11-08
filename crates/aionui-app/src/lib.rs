@@ -6,6 +6,7 @@
 //! submodules. All logic lives in the modules below.
 
 mod config;
+pub mod extension_js_checked_source;
 /// Experimental internal fixed-executable JS client; not connected to extension routes.
 pub mod extension_js_client;
 pub mod extension_js_source;

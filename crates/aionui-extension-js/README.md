@@ -223,3 +223,67 @@ Focused checks:
 cargo test -p aionui-app --lib --no-default-features --features experimental-extension-js extension_js_source::
 cargo test -p aionui-app --lib extension_js_source::
 ```
+
+## Conditional integrity of one source snapshot
+
+The independent app API
+`extension_js_checked_source::read_checked_source(&File, &Path, expected_sri)`
+returns `IntegrityCheckedSource` only if the source snapshot matches a given
+expected digest. This is **conditional integrity**, not a trusted-digest lookup,
+execution permit, curation assertion, installation receipt or owner/root proof.
+The host must independently acquire the correct trusted digest-to-handler
+binding, trustworthy already-open root and trusted current-process `/proc` view.
+An attacker supplying both source and its own hash can satisfy equality; that
+establishes no external trust. Registry labels and signature keys are not
+execution authorization. There is currently **no handler digest field in the
+signed manifest contract**, so this API does not establish signed-manifest to
+handler-byte binding. It reads no unknown JSON field or new receipt format.
+
+Default/non-Linux builds return `Unavailable` immediately regardless of inputs.
+Enabled Linux checks expected-hash format **before file IO**: exactly 95 bytes,
+lowercase `sha512-`, standard base64 alphabet, 86 digest characters followed by
+`==`, and zero canonical padding bits in the final data sextet (A/Q/g/w). No
+trimming, algorithm aliases, URL-safe alphabet or case folding is accepted.
+Format validation uses bounded byte checks without allocating or decoding the
+caller-supplied hash. It then calls existing `read_bounded_source` **exactly
+once**, computes existing public `sri_sha512` over that owned UTF-8 String's exact
+bytes, and compares case-sensitively. A format-valid different digest is an
+`IntegrityMismatch`; malformed metadata is `InvalidIntegrity`; existing reader
+failures retain their original fixed category inside `Reader(SourceError)`.
+No source, path or digest values are added to errors/logs.
+
+The successful type has private owned String storage, borrowing `as_str()` and
+consuming `into_source()` getters, with no unchecked constructor, Default,
+Deserialize or raw-source Debug formatter. A future separately authorized caller
+can transfer `into_source()` to the existing client's `invoke`; nothing invokes
+it automatically here. Consumers must use the returned snapshot, not reread the
+path. UTF-8 bytes including BOM/CRLF remain exact. Changing/replacing the file
+later cannot change this snapshot; this does not prove that a file was immutable
+while being read, or establish hardlink provenance. An empty source may match an
+empty-source digest without being an executable handler.
+
+All reader assumptions and checks remain unchanged: 65536-byte UTF-8 limit,
+O_PATH/REG-before-read-open, symlink/mount-crossing rejection, fixed numeric fd
+reopen and REG/dev/ino check, trusted Host `/proc` mount with no malicious mount
+substitution. Procfs filesystem type alone does **not** authenticate the process
+fd view; a privileged mount substitution could activate a wrong target before
+identity comparison. This is finite-**bytes** synchronous reading, not an I/O
+wall-clock bound. No new syscall/proc/mount fault injection or real side-effect
+device opening is claimed. Host authorization, curation, user isolation, handler
+provenance, OS sandboxing, native risks, runtime and HTTP/plan-safe gaps remain.
+No resolver, installer, gate, registry, route, permission or manifest fields are
+changed. This increment does not complete M9/E13.
+
+Focused tests cover exact UTF-8/CRLF/BOM and snapshot transfer; malformed digest
+format/length/alphabet/padding (including all final-sextet possibilities), content
+tampering and digest case mismatch, empty/64 KiB/+1/invalid-UTF-8 source, owned
+snapshots consumed after both replacement and in-place writes, reader error
+preservation and symlink/FIFO rejection. Invalid hashes paired with missing/FIFO
+handlers or a wrong-kind root demonstrate format-error precedence, not syscall
+fault injection. Disabled tests check immediate Unavailable. Non-Linux support
+is cfg-defined but is not claimed cross-compiled by Linux checks.
+
+```sh
+cargo test -p aionui-app --lib --no-default-features --features experimental-extension-js extension_js_checked_source::
+cargo test -p aionui-app --lib extension_js_checked_source::
+```
