@@ -269,9 +269,9 @@ async fn run_probe(
             ),
             Ok(args) => {
                 match custom_agent_probe::try_connect_custom_agent_with_catalog(command, &args, &env, None).await {
-                    // The probe opened a real session to reach this verdict, so its
-                    // `session/new` already carried whatever modes / models / config
-                    // options the agent advertises. Persist them through the same
+                    // The probe opened a real session to reach this verdict, so it
+                    // already saw the `initialize` capabilities and whatever modes /
+                    // models / config options `session/new` advertises. Persist them through the same
                     // channel a live conversation uses, so the pickers are populated
                     // before the user ever opens one. Best-effort and additive:
                     // `apply_handshake` skips `None` fields, so this never blanks a
