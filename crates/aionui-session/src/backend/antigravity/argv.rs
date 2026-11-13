@@ -75,20 +75,57 @@ fn non_blank(value: &Option<String>) -> Option<&str> {
     value.as_deref().map(str::trim).filter(|s| !s.is_empty())
 }
 
+/// Compose the first user turn's text for one `agy` spawn.
+///
+/// The `[Assistant Rules]` prefix is prepended on the FIRST invocation only
+/// (`resume_conversation_id` absent/blank). A resumed invocation carries agy's
+/// own conversation history from disk, so re-injecting would duplicate the
+/// rules block on every subsequent turn.
+pub(crate) fn effective_initial_prompt(input: &ArgvInput) -> String {
+    match (
+        non_blank(&input.injected_prefix),
+        non_blank(&input.resume_conversation_id),
+    ) {
+        (Some(prefix), None) => format!("{prefix}\n\n{}", input.prompt),
+        _ => input.prompt.clone(),
+    }
+}
+
+/// Serialize one inbound user message for `agy --input-format stream-json`.
+///
+/// Primary-source wire shape (verified live against `agy 1.5.8`
+/// `--input-format stream-json --output-format stream-json -p ""`):
+/// - Inbound messages MUST carry `"event": "user"` (passing Claude's
+///   `{"type":"user",...}` fails immediately on stderr with
+///   `error: stream input message is missing the "event" field`).
+/// - Serialized with `serde_json::to_string` (never string interpolation) so
+///   embedded newlines, quotes, and multi-byte UTF-8 are escaped into a single
+///   NDJSON line.
+pub(crate) fn encode_stream_user_message(text: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "event": "user",
+        "message": {
+            "role": "user",
+            "content": text,
+        }
+    }))
+    .expect("serializing static JSON user envelope cannot fail")
+}
+
+/// Build argv for `agy --input-format stream-json` print mode (`agy >= 1.1.15`).
+///
+/// Flag ordering note (verified live against `agy 1.5.8`):
+/// `-p` (`--print`) is a string flag in Go's `flag` parser, NOT a boolean
+/// switch. Passing `["-p", "--input-format", "stream-json"]` fails immediately
+/// with:
+/// `Error: -p took "--input-format" as its prompt, so the intended prompt was left as an argument and ignored.`
+/// Passing `"-p", ""` explicitly enters non-interactive print mode while all
+/// user prompts (initial turn + mid-turn `Command::Steer` frames) flow over
+/// stdin as NDJSON `{"event":"user",...}` lines.
 pub(crate) fn build_argv(input: &ArgvInput) -> Vec<String> {
-    let mut a: Vec<String> = Vec::with_capacity(12);
-    a.push("-p".into());
-    // First invocation only. A resumed run carries agy's own history, so
-    // re-injecting would repeat the whole rules block on every single turn.
-    a.push(
-        match (
-            non_blank(&input.injected_prefix),
-            non_blank(&input.resume_conversation_id),
-        ) {
-            (Some(prefix), None) => format!("{prefix}\n\n{}", input.prompt),
-            _ => input.prompt.clone(),
-        },
-    );
+    let mut a: Vec<String> = Vec::with_capacity(14);
+    a.push("--input-format".into());
+    a.push("stream-json".into());
     a.push("--output-format".into());
     a.push("stream-json".into());
     // agy cannot prompt for permission in headless mode; with the gate shut it
@@ -98,6 +135,8 @@ pub(crate) fn build_argv(input: &ArgvInput) -> Vec<String> {
     a.push("--dangerously-skip-permissions".into());
     a.push("--print-timeout".into());
     a.push(PRINT_TIMEOUT.into());
+    a.push("-p".into());
+    a.push(String::new());
 
     if let Some(id) = non_blank(&input.resume_conversation_id) {
         a.push("--conversation".into());
@@ -153,9 +192,9 @@ mod tests {
         }
     }
 
-    /// agy spawns a fresh `-p` per turn and resumes with `--conversation`, so the
-    /// injected rules belong on the FIRST invocation only — afterwards agy carries
-    /// its own history and re-injecting would repeat the block every turn.
+    /// agy spawns a fresh process per turn-burst and resumes with `--conversation`,
+    /// so the injected rules belong on the FIRST invocation only — afterwards agy
+    /// carries its own history and re-injecting would repeat the block every turn.
     #[test]
     fn the_first_invocation_prepends_the_injected_rules_to_the_prompt() {
         let mut input = base();
@@ -163,7 +202,7 @@ mod tests {
             Some("[Assistant Rules]\n## Available Skills\n- **cron**: d\n[/Assistant Rules]".into());
         input.resume_conversation_id = None;
 
-        let prompt = flag_value(&build_argv(&input), "-p").unwrap().to_owned();
+        let prompt = effective_initial_prompt(&input);
         assert!(prompt.starts_with("[Assistant Rules]"), "{prompt}");
         assert!(prompt.contains("## Available Skills"));
         assert!(prompt.ends_with("hello"), "the user's own text stays last: {prompt}");
@@ -175,14 +214,41 @@ mod tests {
         input.injected_prefix = Some("[Assistant Rules]\nrules\n[/Assistant Rules]".into());
         input.resume_conversation_id = Some("conv-1".into());
 
-        assert_eq!(flag_value(&build_argv(&input), "-p").unwrap(), "hello");
+        assert_eq!(effective_initial_prompt(&input), "hello");
     }
 
     #[test]
     fn a_blank_prefix_is_treated_as_absent() {
         let mut input = base();
         input.injected_prefix = Some("   \n".into());
-        assert_eq!(flag_value(&build_argv(&input), "-p").unwrap(), "hello");
+        assert_eq!(effective_initial_prompt(&input), "hello");
+    }
+
+    #[test]
+    fn print_flag_carries_explicit_empty_prompt_so_it_never_swallows_next_flag() {
+        // Verified live on agy 1.5.8: `-p` is a string option in Go's flag
+        // parser, so `["-p", "--input-format", "stream-json"]` fails with
+        // `Error: -p took "--input-format" as its prompt`.
+        let a = build_argv(&base());
+        assert_eq!(flag_value(&a, "-p"), Some(""));
+        assert_eq!(flag_value(&a, "--input-format"), Some("stream-json"));
+        assert!(
+            !a.contains(&"hello".to_string()),
+            "prompts flow over stream-json stdin, never OS argv: {a:?}"
+        );
+    }
+
+    #[test]
+    fn encode_stream_user_message_uses_agy_event_user_envelope_and_escapes_newlines() {
+        // Verified live on agy 1.5.8: inbound NDJSON requires `"event":"user"`,
+        // NOT Claude's `"type":"user"` (`stream input message is missing the "event" field`).
+        let line = encode_stream_user_message("line 1\n\"quoted\" 中文");
+        assert!(!line.contains('\n'), "NDJSON frame must be a single line: {line}");
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+        assert_eq!(parsed["event"], "user");
+        assert!(parsed.get("type").is_none());
+        assert_eq!(parsed["message"]["role"], "user");
+        assert_eq!(parsed["message"]["content"], "line 1\n\"quoted\" 中文");
     }
 
     /// Skill allow-listing rides on `extra_args`, which this backend previously
@@ -209,8 +275,8 @@ mod tests {
     #[test]
     fn fresh_turn_uses_print_and_stream_json() {
         let a = build_argv(&base());
-        assert!(a.contains(&"-p".to_string()));
-        assert!(a.contains(&"hello".to_string()));
+        assert_eq!(flag_value(&a, "-p"), Some(""));
+        assert_eq!(flag_value(&a, "--input-format"), Some("stream-json"));
         assert_eq!(flag_value(&a, "--output-format"), Some("stream-json"));
         assert!(!a.contains(&"--conversation".to_string()));
         assert!(

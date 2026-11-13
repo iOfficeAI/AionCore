@@ -1,13 +1,17 @@
 //! Antigravity (`agy` CLI) direct-CLI backend.
 //!
-//! Process model: ONE agy process per turn. agy has no `--input-format` (its
-//! flag set is validated by Go's `flag` package, so an unknown flag is a hard
-//! error — verified), which rules out the persistent-stdin FIFO shape the
-//! claude lane uses. Multi-turn continuity comes from `--conversation <id>`,
-//! which agy resumes from its own on-disk conversation store.
+//! Process model: ONE agy process per conversation turn-burst, driven via
+//! `--input-format stream-json --output-format stream-json -p ""` (`agy
+//! changelog` 1.1.15; live-verified on `agy 1.5.8`). Each turn starts a warm
+//! process with retained stdin so mid-turn `Command::Steer` writes
+//! (`{"event":"user","message":{"role":"user","content":...}}`) run
+//! back-to-back in the same process without a ~6s respawn; once the active turn
+//! and any steered follow-ups settle, stdin is closed (`EOF`) so the process
+//! exits cleanly, and later idle turns resume via `--conversation <id>`.
 //!
 //! Wire shapes here are verified against captured samples in
-//! `~/aion/protocols/samples/antigravity-cli/1.1.8/`.
+//! `~/aion/protocols/samples/antigravity-cli/1.1.8/` and live `agy 1.5.8`
+//! `--input-format stream-json` captures.
 
 mod argv;
 /// i18n key for the "some steps in this turn did not take effect" notice,

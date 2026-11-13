@@ -1,35 +1,42 @@
 //! `AntigravityConnection` / `AntigravitySessionBackend` — the direct-CLI
 //! backend for the `agy` CLI.
 //!
-//! Shape: ONE PROCESS PER TURN. Unlike the claude lane (a persistent process
-//! fed through a retained stdin FIFO), agy has no `--input-format`, so a turn
-//! is a complete `agy -p …` invocation that exits when the turn ends.
-//! Continuity across turns comes from `--conversation <id>`, which agy resumes
-//! from its own on-disk store; the id arrives in the `init` frame and is kept
-//! as this session's resume anchor.
+//! Shape: ONE PROCESS PER TURN-BURST, driven through `--input-format stream-json
+//! --output-format stream-json -p ""` (`agy changelog` 1.1.15; live-verified on
+//! `agy 1.5.8`). `open_session` still spawns nothing; the first `Send` launches
+//! `agy` and delivers the initial prompt as an NDJSON `{"event":"user",...}`
+//! line on retained stdin.
 //!
-//! Consequences of that shape:
-//! - `open_session` spawns NOTHING. It only registers the session; the first
-//!   process appears on the first `Send`.
-//! - There is no mid-turn steering wire (agy ignores stdin once running —
-//!   verified), so `supported_commands.steer` is false.
-//! - `Cancel` kills the process; the turn's own `result` frame may never
-//!   arrive, so the reader synthesizes the terminal event on exit.
+//! Mid-turn steering (`Command::Steer`):
+//! - While the turn's stdin remains open, a `Steer` writes another
+//!   `{"event":"user","message":{"role":"user","content":...}}` line to stdin
+//!   and records its `client_msg_id` in `ActiveTurnIo::pending_steers`.
+//! - Live-verified on `agy 1.5.8`: `agy` buffers the stdin frame while the
+//!   current step runs, emits the intermediate `result` frame, and immediately
+//!   consumes the steered `user_input` in the same warm process (`num_turns: 2`).
+//!   `spawn_reader` folds intermediate `TurnResult` frames into `MessageDelta`
+//!   and `MessageLifecycle::Completed`, closing stdin (`EOF`) only once the
+//!   final steered turn settles, so `StreamRelay` stays continuously open on
+//!   one `turn_gen`.
+//! - Once the final `TurnResult` closes stdin, any late `Steer` returns
+//!   `BackendError::Transport("no active turn to steer")`, triggering
+//!   `ConversationService::deliver_midturn_message` to cleanly start a new turn.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aionui_common::CommandSpec;
-use aionui_process::Spawner;
+use aionui_process::{BoxedStdin, BoxedStdout, Spawner};
 use futures_util::stream::BoxStream;
 use tokio::sync::{Mutex, broadcast, oneshot};
 
-use super::argv::{ArgvInput, build_argv};
+use super::argv::{ArgvInput, build_argv, effective_initial_prompt, encode_stream_user_message};
 use super::models::probe_models;
 use super::skills::skill_commands_from_dirs;
 use super::translate::Translator;
 use super::wire::parse_line;
+use crate::adapter::{AgentIo, ManagedProcessIo};
 use crate::backend::cli_version::session_drift_notice;
 use crate::backend::types::{
     Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, PendingPermissionView,
@@ -38,9 +45,9 @@ use crate::backend::types::{
 use crate::backend::{BackendConnection, SessionBackend, SessionConfig};
 use crate::capability::{
     BlockSet, Capabilities, CapabilityTier, CommandSet, ModeInfo, ModelInfo, PromptAcceptedSource, SignalSet,
-    SlashCommandInfo,
+    SlashCommandInfo, block_kind_name,
 };
-use crate::event::{PermissionKind, SessionEvent, TurnOutcome};
+use crate::event::{MessageLifecyclePhase, PermissionKind, SessionEvent, TurnOutcome};
 
 /// The literal placeholder AionUi's team-creation flow persisted as a member's
 /// model when an assistant had no concrete model (AionUi
@@ -135,6 +142,31 @@ fn append_delta(buffered: &mut String, delta: &str) {
     buffered.push_str(delta);
 }
 
+/// Ensure an intermediate turn's reply ends with a blank line before a steered
+/// follow-up turn's prose appends into `StreamRelay`.
+fn ensure_turn_separator(mut text: String) -> String {
+    if !text.is_empty() {
+        if text.ends_with("\n\n") {
+            // already paragraph-separated
+        } else if text.ends_with('\n') {
+            text.push('\n');
+        } else {
+            text.push_str("\n\n");
+        }
+    }
+    text
+}
+
+/// Write one NDJSON `{"event":"user",...}` line + `\n` and flush without closing.
+async fn write_stream_user_frame(stdin: &mut BoxedStdin, text: &str) -> Result<(), std::io::Error> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut line = encode_stream_user_message(text);
+    line.push('\n');
+    stdin.write_all(line.as_bytes()).await?;
+    stdin.flush().await
+}
+
 /// agy's declared capability surface.
 pub fn antigravity_capabilities() -> Capabilities {
     Capabilities {
@@ -145,9 +177,11 @@ pub fn antigravity_capabilities() -> Capabilities {
             terminal_result: true,
         },
         supported_commands: CommandSet {
-            // agy ignores stdin once a turn is running, so there is no wire to
-            // steer through. Queueing for the NEXT turn is a separate axis.
-            steer: false,
+            // `agy --input-format stream-json` (agy >= 1.1.15; live-verified on
+            // 1.5.8) reads NDJSON `{"event":"user",...}` frames from retained
+            // stdin while a turn is in flight and runs them in the same warm
+            // process without respawning.
+            steer: true,
             cancel_tool: false,
             answer_permission: true,
             answer_auth: false,
@@ -160,7 +194,7 @@ pub fn antigravity_capabilities() -> Capabilities {
         },
         prompt_blocks: BlockSet {
             text: true,
-            // `agy -p` takes a text prompt only — it has no image input flag.
+            // `agy -p` stream-json takes text user messages only.
             image: false,
             audio: false,
             resource: false,
@@ -168,15 +202,13 @@ pub fn antigravity_capabilities() -> Capabilities {
         },
         // agy has no prompt-ack frame; the backend synthesizes one.
         prompt_accepted: PromptAcceptedSource::Synthesized,
-        // A Send during a running turn is QUEUED for the next one. agy cannot
-        // take input mid-turn, but its next turn is a fresh process anyway, so
-        // the input box can stay usable instead of locking until the turn ends.
+        // Keep proactive queuing available for direct `Command::Send` callers.
         accepts_proactive_input: true,
-        // agy runs ONE PROCESS PER TURN and ignores stdin mid-turn (see the
-        // `capabilities_allow_queueing_but_not_steering` test), so a message sent
-        // during a turn cannot reach it — it waits for the next process. agy MUST
-        // therefore behave exactly like ACP in the UI.
-        supports_midturn_delivery: false,
+        // `ConversationService::deliver_midturn_message` routes mid-turn user
+        // messages through `Command::Steer` over the retained stream-json stdin,
+        // falling back to a fresh turn when `"no active turn to steer"` races
+        // turn completion.
+        supports_midturn_delivery: true,
         ..Default::default()
     }
 }
@@ -278,6 +310,7 @@ impl BackendConnection for AntigravityConnection {
             turn_gen: AtomicU64::new(0),
             anchor: Arc::new(Mutex::new(anchor)),
             current: Arc::new(Mutex::new(None)),
+            turn_io: Arc::new(Mutex::new(ActiveTurnIo::default())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
@@ -285,6 +318,8 @@ impl BackendConnection for AntigravityConnection {
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
+            #[cfg(test)]
+            test_ios: Arc::new(Mutex::new(VecDeque::new())),
         });
 
         // Discover models OFF the open path. `agy models` costs a process
@@ -308,6 +343,19 @@ impl BackendConnection for AntigravityConnection {
     }
 }
 
+#[derive(Default)]
+struct ActiveTurnIo {
+    /// Retained stdin of the active `agy --input-format stream-json` process.
+    /// `Some` while the running process can still accept mid-turn `Steer`
+    /// frames; cleared (`None`) atomically when the final turn settles or on
+    /// `Cancel` / `terminate` so EOF reaches `agy` and late steers fail cleanly
+    /// with `"no active turn to steer"`.
+    stdin: Option<BoxedStdin>,
+    /// Correlation ids of `Command::Steer` frames already flushed to `stdin`
+    /// and awaiting consumption as in-process follow-up turns.
+    pending_steers: VecDeque<Option<String>>,
+}
+
 pub struct AntigravitySessionBackend {
     session_id: String,
     /// Models discovered from `agy models`, surfaced through `capabilities()`
@@ -323,9 +371,11 @@ pub struct AntigravitySessionBackend {
     /// agy conversation id to resume with. Set from the first `init` frame and
     /// kept for every later turn.
     anchor: Arc<Mutex<Option<String>>>,
-    /// The in-flight turn's process, retained so `Cancel` / `terminate` can
+    /// The in-flight turn's I/O handle, retained so `Cancel` / `terminate` can
     /// reach it. `None` between turns — that is the normal resting state.
-    current: Arc<Mutex<Option<Arc<aionui_process::ManagedProcess>>>>,
+    current: Arc<Mutex<Option<Arc<dyn AgentIo>>>>,
+    /// Retained stream-json stdin + queued mid-turn steer correlation ids.
+    turn_io: Arc<Mutex<ActiveTurnIo>>,
     /// Tool approvals raised by the PreToolUse hook and not yet answered.
     ///
     /// Each entry parks a hook process (which is holding agy's tool call open)
@@ -335,8 +385,7 @@ pub struct AntigravitySessionBackend {
     pending: Arc<Mutex<HashMap<String, PendingPermission>>>,
     /// Monotonic counter behind each permission's `request_id`.
     permission_seq: AtomicU64,
-    /// True while a turn's process is alive. agy has no way to accept input
-    /// mid-turn, so a Send arriving now has to wait for the next process.
+    /// True while a turn's process is alive.
     in_flight: Arc<AtomicBool>,
     /// Whether the CURRENTLY RUNNING turn was spawned with the approval hook on disk.
     ///
@@ -361,12 +410,16 @@ pub struct AntigravitySessionBackend {
     /// this one ends. `dispatch` only has `&self` (trait signature), so the
     /// Arc cannot be threaded through the call.
     weak_self: std::sync::OnceLock<std::sync::Weak<Self>>,
-    /// Messages the user sent while a turn was running, in order.
+    /// Messages queued via direct `Command::Send` while a turn was running.
     ///
     /// Each becomes its OWN next turn rather than being merged: merging would
     /// silently collapse two things the user said into one, and they would
     /// never see the second one echoed.
     queued: Arc<Mutex<VecDeque<Vec<ContentBlock>>>>,
+    /// Hermetic test seam: scripted `AgentIo` handles popped by `start_turn`
+    /// ahead of `self.spawner` when populated. Empty in all non-scripted tests.
+    #[cfg(test)]
+    test_ios: Arc<Mutex<VecDeque<Arc<dyn AgentIo>>>>,
 }
 
 struct PendingPermission {
@@ -659,13 +712,12 @@ impl AntigravitySessionBackend {
             model: self.effective_model(),
             mode: self.effective_mode(),
             // agy has no prompt pipeline of its own, so the composed rules block
-            // rides in through `init.preset_context` and `build_argv` prepends it
-            // on the first invocation only. Before this, the backend read nothing
-            // from `init` except `mcp_servers` — dropping both the assistant's
-            // preset context and its skills index.
+            // rides in through `init.preset_context` and `effective_initial_prompt`
+            // prepends it on the first invocation only.
             injected_prefix: self.config.init.preset_context.clone(),
             extra_args: self.config.extra_args.clone(),
         };
+        let initial_prompt = effective_initial_prompt(&input);
         let mut spawn_env = self.config.spawn_env.clone();
         if let Some(cwd) = self.config.cwd.as_deref() {
             // agy 1.1.13 resolves its primary customization workspace from PWD,
@@ -689,24 +741,49 @@ impl AntigravitySessionBackend {
             cwd: self.config.cwd.clone(),
         };
 
-        let proc = self
-            .spawner
-            .spawn(spec, &[], &self.session_id)
+        #[cfg(test)]
+        let scripted_io = self.test_ios.lock().await.pop_front();
+        #[cfg(not(test))]
+        let scripted_io: Option<Arc<dyn AgentIo>> = None;
+
+        let io: Arc<dyn AgentIo> = match scripted_io {
+            Some(fake) => fake,
+            None => {
+                let proc = self
+                    .spawner
+                    .spawn(spec, &[], &self.session_id)
+                    .await
+                    .map_err(|e| BackendError::Transport(format!("spawn agy: {e}")))?;
+                Arc::new(ManagedProcessIo::new(proc))
+            }
+        };
+
+        let (mut stdin, stdout) = io
+            .take_stdio()
             .await
-            .map_err(|e| BackendError::Transport(format!("spawn agy: {e}")))?;
-        *self.current.lock().await = Some(Arc::clone(&proc));
+            .ok_or_else(|| BackendError::Transport("spawn agy: stdio unavailable".into()))?;
+        write_stream_user_frame(&mut stdin, &initial_prompt)
+            .await
+            .map_err(|e| BackendError::Transport(format!("write initial agy prompt: {e}")))?;
+
+        *self.current.lock().await = Some(Arc::clone(&io));
+        *self.turn_io.lock().await = ActiveTurnIo {
+            stdin: Some(stdin),
+            pending_steers: VecDeque::new(),
+        };
         // Freeze whether THIS turn can hear about a later mode switch. A hooked turn
         // calls back per tool use, so the host gate applies a switch at once; a full-auto
         // turn never calls back and only the next spawn can pick one up.
         self.turn_started_hooked.store(!self.is_full_auto(), Ordering::SeqCst);
         self.in_flight.store(true, Ordering::SeqCst);
-        self.spawn_reader(Arc::clone(&proc), turn_gen);
+        self.spawn_reader(io, stdout, turn_gen);
         Ok(turn_gen)
     }
 
-    /// Drain the process's stdout, translating each NDJSON line, and close the
-    /// turn out when the process exits.
-    fn spawn_reader(&self, proc: Arc<aionui_process::ManagedProcess>, turn_gen: u64) {
+    /// Drain the process's stdout, translating each NDJSON line, folding any
+    /// steered follow-up turns into the active `turn_gen`, and closing the turn
+    /// out when the final result arrives or the process exits.
+    fn spawn_reader(&self, io: Arc<dyn AgentIo>, stdout: BoxedStdout, turn_gen: u64) {
         let backend = self.weak_self.get().cloned();
         let event_tx = self.event_tx.clone();
         let session_id = self.session_id.clone();
@@ -715,6 +792,7 @@ impl AntigravitySessionBackend {
         // to outlive this reader task.
         let anchor = Arc::clone(&self.anchor);
         let current = Arc::clone(&self.current);
+        let turn_io = Arc::clone(&self.turn_io);
 
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
@@ -722,32 +800,82 @@ impl AntigravitySessionBackend {
             let mut translator = Translator::default();
             let mut saw_terminal = false;
 
-            // agy corrupts multi-byte characters when it splits `text_delta`
-            // (it cuts on byte boundaries, so a Chinese character straddling
-            // two deltas arrives as two U+FFFD). Its `result` frame carries the
-            // same reply intact, so assistant text is held back here and
-            // emitted once, from the authoritative source.
+            // agy < 1.1.15 corrupted multi-byte characters when splitting
+            // `text_delta` across byte boundaries. Its `result` frame carries
+            // the same reply assembled intact, so assistant text is held back
+            // per sub-turn and emitted once from the authoritative source.
             let mut buffered_text = String::new();
             let mut text_item_id = String::new();
             let mut text_flushed = false;
 
-            if let Some((_stdin, stdout)) = proc.take_stdio().await {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let Some(ev) = parse_line(&line) else { continue };
-                    for out in translator.translate(ev) {
-                        match out {
-                            SessionEvent::MessageDelta { item_id, text } => {
-                                if text_item_id.is_empty() {
-                                    text_item_id = item_id;
-                                }
-                                append_delta(&mut buffered_text, &text);
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Some(ev) = parse_line(&line) else { continue };
+                for out in translator.translate(ev) {
+                    match out {
+                        SessionEvent::MessageDelta { item_id, text } => {
+                            if text_item_id.is_empty() {
+                                text_item_id = item_id;
                             }
-                            SessionEvent::TurnResult {
-                                ref is_error,
-                                ref result_text,
-                                ..
-                            } => {
+                            append_delta(&mut buffered_text, &text);
+                        }
+                        SessionEvent::TurnResult {
+                            ref is_error,
+                            ref result_text,
+                            ..
+                        } => {
+                            // Atomically claim the next steered follow-up OR close
+                            // stdin (`EOF`) so no late `Steer` can slip into a
+                            // finished turn.
+                            let steered_cmid = {
+                                let mut guard = turn_io.lock().await;
+                                if !*is_error {
+                                    if let Some(cmid) = guard.pending_steers.pop_front() {
+                                        Some(cmid)
+                                    } else {
+                                        guard.stdin = None;
+                                        None
+                                    }
+                                } else {
+                                    guard.stdin = None;
+                                    guard.pending_steers.clear();
+                                    None
+                                }
+                            };
+
+                            if let Some(maybe_cmid) = steered_cmid {
+                                // A steered user frame is already buffered on stdin:
+                                // agy will immediately start the follow-up turn in
+                                // this same process (verified live on agy 1.5.8).
+                                // Flush this sub-turn's text, emit the receipt echo
+                                // that flips the UI badge ("queued" -> "received"),
+                                // and suppress the intermediate `TurnResult` so
+                                // `StreamRelay` stays continuously open.
+                                if let Some(text) = final_turn_text(false, result_text, &buffered_text) {
+                                    let _ = event_tx.send(SessionEnvelope {
+                                        session_id: session_id.clone(),
+                                        turn_gen,
+                                        event: SessionEvent::MessageDelta {
+                                            item_id: std::mem::take(&mut text_item_id),
+                                            text: ensure_turn_separator(text),
+                                        },
+                                    });
+                                }
+                                buffered_text.clear();
+                                text_item_id.clear();
+                                text_flushed = false;
+
+                                if let Some(client_msg_id) = maybe_cmid {
+                                    let _ = event_tx.send(SessionEnvelope {
+                                        session_id: session_id.clone(),
+                                        turn_gen,
+                                        event: SessionEvent::MessageLifecycle {
+                                            client_msg_id,
+                                            phase: MessageLifecyclePhase::Completed,
+                                        },
+                                    });
+                                }
+                            } else {
                                 saw_terminal = true;
                                 if let Some(text) = final_turn_text(*is_error, result_text, &buffered_text) {
                                     text_flushed = true;
@@ -766,16 +894,22 @@ impl AntigravitySessionBackend {
                                     event: out,
                                 });
                             }
-                            other => {
-                                let _ = event_tx.send(SessionEnvelope {
-                                    session_id: session_id.clone(),
-                                    turn_gen,
-                                    event: other,
-                                });
-                            }
+                        }
+                        other => {
+                            let _ = event_tx.send(SessionEnvelope {
+                                session_id: session_id.clone(),
+                                turn_gen,
+                                event: other,
+                            });
                         }
                     }
                 }
+            }
+
+            {
+                let mut guard = turn_io.lock().await;
+                guard.stdin = None;
+                guard.pending_steers.clear();
             }
 
             // Cancelled or crashed: no `result` frame ever arrives, so the text
@@ -810,19 +944,15 @@ impl AntigravitySessionBackend {
             // A cancelled or crashed run exits without emitting `result`; the
             // FSM still needs a terminal, so synthesize one from the exit.
             if !saw_terminal {
-                let exit = proc.wait_for_exit().await;
-                let ok = exit.map(|s| s.success()).unwrap_or(false);
+                let exit = io.wait_for_exit().await;
+                let ok = exit.is_some_and(|s| s.code == Some(0) && s.signal.is_none());
                 let _ = event_tx.send(SessionEnvelope {
                     session_id: session_id.clone(),
                     turn_gen,
                     event: SessionEvent::TurnResult {
                         is_error: !ok,
                         api_error_status: None,
-                        result_text: if ok {
-                            String::new()
-                        } else {
-                            proc.peek_stderr_tail(20).await
-                        },
+                        result_text: if ok { String::new() } else { io.peek_stderr(20).await },
                         epoch: 0,
                         outcome: if ok { TurnOutcome::EndTurn } else { TurnOutcome::Failed },
                     },
@@ -831,13 +961,14 @@ impl AntigravitySessionBackend {
             // The turn owns no process any more; leaving a dead handle here
             // would make a later Cancel try to kill an exited pid.
             let mut slot = current.lock().await;
-            if slot.as_ref().is_some_and(|p| Arc::ptr_eq(p, &proc)) {
+            if slot.as_ref().is_some_and(|p| Arc::ptr_eq(p, &io)) {
                 *slot = None;
             }
             drop(slot);
 
-            // The turn is over, so anything the user typed while it ran can run
-            // now — as its own turn, resuming the same agy conversation.
+            // The turn is over, so anything queued via direct `Command::Send`
+            // while it ran can run now — as its own turn, resuming the same
+            // agy conversation.
             let Some(backend) = backend.and_then(|w| w.upgrade()) else {
                 // Session dropped; nothing left to run for.
                 return;
@@ -984,7 +1115,33 @@ impl SessionBackend for AntigravitySessionBackend {
                 admission: Admission::Started,
                 turn_gen: self.turn_gen.load(Ordering::SeqCst),
             }),
-            Command::Steer { .. } => Err(BackendError::CommandNotSupported { command: "steer" }),
+            Command::Steer { content, client_msg_id } => {
+                let allowed = self.capabilities().prompt_blocks;
+                if let Some(bad) = content.iter().find(|b| !allowed.allows(b)) {
+                    return Err(BackendError::CommandNotSupported {
+                        command: block_kind_name(bad),
+                    });
+                }
+                let text = Self::prompt_text(&content);
+                let mut guard = self.turn_io.lock().await;
+                if !self.in_flight.load(Ordering::SeqCst) {
+                    return Err(BackendError::Transport("no active turn to steer".into()));
+                }
+                let Some(stdin) = guard.stdin.as_mut() else {
+                    return Err(BackendError::Transport("no active turn to steer".into()));
+                };
+                if let Err(e) = write_stream_user_frame(stdin, &text).await {
+                    guard.stdin = None;
+                    guard.pending_steers.clear();
+                    return Err(BackendError::Transport(format!("no active turn to steer: {e}")));
+                }
+                guard.pending_steers.push_back(client_msg_id);
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::NoTurn,
+                    turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                })
+            }
             Command::Rewind { .. } => Err(BackendError::CommandNotSupported { command: "rewind" }),
             Command::AnswerAuth { .. } => Err(BackendError::CommandNotSupported { command: "answer_auth" }),
             _ => Err(BackendError::CommandNotSupported { command: "unsupported" }),
@@ -1049,8 +1206,13 @@ impl SessionBackend for AntigravitySessionBackend {
     }
 
     async fn terminate(&self) {
-        if let Some(proc) = self.current.lock().await.take() {
-            let _ = proc.kill(std::time::Duration::from_secs(2)).await;
+        {
+            let mut guard = self.turn_io.lock().await;
+            guard.stdin = None;
+            guard.pending_steers.clear();
+        }
+        if let Some(io) = self.current.lock().await.take() {
+            io.terminate().await;
         }
         // The process that would have consumed these answers is gone.
         self.deny_all_pending().await;
@@ -1193,7 +1355,12 @@ mod tests {
         let spec = spawner.last_command().await.expect("recorded");
         assert_eq!(spec.command, std::path::PathBuf::from("agy"));
         assert!(spec.args.contains(&"-p".to_string()));
-        assert!(spec.args.contains(&"hello".to_string()));
+        assert!(spec.args.windows(2).any(|w| w == ["--input-format", "stream-json"]));
+        assert!(spec.args.windows(2).any(|w| w == ["-p", ""]));
+        assert!(
+            !spec.args.contains(&"hello".to_string()),
+            "prompt text flows over stream-json stdin, not OS argv"
+        );
         assert!(spec.args.contains(&"--dangerously-skip-permissions".to_string()));
         assert_eq!(spec.cwd.as_deref(), Some("/w"));
         assert_eq!(
@@ -1229,7 +1396,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn steering_is_rejected_because_agy_ignores_stdin_mid_turn() {
+    async fn steer_without_active_turn_returns_no_active_turn_to_steer() {
+        // `ConversationService::deliver_midturn_message` matches the `"no active
+        // turn to steer"` substring (`steer_rejection_is_turn_ended`) to fall
+        // back cleanly to starting a brand-new turn when an active turn ends
+        // right as the user hits Send.
         let backend = open(
             Arc::new(FakeSpawner::new()),
             SessionSpec::Fresh {
@@ -1240,18 +1411,24 @@ mod tests {
         let err = backend
             .dispatch(Command::Steer {
                 content: vec![ContentBlock::Text("stop".into())],
-                client_msg_id: None,
+                client_msg_id: Some("cmsg-idle".into()),
             })
             .await
-            .expect_err("steer must not be silently accepted");
-        assert!(matches!(err, BackendError::CommandNotSupported { command: "steer" }));
+            .expect_err("steer without an active turn must fail with race-fallback error");
+        match err {
+            BackendError::Transport(msg) => assert!(
+                msg.contains("no active turn to steer"),
+                "expected 'no active turn to steer', got: {msg}"
+            ),
+            other => panic!("expected BackendError::Transport, got: {other:?}"),
+        }
     }
 
     /// Concrete handle so the permission tests can reach the inherent methods
     /// without going through `Arc<dyn SessionBackend>`.
     async fn backend_for_permissions() -> Arc<AntigravitySessionBackend> {
         let (event_tx, _) = broadcast::channel(16);
-        Arc::new(AntigravitySessionBackend {
+        let b = Arc::new(AntigravitySessionBackend {
             session_id: "conv-1".into(),
             models: Arc::new(std::sync::RwLock::new(Vec::new())),
             slash_commands: Vec::new(),
@@ -1262,6 +1439,7 @@ mod tests {
             turn_gen: AtomicU64::new(1),
             anchor: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
+            turn_io: Arc::new(Mutex::new(ActiveTurnIo::default())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
@@ -1269,7 +1447,10 @@ mod tests {
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
-        })
+            test_ios: Arc::new(Mutex::new(VecDeque::new())),
+        });
+        let _ = b.weak_self.set(Arc::downgrade(&b));
+        b
     }
 
     #[tokio::test]
@@ -1397,6 +1578,7 @@ mod tests {
             turn_gen: AtomicU64::new(0),
             anchor: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
+            turn_io: Arc::new(Mutex::new(ActiveTurnIo::default())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
@@ -1404,6 +1586,7 @@ mod tests {
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
+            test_ios: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
@@ -1686,6 +1869,7 @@ mod tests {
             turn_gen: AtomicU64::new(0),
             anchor: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
+            turn_io: Arc::new(Mutex::new(ActiveTurnIo::default())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
@@ -1693,6 +1877,7 @@ mod tests {
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
+            test_ios: Arc::new(Mutex::new(VecDeque::new())),
         };
         assert_eq!(b.effective_mode().as_deref(), Some("default"));
         *b.mode_override.write().unwrap() = Some("plan".to_owned());
@@ -1761,6 +1946,7 @@ mod tests {
             turn_gen: AtomicU64::new(0),
             anchor: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
+            turn_io: Arc::new(Mutex::new(ActiveTurnIo::default())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
@@ -1768,6 +1954,7 @@ mod tests {
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
+            test_ios: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let caps = backend.capabilities();
@@ -1849,31 +2036,33 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_allow_queueing_but_not_steering() {
+    fn capabilities_advertise_steering_and_proactive_input() {
         let c = antigravity_capabilities();
-        // agy ignores stdin mid-turn, so steering is impossible...
-        assert!(!c.supported_commands.steer);
-        // ...but queueing for the next turn is natural for a per-turn process.
+        assert!(c.supported_commands.steer);
         assert!(c.accepts_proactive_input);
     }
 
-    /// Verified backend matrix (task-1 brief): agy MUST NOT advertise
-    /// `supports_midturn_delivery` — it is one-process-per-turn and ignores
-    /// stdin mid-turn, so it must behave like ACP in the UI.
     #[test]
-    fn capabilities_do_not_advertise_midturn_delivery() {
-        assert!(!antigravity_capabilities().supports_midturn_delivery);
+    fn capabilities_advertise_midturn_delivery() {
+        assert!(antigravity_capabilities().supports_midturn_delivery);
+        assert_eq!(
+            antigravity_capabilities().supports_midturn_delivery,
+            crate::capability::backend_supports_midturn_delivery("antigravity"),
+        );
     }
 
     #[test]
-    fn capabilities_reflect_the_one_process_per_turn_shape() {
+    fn capabilities_reflect_the_stream_json_turn_burst_shape() {
         let c = antigravity_capabilities();
-        assert!(!c.supported_commands.steer, "agy ignores stdin mid-turn");
+        assert!(
+            c.supported_commands.steer,
+            "stream-json stdin accepts mid-turn user frames"
+        );
         assert!(c.supported_commands.answer_permission, "the hook bridge answers");
         assert!(c.supported_commands.set_mode && c.supported_commands.set_model);
         assert!(!c.supported_commands.rewind);
         assert!(c.prompt_blocks.text);
-        assert!(!c.prompt_blocks.image, "`agy -p` has no image input");
+        assert!(!c.prompt_blocks.image, "`agy -p` stream-json takes text input only");
         assert_eq!(c.prompt_accepted, PromptAcceptedSource::Synthesized);
     }
 
@@ -1903,6 +2092,7 @@ mod tests {
             turn_gen: AtomicU64::new(0),
             anchor: Arc::new(Mutex::new(None)),
             current: Arc::new(Mutex::new(None)),
+            turn_io: Arc::new(Mutex::new(ActiveTurnIo::default())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             permission_seq: AtomicU64::new(0),
             weak_self: std::sync::OnceLock::new(),
@@ -1910,6 +2100,7 @@ mod tests {
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
+            test_ios: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -2040,5 +2231,356 @@ mod tests {
         }]);
         let cached = cached_models().expect("a non-empty list must be cached");
         assert!(cached.iter().any(|m| m.id == "gemini-3.1-pro-low"));
+    }
+
+    #[tokio::test]
+    async fn steer_rejects_unsupported_image_block_with_command_not_supported() {
+        let b = backend_for_permissions().await;
+        let err = b
+            .dispatch(Command::Steer {
+                content: vec![ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: vec![0, 1, 2, 3],
+                }],
+                client_msg_id: Some("cmsg-img".into()),
+            })
+            .await
+            .expect_err("image block must be rejected before touching stdin");
+        assert!(matches!(
+            err,
+            BackendError::CommandNotSupported {
+                command: "content_block:image"
+            }
+        ));
+    }
+
+    /// Replays a real two-turn `agy 1.5.8 --input-format stream-json
+    /// --output-format stream-json -p ""` wire capture:
+    /// 1. Turn 1 starts (`init` + `tool ACTIVE` on `run_command`).
+    /// 2. User sends a mid-turn `Command::Steer` while the tool is running.
+    /// 3. Turn 1 finishes (`result` with `num_turns: 1`); the backend flushes
+    ///    Turn 1's reply, emits `MessageLifecycle::Completed` for the steered
+    ///    `client_msg_id`, and suppresses the intermediate `TurnResult`.
+    /// 4. Turn 2 runs in the same warm process (`step_index: 6, 7`, `num_turns: 2`)
+    ///    and emits the single authoritative `TurnResult` on the same `turn_gen`.
+    #[tokio::test]
+    async fn midturn_steer_writes_event_user_ndjson_emits_lifecycle_completed_and_folds_followup_turn() {
+        use crate::event::ExitStatusLite;
+        use crate::testing::FakeAgentIo;
+        use futures_util::StreamExt as _;
+
+        let prefix = concat!(
+            r#"{"event":"init","conversation_id":"68a53772-fdd8-458d-88d8-3d11a451b887","init":{"model":"gemini-3.8-flash-low","cwd":"/w","tools":["run_command"],"permission_mode":"always-proceed"}}"#,
+            "\n",
+            r#"{"event":"step_update","step_update":{"conversation_id":"68a53772-fdd8-458d-88d8-3d11a451b887","step_index":0,"state":"DONE","step_type":"user_input"}}"#,
+            "\n",
+            r#"{"event":"step_update","step_update":{"conversation_id":"68a53772-fdd8-458d-88d8-3d11a451b887","step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"Start-Sleep -Seconds 6"}}}}"#,
+            "\n",
+        );
+        let seg_turn1_end = concat!(
+            r#"{"event":"step_update","step_update":{"conversation_id":"68a53772-fdd8-458d-88d8-3d11a451b887","step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","output":"Command exited with code 0."}}}"#,
+            "\n",
+            r#"{"event":"step_update","step_update":{"conversation_id":"68a53772-fdd8-458d-88d8-3d11a451b887","step_index":5,"state":"DONE","step_type":"agent_response","text_delta":"APPLE\n"}}"#,
+            "\n",
+            r#"{"event":"result","result":{"conversation_id":"68a53772-fdd8-458d-88d8-3d11a451b887","status":"SUCCESS","response":"APPLE\n","duration_seconds":17.2,"num_turns":1,"usage":{"input_tokens":17245,"output_tokens":67,"thinking_tokens":0,"cache_read_tokens":8092,"total_tokens":17312}}}"#,
+            "\n",
+        );
+        let seg_turn2_end = concat!(
+            r#"{"event":"step_update","step_update":{"conversation_id":"68a53772-fdd8-458d-88d8-3d11a451b887","step_index":6,"state":"DONE","step_type":"user_input"}}"#,
+            "\n",
+            r#"{"event":"step_update","step_update":{"conversation_id":"68a53772-fdd8-458d-88d8-3d11a451b887","step_index":7,"state":"DONE","step_type":"agent_response","text_delta":"BANANA\n"}}"#,
+            "\n",
+            r#"{"event":"result","result":{"conversation_id":"68a53772-fdd8-458d-88d8-3d11a451b887","status":"SUCCESS","response":"BANANA\n","duration_seconds":19.6,"num_turns":2,"usage":{"input_tokens":21998,"output_tokens":69,"thinking_tokens":0,"cache_read_tokens":12131,"total_tokens":22067}}}"#,
+            "\n",
+        );
+
+        let fake = FakeAgentIo::new(
+            prefix.as_bytes().to_vec(),
+            Some(ExitStatusLite {
+                code: Some(0),
+                signal: None,
+            }),
+        )
+        .with_gated_segments(vec![
+            seg_turn1_end.as_bytes().to_vec(),
+            seg_turn2_end.as_bytes().to_vec(),
+        ]);
+        let captured_stdin = fake.captured_stdin();
+        let release_next = fake.segment_releaser();
+        fake.release_exit();
+
+        let b = backend_for_permissions().await;
+        b.turn_gen.store(0, Ordering::SeqCst);
+        b.test_ios.lock().await.push_back(Arc::new(fake));
+        let mut events = b.events();
+
+        let send_receipt = b.dispatch(send("say APPLE after sleep")).await.expect("send starts");
+        assert_eq!(send_receipt.admission, Admission::Started);
+        assert_eq!(send_receipt.turn_gen, 1);
+
+        // Wait until the active tool step arrives so we know Turn 1 is mid-flight.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                if matches!(env.event, SessionEvent::ToolCall { ref name, .. } if name == "run_command") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("tool call must stream");
+
+        // Inject mid-turn steer while the tool is running.
+        let steer_receipt = b
+            .dispatch(Command::Steer {
+                content: vec![ContentBlock::Text("reply BANANA instead".into())],
+                client_msg_id: Some("cmsg-steer-1".into()),
+            })
+            .await
+            .expect("steer accepted");
+        assert!(steer_receipt.accepted);
+        assert_eq!(steer_receipt.admission, Admission::NoTurn);
+        assert_eq!(steer_receipt.turn_gen, 1);
+
+        // Release Turn 1's completion: must flush Turn 1 text + MessageLifecycle::Completed,
+        // WITHOUT emitting an early TurnResult.
+        release_next();
+        let mut saw_turn1_text = false;
+        let mut saw_lifecycle = false;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                assert_eq!(env.turn_gen, 1);
+                match env.event {
+                    SessionEvent::MessageDelta { text, .. } if text.starts_with("APPLE\n") => {
+                        assert_eq!(text, "APPLE\n\n", "intermediate reply must end with paragraph break");
+                        saw_turn1_text = true;
+                    }
+                    SessionEvent::MessageLifecycle { client_msg_id, phase } => {
+                        assert_eq!(client_msg_id, "cmsg-steer-1");
+                        assert_eq!(phase, MessageLifecyclePhase::Completed);
+                        saw_lifecycle = true;
+                    }
+                    SessionEvent::TurnResult { .. } => {
+                        panic!("intermediate result frame must be suppressed while steered turn is pending");
+                    }
+                    _ => {}
+                }
+                if saw_turn1_text && saw_lifecycle {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Turn 1 boundary events must arrive");
+
+        // Release Turn 2's completion: must emit BANANA + the single terminal TurnResult.
+        release_next();
+        let mut saw_turn2_text = false;
+        let mut terminal_count = 0usize;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                assert_eq!(env.turn_gen, 1);
+                match env.event {
+                    SessionEvent::MessageDelta { text, .. } if text == "BANANA\n" => {
+                        saw_turn2_text = true;
+                    }
+                    SessionEvent::TurnResult {
+                        is_error,
+                        outcome,
+                        result_text,
+                        ..
+                    } => {
+                        assert!(!is_error);
+                        assert_eq!(outcome, TurnOutcome::EndTurn);
+                        assert_eq!(result_text, "BANANA\n");
+                        terminal_count += 1;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("Turn 2 terminal result must arrive");
+        assert!(saw_turn2_text);
+        assert_eq!(terminal_count, 1);
+        assert_eq!(
+            b.anchor.lock().await.as_deref(),
+            Some("68a53772-fdd8-458d-88d8-3d11a451b887")
+        );
+
+        // Wait briefly for the stdin drain task to capture both flushed NDJSON frames.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let raw_stdin = String::from_utf8(captured_stdin.lock().await.clone()).expect("utf8 stdin");
+        let stdin_lines: Vec<&str> = raw_stdin.lines().collect();
+        assert_eq!(stdin_lines.len(), 2, "expected 2 NDJSON user frames: {raw_stdin}");
+        let f1: serde_json::Value = serde_json::from_str(stdin_lines[0]).unwrap();
+        let f2: serde_json::Value = serde_json::from_str(stdin_lines[1]).unwrap();
+        assert_eq!(
+            f1,
+            json!({"event": "user", "message": {"role": "user", "content": "say APPLE after sleep"}})
+        );
+        assert_eq!(
+            f2,
+            json!({"event": "user", "message": {"role": "user", "content": "reply BANANA instead"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn race_after_final_turn_result_closes_stdin_and_rejects_late_steer_cleanly() {
+        use crate::event::ExitStatusLite;
+        use crate::testing::FakeAgentIo;
+        use futures_util::StreamExt as _;
+
+        let single_turn = concat!(
+            r#"{"event":"init","conversation_id":"conv-race-1","init":{"model":"gemini-3.8-flash-low"}}"#,
+            "\n",
+            r#"{"event":"result","result":{"conversation_id":"conv-race-1","status":"SUCCESS","response":"done","num_turns":1}}"#,
+            "\n",
+        );
+        let fake = FakeAgentIo::new(
+            single_turn.as_bytes().to_vec(),
+            Some(ExitStatusLite {
+                code: Some(0),
+                signal: None,
+            }),
+        );
+        fake.release_exit();
+
+        let b = backend_for_permissions().await;
+        b.turn_gen.store(0, Ordering::SeqCst);
+        b.test_ios.lock().await.push_back(Arc::new(fake));
+        let mut events = b.events();
+
+        b.dispatch(send("hi")).await.expect("send starts");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                if matches!(env.event, SessionEvent::TurnResult { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("turn result must arrive");
+
+        assert!(
+            b.turn_io.lock().await.stdin.is_none(),
+            "final TurnResult must drop stdin immediately so EOF reaches agy"
+        );
+        let err = b
+            .dispatch(Command::Steer {
+                content: vec![ContentBlock::Text("too late".into())],
+                client_msg_id: Some("cmsg-late".into()),
+            })
+            .await
+            .expect_err("late steer after TurnResult must fail cleanly");
+        match err {
+            BackendError::Transport(msg) => assert!(msg.contains("no active turn to steer"), "{msg}"),
+            other => panic!("expected Transport('no active turn to steer'), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_intermediate_turn_drops_pending_steers_and_emits_error_terminal() {
+        use crate::event::ExitStatusLite;
+        use crate::testing::FakeAgentIo;
+        use futures_util::StreamExt as _;
+
+        let prefix = concat!(
+            r#"{"event":"init","conversation_id":"conv-err-1","init":{"model":"gemini-3.8-flash-low"}}"#,
+            "\n",
+            r#"{"event":"step_update","step_update":{"conversation_id":"conv-err-1","step_index":1,"state":"ACTIVE","step_type":"tool","tool_name":"run_command"}}"#,
+            "\n",
+        );
+        let err_tail = concat!(
+            r#"{"event":"result","result":{"conversation_id":"conv-err-1","status":"ERROR","error":"quota exhausted","response":""}}"#,
+            "\n",
+        );
+        let fake = FakeAgentIo::new(
+            prefix.as_bytes().to_vec(),
+            Some(ExitStatusLite {
+                code: Some(3),
+                signal: None,
+            }),
+        )
+        .with_gated_tail(err_tail.as_bytes().to_vec());
+        let release_tail = fake.stdout_releaser();
+        fake.release_exit();
+
+        let b = backend_for_permissions().await;
+        b.turn_gen.store(0, Ordering::SeqCst);
+        b.test_ios.lock().await.push_back(Arc::new(fake));
+        let mut events = b.events();
+
+        b.dispatch(send("start")).await.expect("send starts");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                if matches!(env.event, SessionEvent::ToolCall { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("tool call");
+
+        b.dispatch(Command::Steer {
+            content: vec![ContentBlock::Text("follow up".into())],
+            client_msg_id: Some("cmsg-err".into()),
+        })
+        .await
+        .expect("steer queued");
+
+        release_tail();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::TurnResult {
+                    is_error,
+                    result_text,
+                    outcome,
+                    ..
+                } = env.event
+                {
+                    return (is_error, result_text, outcome);
+                }
+            }
+            unreachable!()
+        })
+        .await
+        .expect("error TurnResult must not be swallowed by a pending steer");
+        assert!(terminal.0);
+        assert!(terminal.1.contains("quota exhausted"));
+        assert_eq!(terminal.2, TurnOutcome::Failed);
+        assert!(b.turn_io.lock().await.pending_steers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_clears_pending_steers_and_closes_stdin() {
+        use crate::testing::CountingTerminateIo;
+
+        let counting = CountingTerminateIo::new();
+        let terminate_calls = counting.terminate_counter();
+
+        let b = backend_for_permissions().await;
+        b.turn_gen.store(0, Ordering::SeqCst);
+        b.test_ios.lock().await.push_back(Arc::new(counting));
+
+        b.dispatch(send("long running")).await.expect("send starts");
+        b.dispatch(Command::Steer {
+            content: vec![ContentBlock::Text("steered before cancel".into())],
+            client_msg_id: Some("cmsg-cancel".into()),
+        })
+        .await
+        .expect("steer accepted");
+        assert_eq!(b.turn_io.lock().await.pending_steers.len(), 1);
+
+        b.dispatch(Command::Cancel {
+            target: CancelTarget::Turn,
+        })
+        .await
+        .expect("cancel accepted");
+
+        let guard = b.turn_io.lock().await;
+        assert!(guard.stdin.is_none(), "cancel must close stdin");
+        assert!(guard.pending_steers.is_empty(), "cancel must clear pending steers");
+        assert_eq!(terminate_calls.load(Ordering::SeqCst), 1);
     }
 }
