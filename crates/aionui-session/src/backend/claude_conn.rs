@@ -2840,6 +2840,40 @@ fn sniff_session_info(
 /// `SessionEvent::SessionTitle`. A success reply with an empty/missing title,
 /// or an error reply, is warn-logged and dropped — title generation is
 /// best-effort and never affects the turn. No-op for any other frame.
+/// Markers of the first-turn block the agent layer prepends to the user's text
+/// (`aionui-ai-agent` `first_message_injector` / `prompt_builder`):
+/// `[Assistant Rules]\n…\n[/Assistant Rules]\n\n<what the user typed>`.
+const INJECTED_RULES_OPEN: &str = "[Assistant Rules]";
+const INJECTED_RULES_CLOSE: &str = "[/Assistant Rules]";
+
+/// The text a session title should be generated from: the first prompt's text
+/// blocks, minus a leading injected `[Assistant Rules]` block, bounded to 1000
+/// chars. Without the strip, an assistant with long rules filled the whole
+/// bound with them, and the generated title described the rules ("Assistant
+/// rules and skills") instead of the user's request. `None` when nothing of
+/// the user's own text is left.
+fn title_description_from_prompt(content: &[super::types::ContentBlock]) -> Option<String> {
+    let text = content
+        .iter()
+        .filter_map(|b| match b {
+            super::types::ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let bounded: String = strip_injected_rules(&text).chars().take(1000).collect();
+    (!bounded.trim().is_empty()).then_some(bounded)
+}
+
+fn strip_injected_rules(text: &str) -> &str {
+    if let Some(rest) = text.trim_start().strip_prefix(INJECTED_RULES_OPEN)
+        && let Some(end) = rest.find(INJECTED_RULES_CLOSE)
+    {
+        return rest[end + INJECTED_RULES_CLOSE.len()..].trim_start_matches(['\r', '\n']);
+    }
+    text
+}
+
 fn sniff_session_title(
     frame: &serde_json::Value,
     event_tx: &broadcast::Sender<SessionEnvelope>,
@@ -3090,18 +3124,7 @@ impl SessionBackend for ClaudeSessionBackend {
                 if self.title_gen.pending.load(Ordering::SeqCst) {
                     let mut description = self.title_gen.description.lock().unwrap_or_else(|e| e.into_inner());
                     if description.is_none() {
-                        let text = content
-                            .iter()
-                            .filter_map(|b| match b {
-                                super::types::ContentBlock::Text(t) => Some(t.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let bounded: String = text.chars().take(1000).collect();
-                        if !bounded.is_empty() {
-                            *description = Some(bounded);
-                        }
+                        *description = title_description_from_prompt(&content);
                     }
                 }
                 // F-4: ensure the process is awake before any wire write. When
@@ -7134,6 +7157,53 @@ mod tests {
         })
         .await;
         assert!(!saw_title, "error/empty title replies must not emit SessionTitle");
+    }
+
+    #[test]
+    fn title_description_skips_the_injected_rules_block() {
+        // A long rules block used to fill the whole 1000-char bound.
+        let rules = "You are a helpful project assistant. ".repeat(80);
+        let first = format!("[Assistant Rules]\n{rules}\n[/Assistant Rules]\n\nPlan a trip to Lisbon");
+        assert_eq!(
+            title_description_from_prompt(&[ContentBlock::Text(first)]).as_deref(),
+            Some("Plan a trip to Lisbon")
+        );
+        // The skills-index layout (prompt_builder) ends with the same marker.
+        let indexed = "[Assistant Rules]\nctx\n## Skills\n- a: b\n[/Assistant Rules]\n\nhello".to_owned();
+        assert_eq!(
+            title_description_from_prompt(&[ContentBlock::Text(indexed)]).as_deref(),
+            Some("hello")
+        );
+        // Rules only: nothing to title from yet (a later prompt may fill it).
+        let only = "[Assistant Rules]\nctx\n[/Assistant Rules]\n\n".to_owned();
+        assert_eq!(title_description_from_prompt(&[ContentBlock::Text(only)]), None);
+    }
+
+    #[test]
+    fn title_description_keeps_ordinary_prompts_unchanged() {
+        assert_eq!(
+            title_description_from_prompt(&[ContentBlock::Text("hello".into())]).as_deref(),
+            Some("hello")
+        );
+        // The marker only counts as the leading injected block.
+        let quoted = "What does [Assistant Rules] mean? [/Assistant Rules]".to_owned();
+        assert_eq!(
+            title_description_from_prompt(&[ContentBlock::Text(quoted.clone())]).as_deref(),
+            Some(quoted.as_str())
+        );
+        // An unterminated block is left alone rather than guessed at.
+        let open = "[Assistant Rules]\nno end".to_owned();
+        assert_eq!(
+            title_description_from_prompt(&[ContentBlock::Text(open.clone())]).as_deref(),
+            Some(open.as_str())
+        );
+        // Still bounded.
+        let long = "x".repeat(5000);
+        assert_eq!(
+            title_description_from_prompt(&[ContentBlock::Text(long)]).map(|d| d.chars().count()),
+            Some(1000)
+        );
+        assert_eq!(title_description_from_prompt(&[]), None);
     }
 
     #[tokio::test]
