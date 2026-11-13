@@ -693,6 +693,26 @@ async fn fetch_remote_image(
 // ---------------------------------------------------------------------------
 // B. Workspace snapshot — handlers
 // ---------------------------------------------------------------------------
+//
+// The per-file handlers require `file_path` to stay inside the workspace:
+// the snapshot service joins it onto the workspace and may delete the result
+// (discard of a created file), and `Path::join` with an absolute path
+// replaces the workspace entirely.
+
+fn ensure_workspace_relative(file_path: &str) -> Result<(), ApiError> {
+    let p = Path::new(file_path);
+    let escapes = file_path.trim().is_empty()
+        || p.is_absolute()
+        || p.has_root()
+        || crate::path_safety::has_traversal(file_path)
+        || p.components().any(|c| matches!(c, std::path::Component::Prefix(_)));
+    if escapes {
+        return Err(ApiError::BadRequest(
+            "file_path must be a path relative to the workspace".to_owned(),
+        ));
+    }
+    Ok(())
+}
 
 async fn snapshot_init(
     State(state): State<FileRouterState>,
@@ -726,6 +746,7 @@ async fn snapshot_baseline(
     body: Result<Json<SnapshotBaselineRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    ensure_workspace_relative(&req.file_path)?;
     let content = state
         .snapshot_service
         .get_baseline_content(&req.workspace, &req.file_path)
@@ -738,6 +759,7 @@ async fn snapshot_stage_file(
     body: Result<Json<SnapshotStageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    ensure_workspace_relative(&req.file_path)?;
     state
         .snapshot_service
         .stage_file(&req.workspace, &req.file_path)
@@ -759,6 +781,7 @@ async fn snapshot_unstage_file(
     body: Result<Json<SnapshotStageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    ensure_workspace_relative(&req.file_path)?;
     state
         .snapshot_service
         .unstage_file(&req.workspace, &req.file_path)
@@ -780,6 +803,7 @@ async fn snapshot_discard(
     body: Result<Json<SnapshotDiscardRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    ensure_workspace_relative(&req.file_path)?;
     state
         .snapshot_service
         .discard_file(&req.workspace, &req.file_path, req.operation)
@@ -792,6 +816,7 @@ async fn snapshot_reset(
     body: Result<Json<SnapshotDiscardRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    ensure_workspace_relative(&req.file_path)?;
     state
         .snapshot_service
         .reset_file(&req.workspace, &req.file_path, req.operation)
@@ -892,6 +917,42 @@ fn to_compare_response(r: CompareResult) -> SnapshotCompareResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_file_path_must_stay_inside_the_workspace() {
+        for ok in ["a.txt", "src/main.rs", "dir/sub/file", "./a.txt"] {
+            assert!(ensure_workspace_relative(ok).is_ok(), "{ok}");
+        }
+        let mut bad = vec!["", "  ", "../outside.txt", "src/../../x", "/etc/passwd", "a\0b"];
+        if cfg!(windows) {
+            bad.extend([r"C:\Windows\win.ini", r"\\server\share\x", r"\rooted"]);
+        }
+        for path in bad {
+            assert!(
+                matches!(ensure_workspace_relative(path), Err(ApiError::BadRequest(_))),
+                "{path:?} must be rejected"
+            );
+        }
+    }
+
+    /// Every snapshot handler that takes a file path must keep it relative.
+    /// Bump the counts deliberately when adding a snapshot endpoint.
+    #[test]
+    fn every_snapshot_file_path_handler_checks_containment() {
+        let source = include_str!("routes.rs");
+        let handlers = source
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("routes.rs has a #[cfg(test)] module");
+        let snapshot_routes = handlers.matches(".route(\"/api/fs/snapshot/").count();
+        // `&req.file_paths` (the copy handler) is a different field.
+        let file_path_uses = handlers.matches("&req.file_path").count() - handlers.matches("&req.file_paths").count();
+        let relative_checks = handlers.matches("ensure_workspace_relative(&req.file_path)?;").count();
+        assert_eq!(snapshot_routes, 12);
+        assert_eq!(relative_checks, 5);
+        // Each checked handler mentions `&req.file_path` twice: the check and the call.
+        assert_eq!(file_path_uses, relative_checks * 2);
+    }
 
     #[test]
     fn file_path_outside_sandbox_maps_to_explicit_api_code() {

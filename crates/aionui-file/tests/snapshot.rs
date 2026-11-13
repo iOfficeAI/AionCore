@@ -935,3 +935,37 @@ async fn snapshot_stage_and_discard_flow() {
     let content = std::fs::read_to_string(tmp.path().join("doc.txt")).unwrap();
     assert_eq!(content, "initial");
 }
+
+// UB-07: the discard helper refuses paths that leave the workspace, even if a
+// caller skips the route-level check (absolute, `..`, or through a symlink).
+#[tokio::test]
+async fn git_repo_discard_created_refuses_paths_outside_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    init_repo_with_file(tmp.path(), "a.txt", "a");
+    let victim = outside.path().join("victim.txt");
+    std::fs::write(&victim, "keep me").unwrap();
+
+    let svc = SnapshotService::new();
+    let ws = tmp.path().to_str().unwrap();
+    svc.init(ws).await.unwrap();
+
+    let absolute = victim.to_str().unwrap().to_owned();
+    let dotdot = format!(
+        "../{}/victim.txt",
+        outside.path().file_name().unwrap().to_str().unwrap()
+    );
+    for path in [absolute.as_str(), dotdot.as_str()] {
+        let result = svc.discard_file(ws, path, FileChangeOperation::Create).await;
+        assert!(result.is_err(), "{path} must be refused");
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("link")).unwrap();
+        let result = svc
+            .discard_file(ws, "link/victim.txt", FileChangeOperation::Create)
+            .await;
+        assert!(result.is_err(), "a symlinked directory must not lead outside");
+    }
+    assert!(victim.exists(), "the file outside the workspace was deleted");
+}
