@@ -25,7 +25,7 @@ use aionui_process::Spawner;
 use futures_util::stream::BoxStream;
 use tokio::sync::{Mutex, broadcast, oneshot};
 
-use super::argv::{ArgvInput, build_argv};
+use super::argv::{ArgvInput, apply_default_spawn_env, build_argv};
 use super::models::probe_models;
 use super::skills::skill_commands_from_dirs;
 use super::translate::Translator;
@@ -229,7 +229,7 @@ impl BackendConnection for AntigravityConnection {
     async fn open_session(
         &self,
         spec: SessionSpec,
-        config: SessionConfig,
+        mut config: SessionConfig,
     ) -> Result<Arc<dyn SessionBackend>, BackendError> {
         // No process is spawned here: agy has nothing to keep alive between
         // turns. Resume simply pre-seeds the anchor the next `Send` will pass
@@ -265,6 +265,12 @@ impl BackendConnection for AntigravityConnection {
         // no longer writes `.agents/skills`, and this source is exactly the
         // conversation's enabled set.
         let slash_commands = skill_commands_from_dirs(&config.init.skill_dirs);
+
+        // Normalize subprocess env defaults once on the session config so both
+        // background `agy models` discovery (`spawn_model_probe`) and every
+        // `agy -p` turn (`start_turn`) share `GODEBUG=http2client=0` and UTF-8
+        // Python stdio without clobbering explicit user overrides.
+        apply_default_spawn_env(&mut config.spawn_env);
 
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let backend = Arc::new(AntigravitySessionBackend {
@@ -667,6 +673,7 @@ impl AntigravitySessionBackend {
             extra_args: self.config.extra_args.clone(),
         };
         let mut spawn_env = self.config.spawn_env.clone();
+        apply_default_spawn_env(&mut spawn_env);
         if let Some(cwd) = self.config.cwd.as_deref() {
             // agy 1.1.13 resolves its primary customization workspace from PWD,
             // not only the process cwd/--add-dir. A stale inherited PWD made it
@@ -1203,6 +1210,160 @@ mod tests {
                 .map(|entry| entry.value.as_str())
                 .collect::<Vec<_>>(),
             vec!["/w"]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_populates_default_http2client_and_python_utf8_spawn_env() {
+        let spawner = Arc::new(FakeSpawner::new());
+        // Blank session entries stand in for "unset by caller" while insulating
+        // the assertion from whatever ambient GODEBUG / PYTHON* the test runner's
+        // own shell happens to export.
+        let cfg = SessionConfig {
+            cwd: Some("/w".to_owned()),
+            spawn_env: vec![
+                aionui_common::EnvVar {
+                    name: "GODEBUG".to_owned(),
+                    value: String::new(),
+                },
+                aionui_common::EnvVar {
+                    name: "PYTHONUTF8".to_owned(),
+                    value: String::new(),
+                },
+                aionui_common::EnvVar {
+                    name: "PYTHONIOENCODING".to_owned(),
+                    value: String::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        let backend = AntigravityConnection::new(spawner.clone())
+            .open_session(
+                SessionSpec::Fresh {
+                    session_id: "conv-env-defaults".into(),
+                },
+                cfg,
+            )
+            .await
+            .expect("open_session");
+
+        let _ = backend.dispatch(send("hello")).await;
+        let spec = spawner.last_command().await.expect("recorded");
+        let find_env = |key: &str| {
+            spec.env
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(key))
+                .map(|entry| entry.value.as_str())
+        };
+        assert_eq!(find_env("GODEBUG"), Some("http2client=0"));
+        assert_eq!(find_env("PYTHONUTF8"), Some("1"));
+        assert_eq!(find_env("PYTHONIOENCODING"), Some("utf-8"));
+    }
+
+    #[tokio::test]
+    async fn send_merges_caller_godebug_and_preserves_explicit_spawn_env_overrides() {
+        let spawner = Arc::new(FakeSpawner::new());
+        let cfg = SessionConfig {
+            cwd: Some("/w".to_owned()),
+            spawn_env: vec![
+                aionui_common::EnvVar {
+                    name: "HTTPS_PROXY".to_owned(),
+                    value: "http://127.0.0.1:7897".to_owned(),
+                },
+                aionui_common::EnvVar {
+                    name: "godebug".to_owned(),
+                    value: "netdns=go".to_owned(),
+                },
+                aionui_common::EnvVar {
+                    name: "pythonutf8".to_owned(),
+                    value: "0".to_owned(),
+                },
+                aionui_common::EnvVar {
+                    name: "PYTHONIOENCODING".to_owned(),
+                    value: "gbk".to_owned(),
+                },
+            ],
+            ..Default::default()
+        };
+        let backend = AntigravityConnection::new(spawner.clone())
+            .open_session(
+                SessionSpec::Fresh {
+                    session_id: "conv-env-merge".into(),
+                },
+                cfg,
+            )
+            .await
+            .expect("open_session");
+
+        let _ = backend.dispatch(send("hello")).await;
+        let spec = spawner.last_command().await.expect("recorded");
+        let find_env = |key: &str| {
+            spec.env
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(key))
+                .map(|entry| entry.value.as_str())
+        };
+        assert_eq!(find_env("HTTPS_PROXY"), Some("http://127.0.0.1:7897"));
+        assert_eq!(find_env("GODEBUG"), Some("netdns=go,http2client=0"));
+        assert_eq!(find_env("PYTHONUTF8"), Some("0"));
+        assert_eq!(find_env("PYTHONIOENCODING"), Some("gbk"));
+
+        // Explicit `http2client=1` from the user must survive untouched through FakeSpawner too.
+        let spawner_explicit = Arc::new(FakeSpawner::new());
+        let backend_explicit = AntigravityConnection::new(spawner_explicit.clone())
+            .open_session(
+                SessionSpec::Fresh {
+                    session_id: "conv-env-explicit-h2".into(),
+                },
+                SessionConfig {
+                    cwd: Some("/w".to_owned()),
+                    spawn_env: vec![aionui_common::EnvVar {
+                        name: "GODEBUG".to_owned(),
+                        value: "http2client=1".to_owned(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("open_session");
+
+        let _ = backend_explicit.dispatch(send("hello")).await;
+        let spec_explicit = spawner_explicit.last_command().await.expect("recorded");
+        assert_eq!(
+            spec_explicit
+                .env
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case("GODEBUG"))
+                .map(|entry| entry.value.as_str()),
+            Some("http2client=1")
+        );
+    }
+
+    #[tokio::test]
+    async fn model_probe_receives_normalized_godebug_and_python_utf8_spawn_env() {
+        let spawner = Arc::new(FakeSpawner::new());
+        let mut spawn_env = vec![aionui_common::EnvVar {
+            name: "HTTPS_PROXY".to_owned(),
+            value: "http://127.0.0.1:7897".to_owned(),
+        }];
+        super::super::argv::apply_default_spawn_env_with(&mut spawn_env, |_| None);
+
+        let spawner_dyn: Arc<dyn Spawner> = spawner.clone();
+        let models = probe_models(&spawner_dyn, std::path::Path::new("agy"), "conv-probe", &spawn_env).await;
+        assert!(models.is_empty());
+
+        let spec = spawner.last_command().await.expect("probe_models invoked spawner");
+        assert_eq!(spec.args, vec!["models"]);
+        assert!(
+            spec.env
+                .iter()
+                .any(|e| e.name == "GODEBUG" && e.value == "http2client=0")
+        );
+        assert!(spec.env.iter().any(|e| e.name == "PYTHONUTF8" && e.value == "1"));
+        assert!(
+            spec.env
+                .iter()
+                .any(|e| e.name == "PYTHONIOENCODING" && e.value == "utf-8")
         );
     }
 

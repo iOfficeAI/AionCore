@@ -1,4 +1,6 @@
-//! Command-line construction for one agy turn. Pure: no IO, no spawning.
+//! Command-line and spawn-environment construction for one agy turn. Pure: no IO, no spawning.
+
+use aionui_common::EnvVar;
 
 /// AionUi's sentinel mode id meaning "run without approval prompts".
 ///
@@ -135,6 +137,144 @@ pub(crate) fn build_argv(input: &ArgvInput) -> Vec<String> {
     // Skill-delivery args last, so they cannot displace anything above.
     a.extend(input.extra_args.iter().cloned());
     a
+}
+
+/// Go `GODEBUG` token disabling the `net/http` HTTP/2 client transport.
+///
+/// `agy` (`agy-vendor`) is a Go binary whose upstream stream and model-registry
+/// calls fail behind local TLS-terminating / HTTP proxies with HTTP/2 stream
+/// drops and header timeouts (verified: `agy changelog` 1.4.1 — "`http2: client
+/// connection lost`"; `agy changelog` 1.5.2 — "`http2: timeout awaiting
+/// response headers`"). Disabling Go's HTTP/2 client forces clean HTTP/1.1
+/// framing over proxies while leaving any explicit `http2client=` choice from
+/// the user untouched.
+const GODEBUG_DISABLE_HTTP2_CLIENT: &str = "http2client=0";
+
+/// Default Python stdio UTF-8 settings for `agy` subprocesses and hooks.
+///
+/// On Windows hosts with legacy ANSI/OEM console codepages (e.g. CP936 / CP1252),
+/// Python child scripts, `.agents/hooks.json` PreToolUse hooks, and stdio MCP
+/// servers default to locale encodings unless `PYTHONUTF8=1` and
+/// `PYTHONIOENCODING=utf-8` are set (`agy` only began setting `PYTHONUTF8=1`
+/// inside its own command runner in 1.5.1 — verified: `agy changelog` 1.5.1 —
+/// while [`crate::backend::cli_version::VERIFIED_AGY_VERSION`] supports 1.3.5+
+/// and host-side hooks run outside `agy`'s internal shell wrapper).
+const DEFAULT_PYTHONUTF8: &str = "1";
+const DEFAULT_PYTHONIOENCODING: &str = "utf-8";
+
+fn has_godebug_setting(value: &str, key: &str) -> bool {
+    value.split(',').any(|token| {
+        token
+            .trim()
+            .split_once('=')
+            .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(key))
+    })
+}
+
+fn merge_godebug_disable_http2(existing: Option<&str>) -> String {
+    let Some(raw) = existing.map(str::trim).filter(|s| !s.is_empty()) else {
+        return GODEBUG_DISABLE_HTTP2_CLIENT.to_owned();
+    };
+    if has_godebug_setting(raw, "http2client") {
+        return raw.to_owned();
+    }
+    let trimmed = raw.trim_end_matches(',').trim();
+    if trimmed.is_empty() {
+        GODEBUG_DISABLE_HTTP2_CLIENT.to_owned()
+    } else {
+        format!("{trimmed},{GODEBUG_DISABLE_HTTP2_CLIENT}")
+    }
+}
+
+/// Remove all entries matching `key` (ASCII case-insensitive) and return the
+/// last one — matching `Builder::envs` order, where the last entry wins.
+fn take_last_ci(spawn_env: &mut Vec<EnvVar>, key: &str) -> Option<EnvVar> {
+    let mut found = None;
+    spawn_env.retain(|entry| {
+        if entry.name.eq_ignore_ascii_case(key) {
+            found = Some(entry.clone());
+            false
+        } else {
+            true
+        }
+    });
+    found
+}
+
+fn ensure_default_ci(
+    spawn_env: &mut Vec<EnvVar>,
+    key: &str,
+    default_value: &str,
+    lookup_ambient: &impl Fn(&str) -> Option<String>,
+) {
+    if let Some(existing) = take_last_ci(spawn_env, key) {
+        let value = if existing.value.trim().is_empty() {
+            default_value.to_owned()
+        } else {
+            existing.value
+        };
+        spawn_env.push(EnvVar {
+            name: existing.name,
+            value,
+        });
+        return;
+    }
+    let value = lookup_ambient(key)
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default_value.to_owned());
+    spawn_env.push(EnvVar {
+        name: key.to_owned(),
+        value,
+    });
+}
+
+fn lookup_process_env_ci(key: &str) -> Option<String> {
+    std::env::var(key).ok().or_else(|| {
+        std::env::vars()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v)
+    })
+}
+
+/// Pure, hermetic core of [`apply_default_spawn_env`] accepting an ambient-env
+/// lookup closure so unit tests never depend on the host runner's environment.
+///
+/// Precedence (highest to lowest):
+/// 1. Explicit entry in `spawn_env` (session `agent_env` override) — case-insensitive.
+/// 2. Host process environment (`lookup_ambient`) — case-insensitive, because
+///    `ManagedProcess::spawn` inherits the parent process environment and any
+///    `CommandSpec.env` entry overwrites the inherited value wholesale.
+/// 3. Built-in safe defaults (`GODEBUG=http2client=0`, `PYTHONUTF8=1`,
+///    `PYTHONIOENCODING=utf-8`).
+///
+/// Never logs `spawn_env` contents (entries may hold user API keys or proxy
+/// credentials).
+pub(crate) fn apply_default_spawn_env_with(
+    spawn_env: &mut Vec<EnvVar>,
+    lookup_ambient: impl Fn(&str) -> Option<String>,
+) {
+    if let Some(existing) = take_last_ci(spawn_env, "GODEBUG") {
+        let merged = merge_godebug_disable_http2(Some(&existing.value));
+        spawn_env.push(EnvVar {
+            name: existing.name,
+            value: merged,
+        });
+    } else {
+        let ambient = lookup_ambient("GODEBUG");
+        spawn_env.push(EnvVar {
+            name: "GODEBUG".to_owned(),
+            value: merge_godebug_disable_http2(ambient.as_deref()),
+        });
+    }
+
+    ensure_default_ci(spawn_env, "PYTHONUTF8", DEFAULT_PYTHONUTF8, &lookup_ambient);
+    ensure_default_ci(spawn_env, "PYTHONIOENCODING", DEFAULT_PYTHONIOENCODING, &lookup_ambient);
+}
+
+/// Apply Antigravity's default subprocess environment (`GODEBUG=http2client=0`,
+/// `PYTHONUTF8=1`, `PYTHONIOENCODING=utf-8`) without clobbering user overrides.
+pub(crate) fn apply_default_spawn_env(spawn_env: &mut Vec<EnvVar>) {
+    apply_default_spawn_env_with(spawn_env, lookup_process_env_ci);
 }
 
 #[cfg(test)]
@@ -368,5 +508,121 @@ mod tests {
         assert!(!a.contains(&"--model".to_string()));
         assert!(!a.contains(&"--mode".to_string()));
         assert!(!a.contains(&"--conversation".to_string()));
+    }
+
+    fn env_pair(name: &str, value: &str) -> EnvVar {
+        EnvVar {
+            name: name.to_owned(),
+            value: value.to_owned(),
+        }
+    }
+
+    fn env_val<'a>(env: &'a [EnvVar], key: &str) -> Option<&'a str> {
+        env.iter()
+            .find(|e| e.name.eq_ignore_ascii_case(key))
+            .map(|e| e.value.as_str())
+    }
+
+    #[test]
+    fn empty_spawn_env_injects_http2client_off_and_python_utf8_defaults() {
+        let mut env = Vec::new();
+        apply_default_spawn_env_with(&mut env, |_| None);
+
+        assert_eq!(env_val(&env, "GODEBUG"), Some("http2client=0"));
+        assert_eq!(env_val(&env, "PYTHONUTF8"), Some("1"));
+        assert_eq!(env_val(&env, "PYTHONIOENCODING"), Some("utf-8"));
+    }
+
+    #[test]
+    fn existing_godebug_tokens_are_preserved_when_appending_http2client_off() {
+        let mut env = vec![env_pair("godebug", "netdns=go,gctrace=1")];
+        apply_default_spawn_env_with(&mut env, |_| None);
+
+        assert_eq!(
+            env.iter().filter(|e| e.name.eq_ignore_ascii_case("GODEBUG")).count(),
+            1,
+            "must not emit duplicate case-variant GODEBUG entries: {env:?}"
+        );
+        assert_eq!(env_val(&env, "GODEBUG"), Some("netdns=go,gctrace=1,http2client=0"));
+    }
+
+    #[test]
+    fn explicit_user_http2client_override_is_never_clobbered() {
+        for explicit in [
+            "http2client=1",
+            "netdns=go,http2client=1",
+            "HTTP2CLIENT=1,gctrace=1",
+            "http2client=0",
+        ] {
+            let mut env = vec![env_pair("GODEBUG", explicit)];
+            apply_default_spawn_env_with(&mut env, |_| Some("netdns=cgo".into()));
+            assert_eq!(env_val(&env, "GODEBUG"), Some(explicit), "explicit={explicit}");
+        }
+    }
+
+    #[test]
+    fn substring_prefix_key_does_not_suppress_real_http2client_default() {
+        let mut env = vec![env_pair("GODEBUG", "myhttp2client=1")];
+        apply_default_spawn_env_with(&mut env, |_| None);
+        assert_eq!(env_val(&env, "GODEBUG"), Some("myhttp2client=1,http2client=0"));
+    }
+
+    #[test]
+    fn explicit_python_encoding_overrides_are_preserved_case_insensitively() {
+        let mut env = vec![env_pair("pythonutf8", "0"), env_pair("PythonIoEncoding", "gbk:replace")];
+        apply_default_spawn_env_with(&mut env, |_| Some("should-not-win".into()));
+
+        assert_eq!(env_val(&env, "PYTHONUTF8"), Some("0"));
+        assert_eq!(env_val(&env, "PYTHONIOENCODING"), Some("gbk:replace"));
+        assert_eq!(
+            env.iter().filter(|e| e.name.eq_ignore_ascii_case("PYTHONUTF8")).count(),
+            1
+        );
+        assert_eq!(
+            env.iter()
+                .filter(|e| e.name.eq_ignore_ascii_case("PYTHONIOENCODING"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ambient_process_env_is_merged_instead_of_overwritten_when_spawn_env_omits_keys() {
+        let mut env = vec![env_pair("HTTPS_PROXY", "http://127.0.0.1:7897")];
+        apply_default_spawn_env_with(&mut env, |key| match key {
+            "GODEBUG" => Some("netdns=go,".into()),
+            "PYTHONUTF8" => Some("0".into()),
+            "PYTHONIOENCODING" => Some("latin-1".into()),
+            _ => None,
+        });
+
+        assert_eq!(env_val(&env, "HTTPS_PROXY"), Some("http://127.0.0.1:7897"));
+        assert_eq!(env_val(&env, "GODEBUG"), Some("netdns=go,http2client=0"));
+        assert_eq!(env_val(&env, "PYTHONUTF8"), Some("0"));
+        assert_eq!(env_val(&env, "PYTHONIOENCODING"), Some("latin-1"));
+    }
+
+    #[test]
+    fn ambient_http2client_override_is_preserved_when_spawn_env_omits_godebug() {
+        let mut env = Vec::new();
+        apply_default_spawn_env_with(&mut env, |key| (key == "GODEBUG").then(|| "http2client=1".to_owned()));
+        assert_eq!(env_val(&env, "GODEBUG"), Some("http2client=1"));
+    }
+
+    #[test]
+    fn blank_overrides_fall_back_to_safe_defaults_and_application_is_idempotent() {
+        let mut env = vec![
+            env_pair("GODEBUG", " , "),
+            env_pair("PYTHONUTF8", "   "),
+            env_pair("PYTHONIOENCODING", ""),
+        ];
+        apply_default_spawn_env_with(&mut env, |_| None);
+        let once = env.clone();
+
+        apply_default_spawn_env_with(&mut env, |_| Some("mutated-ambient".into()));
+        assert_eq!(env, once, "applying defaults a second time must be a strict no-op");
+        assert_eq!(env_val(&env, "GODEBUG"), Some("http2client=0"));
+        assert_eq!(env_val(&env, "PYTHONUTF8"), Some("1"));
+        assert_eq!(env_val(&env, "PYTHONIOENCODING"), Some("utf-8"));
     }
 }
