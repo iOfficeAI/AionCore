@@ -918,6 +918,17 @@ async fn status_falls_back_when_index_writeback_is_impossible() {
     readonly.set_mode(0o500); // r-x: traversable, not writable
     std::fs::set_permissions(&git_dir, readonly).expect("make .git read-only");
 
+    // Root (or CAP_DAC_OVERRIDE, e.g. a container CI job) ignores the mode, so
+    // the index writeback would succeed and the fallback never fires. Probe the
+    // permission the way the provider meets it, and skip instead of failing.
+    let probe = git_dir.join(".writable-probe");
+    if std::fs::write(&probe, b"").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&git_dir, original).expect("restore .git permissions");
+        eprintln!("skipped: directory permissions are not enforced for this user (running as root?)");
+        return;
+    }
+
     let status = provider.status(&repo_ref).await;
 
     // Restore before asserting so a failure cannot leave an unwritable tempdir.
