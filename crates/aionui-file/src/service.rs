@@ -544,6 +544,32 @@ fn is_allowed_image_host(url: &reqwest::Url) -> bool {
     ALLOWED_IMAGE_HOSTS.contains(&host)
 }
 
+/// Whether a redirect from an allowed image URL may be followed: the target
+/// must pass the same protocol and host checks as the original URL, so an
+/// allowed host cannot bounce the fetch to an arbitrary (e.g. internal) one.
+fn redirect_target_allowed(url: &reqwest::Url) -> bool {
+    validate_remote_image_url(url.as_str()).is_ok()
+}
+
+/// The MIME type to return for a fetched remote image, or `None` if the
+/// response is not an image. The `Content-Type` header wins when it names an
+/// image; otherwise the URL's extension decides (raw file hosts often serve
+/// `.svg` / `.png` as `text/plain` or `application/octet-stream`).
+fn remote_image_mime(content_type: Option<&str>, url_path: &str) -> Option<String> {
+    let header = content_type
+        .and_then(|ct| ct.split(';').next())
+        .map(|s| s.trim().to_ascii_lowercase());
+    if let Some(mime) = header.as_deref()
+        && mime.starts_with("image/")
+    {
+        return Some(mime.to_owned());
+    }
+    mime_guess::from_path(url_path)
+        .first()
+        .map(|m| m.to_string())
+        .filter(|m| m.starts_with("image/"))
+}
+
 /// Validate a remote image URL: protocol must be HTTP(S) and host must be
 /// whitelisted.
 fn validate_remote_image_url(raw_url: &str) -> Result<reqwest::Url, String> {
@@ -985,7 +1011,16 @@ impl crate::traits::IFileService for FileService {
         };
 
         let client = match reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= MAX_REDIRECTS {
+                    attempt.error("too many redirects")
+                } else if redirect_target_allowed(attempt.url()) {
+                    attempt.follow()
+                } else {
+                    // Stop: the 3xx is returned as-is and becomes the placeholder below.
+                    attempt.stop()
+                }
+            }))
             .timeout(REMOTE_IMAGE_TIMEOUT)
             .build()
         {
@@ -1017,20 +1052,16 @@ impl crate::traits::IFileService for FileService {
             return placeholder_svg_data_url();
         }
 
-        // Determine MIME from Content-Type header, fall back to URL extension
+        // Only images are returned: from the Content-Type header, else the URL extension.
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .and_then(|ct| ct.split(';').next())
-            .map(|s| s.trim().to_owned());
-
-        let mime = content_type.unwrap_or_else(|| {
-            mime_guess::from_path(parsed.path())
-                .first()
-                .map(|m| m.to_string())
-                .unwrap_or_else(|| "application/octet-stream".to_owned())
-        });
+            .map(str::to_owned);
+        let Some(mime) = remote_image_mime(content_type.as_deref(), response.url().path()) else {
+            warn!("remote content is not an image ({:?}) for '{}'", content_type, url);
+            return placeholder_svg_data_url();
+        };
 
         let bytes = match response.bytes().await {
             Ok(b) => b,
@@ -1702,6 +1733,40 @@ mod tests {
         // "sub.github.com" should NOT match "github.com"
         let url = reqwest::Url::parse("https://sub.github.com/img.png").unwrap();
         assert!(!is_allowed_image_host(&url));
+    }
+
+    #[test]
+    fn redirects_must_stay_on_allowed_hosts() {
+        let ok = reqwest::Url::parse("https://raw.githubusercontent.com/o/r/main/a.png").unwrap();
+        assert!(redirect_target_allowed(&ok));
+        for bad in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:25808/api/fs/read",
+            "https://evil.example/a.png",
+            "file:///etc/passwd",
+        ] {
+            let url = reqwest::Url::parse(bad).unwrap();
+            assert!(!redirect_target_allowed(&url), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_images_are_returned() {
+        assert_eq!(remote_image_mime(Some("image/png"), "/a"), Some("image/png".into()));
+        assert_eq!(
+            remote_image_mime(Some("Image/PNG; charset=x"), "/a"),
+            Some("image/png".into())
+        );
+        // Raw hosts serve images as text/plain: the extension decides.
+        assert_eq!(
+            remote_image_mime(Some("text/plain; charset=utf-8"), "/logo.svg"),
+            Some("image/svg+xml".into())
+        );
+        assert_eq!(remote_image_mime(None, "/pic.jpg"), Some("image/jpeg".into()));
+        // Not an image: no data URL.
+        assert_eq!(remote_image_mime(Some("text/html"), "/index.html"), None);
+        assert_eq!(remote_image_mime(Some("application/json"), "/api/data"), None);
+        assert_eq!(remote_image_mime(None, "/no-extension"), None);
     }
 
     #[test]
