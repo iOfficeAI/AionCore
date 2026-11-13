@@ -28,8 +28,10 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 use super::argv::{ArgvInput, build_argv};
 use super::models::probe_models;
 use super::skills::skill_commands_from_dirs;
-use super::translate::Translator;
-use super::wire::parse_line;
+use super::translate::{
+    Translator, compacting_notice, settled_thinking_notice, stopped_status_notice, thinking_or_compacting_notice,
+};
+use super::wire::{AgyEvent, parse_line};
 use crate::backend::cli_version::session_drift_notice;
 use crate::backend::types::{
     Admission, BackendError, CancelTarget, Command, CommandReceipt, ContentBlock, PendingPermissionView,
@@ -91,6 +93,297 @@ fn store_models(models: &[ModelInfo]) {
 /// at 29.5s / 30.0s while it was still blocked). Deciding before that keeps the
 /// refusal ours; leaving it to agy would mean silent approval.
 const PERMISSION_ANSWER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Silence window before surfacing a live reasoning/compaction hint.
+///
+/// Verified live against `agy 1.5.3` (`--model gemini-4-carbon-high` and `-p "/compact"`):
+/// `agy` emits NO `thinking` prose and NO `checkpoint` `ACTIVE` frame, leaving
+/// stdout completely silent for the entire reasoning or compaction call (13.1s
+/// and 8.95s measured). Waiting 3s keeps fast conversational turns completely
+/// quiet while ensuring long reasoning/compaction stalls never look frozen.
+const THINKING_HINT_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Refresh cadence for in-place superseding status hints during long silences.
+const THINKING_HINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn next_turn_status_nonce() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    now.wrapping_shl(16) ^ seq
+}
+
+struct TurnReadSummary {
+    translator: Translator,
+    saw_terminal: bool,
+    unflushed_text: Option<(String, String)>,
+}
+
+fn scope_status_notice(mut ev: SessionEvent, scoped_key: &str) -> SessionEvent {
+    if let SessionEvent::Notice {
+        ref mut supersedes_key, ..
+    } = ev
+        && supersedes_key.as_deref() == Some(super::STATUS_NOTICE_KEY)
+    {
+        *supersedes_key = Some(scoped_key.to_owned());
+    }
+    ev
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_turn_stdout<R: tokio::io::AsyncRead + Unpin>(
+    stdout: R,
+    session_id: &str,
+    turn_gen: u64,
+    turn_nonce: u64,
+    seed_model: Option<String>,
+    seed_context_tokens: u64,
+    pending: &Mutex<HashMap<String, PendingPermission>>,
+    event_tx: &broadcast::Sender<SessionEnvelope>,
+) -> TurnReadSummary {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut lines = BufReader::new(stdout).lines();
+    let mut translator = Translator::default();
+    let mut saw_terminal = false;
+
+    // agy corrupts multi-byte characters when it splits `text_delta`
+    // (it cuts on byte boundaries, so a Chinese character straddling
+    // two deltas arrives as two U+FFFD). Its `result` frame carries the
+    // same reply intact, so assistant text is held back here and
+    // emitted once, from the authoritative source.
+    let mut buffered_text = String::new();
+    let mut text_item_id = String::new();
+    let mut text_flushed = false;
+
+    let mut status_phase: u32 = 0;
+    let mut live_status_open = false;
+    let mut live_status_compacting = false;
+    let mut effective_context_tokens = seed_context_tokens;
+    let mut phase_started_at = tokio::time::Instant::now();
+    let sleep = tokio::time::sleep(THINKING_HINT_DELAY);
+    tokio::pin!(sleep);
+
+    let phase_key = |phase: u32| {
+        format!(
+            "{}:{session_id}:turn-{turn_nonce}-{turn_gen}:phase-{phase}",
+            super::STATUS_NOTICE_KEY
+        )
+    };
+
+    loop {
+        tokio::select! {
+            biased;
+            line_res = lines.next_line() => {
+                let Ok(Some(line)) = line_res else {
+                    break;
+                };
+                let Some(ev) = parse_line(&line) else { continue };
+                let is_result = matches!(&ev, AgyEvent::Result(_));
+                let outs = translator.translate(ev);
+
+                if is_result && live_status_open {
+                    let terminal_aborted = outs.iter().any(|e| matches!(
+                        e,
+                        SessionEvent::TurnResult { is_error, outcome, .. }
+                            if *is_error || matches!(outcome, TurnOutcome::Cancelled { .. })
+                    ));
+                    let key = phase_key(status_phase);
+                    let settled = if terminal_aborted {
+                        stopped_status_notice(live_status_compacting, phase_started_at.elapsed())
+                    } else {
+                        let (wire_dur, thinking_tokens) = translator.take_phase_thinking_metrics();
+                        settled_thinking_notice(phase_started_at.elapsed(), wire_dur, thinking_tokens)
+                    };
+                    let _ = event_tx.send(SessionEnvelope {
+                        session_id: session_id.to_owned(),
+                        turn_gen,
+                        event: scope_status_notice(settled, &key),
+                    });
+                    live_status_open = false;
+                    live_status_compacting = false;
+                    status_phase = status_phase.saturating_add(1);
+                }
+
+                for out in outs {
+                    match out {
+                        SessionEvent::MessageDelta { item_id, text } => {
+                            if text_item_id.is_empty() {
+                                text_item_id = item_id;
+                            }
+                            append_delta(&mut buffered_text, &text);
+                        }
+                        SessionEvent::TurnResult {
+                            ref is_error,
+                            ref result_text,
+                            ..
+                        } => {
+                            saw_terminal = true;
+                            if let Some(text) = final_turn_text(*is_error, result_text, &buffered_text) {
+                                text_flushed = true;
+                                let _ = event_tx.send(SessionEnvelope {
+                                    session_id: session_id.to_owned(),
+                                    turn_gen,
+                                    event: SessionEvent::MessageDelta {
+                                        item_id: std::mem::take(&mut text_item_id),
+                                        text,
+                                    },
+                                });
+                            }
+                            let _ = event_tx.send(SessionEnvelope {
+                                session_id: session_id.to_owned(),
+                                turn_gen,
+                                event: out,
+                            });
+                        }
+                        SessionEvent::ToolCall { .. } => {
+                            if live_status_open {
+                                let key = phase_key(status_phase);
+                                let (wire_dur, thinking_tokens) = translator.take_phase_thinking_metrics();
+                                let settled = settled_thinking_notice(
+                                    phase_started_at.elapsed(),
+                                    wire_dur,
+                                    thinking_tokens,
+                                );
+                                let _ = event_tx.send(SessionEnvelope {
+                                    session_id: session_id.to_owned(),
+                                    turn_gen,
+                                    event: scope_status_notice(settled, &key),
+                                });
+                                live_status_open = false;
+                                live_status_compacting = false;
+                                status_phase = status_phase.saturating_add(1);
+                            }
+                            let _ = event_tx.send(SessionEnvelope {
+                                session_id: session_id.to_owned(),
+                                turn_gen,
+                                event: out,
+                            });
+                        }
+                        SessionEvent::ToolResult { .. } => {
+                            let _ = event_tx.send(SessionEnvelope {
+                                session_id: session_id.to_owned(),
+                                turn_gen,
+                                event: out,
+                            });
+                            if !translator.has_active_foreground_step() {
+                                if let Some(tokens) = translator.latest_context_tokens() {
+                                    effective_context_tokens = tokens;
+                                }
+                                phase_started_at = tokio::time::Instant::now();
+                                sleep.as_mut().reset(phase_started_at + THINKING_HINT_DELAY);
+                            }
+                        }
+                        SessionEvent::Notice {
+                            ref localized,
+                            ref supersedes_key,
+                            ..
+                        } if supersedes_key.as_deref() == Some(super::STATUS_NOTICE_KEY) => {
+                            let is_compacted = localized.as_ref().is_some_and(|l| l.code == super::CODE_COMPACTED);
+                            let is_compacting = localized.as_ref().is_some_and(|l| l.code == super::CODE_COMPACTING);
+                            let key = phase_key(status_phase);
+                            let _ = event_tx.send(SessionEnvelope {
+                                session_id: session_id.to_owned(),
+                                turn_gen,
+                                event: scope_status_notice(out, &key),
+                            });
+                            if is_compacted {
+                                tracing::debug!(
+                                    session_id = %session_id,
+                                    turn_gen,
+                                    "antigravity: context compaction step completed"
+                                );
+                                live_status_open = false;
+                                live_status_compacting = false;
+                                effective_context_tokens = 0;
+                                status_phase = status_phase.saturating_add(1);
+                                phase_started_at = tokio::time::Instant::now();
+                                sleep.as_mut().reset(phase_started_at + THINKING_HINT_DELAY);
+                            } else if is_compacting {
+                                if !live_status_open {
+                                    tracing::debug!(
+                                        session_id = %session_id,
+                                        turn_gen,
+                                        "antigravity: context compaction started"
+                                    );
+                                }
+                                live_status_open = true;
+                                live_status_compacting = true;
+                                sleep
+                                    .as_mut()
+                                    .reset(tokio::time::Instant::now() + THINKING_HINT_DELAY);
+                            }
+                        }
+                        other => {
+                            let _ = event_tx.send(SessionEnvelope {
+                                session_id: session_id.to_owned(),
+                                turn_gen,
+                                event: other,
+                            });
+                        }
+                    }
+                }
+                if let Some(tokens) = translator.latest_context_tokens() {
+                    effective_context_tokens = tokens;
+                }
+            }
+            () = &mut sleep, if !saw_terminal => {
+                let waiting_on_permission = pending.try_lock().map(|g| !g.is_empty()).unwrap_or(true);
+                let waiting_on_tool = translator.has_active_foreground_step();
+                if !waiting_on_permission && !waiting_on_tool {
+                    let elapsed_secs = phase_started_at.elapsed().as_secs().max(1);
+                    let model = translator.current_model().or(seed_model.as_deref());
+                    let (notice, is_compacting) = if translator.is_compacting() {
+                        (compacting_notice(Some(elapsed_secs)), true)
+                    } else {
+                        thinking_or_compacting_notice(elapsed_secs, effective_context_tokens, model)
+                    };
+                    if !live_status_open {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            turn_gen,
+                            elapsed_secs,
+                            is_compacting,
+                            context_tokens = effective_context_tokens,
+                            "antigravity: surfacing silent model-wait status hint"
+                        );
+                    }
+                    let key = phase_key(status_phase);
+                    let _ = event_tx.send(SessionEnvelope {
+                        session_id: session_id.to_owned(),
+                        turn_gen,
+                        event: scope_status_notice(notice, &key),
+                    });
+                    live_status_open = true;
+                    live_status_compacting = is_compacting;
+                }
+                sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + THINKING_HINT_INTERVAL);
+            }
+        }
+    }
+
+    if !saw_terminal && live_status_open {
+        let key = phase_key(status_phase);
+        let settled = stopped_status_notice(live_status_compacting, phase_started_at.elapsed());
+        let _ = event_tx.send(SessionEnvelope {
+            session_id: session_id.to_owned(),
+            turn_gen,
+            event: scope_status_notice(settled, &key),
+        });
+    }
+
+    let unflushed_text = (!text_flushed && !buffered_text.is_empty()).then_some((text_item_id, buffered_text));
+    TurnReadSummary {
+        translator,
+        saw_terminal,
+        unflushed_text,
+    }
+}
 
 /// Which text represents the turn's reply, given agy's terminal frame.
 ///
@@ -266,6 +559,7 @@ impl BackendConnection for AntigravityConnection {
         // conversation's enabled set.
         let slash_commands = skill_commands_from_dirs(&config.init.skill_dirs);
 
+        let initial_model = config.model.clone();
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let backend = Arc::new(AntigravitySessionBackend {
             session_id,
@@ -285,6 +579,8 @@ impl BackendConnection for AntigravityConnection {
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
+            last_context_tokens: Arc::new(AtomicU64::new(0)),
+            last_confirmed_model: Arc::new(std::sync::RwLock::new(initial_model)),
         });
 
         // Discover models OFF the open path. `agy models` costs a process
@@ -367,6 +663,13 @@ pub struct AntigravitySessionBackend {
     /// silently collapse two things the user said into one, and they would
     /// never see the second one echoed.
     queued: Arc<Mutex<VecDeque<Vec<ContentBlock>>>>,
+    /// Latest single-call context occupancy carried across per-turn `agy`
+    /// invocations so a resumed turn near the ~180k (Claude) / ~256k (Gemini)
+    /// auto-compaction ceiling can explain a long silent wait honestly.
+    last_context_tokens: Arc<AtomicU64>,
+    /// Last model `agy` confirmed in `init` (seeded from `config.model`),
+    /// consulted before a new turn's `init` frame lands.
+    last_confirmed_model: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 struct PendingPermission {
@@ -715,83 +1018,61 @@ impl AntigravitySessionBackend {
         // to outlive this reader task.
         let anchor = Arc::clone(&self.anchor);
         let current = Arc::clone(&self.current);
+        let pending = Arc::clone(&self.pending);
+        let last_context_tokens = Arc::clone(&self.last_context_tokens);
+        let last_confirmed_model = Arc::clone(&self.last_confirmed_model);
+        let seed_model = self
+            .last_confirmed_model
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .or_else(|| self.effective_model());
+        let seed_context_tokens = self.last_context_tokens.load(Ordering::Relaxed);
+        let turn_nonce = next_turn_status_nonce();
 
         tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-
-            let mut translator = Translator::default();
-            let mut saw_terminal = false;
-
-            // agy corrupts multi-byte characters when it splits `text_delta`
-            // (it cuts on byte boundaries, so a Chinese character straddling
-            // two deltas arrives as two U+FFFD). Its `result` frame carries the
-            // same reply intact, so assistant text is held back here and
-            // emitted once, from the authoritative source.
-            let mut buffered_text = String::new();
-            let mut text_item_id = String::new();
-            let mut text_flushed = false;
-
-            if let Some((_stdin, stdout)) = proc.take_stdio().await {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let Some(ev) = parse_line(&line) else { continue };
-                    for out in translator.translate(ev) {
-                        match out {
-                            SessionEvent::MessageDelta { item_id, text } => {
-                                if text_item_id.is_empty() {
-                                    text_item_id = item_id;
-                                }
-                                append_delta(&mut buffered_text, &text);
-                            }
-                            SessionEvent::TurnResult {
-                                ref is_error,
-                                ref result_text,
-                                ..
-                            } => {
-                                saw_terminal = true;
-                                if let Some(text) = final_turn_text(*is_error, result_text, &buffered_text) {
-                                    text_flushed = true;
-                                    let _ = event_tx.send(SessionEnvelope {
-                                        session_id: session_id.clone(),
-                                        turn_gen,
-                                        event: SessionEvent::MessageDelta {
-                                            item_id: std::mem::take(&mut text_item_id),
-                                            text,
-                                        },
-                                    });
-                                }
-                                let _ = event_tx.send(SessionEnvelope {
-                                    session_id: session_id.clone(),
-                                    turn_gen,
-                                    event: out,
-                                });
-                            }
-                            other => {
-                                let _ = event_tx.send(SessionEnvelope {
-                                    session_id: session_id.clone(),
-                                    turn_gen,
-                                    event: other,
-                                });
-                            }
-                        }
-                    }
+            let summary = if let Some((_stdin, stdout)) = proc.take_stdio().await {
+                drive_turn_stdout(
+                    stdout,
+                    &session_id,
+                    turn_gen,
+                    turn_nonce,
+                    seed_model,
+                    seed_context_tokens,
+                    &pending,
+                    &event_tx,
+                )
+                .await
+            } else {
+                TurnReadSummary {
+                    translator: Translator::default(),
+                    saw_terminal: false,
+                    unflushed_text: None,
                 }
-            }
+            };
+            let TurnReadSummary {
+                translator,
+                saw_terminal,
+                unflushed_text,
+            } = summary;
 
             // Cancelled or crashed: no `result` frame ever arrives, so the text
             // gathered so far is all there is. Losing the partial reply would be
             // worse than showing agy's own mojibake.
-            if !text_flushed && !buffered_text.is_empty() {
+            if let Some((text_item_id, text)) = unflushed_text {
                 let _ = event_tx.send(SessionEnvelope {
                     session_id: session_id.clone(),
                     turn_gen,
                     event: SessionEvent::MessageDelta {
                         item_id: text_item_id,
-                        text: std::mem::take(&mut buffered_text),
+                        text,
                     },
                 });
             }
 
+            if let Some(tokens) = translator.latest_context_tokens() {
+                last_context_tokens.store(tokens, Ordering::Relaxed);
+            }
             if let Some(id) = translator.backend_session_id() {
                 *anchor.lock().await = Some(id.to_owned());
             }
@@ -804,6 +1085,9 @@ impl AntigravitySessionBackend {
                     "agy ignored the requested model and fell back to its default"
                 );
             } else if let Some(model) = translator.current_model() {
+                if let Ok(mut guard) = last_confirmed_model.write() {
+                    *guard = Some(model.to_owned());
+                }
                 tracing::debug!(session_id = %session_id, model = %model, "agy turn model confirmed");
             }
 
@@ -1269,6 +1553,8 @@ mod tests {
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
+            last_context_tokens: Arc::new(AtomicU64::new(0)),
+            last_confirmed_model: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
@@ -1404,6 +1690,8 @@ mod tests {
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
+            last_context_tokens: Arc::new(AtomicU64::new(0)),
+            last_confirmed_model: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
@@ -1693,6 +1981,8 @@ mod tests {
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
+            last_context_tokens: Arc::new(AtomicU64::new(0)),
+            last_confirmed_model: Arc::new(std::sync::RwLock::new(None)),
         };
         assert_eq!(b.effective_mode().as_deref(), Some("default"));
         *b.mode_override.write().unwrap() = Some("plan".to_owned());
@@ -1768,6 +2058,8 @@ mod tests {
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
+            last_context_tokens: Arc::new(AtomicU64::new(0)),
+            last_confirmed_model: Arc::new(std::sync::RwLock::new(None)),
         };
 
         let caps = backend.capabilities();
@@ -1910,6 +2202,8 @@ mod tests {
             turn_started_hooked: Arc::new(AtomicBool::new(false)),
             deferred_mode_confirm: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(VecDeque::new())),
+            last_context_tokens: Arc::new(AtomicU64::new(0)),
+            last_confirmed_model: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -2040,5 +2334,470 @@ mod tests {
         }]);
         let cached = cached_models().expect("a non-empty list must be cached");
         assert!(cached.iter().any(|m| m.id == "gemini-3.1-pro-low"));
+    }
+
+    async fn drain_broadcast(rx: &mut broadcast::Receiver<SessionEnvelope>) -> Vec<SessionEvent> {
+        let mut out = Vec::new();
+        while let Ok(env) = rx.try_recv() {
+            out.push(env.event);
+        }
+        out
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fast_turn_emits_no_thinking_notice() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let pending = Mutex::new(HashMap::new());
+        let (mut writer, reader) = tokio::io::duplex(4096);
+
+        let driver =
+            tokio::spawn(async move { drive_turn_stdout(reader, "conv-fast", 1, 7, None, 0, &pending, &tx).await });
+
+        use tokio::io::AsyncWriteExt as _;
+        writer
+            .write_all(
+                concat!(
+                    r#"{"event":"init","conversation_id":"c-fast","init":{"model":"gemini-4-carbon","cwd":"/w"}}"#,
+                    "\n",
+                    r#"{"event":"step_update","step_update":{"step_index":0,"state":"DONE","step_type":"user_input"}}"#,
+                    "\n",
+                    r#"{"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"PONG\n"}}"#,
+                    "\n",
+                    r#"{"event":"result","result":{"conversation_id":"c-fast","status":"SUCCESS","response":"PONG\n","num_turns":1}}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let summary = driver.await.unwrap();
+        assert!(summary.saw_terminal);
+        let evs = drain_broadcast(&mut rx).await;
+        assert!(
+            !evs.iter().any(|e| matches!(e, SessionEvent::Notice { .. })),
+            "fast turn must stay quiet: {evs:?}"
+        );
+        assert!(
+            !evs.iter().any(|e| matches!(e, SessionEvent::ThoughtDelta { .. })),
+            "must never synthesize ThoughtDelta: {evs:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_reasoning_turn_surfaces_live_thinking_hints_and_settles_in_place() {
+        // Replays the exact timing & frame shape captured from
+        // `agy 1.5.3 -p ... --model gemini-4-carbon-high --output-format stream-json`:
+        // 13.1s of stdout silence after `user_input` `DONE`, then `agent_response`
+        // (`thinking_tokens: 710, duration_seconds: 13.1072795`) + `result`.
+        let (tx, mut rx) = broadcast::channel(64);
+        let pending = Mutex::new(HashMap::new());
+        let (mut writer, reader) = tokio::io::duplex(4096);
+
+        let driver =
+            tokio::spawn(
+                async move { drive_turn_stdout(reader, "conv-think", 2, 99, None, 8_000, &pending, &tx).await },
+            );
+
+        use tokio::io::AsyncWriteExt as _;
+        writer
+            .write_all(
+                concat!(
+                    r#"{"event":"init","conversation_id":"243b704e-0000-0000-0000-000000000001","init":{"model":"gemini-4-carbon-high","cwd":"/w","permission_mode":"always-proceed"}}"#,
+                    "\n",
+                    r#"{"event":"step_update","step_update":{"conversation_id":"243b704e-0000-0000-0000-000000000001","step_index":0,"state":"DONE","step_type":"user_input"}}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        // First silent tick at 3s.
+        tokio::time::advance(std::time::Duration::from_millis(3_100)).await;
+        tokio::task::yield_now().await;
+        let first_batch = drain_broadcast(&mut rx).await;
+        let (first_msg, first_code, first_key) = first_batch
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Notice {
+                    message,
+                    localized: Some(l),
+                    supersedes_key: Some(k),
+                    ..
+                } => Some((message.clone(), l.code.clone(), k.clone())),
+                _ => None,
+            })
+            .expect("3s silence must surface thinking hint");
+        assert_eq!(first_code, super::super::CODE_THINKING);
+        assert!(first_msg.contains("thinking"), "{first_msg}");
+
+        // Second silent tick 5s later must supersede the SAME card in-place.
+        tokio::time::advance(std::time::Duration::from_millis(5_000)).await;
+        tokio::task::yield_now().await;
+        let second_batch = drain_broadcast(&mut rx).await;
+        let (second_msg, second_key) = second_batch
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Notice {
+                    message,
+                    supersedes_key: Some(k),
+                    ..
+                } => Some((message.clone(), k.clone())),
+                _ => None,
+            })
+            .expect("8s silence must refresh thinking hint");
+        assert_eq!(second_key, first_key, "in-place update must reuse supersedes_key");
+        assert!(second_msg.contains("8s"), "{second_msg}");
+
+        // Thinking finishes at 13.1s and streams the answer.
+        writer
+            .write_all(
+                concat!(
+                    r#"{"event":"step_update","step_update":{"conversation_id":"243b704e-0000-0000-0000-000000000001","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"52"}}"#,
+                    "\n",
+                    r#"{"event":"step_update","step_update":{"conversation_id":"243b704e-0000-0000-0000-000000000001","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"\n","duration_seconds":13.1072795,"usage":{"input_tokens":8201,"output_tokens":716,"thinking_tokens":710,"cache_read_tokens":0,"total_tokens":8917}}}"#,
+                    "\n",
+                    r#"{"event":"result","result":{"conversation_id":"243b704e-0000-0000-0000-000000000001","status":"SUCCESS","response":"52\n","duration_seconds":13.1722026,"num_turns":1,"usage":{"input_tokens":8201,"output_tokens":716,"thinking_tokens":710,"cache_read_tokens":0,"total_tokens":8917}}}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let summary = driver.await.unwrap();
+        assert!(summary.saw_terminal);
+        assert_eq!(summary.translator.latest_context_tokens(), Some(8917));
+
+        let tail = drain_broadcast(&mut rx).await;
+        assert!(
+            !tail.iter().any(|e| matches!(e, SessionEvent::ThoughtDelta { .. })),
+            "must never emit blank/synthetic ThoughtDelta: {tail:?}"
+        );
+        let settled_pos = tail
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    SessionEvent::Notice {
+                        message,
+                        localized: Some(l),
+                        supersedes_key: Some(k),
+                        ..
+                    } if l.code == super::super::CODE_THOUGHT_COMPLETE
+                        && k == &first_key
+                        && message.contains("13.1s")
+                        && message.contains("710 thinking tokens")
+                )
+            })
+            .expect("live thinking card must settle to past tense with same supersedes_key");
+        let text_pos = tail
+            .iter()
+            .position(|e| matches!(e, SessionEvent::MessageDelta { text, .. } if text == "52\n"))
+            .expect("reply text");
+        let term_pos = tail
+            .iter()
+            .position(|e| matches!(e, SessionEvent::TurnResult { .. }))
+            .expect("terminal");
+        assert!(settled_pos < text_pos && text_pos < term_pos);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slash_compact_turn_updates_live_and_supersedes_into_single_compacted_card() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let pending = Mutex::new(HashMap::new());
+        let (mut writer, reader) = tokio::io::duplex(4096);
+
+        let driver = tokio::spawn(async move {
+            drive_turn_stdout(reader, "conv-compact", 3, 101, None, 210_000, &pending, &tx).await
+        });
+
+        use tokio::io::AsyncWriteExt as _;
+        writer
+            .write_all(
+                concat!(
+                    r#"{"event":"init","conversation_id":"286c2016-0000-0000-0000-000000000001","init":{"model":"gemini-4-carbon","cwd":"/w","expanded_commands":[{"name":"compact","type":"system"}]}}"#,
+                    "\n",
+                    r#"{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"user_input"}}"#,
+                    "\n",
+                    r#"{"event":"step_update","step_update":{"step_index":3,"state":"DONE","step_type":"system_message","duration_seconds":0.0005}}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        let initial = drain_broadcast(&mut rx).await;
+        let compact_key = initial
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Notice {
+                    localized: Some(l),
+                    supersedes_key: Some(k),
+                    ..
+                } if l.code == super::super::CODE_COMPACTING => Some(k.clone()),
+                _ => None,
+            })
+            .expect("`/compact` init must immediately emit CODE_COMPACTING");
+
+        // Silence during compaction updates the same card with elapsed seconds.
+        tokio::time::advance(std::time::Duration::from_millis(3_100)).await;
+        tokio::task::yield_now().await;
+        let tick = drain_broadcast(&mut rx).await;
+        assert!(tick.iter().any(|e| matches!(
+            e,
+            SessionEvent::Notice {
+                message,
+                localized: Some(l),
+                supersedes_key: Some(k),
+                ..
+            } if l.code == super::super::CODE_COMPACTING && k == &compact_key && message.contains("3s")
+        )));
+
+        // `checkpoint` DONE supersedes that card in-place with CODE_COMPACTED.
+        writer
+            .write_all(
+                concat!(
+                    r#"{"event":"step_update","step_update":{"step_index":4,"state":"DONE","step_type":"checkpoint","duration_seconds":8.9457684,"usage":{"input_tokens":9299,"output_tokens":335,"total_tokens":9634}}}"#,
+                    "\n",
+                    r#"{"event":"result","result":{"conversation_id":"286c2016-0000-0000-0000-000000000001","status":"SUCCESS","response":"","duration_seconds":21.82,"num_turns":2,"usage":{"input_tokens":9299,"output_tokens":335,"total_tokens":9634}}}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let summary = driver.await.unwrap();
+        assert_eq!(
+            summary.translator.latest_context_tokens(),
+            Some(0),
+            "compaction must reset stale pre-compaction context occupancy"
+        );
+        let tail = drain_broadcast(&mut rx).await;
+        assert!(tail.iter().any(|e| matches!(
+            e,
+            SessionEvent::Notice {
+                message,
+                localized: Some(l),
+                supersedes_key: Some(k),
+                ..
+            } if l.code == super::super::CODE_COMPACTED && k == &compact_key && message.contains("8.9s")
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_compaction_near_threshold_preserves_compacted_card_before_post_compaction_thinking() {
+        // Seed context near Gemini's ~256k auto-compaction ceiling (`252_400 >= 230_400`).
+        let (tx, mut rx) = broadcast::channel(64);
+        let pending = Mutex::new(HashMap::new());
+        let (mut writer, reader) = tokio::io::duplex(4096);
+
+        let driver = tokio::spawn(async move {
+            drive_turn_stdout(
+                reader,
+                "conv-autocompact",
+                4,
+                202,
+                Some("gemini-4-carbon".into()),
+                252_400,
+                &pending,
+                &tx,
+            )
+            .await
+        });
+
+        use tokio::io::AsyncWriteExt as _;
+        writer
+            .write_all(
+                concat!(
+                    r#"{"event":"init","conversation_id":"c-auto","init":{"model":"gemini-4-carbon","cwd":"/w"}}"#,
+                    "\n",
+                    r#"{"event":"step_update","step_update":{"step_index":10,"state":"DONE","step_type":"user_input"}}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(std::time::Duration::from_millis(3_100)).await;
+        tokio::task::yield_now().await;
+        let pre_checkpoint = drain_broadcast(&mut rx).await;
+        let phase0_key = pre_checkpoint
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Notice {
+                    message,
+                    localized: Some(l),
+                    supersedes_key: Some(k),
+                    ..
+                } if l.code == super::super::CODE_COMPACTING && message.contains("~252k tokens") => Some(k.clone()),
+                _ => None,
+            })
+            .expect("high-context silence must warn of potential auto-compaction");
+
+        // Auto-compaction finishes (`checkpoint` DONE), then the resumed model thinks for 4s.
+        writer
+            .write_all(
+                concat!(
+                    r#"{"event":"step_update","step_update":{"step_index":11,"state":"DONE","step_type":"checkpoint","duration_seconds":16.4,"usage":{"input_tokens":255800,"output_tokens":6200,"total_tokens":262000}}}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(std::time::Duration::from_millis(3_500)).await;
+        tokio::task::yield_now().await;
+
+        writer
+            .write_all(
+                concat!(
+                    r#"{"event":"step_update","step_update":{"step_index":12,"state":"DONE","step_type":"agent_response","text_delta":"Done.","duration_seconds":4.0,"usage":{"input_tokens":18500,"output_tokens":420,"thinking_tokens":300,"total_tokens":18920}}}"#,
+                    "\n",
+                    r#"{"event":"result","result":{"conversation_id":"c-auto","status":"SUCCESS","response":"Done.","num_turns":2}}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let summary = driver.await.unwrap();
+        assert_eq!(summary.translator.latest_context_tokens(), Some(18_920));
+        let rest = drain_broadcast(&mut rx).await;
+        assert!(rest.iter().any(|e| matches!(
+            e,
+            SessionEvent::Notice {
+                localized: Some(l),
+                supersedes_key: Some(k),
+                ..
+            } if l.code == super::super::CODE_COMPACTED && k == &phase0_key
+        )));
+        let phase1_key = rest
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Notice {
+                    localized: Some(l),
+                    supersedes_key: Some(k),
+                    ..
+                } if l.code == super::super::CODE_THINKING => Some(k.clone()),
+                _ => None,
+            })
+            .expect("post-compaction reasoning must open a plain thinking card");
+        assert_ne!(
+            phase1_key, phase0_key,
+            "post-compaction thinking must not overwrite the settled compaction notice"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_tool_and_pending_permission_suppress_thinking_hints() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let pending = Mutex::new(HashMap::new());
+        let (mut writer, reader) = tokio::io::duplex(4096);
+
+        let driver = tokio::spawn({
+            let pending_ref = Arc::new(pending);
+            let pending_clone = Arc::clone(&pending_ref);
+            async move { drive_turn_stdout(reader, "conv-tool", 5, 303, None, 0, &pending_clone, &tx).await }
+        });
+
+        use tokio::io::AsyncWriteExt as _;
+        writer
+            .write_all(
+                concat!(
+                    r#"{"event":"init","conversation_id":"c-tool","init":{"model":"gemini-4-carbon","cwd":"/w"}}"#,
+                    "\n",
+                    r#"{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"sleep 10"}}}}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        let _ = drain_broadcast(&mut rx).await;
+
+        // 10s while tool is ACTIVE: zero thinking notices.
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        let during_tool = drain_broadcast(&mut rx).await;
+        assert!(
+            !during_tool.iter().any(|e| matches!(e, SessionEvent::Notice { .. })),
+            "must not claim Antigravity is thinking while a tool is running: {during_tool:?}"
+        );
+
+        drop(writer);
+        let _ = driver.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mid_thinking_eof_settles_open_status_card_instead_of_leaving_it_frozen() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let pending = Mutex::new(HashMap::new());
+        let (mut writer, reader) = tokio::io::duplex(4096);
+
+        let driver =
+            tokio::spawn(async move { drive_turn_stdout(reader, "conv-eof", 6, 404, None, 0, &pending, &tx).await });
+
+        use tokio::io::AsyncWriteExt as _;
+        writer
+            .write_all(
+                concat!(
+                    r#"{"event":"init","conversation_id":"c-eof","init":{"model":"claude-sonnet-4-6","cwd":"/w"}}"#,
+                    "\n",
+                    r#"{"event":"step_update","step_update":{"step_index":0,"state":"DONE","step_type":"user_input"}}"#,
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(std::time::Duration::from_millis(3_200)).await;
+        tokio::task::yield_now().await;
+        let live = drain_broadcast(&mut rx).await;
+        let live_key = live
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Notice {
+                    supersedes_key: Some(k),
+                    ..
+                } => Some(k.clone()),
+                _ => None,
+            })
+            .expect("live thinking notice");
+
+        // Process killed/crashed before `result`.
+        drop(writer);
+        let summary = driver.await.unwrap();
+        assert!(!summary.saw_terminal);
+
+        let eof_events = drain_broadcast(&mut rx).await;
+        assert!(eof_events.iter().any(|e| matches!(
+            e,
+            SessionEvent::Notice {
+                message,
+                localized: Some(l),
+                supersedes_key: Some(k),
+                ..
+            } if l.code == super::super::CODE_THOUGHT_COMPLETE
+                && k == &live_key
+                && message.starts_with("Stopped while thinking")
+        )));
     }
 }

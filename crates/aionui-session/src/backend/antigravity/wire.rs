@@ -120,6 +120,21 @@ pub(crate) struct AgySubagentInfo {
     pub subagents: Vec<AgySubagent>,
 }
 
+/// Slash command agy expanded on this turn's prompt.
+///
+/// Verified live against `agy 1.5.3` (`agy -p "/compact" --conversation <id> --output-format stream-json`):
+/// `init` carries `"expanded_commands":[{"name":"compact","type":"system"}]` at
+/// turn start — the ONLY wire signal that compaction has begun, because `agy`
+/// emits no `checkpoint` `ACTIVE` frame and only flushes `checkpoint` `DONE`
+/// once summarization finishes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct AgyExpandedCommand {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, rename = "type")]
+    pub kind: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct AgyInit {
     #[serde(default)]
@@ -135,6 +150,8 @@ pub(crate) struct AgyInit {
     pub model: Option<String>,
     #[serde(default)]
     pub agent: Option<String>,
+    #[serde(default)]
+    pub expanded_commands: Vec<AgyExpandedCommand>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -155,6 +172,11 @@ pub(crate) struct AgyStepUpdate {
     pub tool_info: Option<AgyToolInfo>,
     #[serde(default)]
     pub subagent_info: Option<AgySubagentInfo>,
+    /// Wall-clock step duration reported by agy on `DONE` steps (verified live
+    /// on `agy 1.5.3`: e.g. `checkpoint` `DONE` carries `duration_seconds: 8.9457684`,
+    /// `agent_response` `DONE` carries `duration_seconds: 13.1072795`).
+    #[serde(default)]
+    pub duration_seconds: Option<f64>,
     #[serde(default)]
     pub usage: Option<AgyUsage>,
 }
@@ -173,6 +195,8 @@ pub(crate) struct AgyResult {
     /// Present on failures, e.g. `"authentication failed or timed out"`.
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub duration_seconds: Option<f64>,
     #[serde(default)]
     pub num_turns: u64,
     #[serde(default)]
@@ -338,5 +362,36 @@ mod tests {
         assert!(parse_line("jetski: no output produced").is_none());
         assert!(parse_line("").is_none());
         assert!(parse_line("   ").is_none());
+    }
+
+    #[test]
+    fn parses_slash_compact_init_expanded_commands() {
+        // Live-captured from `agy 1.5.3 -p "/compact" --conversation <id> --output-format stream-json`.
+        let line = r#"{"event":"init","conversation_id":"286c2016-0000-0000-0000-000000000001","init":{"cwd":"/w","tools":["run_command"],"permission_mode":"always-proceed","expanded_commands":[{"name":"compact","type":"system"}]}}"#;
+        let AgyEvent::Init(init) = parse_line(line).expect("parsed") else {
+            panic!("expected init");
+        };
+        assert_eq!(init.conversation_id, "286c2016-0000-0000-0000-000000000001");
+        assert!(init.model.is_none());
+        assert_eq!(
+            init.expanded_commands,
+            vec![AgyExpandedCommand {
+                name: "compact".into(),
+                kind: "system".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_checkpoint_done_with_duration_and_usage() {
+        // Live-captured from `agy 1.5.3 -p "/compact" --conversation <id> --output-format stream-json`.
+        let line = r#"{"event":"step_update","step_update":{"conversation_id":"286c2016-0000-0000-0000-000000000001","step_index":4,"state":"DONE","step_type":"checkpoint","duration_seconds":8.9457684,"usage":{"input_tokens":9299,"output_tokens":335,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":9634}}}"#;
+        let AgyEvent::StepUpdate(su) = parse_line(line).expect("parsed") else {
+            panic!("expected step_update");
+        };
+        assert_eq!(su.step_type, AgyStepType::Checkpoint);
+        assert_eq!(su.state, AgyState::Done);
+        assert!((su.duration_seconds.expect("duration") - 8.9457684).abs() < 1e-6);
+        assert_eq!(su.usage.map(|u| u.total_tokens), Some(9634));
     }
 }

@@ -4183,6 +4183,14 @@ fn event_is_user_visible_output(event: &AgentStreamEvent) -> bool {
             | AgentStreamEvent::Plan(_)
             | AgentStreamEvent::Permission(_)
             | AgentStreamEvent::AcpPermission(_)
+    ) || matches!(
+        event,
+        // `agy -p "/compact"` completes with `status: "SUCCESS", response: ""`
+        // after `step_type: "checkpoint", state: "DONE"` (verified live on
+        // `agy 1.5.3`). The settled compaction notice IS the turn's visible
+        // deliverable; transient thinking/retry notices deliberately stay
+        // excluded so a genuinely blank reply still surfaces `ACP_EMPTY_TURN`.
+        AgentStreamEvent::Tips(tip) if tip.code.as_deref() == Some(aionui_session::ANTIGRAVITY_COMPACTED_CODE)
     )
     // Deliberately absent: WorkflowProgress. It is an out-of-band refresh of a
     // card the turn already produced, not the turn saying something — counting it
@@ -6084,6 +6092,20 @@ mod translate_tests {
             FinishEventData::default()
         )));
         assert!(!event_is_user_visible_output(&AgentStreamEvent::SegmentBreak));
+        assert!(event_is_user_visible_output(&AgentStreamEvent::Tips(TipsEventData {
+            content: "Conversation context compacted (8.9s).".into(),
+            tip_type: TipType::Info,
+            code: Some(aionui_session::ANTIGRAVITY_COMPACTED_CODE.to_owned()),
+            params: None,
+            supersedes_key: None,
+        })));
+        assert!(!event_is_user_visible_output(&AgentStreamEvent::Tips(TipsEventData {
+            content: "Antigravity is thinking… (3s)".into(),
+            tip_type: TipType::Info,
+            code: Some("ANTIGRAVITY_THINKING".to_owned()),
+            params: None,
+            supersedes_key: None,
+        })));
     }
 }
 
