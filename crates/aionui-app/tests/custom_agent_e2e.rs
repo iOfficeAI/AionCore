@@ -363,3 +363,105 @@ async fn test_on_save_cli_not_found_blocks_upsert() {
         "rejected create must not leave rows behind"
     );
 }
+
+// ── Test-on-save persists the probe's handshake (cold start) ─────────────────
+//
+// A custom agent that has never run a session used to have no
+// `agent_capabilities` row: the save-time probe completed `initialize` but
+// threw the capabilities away, and an edit cleared whatever an earlier session
+// had stored. Consumers that gate on them (MCP injection, Team tool transport)
+// then treated the agent as unknown until its first real conversation.
+
+/// Minimal ACP agent over stdio: answers `initialize` (advertising MCP over
+/// HTTP and `load_session`) and `session/new`, ignores everything else.
+#[cfg(unix)]
+const FAKE_ACP_AGENT_SH: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"mcpCapabilities":{"http":true,"sse":false}},"authMethods":[]}}\n' "$id" ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"probe-session"}}\n' "$id" ;;
+  esac
+done
+"#;
+
+#[cfg(unix)]
+async fn stored_agent_capabilities(services: &aionui_app::AppServices, username: &str, id: &str) -> Option<Value> {
+    use aionui_db::{IAgentMetadataRepository, SqliteAgentMetadataRepository};
+    let user_id = services
+        .user_repo
+        .find_by_username(username)
+        .await
+        .unwrap()
+        .expect("test user should exist")
+        .id;
+    let repo = SqliteAgentMetadataRepository::new(services.database.pool().clone());
+    let row = repo
+        .get_for_user(&user_id, id)
+        .await
+        .unwrap()
+        .expect("custom agent row should exist");
+    row.agent_capabilities
+        .as_deref()
+        .map(|json| serde_json::from_str(json).expect("agent_capabilities is JSON"))
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn custom_agent_save_persists_probe_capabilities_and_edit_keeps_them() {
+    let _guard = lock_env().await;
+    // SAFETY: env mutation under ENV_MUTEX; the real probe must run here.
+    unsafe {
+        std::env::remove_var("AIONUI_BYPASS_PROBE");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("fake-acp-agent.sh");
+    std::fs::write(&script, FAKE_ACP_AGENT_SH).unwrap();
+    let script = script.to_string_lossy().into_owned();
+
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    // Create: the real probe spawns the fake agent; no session is ever opened.
+    let (status, json) = create_agent(
+        &mut app,
+        &token,
+        &csrf,
+        json!({ "name": "Fake ACP", "command": "sh", "args": [script], "env": [] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create failed: {json}");
+    let id = json["data"]["id"].as_str().expect("id in response").to_owned();
+
+    let caps = stored_agent_capabilities(&services, "admin", &id)
+        .await
+        .expect("create must persist the probe's agent_capabilities");
+    assert_eq!(caps["load_session"], true, "snake_case projection: {caps}");
+    assert_eq!(caps["mcp_capabilities"]["http"], true, "snake_case projection: {caps}");
+
+    // Edit without a probe result (bypass = no handshake): the stored snapshot
+    // must survive instead of being cleared by the upsert.
+    unsafe {
+        std::env::set_var("AIONUI_BYPASS_PROBE", "1");
+    }
+    let req = json_with_token(
+        "PUT",
+        &format!("/api/agents/custom/{id}"),
+        json!({ "name": "Fake ACP v2", "command": "sh", "args": [script], "env": [] }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    unsafe {
+        std::env::remove_var("AIONUI_BYPASS_PROBE");
+    }
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let caps_after_edit = stored_agent_capabilities(&services, "admin", &id)
+        .await
+        .expect("an edit must not clear agent_capabilities");
+    assert_eq!(caps_after_edit, caps);
+}

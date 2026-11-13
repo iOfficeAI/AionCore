@@ -474,7 +474,7 @@ fn confirm_option_id(data: &Value) -> Option<String> {
 /// leaves the backend. All handshake columns, WebSocket payloads, and
 /// HTTP responses share this rule — callers should go through this
 /// helper instead of `serde_json::to_value` directly.
-pub(super) fn sdk_to_snake_value<T: serde::Serialize>(value: &T) -> Option<Value> {
+pub(crate) fn sdk_to_snake_value<T: serde::Serialize>(value: &T) -> Option<Value> {
     let mut v = serde_json::to_value(value).ok()?;
     normalize_keys_to_snake_case(&mut v);
     Some(v)

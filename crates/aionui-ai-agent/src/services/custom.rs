@@ -15,14 +15,17 @@ use std::collections::HashMap;
 
 use crate::error::AgentError;
 use aionui_api_types::{
-    AgentMetadata, CustomAgentUpsertRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
+    AgentHandshake, AgentMetadata, CustomAgentUpsertRequest, TryConnectCustomAgentRequest,
+    TryConnectCustomAgentResponse,
 };
 use aionui_common::generate_short_id;
-use aionui_db::UpsertAgentMetadataParams;
+use aionui_db::{AgentMetadataRow, UpsertAgentMetadataParams};
 use tracing::warn;
 
 use super::AgentService;
-use crate::protocol::custom_agent_probe::try_connect_custom_agent as probe;
+use crate::protocol::custom_agent_probe::{
+    try_connect_custom_agent as probe, try_connect_custom_agent_with_catalog as probe_with_handshake,
+};
 use crate::runtime_status::custom_agent_runtime_reporter;
 
 const CUSTOM_SORT_ORDER_DEFAULT: i64 = 1500;
@@ -51,11 +54,18 @@ impl AgentService {
         req: CustomAgentUpsertRequest,
     ) -> Result<AgentMetadata, AgentError> {
         validate_upsert(&req)?;
-        probe_or_reject(&req).await?;
+        let probed = probe_or_reject(&req).await?;
 
         let id = generate_short_id();
-        self.upsert_custom_row(user_id, &id, &req, /* keep_enabled = */ true)
-            .await
+        self.upsert_custom_row(
+            user_id,
+            &id,
+            &req,
+            /* keep_enabled = */ true,
+            None,
+            probed.as_ref(),
+        )
+        .await
     }
 
     pub async fn update_custom_agent(
@@ -77,10 +87,11 @@ impl AgentService {
                 "Only custom agents can be edited via this endpoint",
             ));
         }
-        probe_or_reject(&req).await?;
+        let probed = probe_or_reject(&req).await?;
 
         let keep_enabled = existing.enabled;
-        self.upsert_custom_row(user_id, id, &req, keep_enabled).await
+        self.upsert_custom_row(user_id, id, &req, keep_enabled, Some(&existing), probed.as_ref())
+            .await
     }
 
     pub async fn delete_custom_agent(&self, user_id: &str, id: &str) -> Result<(), AgentError> {
@@ -144,8 +155,31 @@ impl AgentService {
         id: &str,
         req: &CustomAgentUpsertRequest,
         enabled: bool,
+        existing: Option<&AgentMetadataRow>,
+        probed: Option<&AgentHandshake>,
     ) -> Result<AgentMetadata, AgentError> {
         let advanced = req.advanced.clone().unwrap_or_default();
+
+        // Handshake snapshot. The upsert rewrites every column, so a value we
+        // don't pass here is cleared. Take the capabilities the save-time probe
+        // just observed; otherwise keep what an earlier probe or session stored,
+        // so editing a custom agent no longer wipes its snapshot. Capabilities
+        // are written in the same statement (not via the async catalog channel)
+        // so they are visible as soon as the create/update response returns:
+        // a team attach right after creation must already see them.
+        let encode = |v: Option<&serde_json::Value>, field: &str| -> Result<Option<String>, AgentError> {
+            v.map(|v| serde_json::to_string(v).map_err(|e| AgentError::internal(format!("encode {field}: {e}"))))
+                .transpose()
+        };
+        let keep = |pick: fn(&AgentMetadataRow) -> &Option<String>| existing.and_then(|row| pick(row).clone());
+        let agent_capabilities = encode(probed.and_then(|h| h.agent_capabilities.as_ref()), "agent_capabilities")?
+            .or_else(|| keep(|r| &r.agent_capabilities));
+        let auth_methods =
+            encode(probed.and_then(|h| h.auth_methods.as_ref()), "auth_methods")?.or_else(|| keep(|r| &r.auth_methods));
+        let config_options = keep(|r| &r.config_options);
+        let available_modes = keep(|r| &r.available_modes);
+        let available_models = keep(|r| &r.available_models);
+        let available_commands = keep(|r| &r.available_commands);
 
         let args_json =
             serde_json::to_string(&req.args).map_err(|e| AgentError::internal(format!("encode args: {e}")))?;
@@ -187,12 +221,12 @@ impl AgentService {
             skill_delivery: None,
             behavior_policy: behavior_policy_json.as_deref(),
             yolo_id: advanced.yolo_id.as_deref(),
-            agent_capabilities: None,
-            auth_methods: None,
-            config_options: None,
-            available_modes: None,
-            available_models: None,
-            available_commands: None,
+            agent_capabilities: agent_capabilities.as_deref(),
+            auth_methods: auth_methods.as_deref(),
+            config_options: config_options.as_deref(),
+            available_modes: available_modes.as_deref(),
+            available_models: available_models.as_deref(),
+            available_commands: available_commands.as_deref(),
             sort_order: CUSTOM_SORT_ORDER_DEFAULT,
         };
 
@@ -208,6 +242,15 @@ impl AgentService {
             .reload_one(id)
             .await
             .map_err(|e| AgentError::internal(format!("registry reload: {e}")))?;
+
+        // The probe's catalog (modes / models / config options) goes through
+        // the same serialized channel a live session uses, so it gets the same
+        // config-option merge and enrichment. Additive: `None` fields are skipped.
+        if let Some(handshake) = probed {
+            self.registry()
+                .catalog_sender()
+                .send_partial(user_id.to_owned(), id.to_owned(), handshake.clone());
+        }
 
         self.registry()
             .get_for_user(user_id, id)
@@ -226,7 +269,9 @@ fn validate_upsert(req: &CustomAgentUpsertRequest) -> Result<(), AgentError> {
     Ok(())
 }
 
-async fn probe_or_reject(req: &CustomAgentUpsertRequest) -> Result<(), AgentError> {
+/// Test-on-save. On success, returns the handshake the probe observed (if the
+/// agent advertised anything) so the caller can persist it.
+async fn probe_or_reject(req: &CustomAgentUpsertRequest) -> Result<Option<AgentHandshake>, AgentError> {
     // Test-only bypass — real probe spawns a child process and relies
     // on a working ACP CLI on PATH, which is not present in CI.
     // Gated behind cfg(test) / the `test-support` feature so production
@@ -234,23 +279,23 @@ async fn probe_or_reject(req: &CustomAgentUpsertRequest) -> Result<(), AgentErro
     #[cfg(any(test, feature = "test-support"))]
     if std::env::var("AIONUI_BYPASS_PROBE").is_ok() {
         tracing::warn!("AIONUI_BYPASS_PROBE set — skipping custom agent probe. Test-only.");
-        return Ok(());
+        return Ok(None);
     }
 
     let env_map: HashMap<String, String> = req.env.iter().map(|e| (e.name.clone(), e.value.clone())).collect();
-    match probe(&req.command, &req.args, &env_map, None).await {
-        TryConnectCustomAgentResponse::Success => Ok(()),
+    match probe_with_handshake(&req.command, &req.args, &env_map, None).await {
+        (TryConnectCustomAgentResponse::Success, handshake) => Ok(handshake.map(|h| *h)),
         // Reachable but not authorized is a valid agent the user simply hasn't
         // logged into yet — accept the save so it lands in the list (offline,
         // needs-login), where a later "test connection" confirms recovery.
-        TryConnectCustomAgentResponse::FailAuth { error } => {
+        (TryConnectCustomAgentResponse::FailAuth { error }, _) => {
             tracing::info!(%error, "custom agent reachable but requires auth; accepting save");
-            Ok(())
+            Ok(None)
         }
-        TryConnectCustomAgentResponse::FailCli { error } => {
+        (TryConnectCustomAgentResponse::FailCli { error }, _) => {
             Err(AgentError::bad_request(format!("cli_not_found: {error}")))
         }
-        TryConnectCustomAgentResponse::FailAcp { error } => {
+        (TryConnectCustomAgentResponse::FailAcp { error }, _) => {
             Err(AgentError::bad_request(format!("acp_init_failed: {error}")))
         }
     }

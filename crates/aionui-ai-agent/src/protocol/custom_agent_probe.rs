@@ -55,13 +55,14 @@ pub async fn try_connect_custom_agent(
         .0
 }
 
-/// As [`try_connect_custom_agent`], plus the catalog the probe's `session/new`
+/// As [`try_connect_custom_agent`], plus the handshake the probe observed: the
+/// `initialize` capabilities / auth methods and the catalog `session/new`
 /// advertised. The probe already pays for a full spawn + `initialize` +
 /// `session/new`; callers that persist agent metadata use this variant so that
 /// data is stored instead of thrown away. The partial is `Some` only on a
-/// successful session whose agent advertised at least one of modes / models /
-/// config options — an auth-gated or failing probe yields `None`, never an
-/// empty write that would blank an existing catalog.
+/// successful session whose agent advertised at least one of those fields —
+/// an auth-gated or failing probe yields `None`, never an empty write that
+/// would blank an existing snapshot.
 pub async fn try_connect_custom_agent_with_catalog(
     command: &str,
     args: &[String],
@@ -116,6 +117,16 @@ pub async fn try_connect_custom_agent_with_catalog(
     outcome
 }
 
+/// An all-`None` handshake would be a no-op write; callers get `None` instead.
+fn handshake_has_any_field(h: &AgentHandshake) -> bool {
+    h.agent_capabilities.is_some()
+        || h.auth_methods.is_some()
+        || h.config_options.is_some()
+        || h.available_modes.is_some()
+        || h.available_models.is_some()
+        || h.available_commands.is_some()
+}
+
 fn first_token(command: &str) -> &str {
     command.split_whitespace().next().unwrap_or(command)
 }
@@ -163,9 +174,10 @@ async fn spawn_probe_process(
 /// alone returns `authMethods` even for already-authorized agents and cannot
 /// make this distinction.
 enum ProbeOutcome {
-    /// Carries the catalog the successful `session/new` advertised (modes /
-    /// models / config options), already projected into the same shape the live
-    /// session path persists. `None` when the agent advertised nothing. Boxed to
+    /// Carries the handshake the successful probe observed (`initialize`
+    /// capabilities / auth methods plus the `session/new` modes / models /
+    /// config options), already projected into the same shape the live session
+    /// path persists. `None` when the agent advertised nothing. Boxed to
     /// keep the enum small: the success payload dwarfs the error strings.
     Ok(Option<Box<AgentHandshake>>),
     Auth(String),
@@ -252,14 +264,24 @@ async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
             let models = legacy_models
                 .as_ref()
                 .and_then(crate::manager::acp::legacy_session_model::LegacySessionModelState::from_state_value);
-            ProbeOutcome::Ok(
-                crate::manager::acp::catalog_forwarder::catalog_partial_from_session_new(
-                    response.modes.as_ref(),
-                    models.as_ref(),
-                    response.config_options.as_deref(),
-                )
-                .map(Box::new),
+            let mut handshake = crate::manager::acp::catalog_forwarder::catalog_partial_from_session_new(
+                response.modes.as_ref(),
+                models.as_ref(),
+                response.config_options.as_deref(),
             )
+            .unwrap_or_default();
+            // Keep the `initialize` capabilities too (the same projection the
+            // live session's `init` persists). Without them a custom agent that
+            // has never run a session has no `agent_capabilities` row, so
+            // consumers that gate on them (MCP injection, team tool transport)
+            // treat it as unknown until its first real conversation.
+            handshake.agent_capabilities = protocol
+                .agent_capabilities()
+                .and_then(|c| crate::manager::acp::agent::sdk_to_snake_value(&c));
+            handshake.auth_methods = protocol
+                .auth_methods()
+                .and_then(|m| crate::manager::acp::agent::sdk_to_snake_value(&m));
+            ProbeOutcome::Ok(handshake_has_any_field(&handshake).then(|| Box::new(handshake)))
         }
         Err(AcpError::AuthRequired) => {
             ProbeOutcome::Auth("Agent reachable but requires login/authorization".to_string())
