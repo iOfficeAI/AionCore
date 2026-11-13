@@ -102,6 +102,7 @@ fn build_test_office_state(
         conversion_service: conversion,
         proxy_service: proxy,
         allowed_roots,
+        trust_client_roots: true,
         project,
     }
 }

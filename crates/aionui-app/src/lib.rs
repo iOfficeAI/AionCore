@@ -6,6 +6,7 @@
 //! submodules. All logic lives in the modules below.
 
 mod config;
+mod fs_sandbox;
 mod router;
 mod services;
 

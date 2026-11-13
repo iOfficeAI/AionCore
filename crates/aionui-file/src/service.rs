@@ -62,6 +62,12 @@ pub struct FileService {
     broadcaster: Arc<dyn EventBroadcaster>,
     /// Allowed root directories for path safety validation.
     allowed_roots: Vec<std::path::PathBuf>,
+    /// Whether a request-supplied `root` / `workspace` (or a copy source's own
+    /// parent) may widen `allowed_roots` for that request. `true` keeps the
+    /// desktop behaviour, where the client is the local user and any folder it
+    /// picked is fair game. Multi-user/hosted deployments set it to `false`:
+    /// every path must then fall inside `allowed_roots`, whatever the client sends.
+    trust_client_roots: bool,
     /// In-memory cache for `list_workspace_files`, keyed by canonical root.
     workspace_files_cache: DashMap<String, Vec<WorkspaceFlatFile>>,
 }
@@ -71,8 +77,21 @@ impl FileService {
         Self {
             broadcaster,
             allowed_roots,
+            trust_client_roots: true,
             workspace_files_cache: DashMap::new(),
         }
+    }
+
+    /// Set whether request-supplied roots may widen the sandbox (see
+    /// [`FileService::trust_client_roots`]). Defaults to `true`.
+    pub fn with_client_roots_trusted(mut self, trusted: bool) -> Self {
+        self.trust_client_roots = trusted;
+        self
+    }
+
+    /// The request-supplied extra root, or `None` when client roots are not trusted.
+    fn client_root<'a>(&self, extra_root: Option<&'a Path>) -> Option<&'a Path> {
+        if self.trust_client_roots { extra_root } else { None }
     }
 
     /// Invalidate the workspace files cache for a given root.
@@ -88,7 +107,7 @@ impl FileService {
 
     fn allowed_roots_with_extra<'a>(&'a self, extra_root: Option<&'a Path>) -> Vec<&'a Path> {
         let mut roots = self.allowed_roots_refs();
-        if let Some(extra_root) = extra_root {
+        if let Some(extra_root) = self.client_root(extra_root) {
             roots.push(extra_root);
         }
         roots
@@ -107,7 +126,7 @@ impl FileService {
         self.allowed_roots
             .iter()
             .map(PathBuf::as_path)
-            .chain(extra_root)
+            .chain(self.client_root(extra_root))
             .filter_map(|root| std::fs::canonicalize(root).ok())
             .any(|root| candidate.starts_with(root))
     }
@@ -607,6 +626,13 @@ impl crate::traits::IFileService for FileService {
         Ok(())
     }
 
+    fn ensure_in_sandbox(&self, workspace: &str) -> Result<(), FileError> {
+        if self.trust_client_roots {
+            return Ok(());
+        }
+        validate_path_with_extra_root(workspace, &self.allowed_roots_refs(), None).map(|_| ())
+    }
+
     async fn resolved_metadata(&self, absolute_path: &Path) -> Result<FileMetadata, FileError> {
         let path = absolute_path.to_path_buf();
         tokio::task::spawn_blocking(move || get_file_metadata_sync(&path))
@@ -629,9 +655,9 @@ impl crate::traits::IFileService for FileService {
 
     async fn get_files_by_dir(&self, dir: &str, root: &str) -> Result<Vec<DirOrFile>, FileError> {
         let roots = self.allowed_roots_refs();
-        let extra_root = Path::new(root);
-        let canonical_dir = validate_path_with_extra_root(dir, &roots, Some(extra_root))?;
-        let canonical_root = validate_path_with_extra_root(root, &roots, Some(extra_root))?;
+        let extra_root = self.client_root(Some(Path::new(root)));
+        let canonical_dir = validate_path_with_extra_root(dir, &roots, extra_root)?;
+        let canonical_root = validate_path_with_extra_root(root, &roots, extra_root)?;
 
         self.build_dir_tree(&canonical_dir, &canonical_root).await
     }
@@ -646,7 +672,7 @@ impl crate::traits::IFileService for FileService {
         extra_root: Option<&Path>,
     ) -> Result<Vec<WorkspaceFlatFile>, FileError> {
         let roots = self.allowed_roots_refs();
-        let canonical_root = validate_path_with_extra_root(root, &roots, extra_root)?;
+        let canonical_root = validate_path_with_extra_root(root, &roots, self.client_root(extra_root))?;
         let cache_key = canonical_root.to_string_lossy().into_owned();
 
         // Check cache first
@@ -667,7 +693,7 @@ impl crate::traits::IFileService for FileService {
 
     async fn get_file_metadata(&self, path: &str, extra_root: Option<&Path>) -> Result<FileMetadata, FileError> {
         let roots = self.allowed_roots_refs();
-        let canonical = validate_path_with_extra_root(path, &roots, extra_root)?;
+        let canonical = validate_path_with_extra_root(path, &roots, self.client_root(extra_root))?;
 
         let result = tokio::task::spawn_blocking(move || get_file_metadata_sync(&canonical))
             .await
@@ -687,7 +713,7 @@ impl crate::traits::IFileService for FileService {
         }
 
         let roots = self.allowed_roots_refs();
-        let canonical = match validate_path_with_extra_root(path, &roots, extra_root) {
+        let canonical = match validate_path_with_extra_root(path, &roots, self.client_root(extra_root)) {
             Ok(c) => c,
             Err(err) => {
                 if matches!(err, FileError::BadRequest(_))
@@ -773,10 +799,15 @@ impl crate::traits::IFileService for FileService {
         source_root: Option<&str>,
     ) -> Result<CopyResult, FileError> {
         let roots = self.allowed_roots_refs();
-        let ws_canonical = validate_path_with_extra_root(workspace, &roots, Some(Path::new(workspace)))?;
+        let ws_canonical =
+            validate_path_with_extra_root(workspace, &roots, self.client_root(Some(Path::new(workspace))))?;
 
         let sr_canonical = match source_root {
-            Some(sr) => Some(validate_path_with_extra_root(sr, &roots, Some(Path::new(sr)))?),
+            Some(sr) => Some(validate_path_with_extra_root(
+                sr,
+                &roots,
+                self.client_root(Some(Path::new(sr))),
+            )?),
             None => None,
         };
 
@@ -784,6 +815,7 @@ impl crate::traits::IFileService for FileService {
         let roots_owned: Vec<std::path::PathBuf> = self.allowed_roots.clone();
         let workspace_root_owned = ws_canonical.clone();
         let source_root_owned = sr_canonical.clone();
+        let trust_client_roots = self.trust_client_roots;
 
         tokio::task::spawn_blocking(move || {
             let mut roots_refs: Vec<&Path> = roots_owned.iter().map(|p| p.as_path()).collect();
@@ -802,7 +834,10 @@ impl crate::traits::IFileService for FileService {
             };
 
             for fp in &file_paths_owned {
-                let source_extra = source_root_owned.as_deref().or_else(|| Path::new(fp).parent());
+                // A source's own parent widens the sandbox only when client roots are trusted.
+                let source_extra = source_root_owned
+                    .as_deref()
+                    .or_else(|| Path::new(fp).parent().filter(|_| trust_client_roots));
                 let (src, is_dir) = match validate_path_with_extra_root(fp, &roots_refs, source_extra) {
                     Ok(p) if p.is_dir() => (p, true),
                     Ok(p) if p.is_file() => (p, false),
@@ -968,7 +1003,7 @@ impl crate::traits::IFileService for FileService {
         }
 
         let roots = self.allowed_roots_refs();
-        let canonical = validate_path_with_extra_root(path, &roots, extra_root)?;
+        let canonical = validate_path_with_extra_root(path, &roots, self.client_root(extra_root))?;
 
         tokio::task::spawn_blocking(move || get_image_base64_sync(&canonical))
             .await

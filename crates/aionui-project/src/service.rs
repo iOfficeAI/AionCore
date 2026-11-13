@@ -27,6 +27,12 @@ pub struct ProjectService {
     /// `None` in tests and the HTTP-only assembly path, where a root change simply
     /// notifies nobody.
     scm_roots_tx: Arc<OnceLock<UnboundedSender<ScmInbound>>>,
+    /// When set, a folder can only be registered (project workspace or attached
+    /// folder) if it lies inside one of these roots. `None` (the default) keeps the
+    /// desktop behaviour: any existing directory the user picked is accepted.
+    /// Multi-user/hosted deployments set it to the same roots as the file sandbox,
+    /// so a registered folder can never be used to reach outside it.
+    registration_roots: Option<Arc<Vec<PathBuf>>>,
 }
 
 impl ProjectService {
@@ -35,7 +41,14 @@ impl ProjectService {
             store,
             temp_root,
             scm_roots_tx: Arc::new(OnceLock::new()),
+            registration_roots: None,
         }
+    }
+
+    /// Restrict folder registration to `roots` (see `registration_roots`).
+    pub fn with_registration_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.registration_roots = Some(Arc::new(roots));
+        self
     }
 
     /// Install the sink that carries project-root changes to the source-control
@@ -398,7 +411,7 @@ impl ProjectService {
     fn ensure_accessible(&self, canonical: &Canonical) -> Result<(), ProjectError> {
         let path = canonical::fs_path(canonical)?;
         match std::fs::metadata(&path) {
-            Ok(meta) if meta.is_dir() => Ok(()),
+            Ok(meta) if meta.is_dir() => self.ensure_within_registration_roots(&path),
             Ok(_) => Err(ProjectError::FolderNotDirectory {
                 path: path.to_string_lossy().into_owned(),
             }),
@@ -413,6 +426,26 @@ impl ProjectService {
                     path: path.to_string_lossy().into_owned(),
                 },
             }),
+        }
+    }
+
+    /// Reject a folder outside `registration_roots` (when configured) with the
+    /// same `folder_permission_denied` the OS would give for an unreadable one.
+    fn ensure_within_registration_roots(&self, path: &Path) -> Result<(), ProjectError> {
+        let Some(roots) = self.registration_roots.as_deref() else {
+            return Ok(());
+        };
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let inside = roots.iter().any(|root| match std::fs::canonicalize(root) {
+            Ok(root) => resolved.starts_with(root),
+            Err(_) => false,
+        });
+        if inside {
+            Ok(())
+        } else {
+            Err(ProjectError::FolderPermissionDenied {
+                path: path.to_string_lossy().into_owned(),
+            })
         }
     }
 

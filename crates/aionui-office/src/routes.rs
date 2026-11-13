@@ -348,8 +348,8 @@ fn validate_office_path(
     workspace: Option<&str>,
 ) -> Result<PathBuf, ApiError> {
     let allowed_roots: Vec<&FsPath> = state.allowed_roots.iter().map(PathBuf::as_path).collect();
-    validate_path_with_extra_root(file_path, &allowed_roots, workspace.map(FsPath::new))
-        .map_err(file_error_to_api_error)
+    let extra_root = workspace.map(FsPath::new).filter(|_| state.trust_client_roots);
+    validate_path_with_extra_root(file_path, &allowed_roots, extra_root).map_err(file_error_to_api_error)
 }
 
 fn file_error_to_api_error(error: FileError) -> ApiError {
@@ -627,6 +627,7 @@ mod tests {
             conversion_service: conversion,
             proxy_service: proxy,
             allowed_roots: vec![std::env::temp_dir()],
+            trust_client_roots: true,
             project,
         }
     }

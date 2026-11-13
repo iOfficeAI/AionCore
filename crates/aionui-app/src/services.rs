@@ -281,7 +281,12 @@ impl AppServices {
         // `resolve_existing` classifies auto workspaces as temp and
         // user-picked directories as standard.
         let project_store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(database.pool().clone()));
-        let project_service = ProjectService::new(project_store, work_dir.join("conversations"));
+        let mut project_service = ProjectService::new(project_store, work_dir.join("conversations"));
+        if !crate::fs_sandbox::trust_client_roots() {
+            // Strict file sandbox: projects can only be registered inside its roots.
+            project_service =
+                project_service.with_registration_roots(crate::fs_sandbox::allowed_roots(Some(work_dir.as_path())));
+        }
 
         // Sidebar ordering store (`user_order` table). Built early so it can be
         // shared by the conversation delete hook, the team service, and the
