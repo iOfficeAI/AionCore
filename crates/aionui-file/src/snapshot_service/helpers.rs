@@ -5,7 +5,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use aionui_common::FileChangeOperation;
 
@@ -394,8 +394,8 @@ pub(super) fn discard_single_file(
 ) -> Result<(), FileError> {
     match operation {
         FileChangeOperation::Create => {
-            // New/untracked file: just delete it
-            let abs_path = workspace.join(rel_path);
+            // New/untracked file: just delete it, but only inside the workspace.
+            let abs_path = contained_path(workspace, rel_path)?;
             if abs_path.exists() {
                 std::fs::remove_file(&abs_path)
                     .map_err(|e| FileError::Internal(format!("Failed to delete file {}: {}", abs_path.display(), e)))?;
@@ -407,6 +407,40 @@ pub(super) fn discard_single_file(
             checkout_path_from_head(repo, rel_path)
         }
     }
+}
+
+/// Resolve `rel_path` under `workspace` and refuse anything that would leave it.
+///
+/// `Path::join` with an absolute path replaces the base, and `..` or a
+/// symlinked directory can step out of it, so a caller-supplied path is checked
+/// lexically (relative, no `..`, no root or drive prefix) and, when it exists,
+/// again after resolving symlinks. Routes validate first; this keeps the
+/// destructive helpers safe on their own.
+pub(super) fn contained_path(workspace: &Path, rel_path: &str) -> Result<PathBuf, FileError> {
+    let rel = Path::new(rel_path);
+    let lexically_inside = !rel_path.trim().is_empty()
+        && !rel_path.contains('\0')
+        && rel
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+    if !lexically_inside {
+        return Err(FileError::BadRequest(format!(
+            "file path '{}' is not inside the workspace",
+            rel_path
+        )));
+    }
+    let joined = workspace.join(rel);
+    // Resolve symlinks on the deepest existing ancestor (the file itself may not exist).
+    let existing = joined.ancestors().find(|p| p.exists()).unwrap_or(workspace);
+    if let (Ok(resolved), Ok(root)) = (std::fs::canonicalize(existing), std::fs::canonicalize(workspace))
+        && !resolved.starts_with(&root)
+    {
+        return Err(FileError::BadRequest(format!(
+            "file path '{}' resolves outside the workspace",
+            rel_path
+        )));
+    }
+    Ok(joined)
 }
 
 /// Reset a file completely: unstage (if staged) and restore working tree.
