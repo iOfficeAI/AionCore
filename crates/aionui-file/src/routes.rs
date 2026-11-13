@@ -694,8 +694,10 @@ async fn fetch_remote_image(
 // B. Workspace snapshot — handlers
 // ---------------------------------------------------------------------------
 //
-// The per-file handlers require `file_path` to stay inside the workspace:
-// the snapshot service joins it onto the workspace and may delete the result
+// Every handler checks `workspace` against the file sandbox
+// (`ensure_in_sandbox`, a no-op when client roots are trusted), and the
+// per-file handlers require `file_path` to stay inside the workspace: the
+// snapshot service joins it onto the workspace and may delete the result
 // (discard of a created file), and `Path::join` with an absolute path
 // replaces the workspace entirely.
 
@@ -719,6 +721,7 @@ async fn snapshot_init(
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotInfoResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state.file_service.ensure_in_sandbox(&req.workspace)?;
     let info = state.snapshot_service.init(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_snapshot_info_response(info))))
 }
@@ -728,6 +731,7 @@ async fn snapshot_info(
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotInfoResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state.file_service.ensure_in_sandbox(&req.workspace)?;
     let info = state.snapshot_service.get_info(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_snapshot_info_response(info))))
 }
@@ -737,6 +741,7 @@ async fn snapshot_compare(
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotCompareResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state.file_service.ensure_in_sandbox(&req.workspace)?;
     let result = state.snapshot_service.compare(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_compare_response(result))))
 }
@@ -746,6 +751,7 @@ async fn snapshot_baseline(
     body: Result<Json<SnapshotBaselineRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state.file_service.ensure_in_sandbox(&req.workspace)?;
     ensure_workspace_relative(&req.file_path)?;
     let content = state
         .snapshot_service
@@ -759,6 +765,7 @@ async fn snapshot_stage_file(
     body: Result<Json<SnapshotStageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state.file_service.ensure_in_sandbox(&req.workspace)?;
     ensure_workspace_relative(&req.file_path)?;
     state
         .snapshot_service
@@ -772,6 +779,7 @@ async fn snapshot_stage_all(
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state.file_service.ensure_in_sandbox(&req.workspace)?;
     state.snapshot_service.stage_all(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -781,6 +789,7 @@ async fn snapshot_unstage_file(
     body: Result<Json<SnapshotStageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state.file_service.ensure_in_sandbox(&req.workspace)?;
     ensure_workspace_relative(&req.file_path)?;
     state
         .snapshot_service
@@ -794,6 +803,7 @@ async fn snapshot_unstage_all(
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state.file_service.ensure_in_sandbox(&req.workspace)?;
     state.snapshot_service.unstage_all(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -803,6 +813,7 @@ async fn snapshot_discard(
     body: Result<Json<SnapshotDiscardRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state.file_service.ensure_in_sandbox(&req.workspace)?;
     ensure_workspace_relative(&req.file_path)?;
     state
         .snapshot_service
@@ -816,6 +827,7 @@ async fn snapshot_reset(
     body: Result<Json<SnapshotDiscardRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state.file_service.ensure_in_sandbox(&req.workspace)?;
     ensure_workspace_relative(&req.file_path)?;
     state
         .snapshot_service
@@ -829,6 +841,7 @@ async fn snapshot_branches(
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state.file_service.ensure_in_sandbox(&req.workspace)?;
     let branches = state.snapshot_service.get_branches(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(branches)))
 }
@@ -838,6 +851,7 @@ async fn snapshot_dispose(
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state.file_service.ensure_in_sandbox(&req.workspace)?;
     state.snapshot_service.dispose(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -935,20 +949,25 @@ mod tests {
         }
     }
 
-    /// Every snapshot handler that takes a file path must keep it relative.
-    /// Bump the counts deliberately when adding a snapshot endpoint.
+    /// Every snapshot handler takes a raw workspace path, so each must run the
+    /// sandbox check, and each one that also takes a file path must keep it
+    /// relative. Bump the counts deliberately when adding a snapshot endpoint.
     #[test]
-    fn every_snapshot_file_path_handler_checks_containment() {
+    fn every_snapshot_handler_checks_the_sandbox() {
         let source = include_str!("routes.rs");
         let handlers = source
             .split_once("\n#[cfg(test)]")
             .map(|(before, _)| before)
             .expect("routes.rs has a #[cfg(test)] module");
         let snapshot_routes = handlers.matches(".route(\"/api/fs/snapshot/").count();
+        let sandbox_checks = handlers
+            .matches("state.file_service.ensure_in_sandbox(&req.workspace)?;")
+            .count();
         // `&req.file_paths` (the copy handler) is a different field.
         let file_path_uses = handlers.matches("&req.file_path").count() - handlers.matches("&req.file_paths").count();
         let relative_checks = handlers.matches("ensure_workspace_relative(&req.file_path)?;").count();
         assert_eq!(snapshot_routes, 12);
+        assert_eq!(sandbox_checks, snapshot_routes);
         assert_eq!(relative_checks, 5);
         // Each checked handler mentions `&req.file_path` twice: the check and the call.
         assert_eq!(file_path_uses, relative_checks * 2);

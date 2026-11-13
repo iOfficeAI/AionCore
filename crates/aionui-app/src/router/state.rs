@@ -151,26 +151,6 @@ pub struct ModuleStates {
     pub assistant: AssistantRouterState,
 }
 
-fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
-    let mut roots = vec![
-        std::env::temp_dir(),
-        dirs::home_dir().unwrap_or_else(std::env::temp_dir),
-    ];
-    // Auto-provisioned per-conversation workspaces live under
-    // `{work_dir}/conversations/{label}-temp-{id}/`. On Windows the
-    // operator may put `work_dir` on a separate drive (e.g. `X:\AionUi`)
-    // that's neither under `temp_dir` nor `home_dir`. Including `work_dir`
-    // keeps temp workspaces on the default allowlist without widening it
-    // to unrelated paths.
-    if let Some(wd) = work_dir
-        && !wd.as_os_str().is_empty()
-        && !roots.iter().any(|r| r == wd)
-    {
-        roots.push(wd.to_path_buf());
-    }
-    roots
-}
-
 fn build_module_state_phase<T>(boot: &Instant, phase: &'static str, build: impl FnOnce() -> T) -> T {
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -543,8 +523,11 @@ pub fn build_connection_test_state() -> ConnectionTestRouterState {
 /// Build the default `FileRouterState` from application services.
 pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, RouterBuildError> {
     let broadcaster = services.event_bus.clone();
-    let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
-    let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
+    let allowed_roots = crate::fs_sandbox::allowed_roots(Some(services.work_dir.as_path()));
+    let file_service = Arc::new(
+        FileService::new(broadcaster.clone(), allowed_roots.clone())
+            .with_client_roots_trusted(crate::fs_sandbox::trust_client_roots()),
+    );
     let snapshot_service = Arc::new(SnapshotService::new());
     // Shell-backed capabilities for `/api/fs/reveal` (open enclosing folder) and
     // `/api/fs/open-system` (open with the default application): adapters over one
@@ -1068,7 +1051,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
 /// Build the default `OfficeRouterState` from application services.
 pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
     let data_dir = services.data_dir.as_path();
-    let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
+    let allowed_roots = crate::fs_sandbox::allowed_roots(Some(services.work_dir.as_path()));
 
     let spawner: Arc<dyn aionui_office::ProcessSpawner> =
         Arc::new(aionui_office::DefaultProcessSpawner::new(data_dir.to_path_buf()));
@@ -1082,6 +1065,7 @@ pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
         conversion_service,
         proxy_service,
         allowed_roots,
+        trust_client_roots: crate::fs_sandbox::trust_client_roots(),
         project: Arc::new(services.project_service.clone()),
     }
 }

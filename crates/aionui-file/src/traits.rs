@@ -34,6 +34,15 @@ pub trait IFileService: Send + Sync {
     /// Metadata for a pre-resolved absolute path.
     async fn resolved_metadata(&self, absolute_path: &Path) -> Result<FileMetadata, FileError>;
 
+    /// Check that a client-supplied workspace path lies inside the sandbox.
+    ///
+    /// Used by routes that take a raw workspace path and do not otherwise
+    /// validate it (the snapshot endpoints). The default accepts everything,
+    /// which matches implementations that trust client roots.
+    fn ensure_in_sandbox(&self, _workspace: &str) -> Result<(), FileError> {
+        Ok(())
+    }
+
     // -- Directory browsing --
 
     /// List the immediate children of `dir`, returning a tree with one level
