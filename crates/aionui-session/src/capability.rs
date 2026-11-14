@@ -268,7 +268,7 @@ pub struct SignalSet {
 /// same default as `Capabilities`). Locked against the real capability
 /// constructors by tests below and module-local asserts in each backend.
 pub fn backend_supports_midturn_delivery(backend: &str) -> bool {
-    matches!(backend, "claude" | "codex")
+    matches!(backend, "claude" | "codex" | "antigravity")
 }
 
 #[cfg(test)]
@@ -276,7 +276,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn midturn_delivery_is_opt_in_and_antigravity_is_excluded() {
+    fn midturn_delivery_is_opt_in_by_default() {
         // Default MUST be false: a new backend is ACP-like until proven otherwise.
         assert!(!Capabilities::default().supports_midturn_delivery);
     }
@@ -292,7 +292,7 @@ mod tests {
         );
         assert_eq!(
             backend_supports_midturn_delivery("antigravity"),
-            crate::backend::antigravity_capabilities().supports_midturn_delivery,
+            crate::backend::antigravity_acp_capabilities().supports_midturn_delivery,
         );
         // Any ACP agent id (open set) falls through to the ACP connection's bit.
         assert_eq!(

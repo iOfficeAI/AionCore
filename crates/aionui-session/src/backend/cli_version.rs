@@ -38,7 +38,33 @@ use crate::event::{LocalizedText, NoticeLevel};
 /// 0.147.0 and leaves it unverified rather than a floor anyone can install into.
 pub const VERIFIED_CLAUDE_VERSION: &str = "2.1.287";
 pub const VERIFIED_CODEX_VERSION: &str = "0.151.0";
-pub const VERIFIED_AGY_VERSION: &str = "1.3.5";
+pub const VERIFIED_AGY_VERSION: &str = "1.5.8";
+
+/// Minimum `agy` CLI version whose native `agy acp` stdio server satisfies
+/// AionCore's session/model/cancel/permission contracts.
+///
+/// Primary-source evidence (`agy changelog` on `agy 1.5.8`):
+/// - `1.5.0`: added `agy acp` (ACP over stdio, `session/resume` without history
+///   replay, `thought_level` config option, prompt steering, image/resource blocks).
+/// - `1.5.1`: exposed all account models to every ACP client (previously non-Gemini
+///   models were restricted to an editor allowlist) and fixed prompt cancel/close
+///   and permission request lifecycle bugs.
+///
+/// Installs older than `1.5.1` fall back automatically to `AntigravityConnection`.
+pub const MIN_AGY_ACP_VERSION: [u32; 3] = [1, 5, 1];
+
+/// Whether a reported `agy --version` string supports the native `agy acp` path.
+pub fn supports_agy_acp(reported: &str) -> bool {
+    let Some(parts) = parse_version(reported) else {
+        return false;
+    };
+    let tuple = [
+        parts.first().copied().unwrap_or(0),
+        parts.get(1).copied().unwrap_or(0),
+        parts.get(2).copied().unwrap_or(0),
+    ];
+    tuple >= MIN_AGY_ACP_VERSION
+}
 
 /// The verified release for a direct-CLI backend, keyed by the program name the
 /// backend spawns. `None` for anything not version-gated here.
@@ -475,15 +501,31 @@ mod tests {
         // The literal the other two CLIs already pin, which agy was missing: a
         // user on exactly the verified release is told nothing, and a bump that
         // lands without re-verifying against that exact binary breaks here.
-        assert_eq!(classify("1.3.5", VERIFIED_AGY_VERSION), VersionVerdict::Verified);
-        assert!(drift_notice("agy", "1.3.5", VERIFIED_AGY_VERSION).is_none());
+        assert_eq!(classify("1.5.8", VERIFIED_AGY_VERSION), VersionVerdict::Verified);
+        assert!(drift_notice("agy", "1.5.8", VERIFIED_AGY_VERSION).is_none());
 
         // agy prints a bare version, so the older/newer paths are worth pinning
         // on that exact shape rather than only on a decorated one.
-        // 1.1.29 is OLDER than 1.2.0: the minor component decides, and a
-        // lexical compare would get this backwards ("1.1.29" > "1.2.0").
+        // 1.1.29 is OLDER than 1.5.8: the minor component decides, and a
+        // lexical compare would get multi-digit components backwards.
         assert_eq!(classify("1.1.29", VERIFIED_AGY_VERSION), VersionVerdict::Older);
-        assert_eq!(classify("1.3.6", VERIFIED_AGY_VERSION), VersionVerdict::Newer);
+        assert_eq!(classify("1.5.7", VERIFIED_AGY_VERSION), VersionVerdict::Older);
+        assert_eq!(classify("1.5.9", VERIFIED_AGY_VERSION), VersionVerdict::Newer);
+    }
+
+    #[test]
+    fn supports_agy_acp_requires_at_least_1_5_1() {
+        assert!(!supports_agy_acp(""));
+        assert!(!supports_agy_acp("not a version"));
+        assert!(!supports_agy_acp("1.1.15"));
+        assert!(!supports_agy_acp("1.3.5"));
+        assert!(!supports_agy_acp("1.5"));
+        assert!(!supports_agy_acp("1.5.0"));
+        assert!(supports_agy_acp("1.5.1"));
+        assert!(supports_agy_acp("1.5.4"));
+        assert!(supports_agy_acp("1.5.8"));
+        assert!(supports_agy_acp("v1.6.0"));
+        assert!(supports_agy_acp("2.0.0"));
     }
 
     /// Both drift directions are `Info` — the tier the frontend draws as a quiet

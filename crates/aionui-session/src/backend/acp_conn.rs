@@ -50,20 +50,56 @@ use crate::capability::{
 };
 use crate::event::{PermissionKind, SessionEvent, StopReason, SubagentKind, TruncationKind, TurnOutcome};
 
+/// Dialect overrides for ACP agents that extend the baseline ACP v1 wire.
+///
+/// Default (`AcpDialectOptions::default()`) preserves the exact baseline ACP
+/// behavior (no mid-turn prompt steering, `session/load` on resume, no host
+/// full-auto sentinel mode). `agy acp` (`>= 1.5.1`, live-verified on `1.5.8`)
+/// opts into:
+/// - `supports_prompt_steering`: sending a second `session/prompt` mid-turn
+///   steers the active turn cleanly (`agy` settles the superseded prompt RPC
+///   with `stopReason: "end_turn"` within ~12ms and continues streaming on the
+///   same session until the steered prompt RPC settles).
+/// - `use_session_resume`: sends `session/resume` instead of `session/load` on
+///   reconnect so `agy` restores server-side history without replaying every
+///   past `session/update` chunk over stdio (`agy changelog` 1.5.0).
+/// - `host_full_auto_mode` and `full_auto_wire_mode`: surfaces AionUi's `"yolo"`
+///   sentinel in `available_modes`, translates `Command::SetMode { mode: "yolo" }`
+///   to wire `modeId: "accept-edits"`, preserves `"yolo"` across `ConfigChanged`
+///   echoes while active, and auto-approves `session/request_permission` frames
+///   at runtime.
+#[derive(Debug, Clone, Default)]
+pub struct AcpDialectOptions {
+    pub supports_prompt_steering: bool,
+    pub use_session_resume: bool,
+    pub host_full_auto_mode: Option<ModeInfo>,
+    pub full_auto_wire_mode: Option<String>,
+}
+
 /// Connection-level factory for ACP. Holds the injected `Spawner` (S14 — never
 /// raw-spawn) and the command that launches the ACP CLI/bridge. One process per
 /// logical session (P1; ACP `session/new` could multiplex, a later refinement).
 pub struct AcpConnection {
     spawner: Arc<dyn Spawner>,
     /// The command that starts the ACP agent (e.g. `hermes acp`, the codex-acp
-    /// bridge binary). Connection-static; per-session `cwd`/`extra_args` come
-    /// from `SessionConfig` at `open_session`.
+    /// bridge binary, or `agy acp`). Connection-static; per-session
+    /// `cwd`/`extra_args`/`spawn_env` come from `SessionConfig` at `open_session`.
     command: aionui_common::CommandSpec,
+    dialect: AcpDialectOptions,
 }
 
 impl AcpConnection {
     pub fn new(spawner: Arc<dyn Spawner>, command: aionui_common::CommandSpec) -> Self {
-        Self { spawner, command }
+        Self {
+            spawner,
+            command,
+            dialect: AcpDialectOptions::default(),
+        }
+    }
+
+    pub fn with_dialect(mut self, dialect: AcpDialectOptions) -> Self {
+        self.dialect = dialect;
+        self
     }
 }
 
@@ -93,6 +129,7 @@ impl BackendConnection for AcpConnection {
         // Spawner/ManagedProcess rather than the legacy CliAgentProcess path).
         let mut cmd = self.command.clone();
         cmd.args.extend(config.extra_args.iter().cloned());
+        cmd.env.extend(config.spawn_env.iter().cloned());
         if let Some(cwd) = &config.cwd {
             cmd.cwd = Some(cwd.clone());
         }
@@ -103,12 +140,14 @@ impl BackendConnection for AcpConnection {
             .map_err(|e| BackendError::from_spawn("acp spawn failed", e))?;
         let io: Box<dyn AgentIo> = Box::new(crate::adapter::ManagedProcessIo::new(proc));
         // F-4 wake recipe: a Dormant→dispatch wake re-spawns the ACP CLI and
-        // replays the resume handshake (`session/load` against the bound sid).
-        // idle_ttl=None (default) → never suspends → identical to pre-F-4.
+        // replays the resume handshake (`session/load` or `session/resume`
+        // against the bound sid). idle_ttl=None (default) → never suspends →
+        // identical to pre-F-4.
         let wake = AcpWakeRecipe {
             spawner: Some(self.spawner.clone()),
             command: Some(self.command.clone()),
             config: config.clone(),
+            dialect: self.dialect.clone(),
         };
         let mut backend = AcpSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms).await;
 
@@ -155,7 +194,7 @@ impl BackendConnection for AcpConnection {
     }
 
     fn capabilities(&self) -> Capabilities {
-        acp_capabilities()
+        acp_capabilities_for_dialect(&self.dialect)
     }
 }
 
@@ -297,6 +336,19 @@ pub fn acp_capabilities() -> Capabilities {
     }
 }
 
+/// Capabilities for an ACP connection configured with `dialect`.
+pub fn acp_capabilities_for_dialect(dialect: &AcpDialectOptions) -> Capabilities {
+    let mut caps = acp_capabilities();
+    if dialect.supports_prompt_steering {
+        caps.supported_commands.steer = true;
+        caps.supports_midturn_delivery = true;
+    }
+    if let Some(mode) = &dialect.host_full_auto_mode {
+        caps.available_modes.push(mode.clone());
+    }
+    caps
+}
+
 /// Per-session ACP handle. `&self`-concurrent (stdin write behind a Mutex).
 pub struct AcpSessionBackend {
     session_id: String,
@@ -382,6 +434,11 @@ pub struct AcpSessionBackend {
     /// `session/prompt`. `take()`-drained on the first `dispatch(Send)` so it is
     /// applied exactly once; `None` = no preset (the pre-0c first prompt unchanged).
     pending_preamble: Mutex<Option<String>>,
+    /// Whether the session is currently in a host-side full-auto sentinel mode
+    /// (e.g. Antigravity `"yolo"`). Shared with the reader so incoming
+    /// `session/request_permission` requests auto-approve and mode echoes stay
+    /// normalized to the sentinel id.
+    full_auto_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Per-request_id offered permission options: `(optionId, kind)` pairs the agent
@@ -421,6 +478,50 @@ struct Discovered {
     /// (values/labels) surfaces to the UI via the existing modes/models path; this
     /// is purely the dispatch allowlist.
     config_options: Vec<String>,
+    /// Dialect configuration shared with the reader and `map_update`.
+    dialect: AcpDialectOptions,
+    /// Shared full-auto sentinel latch (`true` while the session is in `"yolo"`).
+    full_auto_active: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Discovered {
+    /// Normalize an agent-reported wire mode id back to the host full-auto
+    /// sentinel (e.g. `"accept-edits"` -> `"yolo"`) while full-auto is active.
+    fn normalize_observed_mode(&self, mode: Option<String>) -> Option<String> {
+        let mode = mode?;
+        if self.full_auto_active.load(Ordering::SeqCst)
+            && let (Some(host_mode), Some(wire_mode)) = (
+                self.dialect.host_full_auto_mode.as_ref(),
+                self.dialect.full_auto_wire_mode.as_deref(),
+            )
+            && mode == wire_mode
+        {
+            return Some(host_mode.id.clone());
+        }
+        Some(mode)
+    }
+
+    /// Resolve a `configOptions["model"].currentValue` token against the
+    /// discovered `available_models` list. `agy acp` reports full suffixed ids
+    /// in top-level `models.availableModels` (`"gemini-3.8-flash-low"`) while
+    /// splitting `configOptions` into `model: "gemini-3.8-flash"` plus
+    /// `thought_level: "low"` (live-verified on `agy 1.5.8`). Recombining
+    /// `"{model}-{thought_level}"` when `model` alone is absent from
+    /// `self.models` keeps `ConfigChanged` aligned with `available_models`
+    /// without altering bridges whose `model` token already matches directly.
+    fn normalize_observed_model(&self, model: Option<String>, thought_level: Option<&str>) -> Option<String> {
+        let model = model?;
+        if !self.models.is_empty()
+            && !self.models.iter().any(|m| m.id == model)
+            && let Some(level) = thought_level
+        {
+            let candidate = format!("{model}-{level}");
+            if self.models.iter().any(|m| m.id == candidate) {
+                return Some(candidate);
+            }
+        }
+        Some(model)
+    }
 }
 
 impl AcpSessionBackend {
@@ -430,6 +531,24 @@ impl AcpSessionBackend {
     #[cfg(any(test, feature = "test-support"))]
     pub async fn build_with_io(session_id: impl Into<String>, io: Box<dyn AgentIo>) -> Self {
         Self::spawn(session_id.into(), io).await
+    }
+
+    /// Test-support seam: build over an injected `AgentIo` with explicit
+    /// [`AcpDialectOptions`] and optional initial `SessionConfig`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn build_with_io_and_dialect(
+        session_id: impl Into<String>,
+        io: Box<dyn AgentIo>,
+        dialect: AcpDialectOptions,
+        config: SessionConfig,
+    ) -> Self {
+        let wake = AcpWakeRecipe {
+            spawner: None,
+            command: None,
+            config,
+            dialect,
+        };
+        Self::spawn_with_wake(session_id.into(), io, wake, None).await
     }
 
     /// Test-support seam: build a SUSPENDABLE backend with a caller-supplied
@@ -448,6 +567,7 @@ impl AcpSessionBackend {
             spawner: Some(spawner),
             command: Some(command),
             config: SessionConfig::default(),
+            dialect: AcpDialectOptions::default(),
         };
         Self::spawn_with_wake(session_id.into(), io, wake, Some(idle_ttl_ms)).await
     }
@@ -530,6 +650,7 @@ impl AcpSessionBackend {
                 model: desired_model,
                 ..SessionConfig::default()
             },
+            dialect: AcpDialectOptions::default(),
         };
         Self::spawn_with_wake(session_id.into(), io, wake, None).await
     }
@@ -563,7 +684,18 @@ impl AcpSessionBackend {
         let pending_prompts = Arc::new(Mutex::new(HashMap::new()));
         let pending_set = Arc::new(Mutex::new(HashMap::new()));
         let pending_perm_options = Arc::new(Mutex::new(HashMap::new()));
-        let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
+        let initial_full_auto = wake
+            .dialect
+            .host_full_auto_mode
+            .as_ref()
+            .zip(wake.config.mode.as_deref())
+            .is_some_and(|(host_mode, m)| m.eq_ignore_ascii_case(&host_mode.id));
+        let full_auto_active = Arc::new(std::sync::atomic::AtomicBool::new(initial_full_auto));
+        let discovered = Arc::new(std::sync::Mutex::new(Discovered {
+            dialect: wake.dialect.clone(),
+            full_auto_active: full_auto_active.clone(),
+            ..Discovered::default()
+        }));
         let turn_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (event_tx, _) = broadcast::channel(1024);
 
@@ -594,15 +726,26 @@ impl AcpSessionBackend {
         // Wave 0c-F: compose the first-message preamble from the preset context.
         // ACP has no system-prompt field, so a non-empty preset is delivered by
         // prepending an `[Assistant Rules]` block to the first prompt (light-mode
-        // format, byte-identical to the legacy first_message_injector).
-        let pending_preamble = Mutex::new(
+        // format, byte-identical to the legacy first_message_injector). Skip on a
+        // resumed session (its history already carries the initial rules block)
+        // and avoid double-wrapping when the caller already composed `[Assistant Rules]`.
+        let pending_preamble = Mutex::new(if wake.config.init.resume {
+            None
+        } else {
             wake.config
                 .init
                 .preset_context
                 .as_deref()
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(|ctx| format!("[Assistant Rules]\n{ctx}\n[/Assistant Rules]")),
-        );
+                .map(|ctx| {
+                    if ctx.starts_with("[Assistant Rules]") {
+                        ctx.to_string()
+                    } else {
+                        format!("[Assistant Rules]\n{ctx}\n[/Assistant Rules]")
+                    }
+                })
+        });
 
         let suspend = Arc::new(SuspendController::active(
             ProcHandle::new(reader, io),
@@ -632,9 +775,11 @@ impl AcpSessionBackend {
             )
         };
 
+        let capabilities = acp_capabilities_for_dialect(&wake.dialect);
+
         Self {
             session_id,
-            capabilities: acp_capabilities(),
+            capabilities,
             discovered,
             rpc_id: AtomicU64::new(0),
             turn_gen,
@@ -654,6 +799,7 @@ impl AcpSessionBackend {
             pending_prompts,
             pending_set,
             pending_preamble,
+            full_auto_active,
         }
     }
 
@@ -798,8 +944,13 @@ impl AcpSessionBackend {
                 // sid — clearing it makes the post-wake gate wait for the fresh load
                 // too, not release a prompt against a not-yet-reloaded session.
                 *self.acp_session_id.lock().await = None;
+                let resume_method = if self.wake.dialect.use_session_resume {
+                    "session/resume"
+                } else {
+                    "session/load"
+                };
                 self.write_frame(json!({
-                    "jsonrpc": "2.0", "id": id, "method": "session/load",
+                    "jsonrpc": "2.0", "id": id, "method": resume_method,
                     "params": load_session_params(sid, &self.wake.config)
                 }))
                 .await?;
@@ -829,6 +980,7 @@ impl AcpSessionBackend {
         };
         let mut cmd = command.clone();
         cmd.args.extend(self.wake.config.extra_args.iter().cloned());
+        cmd.env.extend(self.wake.config.spawn_env.iter().cloned());
         if let Some(cwd) = &self.wake.config.cwd {
             cmd.cwd = Some(cwd.clone());
         }
@@ -960,6 +1112,7 @@ struct AcpWakeRecipe {
     spawner: Option<Arc<dyn Spawner>>,
     command: Option<aionui_common::CommandSpec>,
     config: SessionConfig,
+    dialect: AcpDialectOptions,
 }
 
 impl AcpWakeRecipe {
@@ -969,6 +1122,7 @@ impl AcpWakeRecipe {
             spawner: None,
             command: None,
             config: SessionConfig::default(),
+            dialect: AcpDialectOptions::default(),
         }
     }
 }
@@ -1049,6 +1203,11 @@ async fn reader_task(ctx: ReaderCtx) {
                     // reverse-RPC (server-initiated request): permission → surface;
                     // everything else → -32601 unblock (A2/A3).
                     (Some(m), true) => {
+                        let auto_approve = discovered
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .full_auto_active
+                            .load(Ordering::SeqCst);
                         handle_reverse_rpc(
                             m,
                             &frame,
@@ -1057,6 +1216,7 @@ async fn reader_task(ctx: ReaderCtx) {
                             &event_tx,
                             &stdin,
                             &pending_perm_options,
+                            auto_approve,
                         )
                         .await;
                     }
@@ -1224,28 +1384,55 @@ async fn reader_task(ctx: ReaderCtx) {
 
                         // session/prompt response → THE ACP TERMINAL. Synthesize
                         // TurnResult from stopReason (success/error/cancelled).
-                        let pending = pending_prompts.lock().await.remove(&rid);
+                        //
+                        // When `supports_prompt_steering` is enabled (`agy acp`), sending
+                        // a second `session/prompt` mid-turn causes `agy` to settle the
+                        // superseded prompt RPC with `stopReason: "end_turn"` within ~12ms
+                        // while continuing the active turn under the steered prompt RPC
+                        // (live-verified on `agy 1.5.8`). Suppress the intermediate
+                        // `TurnResult` whenever another prompt on the same `turn_gen`
+                        // remains in flight on a non-error response so `StreamRelay` and
+                        // the reducer stay continuously in `Running` until the steered
+                        // prompt settles.
+                        let supports_steering = discovered
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .dialect
+                            .supports_prompt_steering;
+                        let is_error_frame = frame.get("error").is_some();
+                        let (pending, superseded_by_steer) = {
+                            let mut guard = pending_prompts.lock().await;
+                            let removed = guard.remove(&rid);
+                            let superseded = match &removed {
+                                Some(p) if supports_steering && !is_error_frame => {
+                                    guard.values().any(|other| other.turn_gen == p.turn_gen)
+                                }
+                                Some(p) if supports_steering && is_error_frame => {
+                                    guard.retain(|_, other| other.turn_gen != p.turn_gen);
+                                    false
+                                }
+                                _ => false,
+                            };
+                            (removed, superseded)
+                        };
                         if let Some(pending) = pending {
+                            if let Some(usage_ev) = parse_acp_result_usage(&frame) {
+                                emit(&event_tx, &session_id, pending.turn_gen, usage_ev);
+                            }
+                            if superseded_by_steer {
+                                continue;
+                            }
                             // F-4: the prompt-response terminal ends the turn → clear
                             // the turn-active flag so the idle timer may suspend.
                             turn_in_flight.store(false, Ordering::SeqCst);
                             // G1-B: only peek stderr for an ERROR terminal (the cause
                             // of a generic JSON-RPC error lives there); a success
                             // response never needs it — avoids a peek every turn.
-                            let stderr_tail = if frame.get("error").is_some() {
+                            let stderr_tail = if is_error_frame {
                                 Some(io.peek_stderr(crate::adapter::STDERR_PEEK_LINES).await)
                             } else {
                                 None
                             };
-                            // Terminal usage: the session/prompt RESPONSE carries
-                            // result.usage{inputTokens,outputTokens,totalTokens, cost?}
-                            // on bridges that report it (claude-agent-acp, hermes). It
-                            // was previously DROPPED (only the streaming usage_update,
-                            // which lacks the per-direction split, was read). Emit a
-                            // UsageDelta BEFORE the terminal (mirrors claude C-2).
-                            if let Some(usage_ev) = parse_acp_result_usage(&frame) {
-                                emit(&event_tx, &session_id, pending.turn_gen, usage_ev);
-                            }
                             let ev = synth_turn_result(&frame, pending.turn_gen, stderr_tail.as_deref());
                             emit(&event_tx, &session_id, pending.turn_gen, ev);
                         }
@@ -1442,11 +1629,14 @@ async fn handle_open_response(
         }
     }
     // G4: generic config option ids (NOT mode/model — those have dedicated arms),
-    // e.g. claude-acp `effort`. Gates Command::SetConfigOption (advertised ⟺ settable).
+    // e.g. claude-acp `effort` or agy-acp `thought_level`. Gates Command::SetConfigOption
+    // (advertised ⟺ settable).
     let generic = parse_generic_config_option_ids(config_options);
     if !generic.is_empty() {
         disc.config_options = generic;
     }
+    let raw_mode = disc.current_mode.take();
+    disc.current_mode = disc.normalize_observed_mode(raw_mode);
 }
 
 /// opencode shape: pull the `configOptions[]` item with `id == want` (e.g. "model" /
@@ -1541,6 +1731,7 @@ fn parse_modes(modes: &Value) -> Vec<ModeInfo> {
 /// keyed response). Any other reverse method → immediate `-32601` so the channel
 /// never deadlocks (A2/A3 — matches the SDK's own auto-reject + the ACP-audit
 /// finding that unhandled reverse RPC must be clean-rejected, not dropped).
+#[allow(clippy::too_many_arguments)]
 async fn handle_reverse_rpc(
     method: &str,
     frame: &Value,
@@ -1549,11 +1740,48 @@ async fn handle_reverse_rpc(
     event_tx: &broadcast::Sender<SessionEnvelope>,
     stdin: &Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     pending_perm_options: &PendingPermOptions,
+    auto_approve_permissions: bool,
 ) {
     let cur = turn_gen.load(Ordering::SeqCst);
     let id = frame.get("id").cloned().unwrap_or(Value::Null);
     match method {
         "session/request_permission" => {
+            if auto_approve_permissions {
+                // Full-auto sentinel active (e.g. Antigravity `"yolo"`, including a
+                // mid-session toggle from `"default"` -> `"yolo"` on a process spawned
+                // without `--dangerously-skip-permissions`): pick an offered allow
+                // option immediately and answer on the wire without parking the turn.
+                let chosen_oid = frame
+                    .get("params")
+                    .and_then(|p| p.get("options"))
+                    .and_then(Value::as_array)
+                    .and_then(|opts| {
+                        for want in ["allow_always", "allow_once"] {
+                            if let Some(oid) = opts.iter().find_map(|o| {
+                                let kind = o.get("kind").and_then(Value::as_str).unwrap_or("");
+                                (kind == want)
+                                    .then(|| o.get("optionId").and_then(Value::as_str))
+                                    .flatten()
+                            }) {
+                                return Some(oid.to_string());
+                            }
+                        }
+                        opts.first()
+                            .and_then(|o| o.get("optionId"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
+                let outcome = match chosen_oid {
+                    Some(oid) => json!({ "outcome": "selected", "optionId": oid }),
+                    None => json!({ "outcome": "cancelled" }),
+                };
+                let _ = write_frame_to(
+                    stdin,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "outcome": outcome } }),
+                )
+                .await;
+                return;
+            }
             // The wire `id` is the request_id the conversation answers. The backend
             // does NOT decide — it parses G3 context (MCP server name + answerable
             // options) into `metadata` so the conversation facade can consult its
@@ -1804,7 +2032,15 @@ async fn map_update(
         }
         "current_mode_update" => {
             // Real ACP SessionUpdate variant (schema 0.12.0 client.rs:103 CurrentModeUpdate{currentModeId}).
-            let mode = update.get("currentModeId").and_then(Value::as_str).map(str::to_string);
+            let mode = {
+                let mut disc = discovered.lock().unwrap_or_else(|e| e.into_inner());
+                let normalized = disc
+                    .normalize_observed_mode(update.get("currentModeId").and_then(Value::as_str).map(str::to_string));
+                if normalized.is_some() {
+                    disc.current_mode = normalized.clone();
+                }
+                normalized
+            };
             vec![SessionEvent::ConfigChanged { mode, model: None }]
         }
         // NOTE: there is NO `current_model_update` SessionUpdate in ACP. The official
@@ -1854,13 +2090,15 @@ async fn map_update(
             // switch never reached ConfigChanged → the frontend selector would not
             // update (README discipline #10: sense the change however the agent reports
             // it). Extract the mode/model currentValue here so BOTH report shapes are
-            // covered. (acp is not prod-wired yet — backend_router fail-loud — so this
-            // had no production impact; it is fixed now that the real wire is captured.)
+            // covered.
+            //
+            // LIVE-VERIFIED (`agy 1.5.8 acp`): `config_option_update` splits the full
+            // model ID into `{id:"model", currentValue:"gemini-3.8-flash"}` +
+            // `{id:"thought_level", currentValue:"low"}` while `models.availableModels`
+            // lists `"gemini-3.8-flash-low"`, and echoes `mode:"accept-edits"` when the
+            // host selected `"yolo"`. `Discovered::normalize_observed_*` reconciles both.
             let opts = update.get("configOptions");
             let generic = parse_generic_config_option_ids(opts);
-            if !generic.is_empty() {
-                discovered.lock().unwrap_or_else(|e| e.into_inner()).config_options = generic;
-            }
             let current_value = |id: &str| -> Option<String> {
                 opts.and_then(Value::as_array)?
                     .iter()
@@ -1868,8 +2106,22 @@ async fn map_update(
                     .and_then(|o| o.get("currentValue").and_then(Value::as_str))
                     .map(str::to_string)
             };
-            let mode = current_value("mode");
-            let model = current_value("model");
+            let thought_level = current_value("thought_level");
+            let (mode, model) = {
+                let mut disc = discovered.lock().unwrap_or_else(|e| e.into_inner());
+                if !generic.is_empty() {
+                    disc.config_options = generic;
+                }
+                let mode = disc.normalize_observed_mode(current_value("mode"));
+                let model = disc.normalize_observed_model(current_value("model"), thought_level.as_deref());
+                if mode.is_some() {
+                    disc.current_mode = mode.clone();
+                }
+                if model.is_some() {
+                    disc.current_model = model.clone();
+                }
+                (mode, model)
+            };
             let mut events = Vec::new();
             if mode.is_some() || model.is_some() {
                 if let Some(m) = &model {
@@ -2324,13 +2576,32 @@ impl SessionBackend for AcpSessionBackend {
                     .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
                     .await?;
                 let sid = self.bound_session().await?;
+                let (label_mode, wire_mode) = if let Some(host_mode) = self
+                    .wake
+                    .dialect
+                    .host_full_auto_mode
+                    .as_ref()
+                    .filter(|m| mode.eq_ignore_ascii_case(&m.id))
+                {
+                    self.full_auto_active.store(true, Ordering::SeqCst);
+                    let wire = self
+                        .wake
+                        .dialect
+                        .full_auto_wire_mode
+                        .clone()
+                        .unwrap_or_else(|| mode.clone());
+                    (host_mode.id.clone(), wire)
+                } else {
+                    self.full_auto_active.store(false, Ordering::SeqCst);
+                    (mode.clone(), mode)
+                };
                 let id = self.next_rpc_id();
                 // Register so the reader surfaces a JSON-RPC error response (e.g. an
                 // invalid modeId) as a Notice{Error} instead of silently dropping it.
-                self.pending_set.lock().await.insert(id, format!("mode→{mode}"));
+                self.pending_set.lock().await.insert(id, format!("mode→{label_mode}"));
                 self.write_frame(json!({
                     "jsonrpc": "2.0", "id": id, "method": "session/set_mode",
-                    "params": { "sessionId": sid, "modeId": mode }
+                    "params": { "sessionId": sid, "modeId": wire_mode }
                 }))
                 .await?;
                 Ok(CommandReceipt {
@@ -2445,25 +2716,87 @@ impl SessionBackend for AcpSessionBackend {
                     turn_gen: self.turn_gen.load(Ordering::SeqCst),
                 })
             }
-            // ACP base wire has no equivalent → reject (cap advertises false).
-            Command::Steer { .. } => Err(BackendError::CommandNotSupported { command: "steer" }),
-            // G4: ACP exposes generic config options (e.g. claude-acp `effort`,
-            // category `thought_level`) via `session/set_config_option {sessionId,
-            // optionId, value}` (the SDK method, written as raw JSON-RPC). mode/model
-            // still go through their dedicated set_mode/set_model arms (the conversation
-            // routes id=="mode"/"model" there); anything else (effort/custom) lands
-            // here instead of being rejected. Gated on the agent ADVERTISING the option
-            // (cap-behavior invariant: an agent that discovered no config options
-            // rejects, so the surface stays honest).
-            Command::SetConfigOption { option_id, value } => {
-                if !self.has_config_option(&option_id) {
+            // Base ACP wire has no steering equivalent → reject when dialect disables it.
+            // Dialects like `agy acp` (verified live on `agy 1.5.8`) accept a second
+            // `session/prompt` mid-turn: the server immediately settles the superseded
+            // prompt request with `stopReason: "end_turn"` and completes the steered
+            // turn under the new prompt request id on the same logical `turn_gen`.
+            Command::Steer { content, client_msg_id } => {
+                if !self.wake.dialect.supports_prompt_steering {
+                    return Err(BackendError::CommandNotSupported { command: "steer" });
+                }
+                let blocks = self.capabilities().prompt_blocks;
+                if let Some(bad) = content.iter().find(|b| !blocks.allows(b)) {
                     return Err(BackendError::CommandNotSupported {
-                        command: "set_config_option",
+                        command: crate::capability::block_kind_name(bad),
                     });
                 }
+                if !self.turn_in_flight.load(Ordering::SeqCst) {
+                    return Err(BackendError::Transport("no active turn to steer".into()));
+                }
+                let sid = self.bound_session().await?;
+                let id = self.next_rpc_id();
+                let cur_gen = {
+                    let mut guard = self.pending_prompts.lock().await;
+                    if !self.turn_in_flight.load(Ordering::SeqCst) || guard.is_empty() {
+                        return Err(BackendError::Transport("no active turn to steer".into()));
+                    }
+                    let cur_gen = self.turn_gen.load(Ordering::SeqCst);
+                    guard.insert(id, PendingPrompt { turn_gen: cur_gen });
+                    cur_gen
+                };
+                let prompt = build_prompt_blocks(&content);
+                if let Err(err) = self
+                    .write_frame(json!({
+                        "jsonrpc": "2.0", "id": id, "method": "session/prompt",
+                        "params": { "sessionId": sid, "prompt": prompt }
+                    }))
+                    .await
+                {
+                    self.pending_prompts.lock().await.remove(&id);
+                    return Err(err);
+                }
+                if let Some(cmid) = client_msg_id {
+                    emit(
+                        &self.event_tx,
+                        &self.session_id,
+                        cur_gen,
+                        SessionEvent::MessageLifecycle {
+                            client_msg_id: cmid,
+                            phase: crate::event::MessageLifecyclePhase::Completed,
+                        },
+                    );
+                }
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::NoTurn,
+                    turn_gen: cur_gen,
+                })
+            }
+            // G4: ACP exposes generic config options (e.g. claude-acp `effort`,
+            // `agy acp` `thought_level`) via `session/set_config_option`.
+            // Schema 0.12.0 spells the field `configId` (required by `agy 1.5.8 acp`,
+            // which rejects bare `optionId` with `-32603 missing required field configId`),
+            // while legacy bridges read `optionId` — sending BOTH satisfies both shapes
+            // (verified live against `agy 1.5.8 acp`).
+            Command::SetConfigOption { option_id, value } => {
                 self.suspend
                     .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
                     .await?;
+                if self.pending_open.lock().await.is_some() {
+                    let _ = self.bound_session().await?;
+                }
+                let effective_id = if self.has_config_option(&option_id) {
+                    option_id
+                } else if matches!(option_id.as_str(), "reasoning_effort" | "effort")
+                    && self.has_config_option("thought_level")
+                {
+                    "thought_level".to_string()
+                } else {
+                    return Err(BackendError::CommandNotSupported {
+                        command: "set_config_option",
+                    });
+                };
                 let sid = self.bound_session().await?;
                 let id = self.next_rpc_id();
                 // Register the pending set so the reader surfaces a JSON-RPC ERROR
@@ -2477,10 +2810,15 @@ impl SessionBackend for AcpSessionBackend {
                 self.pending_set
                     .lock()
                     .await
-                    .insert(id, format!("config:{option_id}\u{2192}{value}"));
+                    .insert(id, format!("config:{effective_id}\u{2192}{value}"));
                 self.write_frame(json!({
                     "jsonrpc": "2.0", "id": id, "method": "session/set_config_option",
-                    "params": { "sessionId": sid, "optionId": option_id, "value": value }
+                    "params": {
+                        "sessionId": sid,
+                        "configId": effective_id,
+                        "optionId": effective_id,
+                        "value": value,
+                    }
                 }))
                 .await?;
                 Ok(CommandReceipt {
@@ -2557,6 +2895,11 @@ impl SessionBackend for AcpSessionBackend {
         }
         if !disc.modes.is_empty() {
             caps.available_modes = disc.modes.clone();
+        }
+        if let Some(host_mode) = &self.wake.dialect.host_full_auto_mode
+            && !caps.available_modes.iter().any(|m| m.id == host_mode.id)
+        {
+            caps.available_modes.push(host_mode.clone());
         }
         if disc.current_model.is_some() {
             caps.current_model = disc.current_model.clone();
@@ -4096,6 +4439,498 @@ mod tests {
             cmds.iter().any(|c| c.name == "compact"),
             "replayed available_commands_update must still fill discovered.slash_commands \
              (suppression is UI-only), got {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_session_and_wake_handle_forward_session_config_spawn_env() {
+        use crate::testing::FakeSpawner;
+
+        let spawner = Arc::new(FakeSpawner::new());
+        let command = aionui_common::CommandSpec {
+            command: "agy".into(),
+            args: vec!["acp".into()],
+            env: Vec::new(),
+            cwd: None,
+        };
+        let conn = AcpConnection::new(spawner.clone(), command.clone());
+        let env = vec![
+            aionui_common::EnvVar {
+                name: "GODEBUG".to_string(),
+                value: "http2client=0".to_string(),
+            },
+            aionui_common::EnvVar {
+                name: "HTTP_PROXY".to_string(),
+                value: "http://127.0.0.1:7897".to_string(),
+            },
+        ];
+        let cfg = SessionConfig {
+            spawn_env: env.clone(),
+            ..SessionConfig::default()
+        };
+        let err = conn
+            .open_session(
+                SessionSpec::Fresh {
+                    session_id: "open-env".into(),
+                },
+                cfg.clone(),
+            )
+            .await;
+        assert!(err.is_err(), "FakeSpawner rejects spawn after recording");
+        assert_eq!(spawner.last_command().await.map(|c| c.env), Some(env.clone()));
+
+        let wake_spawner = Arc::new(FakeSpawner::new());
+        let wake = AcpWakeRecipe {
+            spawner: Some(wake_spawner.clone()),
+            command: Some(command),
+            config: cfg,
+            dialect: AcpDialectOptions::default(),
+        };
+        let backend = AcpSessionBackend::spawn_with_wake(
+            "wake-env".into(),
+            Box::new(FakeAgentIo::never_exits(Vec::new())),
+            wake,
+            None,
+        )
+        .await;
+        let wake_err = backend.wake_handle().await;
+        assert!(wake_err.is_err(), "FakeSpawner rejects wake spawn after recording");
+        assert_eq!(wake_spawner.last_command().await.map(|c| c.env), Some(env));
+    }
+
+    #[tokio::test]
+    async fn dialect_use_session_resume_writes_session_resume_and_skips_resume_preamble() {
+        use crate::backend::CommandMeta;
+
+        let dialect = AcpDialectOptions {
+            use_session_resume: true,
+            ..AcpDialectOptions::default()
+        };
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let mut cfg = SessionConfig::default();
+        cfg.init.resume = true;
+        cfg.init.preset_context = Some("[Assistant Rules]\nRule 1\n[/Assistant Rules]".into());
+
+        let backend =
+            AcpSessionBackend::build_with_io_and_dialect("agy-resume", Box::new(fake), dialect.clone(), cfg).await;
+        backend
+            .run_handshake(Some("594c7952-24ab-477a-aaf0-44cefb092a35"))
+            .await
+            .expect("handshake writes to FakeAgentIo stdin");
+        backend.bind_for_test("594c7952-24ab-477a-aaf0-44cefb092a35").await;
+        backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("continue".into())],
+                metadata: CommandMeta::default(),
+            })
+            .await
+            .expect("Send succeeds");
+
+        let mut written = String::new();
+        for _ in 0..40 {
+            written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+            if written.contains("session/prompt") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            written.contains(r#""method":"session/resume""#),
+            "dialect.use_session_resume must write session/resume, got: {written}"
+        );
+        assert!(
+            !written.contains(r#""method":"session/load""#),
+            "must not write session/load when use_session_resume is true, got: {written}"
+        );
+        assert!(
+            !written.contains("[Assistant Rules]"),
+            "resumed session must not re-prepend [Assistant Rules], got: {written}"
+        );
+
+        // Fresh session with pre-wrapped `[Assistant Rules]` must inject it ONCE (not nested).
+        let fake_fresh = FakeAgentIo::never_exits(Vec::new());
+        let captured_fresh = fake_fresh.captured_stdin();
+        let mut fresh_cfg = SessionConfig::default();
+        fresh_cfg.init.resume = false;
+        fresh_cfg.init.preset_context = Some("[Assistant Rules]\nStay concise\n[/Assistant Rules]".into());
+        let fresh_backend =
+            AcpSessionBackend::build_with_io_and_dialect("agy-fresh", Box::new(fake_fresh), dialect, fresh_cfg).await;
+        fresh_backend.bind_for_test("fresh-sid").await;
+        fresh_backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("hello".into())],
+                metadata: CommandMeta::default(),
+            })
+            .await
+            .expect("fresh Send succeeds");
+
+        let mut fresh_written = String::new();
+        for _ in 0..40 {
+            fresh_written = String::from_utf8_lossy(&captured_fresh.lock().await.clone()).to_string();
+            if fresh_written.contains("session/prompt") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            fresh_written.matches("[Assistant Rules]").count(),
+            1,
+            "pre-wrapped [Assistant Rules] must not be double-wrapped, got: {fresh_written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_config_option_sends_config_id_and_option_id_and_recombines_split_agy_model() {
+        // Replay live-verified `agy 1.5.8 acp` session/new discovery + config_option_update
+        // where `models.availableModels` lists suffixed IDs (`gemini-3.8-flash-low`,
+        // `gemini-3.8-flash-high`) while `configOptions` splits `model` + `thought_level`.
+        let open_and_update = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"agy-s1","models":{"currentModelId":"gemini-3.8-flash-low","availableModels":[{"modelId":"gemini-3.8-flash-low","name":"Gemini 3 Flash (Low)"},{"modelId":"gemini-3.8-flash-high","name":"Gemini 3 Flash (High)"}]},"configOptions":[{"id":"mode","currentValue":"default","options":[{"value":"default","name":"Default"}]},{"id":"model","currentValue":"gemini-3.8-flash","options":[{"value":"gemini-3.8-flash","name":"Gemini 3 Flash"}]},{"id":"thought_level","currentValue":"low","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"agy-s1","update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"mode","currentValue":"default","options":[{"value":"default","name":"Default"}]},{"id":"model","currentValue":"gemini-3.8-flash","options":[{"value":"gemini-3.8-flash","name":"Gemini 3 Flash"}]},{"id":"thought_level","currentValue":"high","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]}}}"#,
+            "\n",
+        )
+        .as_bytes()
+        .to_vec();
+
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(open_and_update);
+        let captured = fake.captured_stdin();
+        let release = fake.stdout_releaser();
+        let backend = AcpSessionBackend::build_with_io("agy-cfg", Box::new(fake)).await;
+        backend.set_pending_open_for_test(1).await;
+        let mut events = backend.events();
+        release();
+
+        let observed_model = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::ConfigChanged { model: Some(m), .. } = env.event {
+                    return m;
+                }
+            }
+            unreachable!("ConfigChanged must arrive")
+        })
+        .await
+        .expect("must not time out");
+        assert_eq!(
+            observed_model, "gemini-3.8-flash-high",
+            "split model + thought_level must recombine to the advertised modelId"
+        );
+        assert_eq!(
+            backend.capabilities().current_model.as_deref(),
+            Some("gemini-3.8-flash-high")
+        );
+
+        // Dispatch `reasoning_effort` (AionCore's canonical effort key) → must alias to
+        // `thought_level` and write BOTH `configId` (ACP 0.12.0 / agy 1.5.8) and `optionId`.
+        backend
+            .dispatch(Command::SetConfigOption {
+                option_id: "reasoning_effort".into(),
+                value: "high".into(),
+            })
+            .await
+            .expect("reasoning_effort aliases to advertised thought_level");
+
+        let mut written = String::new();
+        for _ in 0..40 {
+            written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+            if written.contains("session/set_config_option") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            written.contains(r#""configId":"thought_level""#)
+                && written.contains(r#""optionId":"thought_level""#)
+                && written.contains(r#""value":"high""#),
+            "session/set_config_option must send both configId and optionId, got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dialect_full_auto_maps_yolo_to_wire_mode_and_auto_approves_permissions() {
+        let dialect = AcpDialectOptions {
+            supports_prompt_steering: true,
+            use_session_resume: true,
+            host_full_auto_mode: Some(crate::capability::ModeInfo {
+                id: "yolo".into(),
+                name: "YOLO".into(),
+                description: None,
+            }),
+            full_auto_wire_mode: Some("accept-edits".into()),
+        };
+        let seg_open = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"agy-yolo","modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"},{"id":"accept-edits","name":"Accept Edits"},{"id":"plan","name":"Plan"}]}}}"#,
+            "\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let seg_echo_and_perm = concat!(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"agy-yolo","update":{"sessionUpdate":"current_mode_update","currentModeId":"accept-edits"}}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":10,"result":{}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":900,"method":"session/request_permission","params":{"sessionId":"agy-yolo","options":[{"optionId":"allow_always_id","kind":"allow_always","name":"Always Allow"},{"optionId":"reject_id","kind":"reject_once","name":"Reject"}],"toolCall":{"title":"Bash","rawInput":{"command":"cargo test"}}}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"agy-yolo","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"DONE"}}}}"#,
+            "\n",
+        )
+        .as_bytes()
+        .to_vec();
+
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_segments(vec![seg_open, seg_echo_and_perm]);
+        let captured = fake.captured_stdin();
+        let release_next = fake.segment_releaser();
+        let backend = AcpSessionBackend::build_with_io_and_dialect(
+            "agy-yolo-sess",
+            Box::new(fake),
+            dialect,
+            SessionConfig::default(),
+        )
+        .await;
+        backend.set_pending_open_for_test(1).await;
+        let mut events = backend.events();
+
+        // Segment 0: open response binds session and merges `yolo` into available_modes.
+        release_next();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(env) = events.next().await {
+                if matches!(env.event, SessionEvent::BackendBound { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("BackendBound arrives");
+        assert!(
+            backend.capabilities().available_modes.iter().any(|m| m.id == "yolo"),
+            "host_full_auto_mode must be merged into capabilities().available_modes"
+        );
+
+        // Advance rpc_id to 9 so SetMode gets id=10 matching our scripted response.
+        for _ in 0..9 {
+            let _ = backend.next_rpc_id();
+        }
+        backend
+            .dispatch(Command::SetMode { mode: "yolo".into() })
+            .await
+            .expect("SetMode(yolo) succeeds");
+
+        // Segment 1: `accept-edits` echo + reverse-RPC `session/request_permission` + DONE delta.
+        release_next();
+        let mut saw_yolo_mode = false;
+        let mut saw_accept_edits_leak = false;
+        let mut saw_permission_card = false;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(env) = events.next().await {
+                match env.event {
+                    SessionEvent::ConfigChanged { mode: Some(m), .. } => {
+                        if m == "yolo" {
+                            saw_yolo_mode = true;
+                        } else if m == "accept-edits" {
+                            saw_accept_edits_leak = true;
+                        }
+                    }
+                    SessionEvent::Permission { .. } => {
+                        saw_permission_card = true;
+                    }
+                    SessionEvent::MessageDelta { text, .. } if text == "DONE" => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("DONE delta arrives");
+
+        assert!(saw_yolo_mode, "ConfigChanged must normalize mode back to yolo");
+        assert!(
+            !saw_accept_edits_leak,
+            "wire accept-edits must not overwrite host yolo mode"
+        );
+        assert!(
+            !saw_permission_card,
+            "full-auto must auto-approve session/request_permission without surfacing a UI card"
+        );
+
+        let mut written = String::new();
+        for _ in 0..40 {
+            written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+            if written.contains("allow_always_id") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            written.contains(r#""modeId":"accept-edits""#),
+            "SetMode(yolo) must write wire mode accept-edits, got: {written}"
+        );
+        assert!(
+            written.contains(r#""id":900"#) && written.contains(r#""optionId":"allow_always_id""#),
+            "reverse-RPC permission must be auto-approved with allow_always_id, got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dialect_prompt_steering_replays_live_agy_acp_midturn_steer_and_rejects_idle() {
+        use crate::backend::CommandMeta;
+        use crate::event::{MessageLifecyclePhase, StopReason, TurnOutcome};
+
+        let dialect = AcpDialectOptions {
+            supports_prompt_steering: true,
+            ..AcpDialectOptions::default()
+        };
+        // Replays live `agy 1.5.8 acp` mid-turn steer (`acp-probe2-steer.ndjson`):
+        // - Send prompt #1 gets rpc id=1
+        // - Steer prompt #2 gets rpc id=2
+        // - Server settles id=1 with `stopReason:"end_turn"` + usage while id=2 is still pending
+        // - Server streams steered response `BANANA` and settles id=2 with `stopReason:"end_turn"`.
+        let seg_turn1_started = concat!(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"agy-steer","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"Working on step 1..."}}}}"#,
+            "\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let seg_steered_completion = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn","usage":{"inputTokens":120,"outputTokens":30,"totalTokens":150}}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"agy-steer","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"BANANA"}}}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn","usage":{"inputTokens":180,"outputTokens":12,"totalTokens":192}}}"#,
+            "\n",
+        )
+        .as_bytes()
+        .to_vec();
+
+        let fake =
+            FakeAgentIo::never_exits(Vec::new()).with_gated_segments(vec![seg_turn1_started, seg_steered_completion]);
+        let captured = fake.captured_stdin();
+        let release_next = fake.segment_releaser();
+        let backend = AcpSessionBackend::build_with_io_and_dialect(
+            "agy-steer-sess",
+            Box::new(fake),
+            dialect,
+            SessionConfig::default(),
+        )
+        .await;
+        backend.bind_for_test("agy-steer").await;
+        let mut events = backend.events();
+
+        // Idle Steer BEFORE any turn starts → must return "no active turn to steer"
+        // (conversation service race-fallback contract).
+        let idle_err = backend
+            .dispatch(Command::Steer {
+                content: vec![ContentBlock::Text("too early".into())],
+                client_msg_id: None,
+            })
+            .await
+            .expect_err("idle Steer must be rejected");
+        assert!(
+            matches!(&idle_err, BackendError::Transport(msg) if msg.contains("no active turn to steer")),
+            "expected 'no active turn to steer', got: {idle_err:?}"
+        );
+
+        // Start turn #1 (rpc id = 1, turn_gen = 1).
+        let send_receipt = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("Run step 1".into())],
+                metadata: CommandMeta {
+                    client_msg_id: Some("msg-1".into()),
+                    ..CommandMeta::default()
+                },
+            })
+            .await
+            .expect("Send accepted");
+        assert_eq!(send_receipt.turn_gen, 1);
+        release_next();
+
+        // Wait for ThoughtDelta from turn #1 so we know it is actively streaming.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(env) = events.next().await {
+                if matches!(env.event, SessionEvent::ThoughtDelta { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("ThoughtDelta arrives");
+
+        // Dispatch mid-turn Steer (rpc id = 2, same turn_gen = 1).
+        let steer_receipt = backend
+            .dispatch(Command::Steer {
+                content: vec![ContentBlock::Text("Stop and reply BANANA".into())],
+                client_msg_id: Some("steer-1".into()),
+            })
+            .await
+            .expect("mid-turn Steer accepted");
+        assert_eq!(steer_receipt.admission, Admission::NoTurn);
+        assert_eq!(steer_receipt.turn_gen, 1);
+
+        // Release prompt #1 settlement + steered `BANANA` + prompt #2 settlement.
+        release_next();
+
+        let mut turn_results = Vec::new();
+        let mut saw_lifecycle_completed = false;
+        let mut saw_banana = false;
+        let mut usage_events = 0usize;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(env) = events.next().await {
+                assert_eq!(env.turn_gen, 1, "all steered events stay on turn_gen 1");
+                match env.event {
+                    SessionEvent::MessageLifecycle {
+                        client_msg_id,
+                        phase: MessageLifecyclePhase::Completed,
+                    } if client_msg_id == "steer-1" => {
+                        saw_lifecycle_completed = true;
+                    }
+                    SessionEvent::UsageDelta { .. } => {
+                        usage_events += 1;
+                    }
+                    SessionEvent::MessageDelta { text, .. } if text == "BANANA" => {
+                        saw_banana = true;
+                    }
+                    SessionEvent::TurnResult { outcome, .. } => {
+                        turn_results.push(outcome);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("steered TurnResult arrives");
+
+        assert!(saw_lifecycle_completed, "Steer must emit MessageLifecycle::Completed");
+        assert!(saw_banana, "steered assistant delta BANANA must arrive");
+        assert_eq!(
+            usage_events, 2,
+            "both superseded prompt #1 and final prompt #2 usage deltas are preserved"
+        );
+        assert_eq!(
+            turn_results,
+            vec![TurnOutcome::Completed {
+                stop_reason: StopReason::EndTurn
+            }],
+            "superseded prompt #1 must NOT emit a premature TurnResult"
+        );
+
+        // Post-turn Steer AFTER prompt #2 settled → must again return "no active turn to steer".
+        let post_err = backend
+            .dispatch(Command::Steer {
+                content: vec![ContentBlock::Text("too late".into())],
+                client_msg_id: None,
+            })
+            .await
+            .expect_err("post-turn Steer must be rejected");
+        assert!(
+            matches!(&post_err, BackendError::Transport(msg) if msg.contains("no active turn to steer")),
+            "expected 'no active turn to steer', got: {post_err:?}"
+        );
+
+        let written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+        assert_eq!(
+            written.matches(r#""method":"session/prompt""#).count(),
+            2,
+            "both initial Send and mid-turn Steer write session/prompt frames, got: {written}"
         );
     }
 }
