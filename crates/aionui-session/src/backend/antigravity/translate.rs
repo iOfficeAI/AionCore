@@ -4,11 +4,173 @@
 //! counting across a `--conversation` resume, so `step-<index>` is a stable
 //! id for pairing a tool's ACTIVE and DONE frames.
 
-use super::CODE_STEPS_FAILED;
+use std::collections::HashSet;
+use std::time::Duration;
+
 use super::wire::{AgyEvent, AgyState, AgyStepType, AgyStepUpdate, AgySubagent, AgyUsage};
+use super::{
+    CODE_COMPACTED, CODE_COMPACTING, CODE_STEPS_FAILED, CODE_THINKING, CODE_THOUGHT_COMPLETE, STATUS_NOTICE_KEY,
+};
 use crate::event::{
     CancelReason, LocalizedText, NoticeLevel, SessionEvent, ToolResultContent, TurnOutcome, UsageBreakdown,
 };
+
+/// Empirical context token ceiling at which `agy` triggers automatic
+/// conversation compaction (`checkpoint` step).
+///
+/// Verified against `agy` session transcripts (`~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl`):
+/// - Gemini models (`gemini-*`, default): `CHECKPOINT` steps fire when single-call
+///   context (`input_tokens + cache_read_tokens`) reaches ~256k tokens
+///   (measured across Gemini Carbon/Argon compactions at 255,518–259,379 tokens).
+/// - Claude models (`claude-*`): 200k context window compacts at ~90% occupancy
+///   (~180,000 tokens).
+pub(crate) fn compaction_threshold_tokens(model: Option<&str>) -> u64 {
+    match model.map(|m| m.trim().to_ascii_lowercase()) {
+        Some(m) if m.starts_with("claude") => 180_000,
+        _ => 256_000,
+    }
+}
+
+/// Whether `context_tokens` is within 90% of the model's empirical compaction
+/// ceiling (`>= 162,000` on Claude, `>= 230,400` on Gemini/default).
+///
+/// `agy` emits NO `checkpoint` `ACTIVE` frame when auto-compaction begins —
+/// stdout stays completely silent for 15–78s until `checkpoint` `DONE` lands.
+/// Above this line, a silent wait may be an in-flight auto-compaction rather
+/// than ordinary reasoning, so the status hint says so honestly.
+pub(crate) fn is_near_compaction_threshold(context_tokens: u64, model: Option<&str>) -> bool {
+    let threshold = compaction_threshold_tokens(model);
+    context_tokens >= (threshold * 9) / 10
+}
+
+pub(crate) fn compacting_notice(elapsed_secs: Option<u64>) -> SessionEvent {
+    let (message, localized) = match elapsed_secs {
+        Some(secs) => (
+            format!("Compacting conversation context… ({secs}s)"),
+            LocalizedText::new(CODE_COMPACTING).with("elapsed_seconds", secs),
+        ),
+        None => (
+            "Compacting conversation context…".to_owned(),
+            LocalizedText::new(CODE_COMPACTING),
+        ),
+    };
+    SessionEvent::Notice {
+        level: NoticeLevel::Info,
+        message,
+        localized: Some(localized),
+        supersedes_key: Some(STATUS_NOTICE_KEY.to_owned()),
+    }
+}
+
+pub(crate) fn compacted_notice(duration_seconds: Option<f64>) -> SessionEvent {
+    let valid_duration = duration_seconds.filter(|d| d.is_finite() && *d >= 0.0);
+    let (message, localized) = match valid_duration {
+        Some(secs) => {
+            let rounded = (secs * 10.0).round() / 10.0;
+            (
+                format!("Conversation context compacted ({secs:.1}s)."),
+                LocalizedText::new(CODE_COMPACTED).with("duration_seconds", rounded),
+            )
+        }
+        None => (
+            "Conversation context compacted.".to_owned(),
+            LocalizedText::new(CODE_COMPACTED),
+        ),
+    };
+    SessionEvent::Notice {
+        level: NoticeLevel::Info,
+        message,
+        localized: Some(localized),
+        supersedes_key: Some(STATUS_NOTICE_KEY.to_owned()),
+    }
+}
+
+/// Build the live status notice for a silent model-wait tick, returning
+/// `(notice, is_compaction_hint)`.
+pub(crate) fn thinking_or_compacting_notice(
+    elapsed_secs: u64,
+    context_tokens: u64,
+    model: Option<&str>,
+) -> (SessionEvent, bool) {
+    if is_near_compaction_threshold(context_tokens, model) {
+        let approx_k = context_tokens.saturating_add(500) / 1_000;
+        let threshold = compaction_threshold_tokens(model);
+        let localized = LocalizedText::new(CODE_COMPACTING)
+            .with("elapsed_seconds", elapsed_secs)
+            .with("context_tokens", context_tokens)
+            .with("threshold_tokens", threshold);
+        return (
+            SessionEvent::Notice {
+                level: NoticeLevel::Info,
+                message: format!(
+                    "Antigravity is thinking or compacting long context (~{approx_k}k tokens, {elapsed_secs}s)…"
+                ),
+                localized: Some(localized),
+                supersedes_key: Some(STATUS_NOTICE_KEY.to_owned()),
+            },
+            true,
+        );
+    }
+
+    (
+        SessionEvent::Notice {
+            level: NoticeLevel::Info,
+            message: format!("Antigravity is thinking… ({elapsed_secs}s)"),
+            localized: Some(LocalizedText::new(CODE_THINKING).with("elapsed_seconds", elapsed_secs)),
+            supersedes_key: Some(STATUS_NOTICE_KEY.to_owned()),
+        },
+        false,
+    )
+}
+
+/// Settle an already-visible thinking banner into past tense so neither the
+/// live view nor reloaded SQLite history retains a frozen `"is thinking…"` card.
+pub(crate) fn settled_thinking_notice(
+    fallback_elapsed: Duration,
+    wire_duration_secs: Option<f64>,
+    thinking_tokens: u64,
+) -> SessionEvent {
+    let secs = wire_duration_secs
+        .filter(|d| d.is_finite() && *d >= 0.0)
+        .unwrap_or(fallback_elapsed.as_secs_f64());
+    let rounded = (secs * 10.0).round() / 10.0;
+    let (message, localized) = if thinking_tokens > 0 {
+        (
+            format!("Thought for {secs:.1}s ({thinking_tokens} thinking tokens)."),
+            LocalizedText::new(CODE_THOUGHT_COMPLETE)
+                .with("duration_seconds", rounded)
+                .with("thinking_tokens", thinking_tokens),
+        )
+    } else {
+        (
+            format!("Thought for {secs:.1}s."),
+            LocalizedText::new(CODE_THOUGHT_COMPLETE).with("duration_seconds", rounded),
+        )
+    };
+    SessionEvent::Notice {
+        level: NoticeLevel::Info,
+        message,
+        localized: Some(localized),
+        supersedes_key: Some(STATUS_NOTICE_KEY.to_owned()),
+    }
+}
+
+/// Settle an open live status banner when a turn ends in cancel, error, or EOF.
+pub(crate) fn stopped_status_notice(was_compacting: bool, elapsed: Duration) -> SessionEvent {
+    let secs = elapsed.as_secs_f64();
+    let rounded = (secs * 10.0).round() / 10.0;
+    let message = if was_compacting {
+        format!("Stopped while compacting context ({secs:.1}s).")
+    } else {
+        format!("Stopped while thinking ({secs:.1}s).")
+    };
+    SessionEvent::Notice {
+        level: NoticeLevel::Info,
+        message,
+        localized: Some(LocalizedText::new(CODE_THOUGHT_COMPLETE).with("duration_seconds", rounded)),
+        supersedes_key: Some(STATUS_NOTICE_KEY.to_owned()),
+    }
+}
 
 /// Rewrite agy's terminal error into something the user can act on.
 ///
@@ -45,6 +207,24 @@ pub(crate) struct Translator {
     /// and its closing message claims the work is done. Counting these is the
     /// only way to notice, because the terminal frame carries no trace of them.
     failed_steps: u32,
+    /// True while a `/compact` command (`init.expanded_commands`) or an active
+    /// `checkpoint` step is in flight.
+    compaction_in_progress: bool,
+    /// True once a `checkpoint` `DONE` step completed in this turn.
+    compacted_this_turn: bool,
+    /// Step indices of currently running `tool` / `subagent` steps. While
+    /// non-empty, `agy` is waiting on external work rather than silent in an
+    /// LLM reasoning/compaction call.
+    active_foreground_steps: HashSet<u64>,
+    /// Thinking tokens reported on `agent_response` `DONE` frames in the
+    /// current model phase.
+    phase_thinking_tokens: u64,
+    /// Wall-clock duration reported on `agent_response` `DONE` frames in the
+    /// current model phase.
+    phase_duration_secs: Option<f64>,
+    /// Latest single-call context occupancy (`Some(0)` right after a compaction
+    /// invalidates the pre-compaction context size).
+    latest_context_tokens: Option<u64>,
 }
 
 impl Translator {
@@ -60,23 +240,59 @@ impl Translator {
         self.model_fallback
     }
 
+    pub(crate) fn is_compacting(&self) -> bool {
+        self.compaction_in_progress
+    }
+
+    pub(crate) fn has_active_foreground_step(&self) -> bool {
+        !self.active_foreground_steps.is_empty()
+    }
+
+    pub(crate) fn latest_context_tokens(&self) -> Option<u64> {
+        self.latest_context_tokens
+    }
+
+    pub(crate) fn take_phase_thinking_metrics(&mut self) -> (Option<f64>, u64) {
+        (
+            self.phase_duration_secs.take(),
+            std::mem::take(&mut self.phase_thinking_tokens),
+        )
+    }
+
     pub(crate) fn translate(&mut self, ev: AgyEvent) -> Vec<SessionEvent> {
         match ev {
             AgyEvent::Init(init) => {
                 if !init.conversation_id.is_empty() {
                     self.backend_session_id = Some(init.conversation_id.clone());
                 }
-                self.model_fallback = init.model.is_none();
+                // Verified live on `agy 1.5.3 -p "/compact"`: system slash-command
+                // expansions omit `init.model` even when no `--model` fallback happened.
+                self.model_fallback = init.model.is_none() && init.expanded_commands.is_empty();
                 self.current_model = init.model;
-                vec![SessionEvent::BackendBound {
+                self.compaction_in_progress = init
+                    .expanded_commands
+                    .iter()
+                    .any(|cmd| cmd.name.eq_ignore_ascii_case("compact"));
+                self.compacted_this_turn = false;
+                self.active_foreground_steps.clear();
+                self.phase_thinking_tokens = 0;
+                self.phase_duration_secs = None;
+                let mut out = Vec::with_capacity(2);
+                out.push(SessionEvent::BackendBound {
                     backend_session_id: self.backend_session_id.clone(),
-                }]
+                });
+                if self.compaction_in_progress {
+                    out.push(compacting_notice(None));
+                }
+                out
             }
             AgyEvent::StepUpdate(su) => self.translate_step(su),
             AgyEvent::Result(r) => {
                 if !r.conversation_id.is_empty() {
                     self.backend_session_id = Some(r.conversation_id);
                 }
+                self.compaction_in_progress = false;
+                self.active_foreground_steps.clear();
                 let is_error = !r.status.eq_ignore_ascii_case("SUCCESS");
                 let outcome = match r.status.to_ascii_uppercase().as_str() {
                     "SUCCESS" => TurnOutcome::EndTurn,
@@ -93,6 +309,9 @@ impl Translator {
                 };
                 let mut out = Vec::with_capacity(3);
                 if let Some(u) = r.usage {
+                    if self.latest_context_tokens.is_none() && !self.compacted_this_turn {
+                        self.latest_context_tokens = Some(context_occupancy_tokens(&u));
+                    }
                     out.push(usage_delta(&u));
                 }
                 // BEFORE the terminal, and it MUST stay there. `StreamRelay`
@@ -199,6 +418,17 @@ impl Translator {
 
         match su.step_type {
             AgyStepType::AgentResponse => {
+                if let Some(u) = su.usage.as_ref() {
+                    self.latest_context_tokens = Some(context_occupancy_tokens(u));
+                    if su.state == AgyState::Done {
+                        self.phase_thinking_tokens = self.phase_thinking_tokens.saturating_add(u.thinking_tokens);
+                    }
+                }
+                if su.state == AgyState::Done
+                    && let Some(d) = su.duration_seconds.filter(|d| d.is_finite() && *d >= 0.0)
+                {
+                    self.phase_duration_secs = Some(self.phase_duration_secs.unwrap_or(0.0) + d);
+                }
                 if let Some(text) = su.text_delta.filter(|t| !t.is_empty()) {
                     out.push(SessionEvent::MessageDelta { item_id: id, text });
                 }
@@ -216,14 +446,18 @@ impl Translator {
                     .unwrap_or_default();
                 let name = Self::display_tool_name(&raw_name, info.as_ref().and_then(|i| i.parameters.as_ref()));
                 match su.state {
-                    AgyState::Active => out.push(SessionEvent::ToolCall {
-                        tool_use_id: id,
-                        name,
-                        subagent: Default::default(),
-                        input: info.and_then(|i| i.parameters).unwrap_or(serde_json::Value::Null),
-                        parent_tool_use_id: None,
-                    }),
+                    AgyState::Active => {
+                        self.active_foreground_steps.insert(su.step_index);
+                        out.push(SessionEvent::ToolCall {
+                            tool_use_id: id,
+                            name,
+                            subagent: Default::default(),
+                            input: info.and_then(|i| i.parameters).unwrap_or(serde_json::Value::Null),
+                            parent_tool_use_id: None,
+                        });
+                    }
                     AgyState::Done => {
+                        self.active_foreground_steps.remove(&su.step_index);
                         let text = info.and_then(|i| i.output).unwrap_or_default();
                         out.push(SessionEvent::ToolResult {
                             tool_use_id: id,
@@ -237,6 +471,7 @@ impl Translator {
                         });
                     }
                     AgyState::Error => {
+                        self.active_foreground_steps.remove(&su.step_index);
                         let msg = info
                             .and_then(|i| i.error)
                             .map(|e| e.message)
@@ -251,8 +486,6 @@ impl Translator {
                     AgyState::Unknown => {}
                 }
             }
-            // Pure bookkeeping frames: agy echoes the user turn, checkpoints and
-            // system notices as steps. They carry no user-visible content.
             // A subagent dispatch is work the user should be able to watch. agy
             // pairs ACTIVE/DONE on one step index, so it maps onto the
             // tool-call shape the frontend already renders — no new surface.
@@ -263,25 +496,61 @@ impl Translator {
             AgyStepType::Subagent => {
                 let agents = su.subagent_info.map(|i| i.subagents).unwrap_or_default();
                 match su.state {
-                    AgyState::Active => out.push(SessionEvent::ToolCall {
-                        tool_use_id: id,
-                        name: subagent_display_name(&agents),
-                        subagent: Default::default(),
-                        input: subagent_input(&agents),
-                        parent_tool_use_id: None,
-                    }),
-                    AgyState::Done | AgyState::Error => out.push(SessionEvent::ToolResult {
-                        tool_use_id: id,
-                        is_error: su.state == AgyState::Error,
-                        content: Vec::new(),
-                        parent_tool_use_id: None,
-                    }),
+                    AgyState::Active => {
+                        self.active_foreground_steps.insert(su.step_index);
+                        out.push(SessionEvent::ToolCall {
+                            tool_use_id: id,
+                            name: subagent_display_name(&agents),
+                            subagent: Default::default(),
+                            input: subagent_input(&agents),
+                            parent_tool_use_id: None,
+                        });
+                    }
+                    AgyState::Done | AgyState::Error => {
+                        self.active_foreground_steps.remove(&su.step_index);
+                        out.push(SessionEvent::ToolResult {
+                            tool_use_id: id,
+                            is_error: su.state == AgyState::Error,
+                            content: Vec::new(),
+                            parent_tool_use_id: None,
+                        });
+                    }
                     // A state this build does not know is not evidence the
                     // dispatch started or finished; settling the card on it
                     // would report an outcome agy never sent.
                     AgyState::Unknown => {}
                 }
             }
+            // Context compaction (`checkpoint`). Verified live on `agy 1.5.3`
+            // (`-p "/compact" --conversation <id> --output-format stream-json`)
+            // and across `transcript.jsonl` `CHECKPOINT` records: `agy` emits
+            // `checkpoint` solely for conversation compaction, carrying
+            // `duration_seconds` and pre-compaction `usage` on `DONE`.
+            AgyStepType::Checkpoint => match su.state {
+                AgyState::Active => {
+                    if !self.compaction_in_progress {
+                        self.compaction_in_progress = true;
+                        out.push(compacting_notice(None));
+                    }
+                }
+                AgyState::Done => {
+                    self.compaction_in_progress = false;
+                    self.compacted_this_turn = true;
+                    // `su.usage` on a `checkpoint` step counts the PRE-compaction
+                    // prompt fed into the summarizer (`input_tokens: 9299, output_tokens: 335`
+                    // measured on `agy 1.5.3`). Resetting occupancy to 0 prevents the
+                    // next turn from mistaking the pre-compaction context size for the
+                    // freshly shrunk one (same invariant as `adapter/claude.rs` `compact_boundary`).
+                    self.latest_context_tokens = Some(0);
+                    self.phase_thinking_tokens = 0;
+                    self.phase_duration_secs = None;
+                    out.push(compacted_notice(su.duration_seconds));
+                }
+                AgyState::Error => {
+                    self.compaction_in_progress = false;
+                }
+                AgyState::Unknown => {}
+            },
             // Counted, not rendered: the frame carries no message, tool name or
             // cause (only `duration_seconds`), so there is nothing truthful to
             // put on screen per-step. The count is what makes the turn's
@@ -291,7 +560,9 @@ impl Translator {
                     self.failed_steps = self.failed_steps.saturating_add(1);
                 }
             }
-            AgyStepType::UserInput | AgyStepType::Checkpoint | AgyStepType::SystemMessage | AgyStepType::Unknown => {}
+            // Pure bookkeeping frames: agy echoes the user turn and system
+            // notices as steps with no user-facing payload.
+            AgyStepType::UserInput | AgyStepType::SystemMessage | AgyStepType::Unknown => {}
         }
 
         if let Some(u) = su.usage.as_ref() {
@@ -337,6 +608,14 @@ fn subagent_input(agents: &[AgySubagent]) -> serde_json::Value {
             })
             .collect(),
     )
+}
+
+fn context_occupancy_tokens(u: &AgyUsage) -> u64 {
+    let summed = u
+        .input_tokens
+        .saturating_add(u.cache_read_tokens)
+        .saturating_add(u.output_tokens);
+    u.total_tokens.max(summed)
 }
 
 fn usage_delta(u: &AgyUsage) -> SessionEvent {
@@ -679,7 +958,6 @@ mod tests {
     fn bookkeeping_steps_emit_nothing() {
         let (_, evs) = tr(&[
             r#"{"event":"step_update","step_update":{"step_index":0,"state":"DONE","step_type":"user_input"}}"#,
-            r#"{"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"checkpoint"}}"#,
             r#"{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"system_message"}}"#,
             r#"{"event":"step_update","step_update":{"step_index":9,"state":"DONE","step_type":"brand_new_thing"}}"#,
         ]);
@@ -810,5 +1088,134 @@ mod tests {
             })
             .expect("notice expected");
         assert!(msg.contains('1') && !msg.contains('2'), "counted twice: {msg}");
+    }
+
+    /// Exact NDJSON sequence captured from `agy 1.5.3 -p "/compact" --conversation <id> --output-format stream-json`
+    /// (note: `agy` omits `init.model` on system slash-command expansions).
+    const SLASH_COMPACT_TURN: &[&str] = &[
+        r#"{"event":"init","conversation_id":"286c2016-0000-0000-0000-000000000001","init":{"cwd":"/w","tools":["run_command"],"permission_mode":"always-proceed","expanded_commands":[{"name":"compact","type":"system"}]}}"#,
+        r#"{"event":"step_update","step_update":{"conversation_id":"286c2016-0000-0000-0000-000000000001","step_index":2,"state":"DONE","step_type":"user_input"}}"#,
+        r#"{"event":"step_update","step_update":{"conversation_id":"286c2016-0000-0000-0000-000000000001","step_index":3,"state":"DONE","step_type":"system_message","duration_seconds":0.0005519}}"#,
+        r#"{"event":"step_update","step_update":{"conversation_id":"286c2016-0000-0000-0000-000000000001","step_index":4,"state":"DONE","step_type":"checkpoint","duration_seconds":8.9457684,"usage":{"input_tokens":9299,"output_tokens":335,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":9634}}}"#,
+        r#"{"event":"result","result":{"conversation_id":"286c2016-0000-0000-0000-000000000001","status":"SUCCESS","response":"","duration_seconds":21.8283029,"num_turns":2,"usage":{"input_tokens":17474,"output_tokens":343,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":17817}}}"#,
+    ];
+
+    #[test]
+    fn slash_compact_turn_emits_compacting_then_superseding_compacted_notice() {
+        let (t, evs) = tr(SLASH_COMPACT_TURN);
+        assert!(!t.is_compacting(), "compaction flag must clear on checkpoint DONE");
+        assert!(
+            !t.model_fallback_detected(),
+            "expanded `/compact` omits init.model and must not warn of model fallback"
+        );
+        // Pre-compaction usage (`9634`) must NOT be retained as post-compaction occupancy.
+        assert_eq!(t.latest_context_tokens(), Some(0));
+        assert!(
+            !evs.iter().any(|e| matches!(e, SessionEvent::ThoughtDelta { .. })),
+            "must never synthesize ThoughtDelta: {evs:?}"
+        );
+
+        let notices: Vec<_> = evs
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Notice {
+                    level,
+                    message,
+                    localized,
+                    supersedes_key,
+                } => Some((level, message.as_str(), localized.as_ref(), supersedes_key.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 2, "expected start + completion notices: {notices:?}");
+        assert_eq!(*notices[0].0, NoticeLevel::Info);
+        assert_eq!(notices[0].2.map(|l| l.code.as_str()), Some(CODE_COMPACTING));
+        assert_eq!(notices[0].3, Some(STATUS_NOTICE_KEY));
+
+        assert_eq!(*notices[1].0, NoticeLevel::Info);
+        assert!(notices[1].1.contains("8.9s"), "unexpected body: {}", notices[1].1);
+        assert_eq!(notices[1].2.map(|l| l.code.as_str()), Some(CODE_COMPACTED));
+        assert_eq!(notices[1].3, Some(STATUS_NOTICE_KEY));
+
+        let compacted_at = evs
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    SessionEvent::Notice {
+                        localized: Some(l),
+                        ..
+                    } if l.code == CODE_COMPACTED
+                )
+            })
+            .expect("compacted notice");
+        let terminal_at = evs
+            .iter()
+            .position(|e| matches!(e, SessionEvent::TurnResult { .. }))
+            .expect("terminal");
+        assert!(compacted_at < terminal_at, "notice must precede TurnResult");
+    }
+
+    #[test]
+    fn checkpoint_without_duration_still_surfaces_compaction_completion() {
+        let (_, evs) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"checkpoint"}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"checkpoint"}}"#,
+        ]);
+        let codes: Vec<_> = evs
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Notice {
+                    localized: Some(l),
+                    message,
+                    ..
+                } => Some((l.code.as_str(), message.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                (CODE_COMPACTING, "Compacting conversation context…"),
+                (CODE_COMPACTED, "Conversation context compacted."),
+            ]
+        );
+    }
+
+    #[test]
+    fn compaction_thresholds_distinguish_claude_and_gemini_windows() {
+        assert_eq!(compaction_threshold_tokens(Some("claude-sonnet-4-6")), 180_000);
+        assert_eq!(compaction_threshold_tokens(Some("Claude-Opus-4-7")), 180_000);
+        assert_eq!(compaction_threshold_tokens(Some("gemini-4-carbon-high")), 256_000);
+        assert_eq!(compaction_threshold_tokens(None), 256_000);
+
+        // Claude 90% line = 162,000; Gemini 90% line = 230,400.
+        assert!(!is_near_compaction_threshold(161_999, Some("claude-sonnet-4-6")));
+        assert!(is_near_compaction_threshold(162_000, Some("claude-sonnet-4-6")));
+        assert!(!is_near_compaction_threshold(175_000, Some("gemini-4-carbon")));
+        assert!(!is_near_compaction_threshold(230_399, Some("gemini-4-carbon")));
+        assert!(is_near_compaction_threshold(230_400, Some("gemini-4-carbon")));
+    }
+
+    #[test]
+    fn active_foreground_step_tracks_tools_and_subagents_only() {
+        let mut t = Translator::default();
+        assert!(!t.has_active_foreground_step());
+
+        t.translate(
+            parse_line(
+                r#"{"event":"step_update","step_update":{"step_index":3,"state":"ACTIVE","step_type":"tool","tool_name":"run_command"}}"#,
+            )
+            .unwrap(),
+        );
+        assert!(t.has_active_foreground_step());
+
+        t.translate(
+            parse_line(
+                r#"{"event":"step_update","step_update":{"step_index":3,"state":"DONE","step_type":"tool","tool_name":"run_command"}}"#,
+            )
+            .unwrap(),
+        );
+        assert!(!t.has_active_foreground_step());
     }
 }
