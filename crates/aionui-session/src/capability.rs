@@ -259,16 +259,17 @@ pub struct SignalSet {
 /// `runtime_backend` string the conversation layer persists and the session
 /// factories dispatch on).
 ///
-/// The bit is a property of the backend TYPE, not of any live session: claude
-/// and codex are the direct-CLI backends whose mid-turn write genuinely reaches
-/// the agent; antigravity, aionrs, and every ACP agent are one-prompt-at-a-time.
+/// The bit is a property of the backend TYPE, not of any live session: claude,
+/// codex, and antigravity (`--input-format stream-json`, added in `agy 1.1.15`)
+/// are the direct-CLI backends whose mid-turn write genuinely reaches the
+/// running agent process; aionrs and generic ACP agents are one-prompt-at-a-time.
 /// Consumers use this when no live `SessionBackend` exists (fresh or dormant
 /// conversations) so the reported capability cannot flap with agent liveness.
 /// Unknown/empty identifiers are conservatively `false` (ACP-like until proven,
 /// same default as `Capabilities`). Locked against the real capability
 /// constructors by tests below and module-local asserts in each backend.
 pub fn backend_supports_midturn_delivery(backend: &str) -> bool {
-    matches!(backend, "claude" | "codex")
+    matches!(backend, "claude" | "codex" | "antigravity")
 }
 
 #[cfg(test)]
@@ -276,9 +277,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn midturn_delivery_is_opt_in_and_antigravity_is_excluded() {
+    fn midturn_delivery_is_opt_in_by_default() {
         // Default MUST be false: a new backend is ACP-like until proven otherwise.
         assert!(!Capabilities::default().supports_midturn_delivery);
+        assert!(backend_supports_midturn_delivery("antigravity"));
     }
 
     /// The static per-backend table must never drift from the bit the real
