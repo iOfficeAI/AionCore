@@ -356,6 +356,52 @@ async fn rename_moves_entry() {
     assert!(dir.path().join("renamed.txt").exists());
 }
 
+#[tokio::test]
+async fn rename_never_replaces_an_existing_target() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"mine").unwrap();
+    std::fs::write(dir.path().join("b.txt"), b"theirs").unwrap();
+    std::fs::create_dir(dir.path().join("d1")).unwrap();
+    std::fs::create_dir(dir.path().join("d2")).unwrap();
+
+    for (n, from, to) in [(13, "a.txt", "b.txt"), (14, "d1", "d2"), (15, "a.txt", "d2")] {
+        actor
+            .dispatch_frame(
+                "1",
+                "system_default_user",
+                request(n, "fs/rename", json!({"from":dir_ref(&pe, from),"to":dir_ref(&pe, to)})),
+            )
+            .await;
+        let reply = push.last_for("1").unwrap();
+        assert!(reply.get("result").is_none(), "{from} -> {to} must fail: {reply}");
+        assert_eq!(reply["error"]["code"], -32006);
+    }
+    assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"mine");
+    assert_eq!(std::fs::read(dir.path().join("b.txt")).unwrap(), b"theirs");
+    assert!(dir.path().join("d1").is_dir() && dir.path().join("d2").is_dir());
+}
+
+#[tokio::test]
+async fn rename_directory_and_case_only_rename_still_work() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::create_dir(dir.path().join("d1")).unwrap();
+    std::fs::write(dir.path().join("d1/inner.txt"), b"x").unwrap();
+    std::fs::write(dir.path().join("note.txt"), b"n").unwrap();
+
+    for (n, from, to) in [(16, "d1", "d2"), (17, "note.txt", "Note.txt")] {
+        actor
+            .dispatch_frame(
+                "1",
+                "system_default_user",
+                request(n, "fs/rename", json!({"from":dir_ref(&pe, from),"to":dir_ref(&pe, to)})),
+            )
+            .await;
+        assert!(push.last_for("1").unwrap()["result"].is_object(), "{from} -> {to}");
+    }
+    assert_eq!(std::fs::read(dir.path().join("d2/inner.txt")).unwrap(), b"x");
+    assert_eq!(std::fs::read(dir.path().join("Note.txt")).unwrap(), b"n");
+}
+
 // ══ fs/copy · fs/move (drag-transfer) ════════════════════════════════════════
 
 #[tokio::test]
