@@ -73,7 +73,8 @@ pub trait IFsProvider: Send + Sync {
     /// Remove a file or directory (recursive for directories when `recursive`).
     async fn remove(&self, uri: &str, recursive: bool) -> Result<(), FsError>;
 
-    /// Rename/move a file or directory.
+    /// Rename/move a file or directory. Never replaces an existing `to`:
+    /// that is `FsError::AlreadyExists`.
     async fn rename(&self, from: &str, to: &str) -> Result<(), FsError>;
 
     /// Copy a file or directory (recursive for directories when `recursive`).

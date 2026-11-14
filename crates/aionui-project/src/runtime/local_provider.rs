@@ -61,6 +61,46 @@ fn map_io(uri: &str, err: &io::Error) -> FsError {
     }
 }
 
+/// Rename `src` to `dst` without ever replacing an existing `dst`.
+///
+/// `std::fs::rename` (rename(2) / MoveFileEx with replace) silently replaces
+/// an existing file at the destination, so renaming onto a sibling's name
+/// would destroy it. Files are moved with a hard link, which fails atomically
+/// on an existing name and keeps the inode; directories (and filesystems
+/// without hard links) are checked first. A case-only rename on a
+/// case-insensitive filesystem (`a.txt` -> `A.txt`) names the same entry, so
+/// it is a plain rename.
+fn rename_no_replace(src: &Path, dst: &Path, from_uri: &str, to_uri: &str) -> Result<(), FsError> {
+    let src_meta = std::fs::symlink_metadata(src).map_err(|e| map_io(from_uri, &e))?;
+    match std::fs::symlink_metadata(dst) {
+        Ok(dst_meta) => {
+            let same_entry = !dst_meta.file_type().is_symlink()
+                && matches!(
+                    (std::fs::canonicalize(src), std::fs::canonicalize(dst)),
+                    (Ok(a), Ok(b)) if a == b
+                );
+            if !same_entry {
+                return Err(FsError::AlreadyExists { uri: to_uri.to_owned() });
+            }
+            return std::fs::rename(src, dst).map_err(|e| map_io(from_uri, &e));
+        }
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(map_io(to_uri, &e)),
+        Err(_) => {}
+    }
+    if !src_meta.is_dir() {
+        match std::fs::hard_link(src, dst) {
+            Ok(()) => return std::fs::remove_file(src).map_err(|e| map_io(from_uri, &e)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(FsError::AlreadyExists { uri: to_uri.to_owned() });
+            }
+            // No hard links on this filesystem (or across devices): the
+            // existence check above is the guard.
+            Err(_) => {}
+        }
+    }
+    std::fs::rename(src, dst).map_err(|e| map_io(from_uri, &e))
+}
+
 /// Inode of a file's metadata (0 on platforms without a stable inode).
 #[cfg(unix)]
 fn inode_of(meta: &std::fs::Metadata) -> u64 {
@@ -224,7 +264,13 @@ impl IFsProvider for LocalFsProvider {
 
     async fn rename(&self, from: &str, to: &str) -> Result<(), FsError> {
         let (src, dst) = (path_of(from)?, path_of(to)?);
-        tokio::fs::rename(&src, &dst).await.map_err(|e| map_io(from, &e))
+        let (from_uri, to_uri) = (from.to_owned(), to.to_owned());
+        tokio::task::spawn_blocking(move || rename_no_replace(&src, &dst, &from_uri, &to_uri))
+            .await
+            .map_err(|e| FsError::Io {
+                uri: from.to_owned(),
+                message: format!("rename task failed: {e}"),
+            })?
     }
 
     async fn copy(&self, from: &str, to: &str, recursive: bool) -> Result<(), FsError> {
