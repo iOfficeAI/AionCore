@@ -21,15 +21,21 @@ mod rehydrate;
 mod suspend;
 mod types;
 
-pub use acp_conn::{AcpConnection, AcpSessionBackend, acp_capabilities};
+pub use acp_conn::{
+    AcpConnection, AcpDialectOptions, AcpSessionBackend, acp_capabilities, acp_capabilities_for_dialect,
+};
 // Shared plan-status normalizer: the claude adapter's TodoWrite translation
 // reuses it rather than adding a third copy of the same match.
 pub(crate) use acp_conn::map_plan_status;
-pub use antigravity::{AntigravityConnection, AntigravitySessionBackend, antigravity_capabilities};
+pub use antigravity::{
+    AntigravityConnection, AntigravitySessionBackend, antigravity_acp_capabilities, antigravity_acp_connection,
+    antigravity_acp_dialect, antigravity_capabilities, build_antigravity_acp_argv, prepare_antigravity_spawn_env,
+};
 pub use claude_conn::{ClaudeConnection, ClaudeSessionBackend};
 pub use cli_version::{
-    VERIFIED_AGY_VERSION, VERIFIED_CLAUDE_VERSION, VERIFIED_CODEX_VERSION, VersionDrift, VersionVerdict,
-    classify as classify_cli_version, parse_version as parse_cli_version, version_drift,
+    MIN_AGY_ACP_VERSION, VERIFIED_AGY_VERSION, VERIFIED_CLAUDE_VERSION, VERIFIED_CODEX_VERSION, VersionDrift,
+    VersionVerdict, classify as classify_cli_version, parse_version as parse_cli_version, probe_cli_version,
+    supports_agy_acp, version_drift,
 };
 pub use codex_conn::{
     CodexConnection, CodexSessionBackend, codex_capabilities, codex_shell_environment_policy_args, slash_command_name,

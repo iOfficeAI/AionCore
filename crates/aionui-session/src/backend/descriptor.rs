@@ -113,7 +113,12 @@ const BACKEND_CAPABILITY_DESCRIPTORS: &[BackendCapabilityDescriptor] = &[
         cli_fallback: true,
         verified_version: VERIFIED_AGY_VERSION,
         origin: CapabilityOrigin::DirectDescriptor,
-        prompt: None,
+        // Verified live on `agy 1.5.8 acp` `initialize` response:
+        // `agentCapabilities.promptCapabilities: { image: true, audio: false, embeddedContext: true }`.
+        prompt: Some(PromptCapabilities {
+            image: true,
+            audio: false,
+        }),
         fork: None,
     },
     BackendCapabilityDescriptor {
@@ -313,5 +318,12 @@ mod tests {
         assert_eq!(effective["mcp_capabilities"]["http"], true);
         assert_eq!(effective["unrelated"]["kept"], true);
         assert_eq!(effective["session_capabilities"]["fork"]["at_turn"], true);
+    }
+
+    #[test]
+    fn antigravity_projects_image_prompt_capability_for_agy_acp() {
+        let effective = effective_agent_capabilities("antigravity", None).unwrap();
+        assert_eq!(effective["prompt_capabilities"]["image"], true);
+        assert_eq!(effective["prompt_capabilities"]["audio"], false);
     }
 }

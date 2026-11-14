@@ -4428,7 +4428,7 @@ async fn runtime_summary_reports_backend_static_midturn_bit_without_live_agent()
     for (backend, expected) in [
         ("claude", true),
         ("codex", true),
-        ("antigravity", false),
+        ("antigravity", true),
         ("gemini", false),
     ] {
         let conv = svc

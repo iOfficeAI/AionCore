@@ -1,9 +1,14 @@
 //! Factory branch for Antigravity (`agy` CLI) sessions.
 //!
-//! Antigravity is a direct-CLI backend that does NOT speak ACP, so it does not
-//! go through `factory::acp` (nor through `session_agent::build_session_instance`,
-//! which carries claude/codex-private assembly). It assembles here and hands the
-//! opened backend to the generic `SessionAgentTask`.
+//! Keeps `AgentType::Antigravity` (`conversations.type = 'antigravity'`) intact while
+//! selecting the best transport for the installed `agy` binary:
+//! - `agy >= 1.5.1` (default): native `agy acp` stdio server via `AcpConnection`,
+//!   delivering JSON-RPC `session/request_permission` approvals (zero `.agents/hooks.json`
+//!   workspace pollution), `session/resume` without history replay, `thought_level`,
+//!   multimodal image blocks, and mid-turn `session/prompt` steering.
+//! - `agy < 1.5.1` (or `AIONUI_ANTIGRAVITY_LEGACY_CLI=1`): falls back cleanly to the
+//!   direct-CLI `AntigravityConnection` (`agy -p --output-format stream-json`) +
+//!   `.agents/hooks.json` bridge.
 
 use std::sync::Arc;
 
@@ -12,6 +17,22 @@ use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
 use crate::session_context::AntigravitySessionBuildContext;
+
+const ENV_ANTIGRAVITY_LEGACY_CLI: &str = "AIONUI_ANTIGRAVITY_LEGACY_CLI";
+
+fn legacy_override_enabled(raw: Option<&str>) -> bool {
+    raw.map(str::trim)
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+/// Pure version-gate predicate: use `agy acp` iff the legacy override env is off
+/// and the probed `agy --version` satisfies `>= 1.5.1`.
+fn should_use_agy_acp(legacy_override: Option<&str>, reported_version: Option<&str>) -> bool {
+    if legacy_override_enabled(legacy_override) {
+        return false;
+    }
+    reported_version.is_some_and(aionui_session::supports_agy_acp)
+}
 
 /// The mode id that means "run without asking" for this agent.
 ///
@@ -64,61 +85,81 @@ pub(super) async fn build(
     let resolved_mode =
         crate::session_agent::resolved_session_mode(&config, build_context.session_snapshot.as_ref(), &meta);
     let full_auto = is_full_auto(resolved_mode.as_deref(), yolo_mode_id(meta.yolo_id.as_deref()));
-    let hook_env = match deps.antigravity_hook_base_url.as_deref() {
-        _ if full_auto => {
-            tracing::info!(
-                conversation_id = %ctx.conversation_id,
-                "antigravity: full-auto mode — tools execute without per-call approval"
-            );
-            // Drop any hook an earlier non-full-auto build left in this
-            // workspace, and revoke its token, or agy would keep calling back
-            // and block on approval nobody is there to give.
-            crate::antigravity_hook::remove_hooks_json(std::path::Path::new(&ctx.workspace));
-            deps.antigravity_hook_tokens.revoke(&ctx.conversation_id);
-            Vec::new()
-        }
-        Some(base_url) => {
-            let hook_binary = deps.backend_binary_path.as_path();
-            crate::antigravity_hook::write_hooks_json(std::path::Path::new(&ctx.workspace), hook_binary).map_err(
-                |e| {
-                    AgentError::internal(format!(
-                        "antigravity: could not register the permission hook in {}: {e}",
-                        ctx.workspace
-                    ))
-                },
-            )?;
-            // Minting here also invalidates any token left over from a prior
-            // build of this conversation, so a stale hook cannot answer for the
-            // new session.
-            let token = deps.antigravity_hook_tokens.issue(&ctx.conversation_id);
-            vec![
-                (
-                    aionui_api_types::AntigravityHookConfig::ENV_BASE_URL.to_owned(),
-                    base_url.to_owned(),
-                ),
-                (aionui_api_types::AntigravityHookConfig::ENV_TOKEN.to_owned(), token),
-                (
-                    aionui_api_types::AntigravityHookConfig::ENV_CONVERSATION_ID.to_owned(),
-                    ctx.conversation_id.clone(),
-                ),
-            ]
-        }
-        None => {
-            tracing::warn!(
-                conversation_id = %ctx.conversation_id,
-                "antigravity: no hook callback address configured — tools will run WITHOUT per-call approval"
-            );
-            Vec::new()
-        }
-    };
 
-    // Prepared in every branch: full auto does not install it now, but the user
-    // may switch out of full auto later and the backend needs it to restore the
-    // gate.
-    let permission_hook_body = deps
-        .antigravity_hook_base_url
-        .as_deref()
-        .map(|_| crate::antigravity_hook::hooks_json_body(deps.backend_binary_path.as_path()));
+    let legacy_override = std::env::var(ENV_ANTIGRAVITY_LEGACY_CLI).ok();
+    let agy_program = crate::session_agent::resolve_session_cli_program("agy", &meta)
+        .unwrap_or_else(|| std::path::PathBuf::from("agy"));
+    let reported_version = if legacy_override_enabled(legacy_override.as_deref()) {
+        None
+    } else {
+        aionui_session::probe_cli_version(&deps.session_spawner, &agy_program, &ctx.conversation_id).await
+    };
+    let use_acp = should_use_agy_acp(legacy_override.as_deref(), reported_version.as_deref());
+
+    let (hook_env, permission_hook_body) = if use_acp {
+        // `agy acp` handles tool approvals natively over JSON-RPC `session/request_permission`
+        // (and auto-approves in `yolo` mode). Clean up any stale `.agents/hooks.json` left by
+        // an older direct-CLI session in this workspace so `agy` does not invoke dead HTTP hooks.
+        crate::antigravity_hook::remove_hooks_json(std::path::Path::new(&ctx.workspace));
+        deps.antigravity_hook_tokens.revoke(&ctx.conversation_id);
+        (Vec::new(), None)
+    } else {
+        let hook_env = match deps.antigravity_hook_base_url.as_deref() {
+            _ if full_auto => {
+                tracing::info!(
+                    conversation_id = %ctx.conversation_id,
+                    "antigravity: full-auto mode — tools execute without per-call approval"
+                );
+                // Drop any hook an earlier non-full-auto build left in this
+                // workspace, and revoke its token, or agy would keep calling back
+                // and block on approval nobody is there to give.
+                crate::antigravity_hook::remove_hooks_json(std::path::Path::new(&ctx.workspace));
+                deps.antigravity_hook_tokens.revoke(&ctx.conversation_id);
+                Vec::new()
+            }
+            Some(base_url) => {
+                let hook_binary = deps.backend_binary_path.as_path();
+                crate::antigravity_hook::write_hooks_json(std::path::Path::new(&ctx.workspace), hook_binary).map_err(
+                    |e| {
+                        AgentError::internal(format!(
+                            "antigravity: could not register the permission hook in {}: {e}",
+                            ctx.workspace
+                        ))
+                    },
+                )?;
+                // Minting here also invalidates any token left over from a prior
+                // build of this conversation, so a stale hook cannot answer for the
+                // new session.
+                let token = deps.antigravity_hook_tokens.issue(&ctx.conversation_id);
+                vec![
+                    (
+                        aionui_api_types::AntigravityHookConfig::ENV_BASE_URL.to_owned(),
+                        base_url.to_owned(),
+                    ),
+                    (aionui_api_types::AntigravityHookConfig::ENV_TOKEN.to_owned(), token),
+                    (
+                        aionui_api_types::AntigravityHookConfig::ENV_CONVERSATION_ID.to_owned(),
+                        ctx.conversation_id.clone(),
+                    ),
+                ]
+            }
+            None => {
+                tracing::warn!(
+                    conversation_id = %ctx.conversation_id,
+                    "antigravity: no hook callback address configured — tools will run WITHOUT per-call approval"
+                );
+                Vec::new()
+            }
+        };
+
+        // Prepared in every legacy branch: full auto does not install it now, but the user
+        // may switch out of full auto later and the backend needs it to restore the gate.
+        let permission_hook_body = deps
+            .antigravity_hook_base_url
+            .as_deref()
+            .map(|_| crate::antigravity_hook::hooks_json_body(deps.backend_binary_path.as_path()));
+        (hook_env, permission_hook_body)
+    };
 
     let mut runtime_env = ctx.runtime_env.clone();
     runtime_env.extend(hook_env);
@@ -132,7 +173,7 @@ pub(super) async fn build(
     )
     .await;
     // agy has no prompt pipeline, so compose the rules block here and let the
-    // backend prepend it to the first `-p` invocation.
+    // backend prepend it to the first turn.
     delivery.injected_prefix = crate::factory::compose_injected_prefix_for(
         deps.as_ref(),
         &ctx.user_id,
@@ -142,7 +183,7 @@ pub(super) async fn build(
     )
     .await;
 
-    let instance = crate::session_agent::build_antigravity_instance(
+    let instance = crate::session_agent::build_antigravity_instance_with_transport(
         crate::session_agent::SessionBuildInputs {
             conversation_id: ctx.conversation_id.clone(),
             user_id: ctx.user_id.clone(),
@@ -164,19 +205,23 @@ pub(super) async fn build(
             permission_hook_body,
         },
         deps.session_spawner.clone(),
+        use_acp,
+        full_auto,
     )
     .await?;
 
     tracing::info!(
         conversation_id = %ctx.conversation_id,
-        "antigravity: routing conversation through the direct-CLI SessionAgentTask"
+        transport = if use_acp { "agy-acp" } else { "direct-cli" },
+        reported_version = reported_version.as_deref().unwrap_or("unknown"),
+        "antigravity: routing conversation through SessionAgentTask"
     );
     Ok(instance)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_full_auto, yolo_mode_id};
+    use super::{is_full_auto, should_use_agy_acp, yolo_mode_id};
 
     #[test]
     fn the_catalog_sentinel_turns_off_the_approval_hook() {
@@ -207,5 +252,21 @@ mod tests {
         // The id is data, not a constant: honour whatever the row declares.
         assert!(is_full_auto(Some("full-access"), yolo_mode_id(Some("full-access"))));
         assert!(!is_full_auto(Some("yolo"), yolo_mode_id(Some("full-access"))));
+    }
+
+    #[test]
+    fn agy_acp_version_gate_requires_1_5_1_and_honours_legacy_override() {
+        assert!(should_use_agy_acp(None, Some("agy 1.5.8")));
+        assert!(should_use_agy_acp(Some(""), Some("agy 1.5.1")));
+        assert!(should_use_agy_acp(Some("0"), Some("1.6.0")));
+        assert!(!should_use_agy_acp(None, Some("agy 1.5.0")));
+        assert!(!should_use_agy_acp(None, Some("agy 1.1.15")));
+        assert!(!should_use_agy_acp(None, None));
+        for truthy in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(
+                !should_use_agy_acp(Some(truthy), Some("agy 1.5.8")),
+                "legacy override {truthy:?} must force direct-CLI fallback"
+            );
+        }
     }
 }

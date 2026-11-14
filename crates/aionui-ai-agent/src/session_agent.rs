@@ -1755,6 +1755,18 @@ pub async fn build_antigravity_instance(
     inputs: SessionBuildInputs<'_>,
     spawner: Arc<dyn aionui_process::Spawner>,
 ) -> Result<crate::agent_task::AgentInstance, AgentError> {
+    build_antigravity_instance_with_transport(inputs, spawner, false, false).await
+}
+
+/// Build an Antigravity (`agy` CLI) `SessionAgentTask` using either the native
+/// `agy acp` stdio server (`use_acp = true`, `agy >= 1.5.1`) or the legacy
+/// direct-CLI `AntigravityConnection` fallback (`use_acp = false`).
+pub async fn build_antigravity_instance_with_transport(
+    inputs: SessionBuildInputs<'_>,
+    spawner: Arc<dyn aionui_process::Spawner>,
+    use_acp: bool,
+    full_auto: bool,
+) -> Result<crate::agent_task::AgentInstance, AgentError> {
     use aionui_session::{AntigravityConnection, BackendConnection, McpServerSpec, SessionConfig, SessionInit};
 
     let SessionBuildInputs {
@@ -1778,6 +1790,7 @@ pub async fn build_antigravity_instance(
     } = inputs;
 
     let (spec, mode, model) = spec_mode_model(&conversation_id, backend_session_id, config, session_snapshot, metadata);
+    let persisted_effort = resolved_effort(config, session_snapshot);
 
     // Same MCP init surface and ordering as the claude/codex path: user servers
     // resolved from the repo, plus the inline snapshot, with the team
@@ -1823,24 +1836,34 @@ pub async fn build_antigravity_instance(
         resume: matches!(spec, aionui_session::SessionSpec::Resume { .. }),
     };
 
+    let cli_program = resolve_session_cli_program("agy", metadata);
     let mut session_config = SessionConfig {
         cwd: Some(workspace.clone()),
         model,
         mode,
         init,
         permission_hook_body,
-        // agy is NOT shipped with the app: it is a large native binary the user
-        // installs themselves, so there is no bundled path to resolve and the
-        // backend always spawns the `agy` on PATH.
-        cli_program: None,
+        cli_program: cli_program.clone(),
         // agy is layer 2, so this carries only the allow-list entries (one
         // `--add-dir` per enabled skill) and never a plugin flag.
         extra_args: skill_delivery.plan.extra_args.clone(),
         ..Default::default()
     };
     session_config.spawn_env = assemble_spawn_env(&metadata.env, runtime_env);
+    aionui_session::prepare_antigravity_spawn_env(&mut session_config.spawn_env, session_config.cwd.as_deref());
 
-    let backend = AntigravityConnection::new(spawner)
+    let connection: Box<dyn BackendConnection> = if use_acp {
+        Box::new(aionui_session::antigravity_acp_connection(
+            spawner,
+            cli_program,
+            Some(&workspace),
+            full_auto,
+        ))
+    } else {
+        Box::new(AntigravityConnection::new(spawner))
+    };
+
+    let backend = connection
         .open_session(spec, session_config)
         .await
         .map_err(|e| match e {
@@ -1849,6 +1872,30 @@ pub async fn build_antigravity_instance(
             }
             e => AgentError::bad_gateway(format!("open antigravity session: {e}")),
         })?;
+
+    // When running `agy acp`, re-apply persisted/requested `thought_level` best-effort
+    // asynchronously once the `session/new` / `session/resume` response populates
+    // `discovered.config_options` (without blocking session open on handshake latency).
+    if use_acp && let Some(effort) = persisted_effort {
+        let effort_backend = backend.clone();
+        let conv_id = conversation_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = effort_backend
+                .dispatch(Command::SetConfigOption {
+                    option_id: EFFORT_CONFIG_KEY.to_owned(),
+                    value: effort.clone(),
+                })
+                .await
+            {
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    effort = %effort,
+                    error = %e,
+                    "antigravity-acp: re-applying persisted thought_level failed (session usable)"
+                );
+            }
+        });
+    }
 
     if let Some((agent_id, catalog_tx)) = catalog_writeback {
         spawn_catalog_writeback(agent_id, user_id.clone(), backend.clone(), catalog_tx);
@@ -2180,7 +2227,7 @@ pub async fn build_session_instance(
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
 }
 
-fn resolve_session_cli_program(
+pub(crate) fn resolve_session_cli_program(
     backend_label: &str,
     metadata: &aionui_api_types::AgentMetadata,
 ) -> Option<std::path::PathBuf> {
