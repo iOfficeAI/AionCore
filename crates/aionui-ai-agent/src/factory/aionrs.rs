@@ -470,7 +470,14 @@ fn uses_openai_responses_api(platform: &str, mapped_provider: &str, model_id: &s
     }
 
     let model = model_id.to_ascii_lowercase();
-    model == "gpt-5.6" || model.starts_with("gpt-5.6-")
+    // GPT-6.1 rejects function tools with reasoning_effort on Chat Completions.
+    // Match family boundaries rather than unrelated names such as gpt-6.10.
+    ["gpt-5.6", "gpt-6.1"].iter().any(|family| {
+        model == *family
+            || model
+                .strip_prefix(*family)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+    })
 }
 
 fn rewrite_openai_api_url(url: &str, mode: OpenAiApiMode) -> Option<String> {
@@ -1322,11 +1329,15 @@ mod tests {
     }
 
     #[test]
-    fn openai_protocol_gpt_5_6_family_uses_responses() {
+    fn openai_protocol_supported_gpt_families_use_responses() {
         let cases = [
             ("openai", "https://api.openai.com/v1", "gpt-5.6"),
             ("custom", "https://api.openai.com/v1", "gpt-5.6-sol"),
             ("new-api", "https://proxy.example.com/v1", "GPT-5.6-SOL-2026-07-01"),
+            ("openai", "https://api.openai.com/v1", "gpt-6.1"),
+            ("openai", "https://api.openai.com/v1", "gpt-6.1-sol"),
+            ("custom", "https://proxy.example.com/v1", "gpt-6.1-terra"),
+            ("new-api", "https://proxy.example.com/v1", "GPT-6.1-SOL-2026-11-01"),
         ];
 
         for (platform, raw_base_url, model_id) in cases {
@@ -1344,6 +1355,11 @@ mod tests {
             ("gemini", "openai", "gpt-5.6-sol", false),
             ("bedrock", "bedrock", "openai.gpt-5.6-sol", false),
             ("openai", "openai", "gpt-5.60-sol", false),
+            ("gemini", "openai", "gpt-6.1-sol", false),
+            ("bedrock", "bedrock", "openai.gpt-6.1-sol", false),
+            ("openai", "openai", "gpt-6.10-sol", false),
+            ("openai", "openai", "gpt-6.1sol", false),
+            ("openai", "openai", "gpt-4o", false),
         ];
 
         for (platform, provider, model_id, is_full_url) in cases {
@@ -1360,18 +1376,27 @@ mod tests {
     }
 
     #[test]
-    fn openai_protocol_gpt_5_6_full_url_is_rewritten_to_responses() {
-        for raw_base_url in [
-            "https://api.openai.com/v1/chat/completions",
-            "https://proxy.example.com/v1/chat/completions/",
-            "https://api.openai.com/v1/responses",
-        ] {
-            let (base_url, compat) =
-                resolve_aionrs_url_and_compat("custom", raw_base_url, "openai", "gpt-5.6-sol", true);
+    fn openai_protocol_supported_gpt_full_url_is_rewritten_to_responses() {
+        for model_id in ["gpt-5.6-sol", "gpt-6.1-sol"] {
+            for raw_base_url in [
+                "https://api.openai.com/v1/chat/completions",
+                "https://proxy.example.com/v1/chat/completions/",
+                "https://api.openai.com/v1/responses",
+            ] {
+                let (base_url, compat) =
+                    resolve_aionrs_url_and_compat("custom", raw_base_url, "openai", model_id, true);
 
-            assert!(base_url.as_deref().unwrap().ends_with("/responses"), "{raw_base_url}");
-            assert_eq!(compat.openai_api_mode, Some(OpenAiApiMode::Responses), "{raw_base_url}");
-            assert_eq!(compat.api_path.as_deref(), Some(""), "{raw_base_url}");
+                assert!(
+                    base_url.as_deref().unwrap().ends_with("/responses"),
+                    "{model_id}/{raw_base_url}"
+                );
+                assert_eq!(
+                    compat.openai_api_mode,
+                    Some(OpenAiApiMode::Responses),
+                    "{model_id}/{raw_base_url}"
+                );
+                assert_eq!(compat.api_path.as_deref(), Some(""), "{model_id}/{raw_base_url}");
+            }
         }
     }
 
