@@ -79,6 +79,22 @@ fn explicit_chat_completions_overrides_gpt_5_6_responses_default() {
 }
 
 #[test]
+fn explicit_chat_completions_overrides_gpt_6_1_responses_default() {
+    let (base_url, compat) = resolve_aionrs_url_and_compat_with_mode(
+        "openai",
+        "https://api.openai.com/v1",
+        "openai",
+        "gpt-6.1-sol",
+        false,
+        Some(OpenAiApiMode::ChatCompletions),
+    );
+
+    assert_eq!(base_url.as_deref(), Some("https://api.openai.com/v1"));
+    assert_eq!(compat.api_path.as_deref(), Some("/chat/completions"));
+    assert_eq!(compat.openai_api_mode, Some(OpenAiApiMode::ChatCompletions));
+}
+
+#[test]
 fn explicit_responses_overrides_non_responses_model_default() {
     let (_, compat) = resolve_aionrs_url_and_compat_with_mode(
         "custom",
