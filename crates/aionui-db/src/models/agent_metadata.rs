@@ -38,7 +38,7 @@ pub struct AgentMetadataRow {
     pub skill_delivery: Option<String>,
 
     pub behavior_policy: Option<String>,
-    /// Native mode id that AionUi's legacy `yolo` / `yoloNoSandbox`
+    /// Native mode id that Super Digital's legacy `yolo` / `yoloNoSandbox`
     /// aliases resolve to before calling `session/set_mode`.
     ///
     /// `None` does NOT mean "pass the alias through unchanged": every

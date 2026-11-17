@@ -75,7 +75,7 @@ fn write_bundled_node_source_with_flaky_npm(bundled_root: &Path, directory_name:
 
 /// A transient `npm --version` failure inside the retry budget must be absorbed:
 /// `install_and_validate_with_reporter` succeeds and never reports a `Failed`
-/// phase, so AionUi is never told the installation is broken (spec AC1).
+/// phase, so Super Digital is never told the installation is broken (spec AC1).
 ///
 /// Unlike the `version_probe_*` unit tests — which inject a closure and so never
 /// execute `command_version_once` — this drives the real chain: spawn a real

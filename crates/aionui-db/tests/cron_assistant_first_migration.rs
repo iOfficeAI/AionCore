@@ -49,7 +49,7 @@ async fn seed_legacy_assistant_identity(pool: &sqlx::SqlitePool) {
     .unwrap();
 
     for (id, backend, agent_type, name, source, sort_order) in [
-        ("agent-aionrs", "", "aionrs", "Aion CLI", "internal", 100),
+        ("agent-aionrs", "", "aionrs", "Super Digital CLI", "internal", 100),
         ("agent-codex", "codex", "acp", "Codex CLI", "builtin", 200),
         ("agent-claude", "claude", "acp", "Claude Code", "builtin", 210),
     ] {
@@ -96,7 +96,7 @@ async fn seed_legacy_assistant_identity(pool: &sqlx::SqlitePool) {
     }
 
     for (conversation_id, name, agent_type, extra) in [
-        ("conv_aionrs", "Aion cron", "aionrs", r#"{"workspace":"/tmp/aionrs"}"#),
+        ("conv_aionrs", "Super Digital cron", "aionrs", r#"{"workspace":"/tmp/aionrs"}"#),
         (
             "conv_snapshot",
             "Snapshot cron",
@@ -172,7 +172,7 @@ async fn migration_015_populates_aionrs_catalog_by_agent_type() {
     sqlx::query(
         "INSERT INTO agent_metadata (
             id, name, backend, command, agent_type, enabled, agent_source, sort_order, created_at, updated_at
-         ) VALUES ('agent-aionrs', 'Aion CLI', NULL, '', 'aionrs', 1, 'internal', 100, 1, 1)",
+         ) VALUES ('agent-aionrs', 'Super Digital CLI', NULL, '', 'aionrs', 1, 'internal', 100, 1, 1)",
     )
     .execute(&pool)
     .await
@@ -403,7 +403,7 @@ async fn migration_013_normalizes_legacy_cron_agent_identity() {
         "cron_aionrs",
         "conv_aionrs",
         "aionrs",
-        r#"{"backend":"provider-1","name":"Aion","assistant_id":"aionui-assistant","model_id":"gpt-5"}"#,
+        r#"{"backend":"provider-1","name":"Super Digital","assistant_id":"aionui-assistant","model_id":"gpt-5"}"#,
     )
     .await;
     insert_legacy_cron(

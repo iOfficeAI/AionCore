@@ -1,11 +1,11 @@
 ---
 name: aionui-config
-description: Configure AionUi itself with the bundled aioncore CLI. Use when asked to set up or change assistants, assistant rules, skills, MCP servers, model providers, agents, scheduled tasks, or settings.
+description: Configure Super Digital itself with the bundled aioncore CLI. Use when asked to set up or change assistants, assistant rules, skills, MCP servers, model providers, agents, scheduled tasks, or settings.
 ---
 
-# AionUi Config
+# Super Digital Config
 
-Configure AionUi with the bundled agent-facing CLI. Do not discover ports, do
+Configure Super Digital with the bundled agent-facing CLI. Do not discover ports, do
 not call raw backend paths, and do not depend on tools outside the bundled
 `aioncore` binary.
 
@@ -68,7 +68,7 @@ rules or defaults.
 
 ## Assistant Change Timing
 
-AionUi persists assistant configuration immediately, but running conversations
+Super Digital persists assistant configuration immediately, but running conversations
 may keep the assistant snapshot created when the conversation started. Use this
 timing model when reporting successful assistant changes:
 

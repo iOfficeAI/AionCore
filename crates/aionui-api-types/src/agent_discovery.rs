@@ -204,7 +204,7 @@ pub struct AgentMetadata {
     #[serde(default)]
     pub behavior_policy: BehaviorPolicy,
 
-    /// Native mode id that AionUi's legacy `yolo` / `yoloNoSandbox`
+    /// Native mode id that Super Digital's legacy `yolo` / `yoloNoSandbox`
     /// aliases resolve to before calling `session/set_mode`. `None`
     /// means the backend has no "yolo" equivalent and the alias should
     /// pass through unchanged.

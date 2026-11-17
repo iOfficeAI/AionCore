@@ -389,7 +389,7 @@ mod tests {
         );
 
         // `approved-for-session` is selected because it is the first AllowAlways option,
-        // not because the option id has special meaning in AionCore.
+        // not because the option id has special meaning in Super Digital.
         assert_eq!(
             auto_approve_option_id(&request).as_deref(),
             Some("approved-for-session")
@@ -409,7 +409,7 @@ mod tests {
         );
 
         // `allow_always` is selected because it is the only AllowAlways option,
-        // not because the option id has special meaning in AionCore.
+        // not because the option id has special meaning in Super Digital.
         assert_eq!(auto_approve_option_id(&request).as_deref(), Some("allow_always"));
     }
 

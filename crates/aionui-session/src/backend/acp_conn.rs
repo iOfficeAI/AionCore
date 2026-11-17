@@ -246,7 +246,7 @@ pub fn acp_capabilities() -> Capabilities {
         mode_switch_effect: crate::capability::ModeSwitchEffect::Immediate,
         emits: SignalSet {
             // ACP has no liveness heartbeat notification; the turn terminal is the
-            // prompt response (no idle-timeout in AionCore anyway, post-007).
+            // prompt response (no idle-timeout in Super Digital anyway, post-007).
             heartbeat: false,
             tool_lifecycle: true,
             terminal_result: true,
@@ -1583,7 +1583,7 @@ async fn handle_reverse_rpc(
                 }
             }
             // Carry the raised toolCall's `title` and `rawInput` so the permission
-            // card can show the approver WHAT they are approving (AionUi issue
+            // card can show the approver WHAT they are approving (Super Digital issue
             // #3779 — a title-less card read as a bare "Permission request" and the
             // user approved blind). Same wire fields `parse_permission_metadata`
             // already reads (`toolCall.title` / `toolCall.rawInput`, ACP
@@ -3530,7 +3530,7 @@ mod tests {
         .await
         .expect("must not hang")
         .expect("Permission surfaced");
-        // AionUi issue #3779: the card must show what is being approved — the
+        // Super Digital issue #3779: the card must show what is being approved — the
         // toolCall's title and rawInput ride on the Permission event.
         assert_eq!(
             perm_tool_name.as_deref(),

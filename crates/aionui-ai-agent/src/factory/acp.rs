@@ -1282,7 +1282,7 @@ mod tests {
     /// non-aionrs agent on the ACP chat surface — but agy does not speak ACP.
     /// Routing it to the manager makes the initialize handshake time out and the
     /// user sees "The selected Agent failed to start", with a fully working agy
-    /// installed. Verified end-to-end from the AionUi UI.
+    /// installed. Verified end-to-end from the Super Digital UI.
     #[test]
     fn antigravity_never_routes_to_the_acp_manager() {
         assert_eq!(route_for_backend(Some("antigravity")), BackendRoute::Antigravity);

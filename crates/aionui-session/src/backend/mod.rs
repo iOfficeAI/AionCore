@@ -128,7 +128,7 @@ pub trait SessionBackend: Send + Sync {
     /// wire, and block until the user answers it.
     ///
     /// Only Antigravity needs this. agy cannot prompt for tool permission in
-    /// headless mode, so AionUi registers itself as agy's `PreToolUse` hook;
+    /// headless mode, so Super Digital registers itself as agy's `PreToolUse` hook;
     /// the request therefore arrives over HTTP from a separate hook process
     /// rather than up the backend's stream. Every other backend raises
     /// permissions on its own wire and never calls this.
@@ -222,12 +222,12 @@ pub struct SessionInit {
     /// deliver these via the first prompt, not a `session/new` param).
     ///
     /// NB: claude/codex direct-CLI backends intentionally do NOT consume this.
-    /// They receive skills through AionUi's own per-conversation view directory
+    /// They receive skills through Super Digital's own per-conversation view directory
     /// instead — claude via a `--plugin-dir` launch flag, codex via a
     /// `skills/extraRoots/set` request carrying [`Self::skill_view_skills_dir`].
     /// The field is carried for the aionrs/acp first-prompt delivery path only.
     pub skills: Vec<String>,
-    /// Absolute path to this conversation's SKILLS ROOT inside AionUi's own view
+    /// Absolute path to this conversation's SKILLS ROOT inside Super Digital's own view
     /// directory (`{view}/skills`, which directly holds `{name}/SKILL.md`).
     ///
     /// Populated only for protocol-mode delivery, where the backend has to send
@@ -238,7 +238,7 @@ pub struct SessionInit {
     ///
     /// For backends that need name+path without reading the workspace — agy
     /// builds its slash-command list from these rather than scanning
-    /// `{cwd}/.agents/skills`, which AionUi no longer creates. Empty = no skills.
+    /// `{cwd}/.agents/skills`, which Super Digital no longer creates. Empty = no skills.
     pub skill_dirs: Vec<SkillDirSpec>,
     /// Composed system prompt / preset context (the `compose_preset_context`
     /// output + aionrs `preset_rules`-merged prompt). Delivered first-message.
@@ -286,12 +286,12 @@ pub struct SessionConfig {
     /// only (byte-identical to the pre-#103 spawn). Carried into the F-4 wake
     /// recipe so a resume-respawn re-applies the same env (R16 continuity).
     pub spawn_env: Vec<aionui_common::EnvVar>,
-    /// Antigravity only: the `.agents/hooks.json` body that registers AionUi as
+    /// Antigravity only: the `.agents/hooks.json` body that registers Super Digital as
     /// agy's approval gate.
     ///
     /// Carried rather than written unconditionally because a session that starts
     /// in full auto installs no hook — and the backend cannot rebuild this body
-    /// itself (it knows the workspace, not where AionUi's binary lives). Holding
+    /// itself (it knows the workspace, not where Super Digital's binary lives). Holding
     /// it lets a later switch OUT of full auto restore the gate; without it that
     /// switch would silently leave the session running unattended.
     pub permission_hook_body: Option<String>,

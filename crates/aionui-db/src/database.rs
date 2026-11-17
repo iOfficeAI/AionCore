@@ -34,7 +34,7 @@ const RECOVERABLE_DATABASE_CORRUPTION_STAGE: &str = "database.recoverable_corrup
 /// this binary: `_sqlx_migrations` contains a version the embedded migrator
 /// does not know (sqlx `MigrateError::VersionMissing`). This is a downgrade
 /// scenario, not a broken migration — the fix is upgrading the app, so hosts
-/// (AionUi) surface a dedicated "upgrade required" dialog instead of the
+/// (Super Digital) surface a dedicated "upgrade required" dialog instead of the
 /// generic migration-failure one (Sentry ELECTRON-31Z).
 pub const DATABASE_NEWER_THAN_APP_STAGE: &str = "database.newer_than_app";
 
@@ -405,6 +405,19 @@ async fn run_migrations_staged(pool: &SqlitePool) -> Result<(), DatabaseInitErro
         .await
         .map_err(|e| DatabaseInitError::new("database.migration", e))?;
 
+    // Reconcile applied-migration checksums that drifted from this binary's
+    // embedded history (comment-only edits, CRLF/LF differences between
+    // Windows checkouts and CI builds). sqlx aborts with VersionMismatch on
+    // any such drift ("migration N was previously applied but has been
+    // modified"), bricking every install whose database predates the edit.
+    // For an already-applied migration the SQL never re-runs, so the stored
+    // checksum is pure history tamper-detection: re-stamping it from the
+    // embedded migrator is safe and unbricks affected databases. Every
+    // rewrite is logged (version + digest prefixes) so drift stays observable.
+    reconcile_applied_migration_checksums(&mut conn)
+        .await
+        .map_err(|e| DatabaseInitError::new("database.migration", e))?;
+
     let result = run_migrations_with_retry(&mut conn).await.map_err(|e| {
         if let Some(db_version) = e.missing_migration_version() {
             // Downgrade: the DB holds a migration this binary doesn't ship.
@@ -672,6 +685,84 @@ async fn align_reconciled_mcp_migration_checksum(conn: &mut sqlx::SqliteConnecti
     Ok(updated.rows_affected() > 0)
 }
 
+/// Re-stamp applied-migration checksums that drifted from this binary's
+/// embedded history, before the migrator validates them.
+///
+/// sqlx validates every `success = 1` row of `_sqlx_migrations` against the
+/// SHA-384 of the embedded migration file bytes and aborts with
+/// `VersionMismatch` ("migration N was previously applied but has been
+/// modified") on the first mismatch. The raw bytes change whenever a shipped
+/// migration file is edited after release — even a comment-only rename, or the
+/// CRLF/LF line-ending difference between a Windows checkout (`core.autocrlf`)
+/// and a Linux CI build of the identical text.
+///
+/// For an already-applied migration the SQL never re-runs on existing
+/// databases, so the stored checksum is pure history tamper-detection, not
+/// schema truth. Re-stamping it from the embedded migrator is therefore safe
+/// for existing data and lets legitimately-drifted histories (branding renames,
+/// eol normalization) keep opening their databases across app updates. Fresh
+/// installs are unaffected (no `_sqlx_migrations` table yet) and still get the
+/// exact embedded history. The downgrade guard is untouched: rows whose
+/// version is absent from this binary are ignored here and still surface as
+/// `VersionMissing` → `database.newer_than_app`.
+async fn reconcile_applied_migration_checksums(conn: &mut sqlx::SqliteConnection) -> Result<(), DbError> {
+    let has_table: bool =
+        sqlx::query_scalar("SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(DbError::Query)?;
+    if !has_table {
+        // Fresh install: the migrator creates the history table from scratch.
+        return Ok(());
+    }
+
+    let applied: Vec<(i64, Vec<u8>)> =
+        sqlx::query_as::<_, (i64, Vec<u8>)>("SELECT version, checksum FROM _sqlx_migrations WHERE success = 1")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(DbError::Query)?;
+
+    let mut healed: Vec<i64> = Vec::new();
+    for migration in DB_MIGRATOR.iter() {
+        let Some((_, stored)) = applied.iter().find(|(version, _)| *version == migration.version) else {
+            continue;
+        };
+        if stored.as_slice() == &*migration.checksum {
+            continue;
+        }
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")
+            .bind(&*migration.checksum)
+            .bind(migration.version)
+            .execute(&mut *conn)
+            .await
+            .map_err(DbError::Query)?;
+        healed.push(migration.version);
+        warn!(
+            migration = migration.version,
+            stored = %checksum_digest_prefix(stored),
+            embedded = %checksum_digest_prefix(migration.checksum.as_ref()),
+            "Applied-migration checksum drifted from the embedded history; re-stamped"
+        );
+    }
+    if !healed.is_empty() {
+        info!(
+            count = healed.len(),
+            versions = ?healed,
+            "Reconciled drifted applied-migration checksums against the embedded history"
+        );
+    }
+    Ok(())
+}
+
+/// First 8 bytes of a checksum as hex, for logs. Never the migration SQL text.
+fn checksum_digest_prefix(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(16);
+    for byte in bytes.iter().take(8) {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
 /// Ensure the system default user exists.
 ///
 /// Uses INSERT OR IGNORE so it is safe to call on every startup.
@@ -754,6 +845,7 @@ fn is_corruption_like_error(err: &DbError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Connection;
 
     #[test]
     fn recovery_skips_migration_version_mismatch() {
@@ -865,5 +957,92 @@ mod tests {
     fn startup_file_retry_rejects_non_transient_errors() {
         let err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing file");
         assert!(!is_retryable_startup_file_error(&err));
+    }
+
+    async fn seed_history_with_checksums(
+        c: &mut sqlx::SqliteConnection,
+        rows: &[(i64, &[u8])],
+    ) {
+        sqlx::query(
+            "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT, \
+             installed_on TIMESTAMP, success BOOLEAN, checksum BLOB, execution_time BIGINT)",
+        )
+        .execute(&mut *c)
+        .await
+        .unwrap();
+        for (version, checksum) in rows {
+            sqlx::query("INSERT INTO _sqlx_migrations (version, success, checksum) VALUES (?, 1, ?)")
+                .bind(version)
+                .bind(*checksum)
+                .execute(&mut *c)
+                .await
+                .unwrap();
+        }
+    }
+
+    fn embedded_checksum(version: i64) -> Vec<u8> {
+        DB_MIGRATOR
+            .iter()
+            .find(|m| m.version == version)
+            .unwrap_or_else(|| panic!("migration {version} must be embedded"))
+            .checksum
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn checksum_heal_restamps_drifted_checksums() {
+        let mut c = sqlx::SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        let drifted: &[u8] = &[0x00, 0x01, 0x02, 0x03];
+        seed_history_with_checksums(&mut c, &[(1, drifted), (2, &embedded_checksum(2))]).await;
+
+        reconcile_applied_migration_checksums(&mut c).await.unwrap();
+
+        let stored: Vec<u8> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored.as_slice(),
+            embedded_checksum(1).as_slice(),
+            "drifted checksum must be re-stamped from the embedded migrator"
+        );
+        let untouched: Vec<u8> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 2")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+        assert_eq!(
+            untouched.as_slice(),
+            embedded_checksum(2).as_slice(),
+            "matching checksums must not be rewritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn checksum_heal_noop_without_history_table() {
+        let mut c = sqlx::SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        reconcile_applied_migration_checksums(&mut c)
+            .await
+            .expect("fresh installs (no history table) must be a no-op, not an error");
+    }
+
+    #[tokio::test]
+    async fn checksum_heal_ignores_versions_absent_from_this_binary() {
+        // Downgrade scenario: the history holds a version this binary does not
+        // ship. The heal must neither touch nor delete it — the migrator's
+        // VersionMissing path (database.newer_than_app) handles that case.
+        let mut c = sqlx::SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        let future: &[u8] = &[0xAA; 48];
+        seed_history_with_checksums(&mut c, &[(9_999, future)]).await;
+
+        reconcile_applied_migration_checksums(&mut c).await.unwrap();
+
+        let stored: Vec<u8> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 9999")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+        assert_eq!(stored.as_slice(), future, "unknown version must be left alone");
     }
 }

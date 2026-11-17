@@ -22,7 +22,7 @@ pub enum ProvisionError {
     Token(#[from] crate::AuthError),
 }
 
-/// Port for the on-disk side of AionUi → AionPro adoption. When DB adoption
+/// Port for the on-disk side of Super Digital → Super Digital Pro adoption. When DB adoption
 /// re-owns `system_default_user`'s rows to the first external user, this moves
 /// the corresponding per-user files (and rewrites stored paths). Implemented
 /// in the composition layer over the skill filesystem so `aionui-auth` stays
@@ -86,7 +86,7 @@ impl AuthProvisionService {
             return Err(ProvisionError::UserDisabled);
         }
 
-        // Upgrade path (AionUi -> AionPro over the same database): while this
+        // Upgrade path (Super Digital -> Super Digital Pro over the same database): while this
         // is the machine's only external user, re-own the local default
         // user's pre-multi-account data to it. Self-idempotent — moves
         // nothing once the source set is empty or a second account exists.

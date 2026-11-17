@@ -47,7 +47,7 @@ pub struct AgentFactoryDeps {
     pub session_spawner: Arc<dyn aionui_process::Spawner>,
     /// Base URL the Antigravity permission hook calls back on (e.g.
     /// `http://127.0.0.1:25808`). agy cannot prompt for permission in headless
-    /// mode, so AionUi registers its own binary as a PreToolUse hook and
+    /// mode, so Super Digital registers its own binary as a PreToolUse hook and
     /// answers each request itself — the hook process needs this address to
     /// reach us. `None` disables the bridge, which means agy runs with its gate
     /// open and NO per-call approval; only acceptable in tests.

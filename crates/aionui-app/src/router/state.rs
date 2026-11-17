@@ -93,7 +93,7 @@ impl RouterBuildError {
 ///
 /// A [`AssistantError::ConcurrentBootstrapContention`] is benign and recoverable
 /// (a transient concurrent-startup race), so it gets a distinct boundary stage
-/// (`router.assistant.bootstrap.concurrency_contended`) that AionUi maps to a
+/// (`router.assistant.bootstrap.concurrency_contended`) that Super Digital maps to a
 /// gentle "retry/restart" message instead of the "local data corruption" false
 /// alarm. The boundary code stays `BOOTSTRAP_SERVER_FAILED`; only the stage
 /// differs (Sentry 135525166). All other errors keep the original stage.
@@ -158,7 +158,7 @@ fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::P
     ];
     // Auto-provisioned per-conversation workspaces live under
     // `{work_dir}/conversations/{label}-temp-{id}/`. On Windows the
-    // operator may put `work_dir` on a separate drive (e.g. `X:\AionUi`)
+    // operator may put `work_dir` on a separate drive (e.g. `X:\Super Digital`)
     // that's neither under `temp_dir` nor `home_dir`. Including `work_dir`
     // keeps temp workspaces on the default allowlist without widening it
     // to unrelated paths.
@@ -1322,7 +1322,7 @@ mod tests {
             source: "generated",
             owner_type: "system",
             source_ref: Some("bare-channel-aionrs"),
-            name: "Bare Channel Aionrs",
+            name: "Bare Channel Super Digital",
             name_i18n: "{}",
             description: Some("Channel state regression assistant"),
             description_i18n: "{}",
@@ -1415,7 +1415,7 @@ mod tests {
                 "system_default_user",
                 &[(
                     "assistant.weixin.agent",
-                    r#"{"assistant_id":"bare-channel-aionrs","name":"Weixin Aionrs"}"#,
+                    r#"{"assistant_id":"bare-channel-aionrs","name":"Weixin Super Digital"}"#,
                 )],
             )
             .await
@@ -1459,7 +1459,7 @@ mod tests {
         assert_eq!(snapshot.assistant_id, "bare-channel-aionrs");
         assert_eq!(snapshot.agent_id, "632f31d2");
         assert_eq!(conversation.r#type, AgentType::Aionrs.serde_name());
-        assert_eq!(conversation.name, "Weixin Aionrs");
+        assert_eq!(conversation.name, "Weixin Super Digital");
 
         let second_session = AssistantSessionRow {
             conversation_id: Some(first.conversation_id.clone()),

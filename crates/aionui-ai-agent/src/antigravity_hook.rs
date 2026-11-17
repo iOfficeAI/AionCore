@@ -1,4 +1,4 @@
-//! Writes the `hooks.json` that registers AionUi's own binary as agy's
+//! Writes the `hooks.json` that registers Super Digital's own binary as agy's
 //! PreToolUse hook. The file carries NO policy: every decision is made at
 //! runtime by the user. Only the callback coordinates live on disk.
 
@@ -78,7 +78,7 @@ pub fn remove_hooks_json(workspace: &Path) {
 /// Write `<workspace>/.agents/hooks.json` registering `hook_binary` as the
 /// PreToolUse gate for every tool.
 ///
-/// The `matcher: "*"` is deliberate — AionUi decides per call, so agy must ask
+/// The `matcher: "*"` is deliberate — Super Digital decides per call, so agy must ask
 /// about all of them.
 ///
 /// `command` is a COMMAND LINE, not a bare path: agy word-splits it and honours
@@ -96,7 +96,7 @@ pub fn write_hooks_json(workspace: &Path, hook_binary: &Path) -> std::io::Result
 ///
 /// A session that starts in full auto installs no hook — but it may be switched
 /// out of full auto later, and the backend has no way to rebuild this on its own
-/// (it knows the workspace, not where AionUi's binary lives). Handing it the
+/// (it knows the workspace, not where Super Digital's binary lives). Handing it the
 /// prepared body lets it restore the gate when the user asks for it back.
 pub fn hooks_json_body(hook_binary: &Path) -> String {
     // A COMMAND LINE, not a bare path: agy word-splits it and honours double
@@ -178,7 +178,7 @@ mod tests {
             "\"/opt/aionui/backend\" antigravity-hook"
         );
 
-        // The decision must never be baked into the file: AionUi owns it at
+        // The decision must never be baked into the file: Super Digital owns it at
         // runtime. A literal allow/deny here would silently bypass the user.
         assert!(!raw.contains("\"allow\""), "policy leaked into hooks.json");
         assert!(!raw.contains("\"deny\""), "policy leaked into hooks.json");

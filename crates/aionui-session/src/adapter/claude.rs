@@ -969,7 +969,7 @@ impl ClaudeAdapter {
                 // Carry the raw `input` for EVERY tool. The permission card must show
                 // the user WHAT they are approving (a Bash `command`, a Write target)
                 // — with only `tool_name` the card reads "命令: Bash" and the user
-                // approves blind (AionUi issue #3779). This is display-to-the-approver,
+                // approves blind (Super Digital issue #3779). This is display-to-the-approver,
                 // not logging: TIO-13 ("never log tool input at info") still holds, and
                 // the SAME `input` already reaches the frontend via the assistant
                 // tool_use block (ToolBegin carries it), so the card adds no new
@@ -3056,7 +3056,7 @@ mod tests {
 
     /// An ORDINARY tool permission (Bash) carries `tool_name` AND `input` — the
     /// permission card must show the approver what command they are approving
-    /// (AionUi issue #3779: with input dropped the card read "命令: Bash" and the
+    /// (Super Digital issue #3779: with input dropped the card read "命令: Bash" and the
     /// user approved blind). Display-to-the-approver is not logging, so TIO-13
     /// (never log tool input at info) is unaffected.
     #[test]

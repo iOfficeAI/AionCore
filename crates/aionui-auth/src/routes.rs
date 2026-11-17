@@ -82,7 +82,7 @@ pub struct AuthRouterState {
     /// Coalesces concurrent refreshes for the same token (refresh-storm guard).
     pub refresh_coalescer: RefreshCoalescer,
     pub user_repo: Arc<dyn IUserRepository>,
-    /// Optional on-disk adoption side-effect (AionUi → AionPro upgrade).
+    /// Optional on-disk adoption side-effect (Super Digital → Super Digital Pro upgrade).
     pub fs_adopter: Option<Arc<dyn crate::service::SystemDefaultFilesystemAdopter>>,
     pub cookie_config: Arc<CookieConfig>,
     pub qr_token_store: Arc<QrTokenStore>,
@@ -1038,7 +1038,7 @@ const QR_LOGIN_HTML: &str = r#"<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QR Login - AionUI</title>
+<title>QR Login - Super Digital</title>
 <style>
   body { font-family: system-ui, sans-serif; display: flex; justify-content: center;
          align-items: center; min-height: 100vh; margin: 0; background: #f5f5f5; }
@@ -1051,7 +1051,7 @@ const QR_LOGIN_HTML: &str = r#"<!DOCTYPE html>
 </head>
 <body>
 <div class="card">
-  <h1>AionUI</h1>
+  <h1>Super Digital</h1>
   <p id="status" class="status">Processing login...</p>
 </div>
 <script>

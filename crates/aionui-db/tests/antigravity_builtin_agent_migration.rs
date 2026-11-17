@@ -83,7 +83,7 @@ async fn available_modes_match_the_capability_projection_shape() {
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     let modes = v["available_modes"].as_array().expect("top-level available_modes key");
     let ids: Vec<&str> = modes.iter().map(|m| m["id"].as_str().unwrap()).collect();
-    // agy's own axis is default / accept-edits / plan; `yolo` is AionUi's
+    // agy's own axis is default / accept-edits / plan; `yolo` is Super Digital's
     // sentinel, offered here so full auto is a deliberate choice rather than
     // something only teams and cron can reach.
     assert_eq!(ids, vec!["default", "accept-edits", "plan", "yolo"]);

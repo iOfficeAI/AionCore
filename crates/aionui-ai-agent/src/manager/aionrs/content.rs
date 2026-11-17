@@ -5,7 +5,7 @@ const ATTACHED_FILES_HEADER: &str = "[Attached files]";
 
 /// Build provider-independent user input from the message and its attachments.
 ///
-/// Attachments remain local paths in the conversation snapshot. Aionrs's
+/// Attachments remain local paths in the conversation snapshot. Super Digital's
 /// `ViewImage` tool loads an image only when a vision-capable model requests
 /// it, so a text-only leader can still receive the turn and delegate the path.
 pub(super) fn build_content_blocks(content: &str, files: &[String]) -> Vec<ContentBlock> {

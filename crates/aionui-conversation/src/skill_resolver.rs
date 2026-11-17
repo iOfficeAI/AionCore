@@ -55,12 +55,12 @@ pub trait SkillResolver: Send + Sync {
         load_resolved_skill_bodies(&resolved).await
     }
 
-    /// Rebuild this conversation's skill VIEW directory under AionUi's own data
+    /// Rebuild this conversation's skill VIEW directory under Super Digital's own data
     /// dir, so the agent CLI can be pointed at it instead of at the user's
     /// workspace. Returns the number of links created.
     ///
     /// Called unconditionally, not only for vendors that consume it: the view is
-    /// AionUi's own tree, and building it for every conversation means a delivery
+    /// Super Digital's own tree, and building it for every conversation means a delivery
     /// mode flipped in the registry needs no per-conversation backfill.
     ///
     /// Defaults to a no-op so the many test stubs in this workspace do not each

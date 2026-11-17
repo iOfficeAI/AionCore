@@ -1,10 +1,10 @@
-//! Integration tests for file-based MCP Agent adapters (Opencode, Aionrs, Aionui).
+//! Integration tests for file-based MCP Agent adapters (Opencode, Super Digital, Super Digital).
 //!
 //! These tests exercise the real filesystem read/write logic using temp
 //! directories. CLI detection (`is_installed`, `which`) is NOT tested here
 //! because it depends on the host environment.
 //!
-//! For Aionui, we use a mock repository since it reads from the DB.
+//! For Super Digital, we use a mock repository since it reads from the DB.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use aionui_common::McpSource;
 use aionui_mcp::{AionuiAdapter, McpAgentAdapter, McpServerTransport};
 
 // ===========================================================================
-// Aionui adapter (DB-backed)
+// Super Digital adapter (DB-backed)
 // ===========================================================================
 
 mod aionui {
@@ -237,10 +237,10 @@ mod opencode {
 }
 
 // ===========================================================================
-// Aionrs adapter (CLI + TOML-backed)
+// Super Digital adapter (CLI + TOML-backed)
 // ===========================================================================
 
-// Note: Full lifecycle tests for Aionrs require the `aionrs` CLI to be
+// Note: Full lifecycle tests for Super Digital require the `aionrs` CLI to be
 // installed (for `--config-path`). The unit tests in aionrs.rs thoroughly
 // cover TOML parsing, serialization, and roundtrip behavior. Here we
 // verify the public API surface.

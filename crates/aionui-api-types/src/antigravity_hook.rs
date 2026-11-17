@@ -1,14 +1,14 @@
 //! Contract for the Antigravity permission bridge.
 //!
 //! agy cannot prompt for tool permission in headless mode, and a `PreToolUse`
-//! hook can only TIGHTEN a decision, never loosen one (verified). So AionUi
+//! hook can only TIGHTEN a decision, never loosen one (verified). So Super Digital
 //! opens agy's gate with `--dangerously-skip-permissions` and registers its own
 //! backend binary as the hook — making that hook the sole gatekeeper.
 //!
 //! The registered `hooks.json` carries NO policy: it only points at the binary.
-//! Every decision is made at runtime, by the user, in AionUi.
+//! Every decision is made at runtime, by the user, in Super Digital.
 //!
-//! Flow: agy → hook process (stdin JSON) → AionUi endpoint → user's permission
+//! Flow: agy → hook process (stdin JSON) → Super Digital endpoint → user's permission
 //! card → decision → hook stdout JSON → agy.
 
 use serde::{Deserialize, Serialize};
@@ -19,14 +19,14 @@ use serde::{Deserialize, Serialize};
 /// from its own environment and passes them to the hook child process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AntigravityHookConfig {
-    /// Scheme + host + port of the running AionUi backend.
+    /// Scheme + host + port of the running Super Digital backend.
     pub base_url: String,
     pub token: String,
     pub conversation_id: String,
 }
 
 impl AntigravityHookConfig {
-    /// env key the hook reads to learn AionUi's base URL (scheme + host +
+    /// env key the hook reads to learn Super Digital's base URL (scheme + host +
     /// port, e.g. `http://127.0.0.1:25808`).
     pub const ENV_BASE_URL: &'static str = "AIONUI_ANTIGRAVITY_HOOK_BASE_URL";
     /// env key the hook reads to learn its auth token.

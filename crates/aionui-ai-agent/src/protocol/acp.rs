@@ -79,7 +79,7 @@ const CONFIG_RPC_TIMEOUT_SECS: u64 = 10;
 /// Some agents forward these fields downstream as client metadata — e.g. Mistral
 /// Vibe passes them to the Mistral API as `client_name`/`client_version`, which the
 /// API rejects when empty. Always send non-empty values (see issue #3326).
-const ACP_CLIENT_NAME: &str = "AionUi";
+const ACP_CLIENT_NAME: &str = "Super Digital";
 const ACP_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1100,7 +1100,7 @@ fn log_acp_initialize_failed(failure_class: &'static str, elapsed_ms: u64) {
     );
 }
 
-/// Log a JSON-RPC request from AionUi to the ACP agent.
+/// Log a JSON-RPC request from Super Digital to the ACP agent.
 /// `session/prompt` carries large user input and stays at debug.
 fn log_client_request(method: &str, body: &str) {
     let summary = AcpLogSummary::from_payload(body);
@@ -1150,7 +1150,7 @@ fn log_agent_response(method: &str, body: &str) {
     }
 }
 
-/// Log a fire-and-forget notification from AionUi to the agent.
+/// Log a fire-and-forget notification from Super Digital to the agent.
 fn log_client_notify(method: &str, body: &str) {
     let summary = AcpLogSummary::from_payload(body);
     info!(
@@ -1223,7 +1223,7 @@ fn log_agent_request(method: &str, body: &str) {
     );
 }
 
-/// Log a JSON-RPC response from AionUi back to the agent.
+/// Log a JSON-RPC response from Super Digital back to the agent.
 fn log_client_response(method: &str, body: &str) {
     let summary = AcpLogSummary::from_payload(body);
     info!(
@@ -1489,13 +1489,13 @@ mod tests {
         let req = build_initialize_request();
 
         let client_info = req.client_info.as_ref().expect("clientInfo must be present");
-        assert_eq!(client_info.name, "AionUi");
+        assert_eq!(client_info.name, "Super Digital");
         assert!(!client_info.name.is_empty(), "client name must not be empty");
         assert!(!client_info.version.is_empty(), "client version must not be empty");
 
         // The serialized handshake must carry non-empty camelCase clientInfo fields.
         let json = serde_json::to_value(&req).expect("request serializes");
-        assert_eq!(json["clientInfo"]["name"], "AionUi");
+        assert_eq!(json["clientInfo"]["name"], "Super Digital");
         assert_ne!(json["clientInfo"]["version"], "");
     }
 

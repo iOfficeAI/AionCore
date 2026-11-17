@@ -14,7 +14,7 @@ pub(crate) enum BootstrapErrorCode {
     ShutdownFailed,
     /// Emitted when this process yields the data-dir instance guard to a peer
     /// aioncore that already owns the data directory (Sentry 135525166). Benign
-    /// and transient — AionUi treats it as recoverable and retries.
+    /// and transient — Super Digital treats it as recoverable and retries.
     PeerAlreadyRunning,
 }
 

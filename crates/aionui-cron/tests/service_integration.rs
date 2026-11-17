@@ -453,7 +453,7 @@ impl IConversationRepository for StubConvRepo {
             aionui_db::models::ConversationRow {
                 id: id.into(),
                 user_id: "u1".into(),
-                name: "Aionrs Chat".into(),
+                name: "Super Digital Chat".into(),
                 r#type: "aionrs".into(),
                 model: Some(
                     serde_json::json!({
@@ -468,7 +468,7 @@ impl IConversationRepository for StubConvRepo {
                 channel_chat_id: None,
                 extra: serde_json::json!({
                     "backend": "anthropic",
-                    "agent_name": "Aion CLI",
+                    "agent_name": "Super Digital CLI",
                     "workspace": ensure_named_workspace_path("aionui-cron-service-aionrs-workspace"),
                     "session_mode": "default",
                     "current_model_id": "claude-sonnet-4-20250514"
@@ -1380,9 +1380,9 @@ async fn create_job_derives_runtime_type_from_aionrs_assistant() {
     let (svc, _, _, _, definition_repo, _) = setup_with_assistant_repos().await;
     seed_assistant_definition(&definition_repo, "asstdef_runtime_aionrs", "assistant-aionrs", "aionrs").await;
 
-    let mut req = make_create_req("Assistant Aionrs", every_60s());
+    let mut req = make_create_req("Assistant Super Digital", every_60s());
     req.agent_config = Some(aionui_api_types::CronAgentConfigWriteDto {
-        name: "Aionrs Assistant".into(),
+        name: "Super Digital Assistant".into(),
         cli_path: None,
         assistant_id: Some("assistant-aionrs".into()),
         mode: Some("yolo".into()),

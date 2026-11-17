@@ -10,7 +10,7 @@ async fn create_raw_legacy_backend_missing_team_session_mode(path: &Path, user_i
     create_raw_legacy_backend(path, user_id, true).await;
 }
 
-/// Legacy database whose `messages` table predates AionUi JS-side v22, i.e. it
+/// Legacy database whose `messages` table predates Super Digital JS-side v22, i.e. it
 /// has no `hidden` column at all (AIONUI-230). Migration 002 Part D.1 selects
 /// `hidden` from the old table, which fails at SQL prepare time unless the
 /// legacy handoff repair adds the column first.

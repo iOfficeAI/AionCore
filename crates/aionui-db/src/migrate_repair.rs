@@ -42,7 +42,7 @@ pub(crate) struct GuardViolation {
 ///   the irreversible repair never re-runs on a DB already past 030.
 ///
 /// Unlike the previous `MAX(version) == 29` gate, this fires for ANY pre-030
-/// start point (e.g. v28 from AionCore 0.1.52 — the ELECTRON-31Z one-step
+/// start point (e.g. v28 from Super Digital 0.1.52 — the ELECTRON-31Z one-step
 /// upgrade that jumped over v29 and so skipped the repair). Repair statements
 /// referencing tables/columns absent from an older schema are skipped as
 /// not-applicable (see [`is_missing_object_error`]); such tables hold no dirty
@@ -393,7 +393,7 @@ mod tests {
     #[tokio::test]
     async fn gate_true_at_pre_030_start_points() {
         // The widened gate fires for ANY pre-030 history, not just v29. v28 is
-        // the ELECTRON-31Z upgrade path (a one-step jump from AionCore 0.1.52,
+        // the ELECTRON-31Z upgrade path (a one-step jump from Super Digital 0.1.52,
         // whose DB stops at 28) that the old `== 29` gate skipped; v20 covers an
         // even older start point.
         for v in [20, 28] {

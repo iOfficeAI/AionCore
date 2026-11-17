@@ -47,7 +47,7 @@ pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AgentError> {
 /// Manages a CLI subprocess used by SDK-based agent transports.
 ///
 /// ACP sessions call [`take_stdio`](Self::take_stdio) to hand raw stdin/stdout
-/// to the ACP SDK transport. Aionrs uses its own manager and does not rely on
+/// to the ACP SDK transport. Super Digital uses its own manager and does not rely on
 /// line-delimited legacy JSON mode.
 pub struct CliAgentProcess {
     /// Stdin writer, wrapped in Mutex for concurrent send safety.

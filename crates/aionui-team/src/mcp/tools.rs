@@ -192,7 +192,7 @@ mod tests {
         assert_eq!(desc, TEAM_SPAWN_AGENT_DESCRIPTION);
         assert!(
             desc.contains("Before calling this tool"),
-            "description must be the full AionUi original, not the legacy one-liner"
+            "description must be the full Super Digital original, not the legacy one-liner"
         );
         assert!(
             desc.contains("explicitly approved"),

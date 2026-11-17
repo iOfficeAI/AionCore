@@ -23,7 +23,7 @@ use crate::bootstrap::{BootstrapError, BootstrapErrorCode, ParentExitSignal, Ser
 const LISTENING_EVENT_PREFIX: &str = "AIONCORE_LISTENING";
 // Bare, payload-less readiness marker emitted once `axum::serve` actually begins
 // serving. The port is already known from the earlier AIONCORE_LISTENING line,
-// so this marker only signals the "now serving" edge. AionUi treats it as the
+// so this marker only signals the "now serving" edge. Super Digital treats it as the
 // authoritative ready signal, eliminating the "listening early, serving late"
 // false gap.
 const READY_EVENT_MARKER: &str = "AIONCORE_READY";
@@ -32,7 +32,7 @@ const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Bounded graceful-shutdown tail (AIONUI-16). The data-dir instance flock is
 // only released when this process exits, so every await between the shutdown
-// signal and process exit must be bounded — otherwise a restarting AionUi
+// signal and process exit must be bounded — otherwise a restarting Super Digital
 // keeps hitting BOOTSTRAP_PEER_ALREADY_RUNNING against a zombie backend.
 //
 // Stage bounds below cover the awaits that are unbounded by design:
@@ -343,7 +343,7 @@ pub(crate) async fn run_server(
     let client_pref_service = router_runtime.client_pref_service.clone();
 
     // All initialization is complete and we are about to begin serving. Emit the
-    // authoritative readiness marker now (never at bind time) so AionUi can treat
+    // authoritative readiness marker now (never at bind time) so Super Digital can treat
     // it as "ready" without racing the /health poll against the startup clock.
     emit_ready_event();
     info!("startup: server ready, emitted AIONCORE_READY");

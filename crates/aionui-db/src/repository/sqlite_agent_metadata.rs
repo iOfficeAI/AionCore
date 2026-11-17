@@ -870,7 +870,7 @@ mod tests {
         );
         assert!(
             rows.iter()
-                .any(|r| r.name == "Aion CLI" && r.agent_source == "internal")
+                .any(|r| r.name == "Super Digital CLI" && r.agent_source == "internal")
         );
         // Nanobot and OpenClaw are builtin (not internal).
         assert!(rows.iter().any(|r| r.name == "Nanobot" && r.agent_source == "builtin"));

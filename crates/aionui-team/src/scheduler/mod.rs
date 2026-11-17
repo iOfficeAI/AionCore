@@ -59,7 +59,7 @@ pub fn normalize_name(name: &str) -> String {
 /// Status set that counts as "settled" for the purpose of
 /// "all teammates settled -> wake leader" transitions.
 ///
-/// Expanded beyond `Idle` to match the AionUi reference implementation
+/// Expanded beyond `Idle` to match the Super Digital reference implementation
 /// (TeammateManager.ts:440-452): `Completed` and `Error` teammates are
 /// terminal and should not block the leader from being woken up.
 /// `Pending` is not in the set because the backend currently serde-aliases

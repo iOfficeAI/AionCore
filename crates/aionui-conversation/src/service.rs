@@ -1299,11 +1299,11 @@ impl ConversationService {
         let auto_inject_names = self.skill_resolver.auto_inject_names().await;
         let initial_skills = compute_initial_skills(&auto_inject_names, &preset_enabled, &exclude_auto_inject);
 
-        // Build the per-conversation skill VIEW under AionUi's own data dir.
+        // Build the per-conversation skill VIEW under Super Digital's own data dir.
         //
         // This REPLACED a step that symlinked the resolved skills into the
         // workspace's native skills dir (`.claude/skills/` and friends) for both
-        // temp and user-selected workspaces. AionUi no longer writes there at
+        // temp and user-selected workspaces. Super Digital no longer writes there at
         // all: the workspace may be a git repository, the directories were never
         // cleaned up, and a failed symlink used to degrade into copying real
         // files in. See `workspace_is_untouched_*` in service_test.rs.
@@ -2526,7 +2526,7 @@ impl ConversationService {
     }
 
     /// Whether this owned conversation has the ACP session row required for
-    /// an in-place Fresh-session reset. AionRS conversations intentionally do
+    /// an in-place Fresh-session reset. Super DigitalRS conversations intentionally do
     /// not create `acp_session` state and therefore return `false`.
     pub async fn supports_acp_context_reset(
         &self,
@@ -2966,7 +2966,7 @@ impl ConversationService {
 
     /// Agent identity owning capability metadata for an aionrs conversation
     /// (which has no acp_session row): the assistant snapshot's agent binding
-    /// when present, else the builtin Aion CLI row resolved through the
+    /// when present, else the builtin Super Digital CLI row resolved through the
     /// standard id/backend/agent_type binding ladder (aionrs's backend column
     /// is NULL, so it resolves by agent_type).
     async fn aionrs_capability_agent_id(
@@ -4865,7 +4865,7 @@ impl ConversationService {
     ) -> Option<String> {
         let service = self.runtime_token_service.as_ref()?;
         // Every conversation gets a helper-scoped token so the in-conversation
-        // CLI (`aioncore config` / `diagnose`) can authenticate in AionPro
+        // CLI (`aioncore config` / `diagnose`) can authenticate in Super Digital Pro
         // mode; team-bound conversations additionally get the team-tools scopes.
         let mut scopes = vec![RuntimeTokenScope::ConversationHelper];
         if build_opts.context.team.is_some() {
@@ -4878,7 +4878,7 @@ impl ConversationService {
     /// Rebuild this conversation's skill view directory from its snapshot.
     ///
     /// Idempotent and independent of the workspace: the view lives under
-    /// AionUi's data dir, so unlike the workspace wiring this needs no
+    /// Super Digital's data dir, so unlike the workspace wiring this needs no
     /// auto-workspace-path guard and runs for every agent regardless of the
     /// vendor's declared delivery mode.
     pub(crate) async fn ensure_session_skill_view(&self, context: &AgentSessionContext) {

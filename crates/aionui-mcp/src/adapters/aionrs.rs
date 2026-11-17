@@ -10,9 +10,9 @@ use super::cli_helpers::{DETECT_TIMEOUT, is_cli_installed, run_cli, run_cli_stri
 
 const CLI_NAME: &str = "aionrs";
 
-/// MCP Agent adapter for Aionrs.
+/// MCP Agent adapter for Super Digital.
 ///
-/// Aionrs stores MCP configuration in a TOML config file. The config path
+/// Super Digital stores MCP configuration in a TOML config file. The config path
 /// is obtained via `aionrs --config-path`.
 ///
 /// # Config Format (TOML)

@@ -1606,7 +1606,7 @@ pub async fn sync_skill_catalog_into_repo(
     sync_skill_catalog_into_repo_for_user(paths, repo, DEFAULT_USER_ID).await
 }
 
-/// Startup sync for AionPro machines: built-in skills only.
+/// Startup sync for Super Digital Pro machines: built-in skills only.
 ///
 /// The legacy shared-directory backfill cannot attribute on-disk files to a
 /// real account (that information never existed on disk), so ingesting them

@@ -335,7 +335,7 @@ impl AgentInstance {
     /// Pending confirmation items for this task.
     ///
     /// ACP surfaces pending permission prompts through its permission
-    /// router. Aionrs maintains inline confirmation lists.
+    /// router. Super Digital maintains inline confirmation lists.
     pub fn get_confirmations(&self) -> Vec<aionui_common::Confirmation> {
         match self {
             Self::Acp(m) => m.get_confirmations(),
@@ -481,7 +481,7 @@ impl AgentInstance {
     /// structure mirrors the ACP SDK `UsageUpdate` schema
     /// (`used` / `size` / `cost` / `_meta`), normalised via
     /// [`aionui_common::normalize_keys_to_snake_case`] so keys land as
-    /// `used` / `size` / `cost` to match the AionUI wire convention —
+    /// `used` / `size` / `cost` to match the Super Digital wire convention —
     /// `_meta` passes through verbatim.
     ///
     /// Non-ACP agents return `None`.

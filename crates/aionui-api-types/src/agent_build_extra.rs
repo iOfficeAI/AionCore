@@ -101,7 +101,7 @@ pub struct AcpBuildExtra {
     pub fork: Option<ForkSpec>,
 }
 
-/// Aionrs-specific fields extracted from `extra` in build task options.
+/// Super Digital-specific fields extracted from `extra` in build task options.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AionrsBuildExtra {
     #[serde(default)]

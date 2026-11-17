@@ -50,7 +50,7 @@ fn registry_npx_lock() -> Result<&'static RegistryNpxLock, RegistryNpxLockError>
 }
 
 /// Replace the stable npm package identity in a builtin Registry agent's npx
-/// arguments with the exact version validated for this AionCore release.
+/// arguments with the exact version validated for this Super Digital release.
 pub fn pin_registry_npx_args(backend: &str, args: &[String]) -> Result<Vec<String>, RegistryNpxLockError> {
     let lock = registry_npx_lock()?;
     let package = lock

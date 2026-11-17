@@ -258,7 +258,7 @@ async fn a_plain_tip_gets_no_totals() {
 
     let rx = tx.subscribe();
     tx.send(AgentStreamEvent::Tips(TipsEventData {
-        content: "The installed codex is newer than the version AionUi verified.".into(),
+        content: "The installed codex is newer than the version Super Digital verified.".into(),
         tip_type: TipType::Info,
         code: Some("CLI_VERSION_NEWER".into()),
         params: Some(json!({ "cli": "codex" })),

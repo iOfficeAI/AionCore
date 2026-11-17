@@ -1,11 +1,11 @@
-//! AionPro-mode gate: machine startup must not mint local-default-user rows.
+//! Super Digital Pro-mode gate: machine startup must not mint local-default-user rows.
 //!
 //! Historical failure mode: machine-level startup routines (agent probing,
 //! generated-assistant reconcile, legacy skill-directory ingestion) ran
 //! through "no acting user" convenience paths that mapped to
 //! `system_default_user`, silently accumulating business rows under an
-//! account that never logs in on an AionPro machine. This e2e boots the full
-//! router in AionPro mode and then sweeps EVERY ownership column in the live
+//! account that never logs in on an Super Digital Pro machine. This e2e boots the full
+//! router in Super Digital Pro mode and then sweeps EVERY ownership column in the live
 //! schema: outside the `users` table, zero `system_default_user` rows may
 //! exist.
 
@@ -62,7 +62,7 @@ async fn aionpro_startup_writes_no_system_default_user_rows() {
 
     assert!(
         offenders.is_empty(),
-        "AionPro startup minted local-default-user rows — a machine-level \
+        "Super Digital Pro startup minted local-default-user rows — a machine-level \
          routine is writing through a default-user path: {offenders:?}"
     );
 

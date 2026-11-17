@@ -237,7 +237,7 @@ impl AssistantService {
         Ok(())
     }
 
-    /// Bootstrap for AionPro machines: identical to
+    /// Bootstrap for Super Digital Pro machines: identical to
     /// [`Self::bootstrap_assistant_storage`] except the trailing generated
     /// reconcile is skipped — generated definitions are per-user and each
     /// real account materializes its own lazily on first catalog read, so a
@@ -977,7 +977,7 @@ impl AssistantService {
     ///
     /// Inference rule (ELECTRON-1J1 / 1KV):
     /// 1. If any enabled provider exists (Anthropic, OpenAI, custom,
-    ///    Bedrock, Vertex, …), return `"aionrs"`. AionRS speaks both
+    ///    Bedrock, Vertex, …), return `"aionrs"`. Super DigitalRS speaks both
     ///    OpenAI-compatible and Anthropic-protocol APIs over the
     ///    user-configured base URL and does not require any third-party
     ///    CLI to be installed. CLI-based agents (`claude`, `gemini`)
@@ -5030,7 +5030,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_falls_back_to_agent_type_when_backend_is_empty() {
-        // Engines like Aion CLI carry their identity in `agent_type` and leave
+        // Engines like Super Digital CLI carry their identity in `agent_type` and leave
         // `backend` empty (it is an ACP-vendor label). The generated assistant must
         // still expose the concrete agent id so the frontend does not bind it
         // through an overloaded runtime backend label.
@@ -5070,7 +5070,7 @@ mod tests {
         aionrs_row.backend = None;
         aionrs_row.agent_type = aionui_common::AgentType::Aionrs;
 
-        let mut builtin = mk_builtin("builtin-aionrs", "Aion Assistant");
+        let mut builtin = mk_builtin("builtin-aionrs", "Super Digital Assistant");
         builtin.agent_ref = "aionrs".into();
 
         let fx = fixture_with_options(FixtureOpts {
@@ -5210,7 +5210,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_reactivates_soft_deleted_builtin_definition_by_source_ref() {
-        let mut builtin = mk_builtin("aionui-assistant", "AionUi Butler");
+        let mut builtin = mk_builtin("aionui-assistant", "Super Digital Butler");
         builtin.rule_file = Some("rules/aionui-assistant.{locale}.md".into());
         let fx = fixture_with_builtins(vec![builtin]).await;
 
@@ -6771,7 +6771,7 @@ mod tests {
     // Default agent inference (ELECTRON-1J1 / 1KV regression coverage)
     // -----------------------------------------------------------------------
 
-    /// Anthropic provider routes to AionRS, not the Claude Code CLI:
+    /// Anthropic provider routes to Super DigitalRS, not the Claude Code CLI:
     /// having an Anthropic API key does not imply the user has
     /// `claude` on `PATH`. CLI-based agents must be opted into
     /// explicitly.
@@ -6786,7 +6786,7 @@ mod tests {
         assert_eq!(resolved, "632f31d2");
     }
 
-    /// OpenAI / custom provider falls back to AionRS, the only AionUI
+    /// OpenAI / custom provider falls back to Super DigitalRS, the only Super Digital
     /// agent that doesn't require a third-party CLI.
     #[tokio::test]
     async fn resolve_default_agent_id_falls_back_to_aionrs_for_openai_provider() {
@@ -6799,7 +6799,7 @@ mod tests {
         assert_eq!(resolved, "632f31d2");
     }
 
-    /// Custom (non-anthropic, non-openai) platform also routes to AionRS,
+    /// Custom (non-anthropic, non-openai) platform also routes to Super DigitalRS,
     /// which handles OpenAI-compatible custom URLs.
     #[tokio::test]
     async fn resolve_default_agent_id_handles_custom_platform_as_aionrs() {

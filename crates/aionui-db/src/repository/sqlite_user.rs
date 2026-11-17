@@ -214,7 +214,7 @@ impl IUserRepository for SqliteUserRepository {
         // external account's first login. Eligibility alone used to be
         // re-evaluated on every provision call, which kept re-sweeping data
         // the local default user accumulated AFTER the first adoption (new
-        // AionUi conversations were repeatedly re-owned). A stamped marker
+        // Super Digital conversations were repeatedly re-owned). A stamped marker
         // closes the window permanently regardless of later data.
         let already_adopted: Option<Option<String>> =
             sqlx::query_scalar("SELECT adopted_by FROM users WHERE id = 'system_default_user'")
@@ -761,7 +761,7 @@ mod tests {
     async fn ensure_external_user_is_idempotent_and_has_no_password() {
         let (repo, _db) = setup().await;
         let projection = ExternalUserProjection {
-            username: Some("AionPro User".to_string()),
+            username: Some("Super Digital Pro User".to_string()),
             email: Some("user@example.com".to_string()),
             avatar_path: Some("/avatar.png".to_string()),
         };
@@ -789,7 +789,7 @@ mod tests {
         assert_eq!(first.status, UserStatus::Active);
         assert_eq!(first.session_generation, 0);
         assert!(first.password_hash.is_none());
-        assert!(repo.find_by_username("AionPro User").await.unwrap().is_none());
+        assert!(repo.find_by_username("Super Digital Pro User").await.unwrap().is_none());
     }
 
     #[tokio::test]

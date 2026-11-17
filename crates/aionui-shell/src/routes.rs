@@ -249,7 +249,7 @@ fn stt_error_response(err: &SttError) -> (StatusCode, Json<serde_json::Value>) {
 
 /// Load the stored STT config from client preferences.
 ///
-/// Key mismatch fix: the AionUI frontend stores the config under
+/// Key mismatch fix: the Super Digital frontend stores the config under
 /// "tools.speechToText" while older backends used "speechToText"; both keys
 /// are queried and the namespaced key wins. A missing or malformed config
 /// falls back to a disabled default so callers surface a uniform

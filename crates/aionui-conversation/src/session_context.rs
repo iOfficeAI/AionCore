@@ -887,7 +887,7 @@ mod tests {
     fn aionrs_context(context: AgentSessionContext) -> AionrsSessionBuildContext {
         match context.kind {
             AgentSessionKind::Aionrs(aionrs) => *aionrs,
-            other => panic!("expected Aionrs context, got {other:?}"),
+            other => panic!("expected Super Digital context, got {other:?}"),
         }
     }
 

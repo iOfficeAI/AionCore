@@ -333,7 +333,7 @@ fn lp2_lead_prompt_contains_tool_descriptions() {
     let lead = make_agent("lead-1", "Lead", TeammateRole::Lead);
     let prompt = build_lead_prompt(&lead, "Beta", &[], &default_assistants());
 
-    // AionUi lead prompt references the `team_*` coordination tools that the
+    // Super Digital lead prompt references the `team_*` coordination tools that the
     // leader must use; the MCP layer enumerates them with arguments, so the
     // prompt mentions each tool at least once.
     let expected_tools = [

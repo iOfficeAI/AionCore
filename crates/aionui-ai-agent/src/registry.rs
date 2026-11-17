@@ -871,7 +871,7 @@ fn decode_row(
         warn!(
             id = %meta.id,
             name = %meta.name,
-            "Ignoring command override for internal Aion CLI agent"
+            "Ignoring command override for internal Super Digital CLI agent"
         );
     }
     let env_override = parse_env_override(&env_override_raw);
@@ -879,7 +879,7 @@ fn decode_row(
         warn!(
             id = %meta.id,
             name = %meta.name,
-            "Ignoring environment overrides for internal Aion CLI agent"
+            "Ignoring environment overrides for internal Super Digital CLI agent"
         );
     }
 
@@ -1374,7 +1374,7 @@ fn guidance_for_unavailable_reason(reason: &UnavailableReason) -> String {
 }
 
 /// Keys a user-supplied env override must never set — they would corrupt the
-/// agent's runtime environment or AionUi-internal wiring. Case-insensitive.
+/// agent's runtime environment or Super Digital-internal wiring. Case-insensitive.
 pub(crate) fn is_blocked_override_env_key(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
     if upper.starts_with("AIONUI_") {
@@ -1665,7 +1665,7 @@ mod tests {
     async fn codex_yolo_id_maps_to_agent_full_access() {
         let reg = registry().await;
         let codex = reg.find_builtin_by_backend("codex").await.unwrap();
-        // Legacy AionUi yolo aliases resolve to Codex's native
+        // Legacy Super Digital yolo aliases resolve to Codex's native
         // `agent-full-access` mode via the catalog row.
         assert_eq!(codex.yolo_id.as_deref(), Some("agent-full-access"));
     }
@@ -1777,7 +1777,7 @@ mod tests {
 
     /// On a host that has *none* of the seeded CLIs installed, the
     /// public listing collapses to the rows that don't need one
-    /// (Aion CLI is `agent_source = internal` with no `command`).
+    /// (Super Digital CLI is `agent_source = internal` with no `command`).
     /// This guards the pill-bar contract: never show an unusable
     /// vendor.
     #[tokio::test]
@@ -1792,7 +1792,7 @@ mod tests {
                 .map(|m| (&m.id, m.enabled, m.available))
                 .collect::<Vec<_>>()
         );
-        // Aion CLI (internal, no spawn command) is always available.
+        // Super Digital CLI (internal, no spawn command) is always available.
         assert!(
             visible.iter().any(|m| m.agent_type == AgentType::Aionrs),
             "internal aionrs row should survive the filter"
@@ -2169,7 +2169,7 @@ mod tests {
             id: "632f31d2".to_string(),
             user_id: None,
             icon: None,
-            name: "Aion CLI".to_string(),
+            name: "Super Digital CLI".to_string(),
             name_i18n: None,
             description: None,
             description_i18n: None,

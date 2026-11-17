@@ -5,7 +5,7 @@
 //! - Agent factory can build all agent types
 //! - Idle scanner finds eligible tasks
 //! - Workspace browsing works with real filesystem
-//! - Aionrs stub returns appropriate errors
+//! - Super Digital stub returns appropriate errors
 
 use std::sync::Arc;
 
@@ -85,7 +85,7 @@ impl IAgentTask for TypedMockAgent {
 impl IMockAgent for TypedMockAgent {}
 
 // ---------------------------------------------------------------------------
-// Aionrs agent tests (real implementation with AgentEngine)
+// Super Digital agent tests (real implementation with AgentEngine)
 // ---------------------------------------------------------------------------
 
 fn make_aionrs_config() -> AionrsResolvedConfig {

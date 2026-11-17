@@ -409,7 +409,7 @@ pub fn save_states_to_file(path: &Path, states: &HashMap<String, ExtensionState>
     Ok(())
 }
 
-/// Resolve the extension state file path using the historical AionUi rules.
+/// Resolve the extension state file path using the historical Super Digital rules.
 ///
 /// Priority:
 /// 1. `AIONUI_EXTENSION_STATES_FILE`
