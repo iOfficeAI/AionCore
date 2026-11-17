@@ -92,7 +92,7 @@ pub struct WsTokenResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Internal AionPro user provisioning endpoints
+// Internal Super Digital Pro user provisioning endpoints
 // ---------------------------------------------------------------------------
 
 /// Request body for `PUT /api/auth/internal/external-users/{external_user_id}`.
@@ -148,7 +148,7 @@ pub struct RevokeExternalSessionResponse {
     pub session_generation: i64,
 }
 
-/// Stable internal auth error codes for AionPro/Core session exchange.
+/// Stable internal auth error codes for Super Digital Pro/Core session exchange.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum InternalAuthErrorCode {

@@ -1,4 +1,4 @@
-//! Per-conversation skill VIEW directory, owned exclusively by AionUi.
+//! Per-conversation skill VIEW directory, owned exclusively by Super Digital.
 //!
 //! This is the point of the refactor: the symlink LANDING SITE moves out of the
 //! user's workspace (which may be a git repository) and into
@@ -17,7 +17,7 @@
 //! skills root, directly holding `{name}/SKILL.md`). Both were probed against
 //! this exact layout, including with the skill directory as a symlink.
 //!
-//! Because AionUi OWNS this tree, two things differ from the old workspace path:
+//! Because Super Digital OWNS this tree, two things differ from the old workspace path:
 //! rebuild is an EXACT match against the snapshot (no first-write-wins, so a
 //! skill dropped from the snapshot actually disappears), and deletion is safe.
 //!
@@ -84,7 +84,7 @@ fn plugin_manifest_body() -> String {
     serde_json::json!({
         "name": PLUGIN_NAME,
         "version": "0.0.1",
-        "description": "AionUi session skills",
+        "description": "Super Digital session skills",
     })
     .to_string()
 }
@@ -390,7 +390,7 @@ mod tests {
         );
     }
 
-    /// AionUi OWNS this directory, so unlike the old workspace path there is no
+    /// Super Digital OWNS this directory, so unlike the old workspace path there is no
     /// first-write-wins: a snapshot change must produce an exact match.
     #[tokio::test]
     async fn rebuild_drops_skills_that_left_the_snapshot() {

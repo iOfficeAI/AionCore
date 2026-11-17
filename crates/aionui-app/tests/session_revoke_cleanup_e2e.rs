@@ -3,7 +3,7 @@
 //! The auth-layer tests exercise the revoke endpoint with an INJECTED hook and
 //! only prove "the hook was called". This test boots the real router — whose
 //! `session_revoked_hook` is the production closure wired to the real module
-//! services — revokes an AionPro session over HTTP, and asserts observable
+//! services — revokes an Super Digital Pro session over HTTP, and asserts observable
 //! cleanup actually happened:
 //!
 //!   - channel sessions: the user's `assistant_sessions` rows are deleted by
@@ -69,7 +69,7 @@ async fn http_revoke_runs_the_real_cleanup_hook_end_to_end() {
     // closure over the real module services, not a test double.
     let app = aionui_app::create_router(&services).await.expect("build router");
 
-    // Provision an AionPro user + session over the internal API.
+    // Provision an Super Digital Pro user + session over the internal API.
     let resp = app
         .clone()
         .oneshot(bootstrap_json(

@@ -127,7 +127,7 @@ pub struct AionrsCompatOverrides {
     pub api_path: Option<String>,
 }
 
-/// Fully resolved Aionrs configuration passed to the agent manager.
+/// Fully resolved Super Digital configuration passed to the agent manager.
 #[derive(Debug, Clone)]
 pub struct AionrsResolvedConfig {
     /// LLM provider name (anthropic, openai, bedrock, vertex).
@@ -141,7 +141,7 @@ pub struct AionrsResolvedConfig {
     /// System prompt override.
     pub system_prompt: Option<String>,
     /// Internal response cap for specialized flows such as provider health probes.
-    /// Normal AionUi conversations leave this unset.
+    /// Normal Super Digital conversations leave this unset.
     pub max_tokens: Option<u32>,
     /// Max agentic turns.
     pub max_turns: Option<usize>,

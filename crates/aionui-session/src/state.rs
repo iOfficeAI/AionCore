@@ -320,7 +320,7 @@ pub fn is_requires_action(state: &SessionState) -> bool {
 /// ⚠️ CORRECTION (2026-06-13): an earlier version claimed background_active=false
 /// was "empirically correct" / semantic-② "structurally unreachable", citing a C1
 /// capture of a `run_in_background` bash dying with the turn. That conflated bash
-/// with a Workflow and was WRONG. Re-measured on claude 2.1.176 (AionCore's exact
+/// with a Workflow and was WRONG. Re-measured on claude 2.1.176 (Super Digital's exact
 /// persistent stream-json flags): a Workflow (Task tool) is NON-BLOCKING and
 /// outlives its turn — the process replies to a new message ~2s later while the
 /// workflow's 60s sleep still runs, and `result` is deferred to workflow

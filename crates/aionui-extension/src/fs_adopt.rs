@@ -1,7 +1,7 @@
-//! Filesystem side of AionUi → AionPro adoption.
+//! Filesystem side of Super Digital → Super Digital Pro adoption.
 //!
 //! DB adoption (`adopt_system_default_data`) re-owns the local default user's
-//! rows to the first external (AionPro) user. Because per-user data now lives
+//! rows to the first external (Super Digital Pro) user. Because per-user data now lives
 //! under `X/users/{user_dir}/`, the on-disk files must move with the DB
 //! ownership: `X/users/system_default_user/*` → `X/users/{adopter_dir}/*`,
 //! and any stored absolute `path` column (`skills.path`) rewritten to match.

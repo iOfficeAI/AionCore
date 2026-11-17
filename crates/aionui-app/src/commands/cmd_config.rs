@@ -1,4 +1,4 @@
-//! `aioncore config` subcommand: agent-facing automation CLI for AionUi config.
+//! `aioncore config` subcommand: agent-facing automation CLI for Super Digital config.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
@@ -1244,7 +1244,7 @@ struct ConfigEnv {
     user_id: String,
     /// Conversation-helper credential minted by the backend. Optional so the
     /// CLI stays usable against runtimes that predate token injection; the
-    /// backend rejects tokenless requests in AionPro mode.
+    /// backend rejects tokenless requests in Super Digital Pro mode.
     runtime_token: Option<String>,
 }
 
@@ -1415,7 +1415,7 @@ async fn request_json(
         ConfigError::new(
             ConfigErrorCode::HttpRequestFailed,
             command,
-            "failed to call AionUi backend",
+            "failed to call Super Digital backend",
         )
         .field("path", path)
     })?;
@@ -1425,7 +1425,7 @@ async fn request_json(
         ConfigError::new(
             ConfigErrorCode::ResponseReadFailed,
             command,
-            "failed to read AionUi backend response",
+            "failed to read Super Digital backend response",
         )
         .field("path", path)
     })?;
@@ -1441,7 +1441,7 @@ async fn request_json(
         return Err(ConfigError::new(
             ConfigErrorCode::HttpStatusError,
             command,
-            "AionUi backend returned an error status",
+            "Super Digital backend returned an error status",
         )
         .field("path", path)
         .field("status", status.as_u16().to_string()));
@@ -1462,7 +1462,7 @@ async fn request_json(
         ConfigError::new(
             ConfigErrorCode::ResponseJsonInvalid,
             command,
-            "AionUi backend returned invalid JSON",
+            "Super Digital backend returned invalid JSON",
         )
         .field("path", path)
     })?;
@@ -1498,7 +1498,7 @@ fn extract_api_data(value: Value, command: &str) -> Result<Value, ConfigError> {
     Err(ConfigError::new(
         ConfigErrorCode::HttpStatusError,
         command,
-        "AionUi backend returned an unsuccessful response",
+        "Super Digital backend returned an unsuccessful response",
     ))
 }
 

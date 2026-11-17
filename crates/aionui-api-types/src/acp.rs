@@ -354,7 +354,7 @@ mod tests {
         assert_eq!(req.backend, "claude");
     }
 
-    /// The confirmation wire strings are a cross-repo contract: AionUi's
+    /// The confirmation wire strings are a cross-repo contract: Super Digital's
     /// `AcpConfigOptionConfirmation` matches on these literals, and its picker branches on
     /// them to decide between "switched", "pending" and "failed". A rename here that looked
     /// harmless in Rust would silently push the frontend into its error path, so pin the

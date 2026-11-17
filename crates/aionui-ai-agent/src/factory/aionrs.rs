@@ -57,7 +57,7 @@ pub(super) async fn build(
     // Merge preset assistant rules into system_prompt (used as custom_prompt
     // in aionrs's build_system_prompt). Mirrors the old architecture's
     // `init_history` injection of `[Assistant System Rules]`.
-    // AionrsBuildExtra parses `skills` so Team preset snapshots preserve the
+    // Super DigitalBuildExtra parses `skills` so Team preset snapshots preserve the
     // target contract.
     if let Some(rules) = overrides.preset_rules.take() {
         overrides.system_prompt = Some(match overrides.system_prompt.take() {
@@ -163,7 +163,7 @@ pub(super) async fn build(
             is_full_url = row.is_full_url,
             api_mode = ?compat_overrides.openai_api_mode.unwrap_or_default(),
             api_mode_source = if model_overrides.openai_api_mode.is_some() { "user" } else { "automatic" },
-            "Resolved Aionrs OpenAI transport"
+            "Resolved Super Digital OpenAI transport"
         );
     }
 
@@ -345,7 +345,7 @@ fn resolve_build_session(
     Ok(None)
 }
 
-/// Map AionUi DB platform/protocol settings to the aionrs provider identifier.
+/// Map Super Digital DB platform/protocol settings to the aionrs provider identifier.
 pub(crate) fn map_aionrs_provider(
     platform: &str,
     model_id: &str,

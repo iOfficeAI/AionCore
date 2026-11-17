@@ -90,7 +90,7 @@ impl AgentSendError {
                 },
             },
             AgentError::Internal(_) => Self::new(
-                "AionUI failed while sending the message",
+                "Super Digital failed while sending the message",
                 AgentErrorCode::AionuiInternalError,
                 AgentErrorOwnership::Aionui,
                 Some(detail),
@@ -102,7 +102,7 @@ impl AgentSendError {
                 ),
             ),
             AgentError::Forbidden(_) => Self::new(
-                "AionUI blocked the request before it reached the Agent",
+                "Super Digital blocked the request before it reached the Agent",
                 AgentErrorCode::AionuiPermissionError,
                 AgentErrorOwnership::Aionui,
                 Some(detail),
@@ -343,7 +343,7 @@ impl AgentSendError {
                 None,
             ),
             AcpError::NotConnected => Self::new(
-                "AionUI lost its Agent protocol connection",
+                "Super Digital lost its Agent protocol connection",
                 AgentErrorCode::UserAgentDisconnected,
                 AgentErrorOwnership::UserAgent,
                 Some(detail),
@@ -1508,7 +1508,7 @@ mod tests {
 
     #[test]
     fn classifies_provider_504_html_body_as_timeout_with_stripped_detail() {
-        let raw = "Aionrs agent error: Provider error: API error 504: <html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>openresty</center>\r\n</body>\r\n</html>";
+        let raw = "Super Digital agent error: Provider error: API error 504: <html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>openresty</center>\r\n</body>\r\n</html>";
         let err = AgentSendError::from_agent_error(AgentError::bad_gateway(raw));
 
         assert_eq!(err.code(), Some(AgentErrorCode::UserLlmProviderTimeout));
@@ -1811,25 +1811,25 @@ mod tests {
     #[test]
     fn classifies_provider_billing_auth_and_rate_limit() {
         assert_classification(
-            "Aionrs agent error: Provider error: API error 402: {\"error\":{\"message\":\"Insufficient Balance\"}}",
+            "Super Digital agent error: Provider error: API error 402: {\"error\":{\"message\":\"Insufficient Balance\"}}",
             AgentErrorCode::UserLlmProviderBillingRequired,
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::CheckProviderBilling,
         );
         assert_classification(
-            "Aionrs agent error: Provider error: API error 400: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.\"}}",
+            "Super Digital agent error: Provider error: API error 400: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.\"}}",
             AgentErrorCode::UserLlmProviderBillingRequired,
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::CheckProviderBilling,
         );
         assert_classification(
-            "Aionrs agent error: Provider error: API error 401: invalid x-api-key",
+            "Super Digital agent error: Provider error: API error 401: invalid x-api-key",
             AgentErrorCode::UserLlmProviderAuthFailed,
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::CheckProviderCredentials,
         );
         assert_classification(
-            "Aionrs agent error: Provider error: Rate limited, retry after 5000ms",
+            "Super Digital agent error: Provider error: Rate limited, retry after 5000ms",
             AgentErrorCode::UserLlmProviderRateLimited,
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::Retry,
@@ -1871,13 +1871,13 @@ mod tests {
             AgentErrorResolutionKind::ChangeModel,
         );
         assert_classification(
-            "Aionrs agent error: provider repeatedly returned malformed tool calls (3/3); stopped to avoid wasting tokens",
+            "Super Digital agent error: provider repeatedly returned malformed tool calls (3/3); stopped to avoid wasting tokens",
             AgentErrorCode::UserLlmProviderInvalidRequest,
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::ChangeModel,
         );
         assert_resolution_target(
-            "Aionrs agent error: provider repeatedly returned malformed tool calls (3/3); stopped to avoid wasting tokens",
+            "Super Digital agent error: provider repeatedly returned malformed tool calls (3/3); stopped to avoid wasting tokens",
             AgentErrorResolutionTarget::ProviderSettings,
         );
         assert_classification(
@@ -1922,13 +1922,13 @@ mod tests {
     #[test]
     fn classifies_bedrock_invalid_model_identifier_as_model_not_found() {
         assert_classification(
-            "Aionrs agent error: Provider error: API error 400: {\"message\":\"The provided model identifier is invalid.\"}",
+            "Super Digital agent error: Provider error: API error 400: {\"message\":\"The provided model identifier is invalid.\"}",
             AgentErrorCode::UserLlmProviderModelNotFound,
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::ChangeModel,
         );
         assert_resolution_target(
-            "Aionrs agent error: Provider error: API error 400: {\"message\":\"The provided model identifier is invalid.\"}",
+            "Super Digital agent error: Provider error: API error 400: {\"message\":\"The provided model identifier is invalid.\"}",
             AgentErrorResolutionTarget::ProviderSettings,
         );
     }
@@ -2003,13 +2003,13 @@ mod tests {
             AgentErrorResolutionTarget::ProviderSettings,
         );
         assert_classification(
-            "Aionrs agent error: API error: Connection error: error decoding response body",
+            "Super Digital agent error: API error: Connection error: error decoding response body",
             AgentErrorCode::UserLlmProviderNetworkError,
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::Retry,
         );
         assert_classification(
-            "Aionrs agent error: API error: error sending request for url",
+            "Super Digital agent error: API error: error sending request for url",
             AgentErrorCode::UserLlmProviderNetworkError,
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::Retry,
@@ -2024,7 +2024,7 @@ mod tests {
 
     #[test]
     fn classifies_bare_provider_404_as_endpoint_not_found() {
-        let detail = "Aionrs agent error: Provider error: API error 404: {\"detail\":\"Not Found\"}";
+        let detail = "Super Digital agent error: Provider error: API error 404: {\"detail\":\"Not Found\"}";
         assert_classification(
             detail,
             AgentErrorCode::UserLlmProviderEndpointNotFound,

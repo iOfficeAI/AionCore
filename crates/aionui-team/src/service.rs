@@ -4576,7 +4576,7 @@ mod tests {
         let (svc, _repo, _task_manager, _conv_repo, _broadcaster) =
             setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
         let created = svc
-            .create_team("user-test", team_with_aionrs_worker_request("Idle Aionrs Cleanup"))
+            .create_team("user-test", team_with_aionrs_worker_request("Idle Super Digital Cleanup"))
             .await
             .unwrap();
         let lead = created.assistants.iter().find(|agent| agent.role == "lead").unwrap();

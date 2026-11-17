@@ -107,7 +107,7 @@ async fn relay_handles_error_event() {
 
 #[tokio::test]
 async fn weixin_flushes_pending_text_before_tool_call() {
-    // Port of AionUi TS fix `406a62665` to the backend relay layer. On
+    // Port of Super Digital TS fix `406a62665` to the backend relay layer. On
     // WeChat, in-place editing is not supported, so a tool-status update
     // would otherwise overwrite any assistant text the user hasn't yet
     // seen. The relay should flush buffered text as an independent

@@ -493,7 +493,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     }
 }
 
-/// Adapter running the on-disk side of AionUi → AionPro adoption over the
+/// Adapter running the on-disk side of Super Digital → Super Digital Pro adoption over the
 /// skill filesystem (auth crate cannot depend on the extension/filesystem).
 struct SkillFilesystemAdopter {
     skill_paths: Arc<aionui_extension::SkillPaths>,

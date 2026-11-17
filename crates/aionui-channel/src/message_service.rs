@@ -381,7 +381,7 @@ fn platform_to_source(platform: PluginType) -> ConversationSource {
         PluginType::Lark => ConversationSource::Lark,
         PluginType::Dingtalk => ConversationSource::Dingtalk,
         PluginType::Weixin => ConversationSource::Weixin,
-        // Reserved variants default to Aionui
+        // Reserved variants default to Super Digital
         PluginType::Slack | PluginType::Discord => ConversationSource::Aionui,
     }
 }

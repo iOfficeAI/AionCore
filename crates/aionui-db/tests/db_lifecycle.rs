@@ -296,7 +296,7 @@ async fn unauthorized_open_stage_corruption_upgrades_to_recoverable_stage() {
     .expect_err("unauthorized corruption must not rebuild, must surface a staged error");
 
     // The fix: corruption-like failure must upgrade to the recoverable stage,
-    // NOT the generic database.open stage (which AionUi maps to restart-only).
+    // NOT the generic database.open stage (which Super Digital maps to restart-only).
     assert_eq!(err.stage(), "database.recoverable_corruption");
 
     // Original corrupt file untouched, no backup created (no rebuild without auth).

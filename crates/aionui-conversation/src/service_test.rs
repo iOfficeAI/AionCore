@@ -735,7 +735,7 @@ fn stub_agent_metadata_rows() -> Vec<AgentMetadataRow> {
         ("2d23ff1c", Some("claude"), "acp", "Claude Code", 100),
         ("8e1acf31", Some("codex"), "acp", "Codex CLI", 110),
         ("cc126dd5", Some("gemini"), "acp", "Gemini CLI", 120),
-        ("632f31d2", None, "aionrs", "Aion CLI", 200),
+        ("632f31d2", None, "aionrs", "Super Digital CLI", 200),
         ("b7e8a9c4", Some("openclaw"), "acp", "OpenClaw", 3140),
         ("f9f61666", None, "openclaw-gateway", "OpenClaw Gateway", 3150),
         ("custom-acp-1", None, "acp", "My Custom ACP", 1500),
@@ -8176,7 +8176,7 @@ async fn assistant_backed_aionrs_build_options_include_snapshot_rule_as_preset_r
 
     match options.context.kind {
         AgentSessionKind::Acp(_) | AgentSessionKind::Antigravity(_) => {
-            panic!("test conversation should build Aionrs options")
+            panic!("test conversation should build Super Digital options")
         }
         AgentSessionKind::Aionrs(ctx) => {
             assert_eq!(ctx.config.preset_rules.as_deref(), Some("assistant rule body"));
@@ -8686,7 +8686,7 @@ async fn warmup_rebuilds_the_skill_view_for_a_custom_workspace() {
 
 // ── G1 regression: the workspace is never written to ────────────────
 //
-// The single most important assertion in this refactor. AionUi's skill delivery
+// The single most important assertion in this refactor. Super Digital's skill delivery
 // used to symlink into `{workspace}/.claude/skills` and friends -- for BOTH
 // temp and user-selected workspaces, the latter frequently being a git
 // repository. The directories were never cleaned up, a manual delete was
@@ -8727,10 +8727,10 @@ fn assert_workspace_unchanged(before: &std::collections::BTreeSet<String>, after
         .filter(|path| !G1_ALLOWED_WORKSPACE_PATHS.contains(&path.as_str()))
         .collect();
     let removed: Vec<&String> = before.difference(after).collect();
-    assert!(added.is_empty(), "AionUi created files in the workspace: {added:?}");
+    assert!(added.is_empty(), "Super Digital created files in the workspace: {added:?}");
     assert!(
         removed.is_empty(),
-        "AionUi removed files from the workspace: {removed:?}"
+        "Super Digital removed files from the workspace: {removed:?}"
     );
 }
 
@@ -9281,7 +9281,7 @@ async fn seed_aionrs_conversation_with_snapshot(
 fn aionrs_session_mode(options: &BuildTaskOptions) -> Option<String> {
     match &options.context.kind {
         AgentSessionKind::Aionrs(ctx) => ctx.config.session_mode.clone(),
-        AgentSessionKind::Acp(_) | AgentSessionKind::Antigravity(_) => panic!("expected Aionrs build options"),
+        AgentSessionKind::Acp(_) | AgentSessionKind::Antigravity(_) => panic!("expected Super Digital build options"),
     }
 }
 

@@ -628,7 +628,7 @@ async fn st10_language_hint_passed() {
     assert_eq!(json["data"]["text"], "你好世界");
 }
 
-// ST-11: AionUI web frontend compatibility shape.
+// ST-11: Super Digital web frontend compatibility shape.
 #[tokio::test]
 async fn st11_web_frontend_tools_key_audio_part_headers_only() {
     let mock_server = MockServer::start().await;

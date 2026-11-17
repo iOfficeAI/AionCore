@@ -511,7 +511,7 @@ async fn t2_4_list_source_filter() {
 
     // Create 2 aionui + 1 telegram
     for _ in 0..2 {
-        let req = json_with_token("POST", "/api/conversations", create_body("Aionui Conv"), &token, &csrf);
+        let req = json_with_token("POST", "/api/conversations", create_body("Super Digital Conv"), &token, &csrf);
         app.clone().oneshot(req).await.unwrap();
     }
 

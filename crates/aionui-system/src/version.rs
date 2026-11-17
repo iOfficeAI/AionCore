@@ -3,7 +3,14 @@ use serde::Deserialize;
 
 use crate::error::SystemError;
 
-const DEFAULT_REPO: &str = "iOfficeAI/AionUi";
+/// GitHub repository (`owner/name`) used as the update channel.
+///
+/// Super Digital does not publish releases through a GitHub channel, so this is
+/// intentionally empty. An empty value means "no update channel configured":
+/// the check reports "no update available" without contacting any third-party
+/// repository. Pass `repo` in the request or set `SUPER_DIGITAL_GITHUB_REPO` to
+/// enable a real channel.
+const DEFAULT_REPO: &str = "";
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
 /// Service that checks GitHub Releases for available updates.
@@ -38,6 +45,14 @@ impl VersionCheckService {
     /// Check for updates against GitHub Releases.
     pub async fn check_update(&self, req: &UpdateCheckRequest) -> Result<UpdateCheckResult, SystemError> {
         let repo = resolve_repo(req.repo.as_deref());
+        let Some(repo) = repo else {
+            // No update channel configured: nothing to compare against.
+            return Ok(UpdateCheckResult {
+                current_version: self.current_version.clone(),
+                update_available: false,
+                latest: None,
+            });
+        };
         let releases = self.fetch_releases(&repo).await?;
 
         let current = parse_version(&self.current_version)
@@ -87,10 +102,16 @@ impl VersionCheckService {
                 .http_client
                 .get(&url)
                 .header("Accept", "application/vnd.github+json")
-                .header("User-Agent", "aioncore")
+                .header("User-Agent", "superdigital")
                 .send()
                 .await
                 .map_err(|e| SystemError::BadGateway(format!("GitHub API request failed: {e}")))?;
+
+            // A missing repository simply means "nothing published yet"; it is
+            // not a transport failure, so it must not surface as an error.
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(Vec::new());
+            }
 
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -123,18 +144,23 @@ impl VersionCheckService {
 }
 
 /// Resolve the GitHub repo from request or env or default.
-fn resolve_repo(from_request: Option<&str>) -> String {
+///
+/// Returns `None` when no update channel is configured at all.
+fn resolve_repo(from_request: Option<&str>) -> Option<String> {
     if let Some(r) = from_request
         && !r.is_empty()
     {
-        return r.to_owned();
+        return Some(r.to_owned());
     }
-    if let Ok(v) = std::env::var("AIONUI_GITHUB_REPO")
+    if let Ok(v) = std::env::var("SUPER_DIGITAL_GITHUB_REPO")
         && !v.is_empty()
     {
-        return v;
+        return Some(v);
     }
-    DEFAULT_REPO.to_owned()
+    if DEFAULT_REPO.is_empty() {
+        return None;
+    }
+    Some(DEFAULT_REPO.to_owned())
 }
 
 /// Parse a version string, stripping a leading `v` if present.
@@ -278,20 +304,30 @@ mod tests {
 
     #[test]
     fn test_resolve_repo_from_request() {
-        assert_eq!(resolve_repo(Some("org/repo")), "org/repo");
+        assert_eq!(resolve_repo(Some("org/repo")).as_deref(), Some("org/repo"));
     }
 
     #[test]
-    fn test_resolve_repo_empty_request() {
-        let result = resolve_repo(Some(""));
-        // Falls back to env or default
-        assert!(!result.is_empty());
+    fn test_resolve_repo_never_targets_upstream() {
+        // Regression guard: the update channel must never point back at the
+        // upstream project, otherwise the app would offer to download it.
+        for candidate in [resolve_repo(None), resolve_repo(Some(""))] {
+            if let Some(repo) = candidate {
+                assert!(
+                    !repo.to_lowercase().contains("aionui"),
+                    "update channel points at upstream: {repo}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn test_resolve_repo_none() {
-        let result = resolve_repo(None);
-        assert!(!result.is_empty());
+    fn test_resolve_repo_empty_is_none_by_default() {
+        // With no request, no env var and no default, there is no channel.
+        if std::env::var("SUPER_DIGITAL_GITHUB_REPO").is_err() {
+            assert_eq!(resolve_repo(None), None);
+            assert_eq!(resolve_repo(Some("")), None);
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! AionPro-mode auth for the in-conversation helper CLI (`aioncore config`).
+//! Super Digital Pro-mode auth for the in-conversation helper CLI (`aioncore config`).
 //!
 //! Regression for the 401 that broke `/cron` inside agent conversations: the
 //! helper cannot carry a JWT, so it authenticates through the runtime-token

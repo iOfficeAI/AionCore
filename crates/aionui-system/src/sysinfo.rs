@@ -19,7 +19,7 @@ fn map_arch() -> &'static str {
     }
 }
 
-/// Resolve the cache directory for AionUI.
+/// Resolve the cache directory for Super Digital.
 ///
 /// Priority: `AIONUI_CACHE_DIR` env → `dirs::cache_dir()/aionui`.
 fn resolve_cache_dir() -> String {
@@ -33,7 +33,7 @@ fn resolve_cache_dir() -> String {
         .unwrap_or_default()
 }
 
-/// Resolve the work (data) directory for AionUI.
+/// Resolve the work (data) directory for Super Digital.
 ///
 /// Priority: `AIONUI_WORK_DIR` env → `dirs::data_dir()/aionui`.
 fn resolve_work_dir() -> String {
@@ -47,7 +47,7 @@ fn resolve_work_dir() -> String {
         .unwrap_or_default()
 }
 
-/// Resolve the log directory for AionUI.
+/// Resolve the log directory for Super Digital.
 ///
 /// Priority: `AIONUI_LOG_DIR` env →
 ///   macOS: `~/Library/Logs/aionui`

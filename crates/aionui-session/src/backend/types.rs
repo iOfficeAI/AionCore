@@ -339,7 +339,7 @@ pub enum TransitionReason {
 // session identity (two-id model, §4.1 / Addendum 4)
 // ==========================================================================
 
-/// How a session is (re)opened. `session_id` is the STABLE AionCore-minted
+/// How a session is (re)opened. `session_id` is the STABLE Super Digital-minted
 /// logical id (immutable across fork/resume/crash-respawn; the demux key).
 /// `backend_session_id` is the MUTABLE transport binding (adapter-private,
 /// lives only on the checkpoint; None = backend session lost → adapter mints a

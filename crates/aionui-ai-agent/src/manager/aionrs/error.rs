@@ -7,7 +7,7 @@ use aionui_api_types::{
 use crate::protocol::send_error::AgentSendError;
 
 pub(super) fn aionrs_engine_error_to_send_error(error: &AionrsAgentError) -> AgentSendError {
-    let detail = format!("Aionrs agent error: {error}");
+    let detail = format!("Super Digital agent error: {error}");
     match error {
         AionrsAgentError::Provider(provider_error) => aionrs_provider_error_to_send_error(provider_error, detail),
         AionrsAgentError::ToolCallMalformed { .. } => provider_send_error(

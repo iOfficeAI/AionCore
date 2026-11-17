@@ -158,7 +158,7 @@ async fn running_model_for(model: Option<&str>) -> Option<String> {
     observe_run(model).await.map(|(_, running)| running)
 }
 
-/// The model AionUi asks for is the model claude runs — end to end, through the real
+/// The model Super Digital asks for is the model claude runs — end to end, through the real
 /// spawn, with NO `--model` flag involved (the selection travels in-band).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "LIVE: spawns the real claude CLI and spends tokens"]

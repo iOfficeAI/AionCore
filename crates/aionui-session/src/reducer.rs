@@ -75,7 +75,7 @@ fn anchor_epoch(s: &SessionState) -> u64 {
 /// seam b-side, monomorphic pure fn. epoch single-home = `TurnStarted{epoch}`
 /// (I3): `Running.since_epoch` is the reducer's baseline; `step` takes no
 /// separate epoch scalar. Commands arrive as `SessionEvent::TurnStarted`. There
-/// is NO clock input: AionCore imposes no auto-timeout on any state (the deadline
+/// is NO clock input: Super Digital imposes no auto-timeout on any state (the deadline
 /// janitor + `Timeout` event were removed) — a wedged turn ends by user Cancel, a
 /// dead process by `Detached`. The reducer never reads a clock.
 pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Transition>) {

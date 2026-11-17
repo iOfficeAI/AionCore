@@ -127,7 +127,7 @@ async fn run_probe(
     let mut engine = match build_probe_engine(config_extra).await {
         Ok(engine) => engine,
         Err(error) => {
-            let message = format!("Aionrs probe bootstrap failed: {error}");
+            let message = format!("Super Digital probe bootstrap failed: {error}");
             let response = unhealthy_response(provider_id, platform, model, started.elapsed(), message, None);
             log_health_check_result(&response);
             return Ok(response);

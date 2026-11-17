@@ -7,10 +7,10 @@ use crate::adapter::{DetectedServer, McpAgentAdapter};
 use crate::error::McpError;
 use crate::types::{McpServer, McpServerTransport};
 
-/// MCP Agent adapter for Aionui itself.
+/// MCP Agent adapter for Super Digital itself.
 ///
 /// Unlike CLI-based adapters, this adapter reads/writes directly to the
-/// local database. It is always "installed" since AionUi is the host
+/// local database. It is always "installed" since Super Digital is the host
 /// application.
 ///
 /// # Behavior
@@ -59,7 +59,7 @@ impl McpAgentAdapter for AionuiAdapter {
     async fn install_server(&self, _name: &str, _transport: &McpServerTransport) -> Result<(), McpError> {
         // No-op: DB writes are handled by McpConfigService.
         // The sync service calls install_server on all adapters, but for
-        // Aionui the server is already in the DB.
+        // Super Digital the server is already in the DB.
         Ok(())
     }
 

@@ -709,7 +709,7 @@ mod tests {
     #[test]
     fn resolve_scan_paths_for_data_dir_prefers_env_then_data_dir_then_appdata() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let app_root = tmp.path().join("AionUi-Dev");
+        let app_root = tmp.path().join("Super Digital-Dev");
         let data_dir = app_root.join("aionui");
         std::fs::create_dir_all(&data_dir).unwrap();
         let canonical_app_root = std::fs::canonicalize(&app_root).unwrap();

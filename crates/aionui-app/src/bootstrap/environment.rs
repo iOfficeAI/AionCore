@@ -112,7 +112,7 @@ fn validate_identity_environment(
         return Err(BootstrapError::new(
             BootstrapErrorCode::ConfigInvalid,
             "config.identity_mode",
-            "AionPro identity mode requires AIONCORE_BOOTSTRAP_SECRET",
+            "Super Digital Pro identity mode requires AIONCORE_BOOTSTRAP_SECRET",
         ));
     }
 
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn aionpro_identity_requires_bootstrap_secret() {
         let err = validate_identity_environment(IdentityMode::AionPro, None)
-            .expect_err("AionPro startup must require bootstrap secret");
+            .expect_err("Super Digital Pro startup must require bootstrap secret");
 
         assert_eq!(err.code(), BootstrapErrorCode::ConfigInvalid);
         assert_eq!(err.stage(), "config.identity_mode");
@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn aionpro_identity_accepts_bootstrap_secret() {
         validate_identity_environment(IdentityMode::AionPro, Some("secret"))
-            .expect("AionPro startup should accept configured bootstrap secret");
+            .expect("Super Digital Pro startup should accept configured bootstrap secret");
     }
 
     #[test]

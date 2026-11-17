@@ -52,7 +52,7 @@ pub(super) async fn build(
         config.backend.clone_from(&meta.backend);
     }
 
-    // Register AionUi as agy's PreToolUse gate for THIS workspace, and mint the
+    // Register Super Digital as agy's PreToolUse gate for THIS workspace, and mint the
     // token that authenticates the hook's callback. Without this the session
     // still runs, but with agy's gate wide open and no per-call approval — so a
     // failure here must be loud.

@@ -95,7 +95,7 @@ mod tests {
 
     /// `skill_delivery` must NOT be settable through the custom-agent overrides.
     ///
-    /// The AionUi editor parses this struct with a per-field WHITELIST, so adding
+    /// The Super Digital editor parses this struct with a per-field WHITELIST, so adding
     /// a field here without the matching frontend change means a user can type it
     /// in and have it silently discarded — worse than it being unsupported,
     /// because there is no feedback. It is also a vendor capability declaration

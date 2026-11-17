@@ -41,7 +41,7 @@ pub(crate) const LEGACY_HANDOFF_COLUMNS: &[LegacyHandoffColumn] = &[
         column: "agents_version",
         definition: "TEXT NOT NULL DEFAULT '1.0.0'",
     },
-    // AIONUI-230 (Sentry): legacy databases that never ran AionUi JS-side v22
+    // AIONUI-230 (Sentry): legacy databases that never ran Super Digital JS-side v22
     // lack `messages.hidden`, and migration 002 Part D.1 reads it from the old
     // table (`COALESCE(hidden, 0)` fails at SQL prepare time when the source
     // column is absent), leaving startup permanently broken. Definition matches
@@ -155,28 +155,28 @@ mod tests {
             (
                 "conversations",
                 "source",
-                "AionUi v8 baseline before v23-v26 issue path",
+                "Super Digital v8 baseline before v23-v26 issue path",
             ),
             (
                 "conversations",
                 "channel_chat_id",
-                "AionUi v14 baseline before v23-v26 issue path",
+                "Super Digital v14 baseline before v23-v26 issue path",
             ),
-            ("mailbox", "files", "AionUi v25 adds it on the observed v23->v26 path"),
+            ("mailbox", "files", "Super Digital v25 adds it on the observed v23->v26 path"),
             (
                 "remote_agents",
                 "allow_insecure",
-                "AionUi v18 baseline before v23-v26 issue path",
+                "Super Digital v18 baseline before v23-v26 issue path",
             ),
             (
                 "cron_jobs",
                 "execution_mode",
-                "AionUi v22 baseline before v23-v26 issue path",
+                "Super Digital v22 baseline before v23-v26 issue path",
             ),
             (
                 "cron_jobs",
                 "agent_config",
-                "AionUi v22 baseline before v23-v26 issue path",
+                "Super Digital v22 baseline before v23-v26 issue path",
             ),
         ];
 

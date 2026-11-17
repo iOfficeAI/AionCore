@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(name = "aioncore", about = "AionUi Backend Server", version)]
+#[command(name = "aioncore", about = "Super Digital Backend Server", version)]
 pub(crate) struct Cli {
     /// Host address to listen on.
     #[arg(long, default_value_t = String::from(aionui_common::constants::DEFAULT_HOST))]
@@ -41,7 +41,7 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub local: bool,
 
-    /// Identity source mode. AionPro mode requires AIONCORE_BOOTSTRAP_SECRET.
+    /// Identity source mode. Super Digital Pro mode requires AIONCORE_BOOTSTRAP_SECRET.
     #[arg(long, value_enum, default_value_t = IdentityModeArg::Webui)]
     pub identity_mode: IdentityModeArg,
 
@@ -108,9 +108,9 @@ impl From<ManagedResourcesModeArg> for aionui_runtime::ManagedResourcesMode {
 pub(crate) enum Command {
     /// Print the top-level agent-facing CLI capability index.
     Capabilities,
-    /// Agent-facing automation CLI for AionUi configuration.
+    /// Agent-facing automation CLI for Super Digital configuration.
     Config(ConfigArgs),
-    /// Agent-facing read-only troubleshooting CLI for AionUi diagnosis.
+    /// Agent-facing read-only troubleshooting CLI for Super Digital diagnosis.
     Diagnose(DiagnoseArgs),
     /// Agent-facing Team collaboration CLI fallback.
     Team(TeamArgs),
@@ -125,7 +125,7 @@ pub(crate) enum Command {
     /// `[LOAD_SKILL]` text-protocol round trip.
     Skills(SkillsArgs),
     /// PreToolUse permission gate for the Antigravity CLI (spawned by agy).
-    /// Reads the tool request on stdin, asks the running AionUi backend, and
+    /// Reads the tool request on stdin, asks the running Super Digital backend, and
     /// writes agy's decision to stdout.
     AntigravityHook,
     /// Stdio ↔ TCP bridge for the team MCP server (spawned by the ACP agent CLI).
@@ -400,7 +400,7 @@ pub(crate) enum ConfigCommand {
     Conversation(ConfigConversationArgs),
     /// Manage assistants and assistant-owned behavior.
     Assistants(ConfigAssistantsArgs),
-    /// Manage AionUi skills.
+    /// Manage Super Digital skills.
     Skills(ConfigSkillsArgs),
     /// Manage MCP servers and OAuth state.
     Mcp(ConfigMcpArgs),
@@ -702,7 +702,7 @@ pub(crate) enum ConfigConversationCommand {
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct PrepareManagedResourcesArgs {
-    /// Bundle output root. Aioncore writes the managed resources under
+    /// Bundle output root. Super Digitalcore writes the managed resources under
     /// `<bundle-out>/{node,acp}/...` for packaging.
     #[arg(long)]
     pub bundle_out: PathBuf,

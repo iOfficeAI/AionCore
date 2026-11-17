@@ -372,7 +372,7 @@ impl BackendConnection for ClaudeConnection {
         // Ordered AFTER initialize purely for log readability — both are written before
         // any prompt, which is all the ordering the CLI requires.
         backend.apply_desired_model().await;
-        // Report a claude whose version differs from the release AionUi
+        // Report a claude whose version differs from the release Super Digital
         // verified. claude runs from the user's own install (nothing is
         // bundled), so this is the same situation agy has always been in.
         backend.spawn_version_check();
@@ -1214,7 +1214,7 @@ impl ClaudeSessionBackend {
     }
 
     /// Tell the user once per conversation when the installed claude is not the
-    /// release AionUi verified.
+    /// release Super Digital verified.
     ///
     /// Fire-and-forget: the probe spawns `claude --version` and a failure only
     /// costs the drift claim, never the session.

@@ -24,7 +24,7 @@ const NOISE_SUPPRESSIONS: &[&str] = &[
     // out of default dev logs; aionui_ai_agent::protocol::acp emits sanitized
     // summaries for the ACP flow we need to debug.
     "agent_client_protocol::jsonrpc=info",
-    // Aionrs provider/agent debug logs include raw request bodies and SSE
+    // Super Digital provider/agent debug logs include raw request bodies and SSE
     // chunks. Keep lifecycle info logs, but do not write prompt/output
     // payloads by default.
     "aion_agent=info",
@@ -189,7 +189,7 @@ pub fn init_tracing(
         .with_target(true)
         .with_filter(build_backend_filter(log_level));
 
-    // Aionrs file layer — only aion_* targets
+    // Super Digital file layer — only aion_* targets
     let aionrs_level = build_aionrs_level(log_level);
     let aionrs_filter = EnvFilter::try_new(&aionrs_level).map_err(|e| {
         BootstrapError::new(
@@ -354,7 +354,7 @@ mod tests {
             );
             assert!(
                 tracing::enabled!(target: "aionui_ai_agent::protocol::acp", Level::DEBUG),
-                "AionUi ACP sanitized debug summaries should still be available"
+                "Super Digital ACP sanitized debug summaries should still be available"
             );
         });
     }
@@ -369,7 +369,7 @@ mod tests {
             );
             assert!(
                 tracing::enabled!(target: "aionui_ai_agent::protocol::acp", Level::DEBUG),
-                "AionUi ACP sanitized debug summaries should still be available"
+                "Super Digital ACP sanitized debug summaries should still be available"
             );
         });
     }
@@ -388,7 +388,7 @@ mod tests {
             );
             assert!(
                 tracing::enabled!(target: "aionui_ai_agent::manager::aionrs::agent", Level::DEBUG),
-                "AionUi aionrs lifecycle debug logs should still be available"
+                "Super Digital aionrs lifecycle debug logs should still be available"
             );
         });
     }

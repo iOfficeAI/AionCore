@@ -1,4 +1,4 @@
-//! End-to-end reproduction of the AionUi → AionPro adoption path for
+//! End-to-end reproduction of the Super Digital → Super Digital Pro adoption path for
 //! assistant rules, run against the REAL adoption code (no mocks):
 //! real migrations, real `ensure_external_user`, real
 //! `adopt_system_default_data` (one-shot stamp), real

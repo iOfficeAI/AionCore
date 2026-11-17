@@ -16,7 +16,7 @@ pub(crate) fn normalize_requested_mode(metadata: &AgentMetadata, mode: &str) -> 
             .unwrap_or_else(|| CODEX_CANONICAL_FULL_ACCESS_MODE.to_owned());
     }
 
-    // AionUi persists the legacy aliases `yolo` / `yoloNoSandbox` while
+    // Super Digital persists the legacy aliases `yolo` / `yoloNoSandbox` while
     // ACP backends expect their native mode id (e.g. `full-access` for
     // Codex). Resolution is data-driven: the mapping lives on each
     // catalog row's top-level `yolo_id` column. Backends without a

@@ -39,7 +39,7 @@ async fn claude_gets_layer_one_argv_delivery_with_allow_dir_args() {
     );
     // Not optional: spec §10.2 #9 measured that a `--plugin-dir` registered
     // skill still fails claude's path check when the agent Reads its
-    // supplementary files, under AionUi's real default permission mode.
+    // supplementary files, under Super Digital's real default permission mode.
     assert_eq!(
         delivery["allow_dir_args"],
         serde_json::json!(["--add-dir", "{skill_dir}"])

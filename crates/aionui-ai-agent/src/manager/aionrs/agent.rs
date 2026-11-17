@@ -44,7 +44,7 @@ fn resolve_aionui_config(cli_args: &CliArgs) -> Result<Config, AgentError> {
     let mut config =
         Config::resolve(cli_args).map_err(|e| AgentError::internal(format!("Config resolve failed: {e}")))?;
 
-    // AionUi owns the embedded runtime policy. Standalone aionrs max-token
+    // Super Digital owns the embedded runtime policy. Standalone aionrs max-token
     // settings must not leak in from global or workspace config files.
     config.max_tokens = None;
     let default_transport = match config.provider {
@@ -160,7 +160,7 @@ impl AionrsAgentManager {
             model = %config_extra.model,
             image_input_capability = ?image_input_capability,
             image_input_source = if image_input_override.is_some() { "provider_settings" } else { "catalog" },
-            "Resolved image input capability for Aionrs model"
+            "Resolved image input capability for Super Digital model"
         );
         let final_input_dump = config_extra
             .prompt_dump_dir
@@ -252,7 +252,7 @@ impl AionrsAgentManager {
             info!(
                 conversation_id = %conversation_id,
                 session_mode = mode_str,
-                "Aionrs initial session mode applied"
+                "Super Digital initial session mode applied"
             );
         }
 
@@ -303,7 +303,7 @@ impl AionrsAgentManager {
             ?reason,
             was_running,
             operation,
-            "Aionrs stop signal requested"
+            "Super Digital stop signal requested"
         );
 
         was_running
@@ -388,7 +388,7 @@ impl IAgentTask for AionrsAgentManager {
             conversation_id = %self.runtime.conversation_id(),
             msg_id = %data.msg_id,
             turn_id = data.turn_id.as_deref().unwrap_or("none"),
-            "Aionrs send_message started"
+            "Super Digital send_message started"
         );
         self.runtime.bump_activity();
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
@@ -398,12 +398,12 @@ impl IAgentTask for AionrsAgentManager {
         // are loaded on demand by aionrs's ViewImage tool.
         debug!(
             attachment_count = data.files.len(),
-            "Building structured Aionrs content blocks"
+            "Building structured Super Digital content blocks"
         );
         let content_blocks = build_content_blocks(&data.content, &data.files);
         debug!(
             block_count = content_blocks.len(),
-            "Built structured Aionrs content blocks"
+            "Built structured Super Digital content blocks"
         );
 
         // One anchor for both history stores: the conversation-layer turn id
@@ -428,7 +428,7 @@ impl IAgentTask for AionrsAgentManager {
             _ = self.cancel_notify.notified() => {
                 info!(
                     conversation_id = %self.runtime.conversation_id(),
-                    "Aionrs engine.run() cancelled by stop signal"
+                    "Super Digital engine.run() cancelled by stop signal"
                 );
                 engine.abort_current_turn("Tool execution canceled by user");
                 None
@@ -443,7 +443,7 @@ impl IAgentTask for AionrsAgentManager {
                 info!(
                     conversation_id = %self.runtime.conversation_id(),
                     elapsed_ms,
-                    "Aionrs engine.run() completed, emitting Finish"
+                    "Super Digital engine.run() completed, emitting Finish"
                 );
                 self.runtime.emit_finish(None);
                 Ok(())
@@ -454,7 +454,7 @@ impl IAgentTask for AionrsAgentManager {
                     conversation_id = %self.runtime.conversation_id(),
                     elapsed_ms,
                     error = %ErrorChain(&e),
-                    "Aionrs engine.run() failed, emitting Error"
+                    "Super Digital engine.run() failed, emitting Error"
                 );
                 error!(
                     target: "aionui_feedback_diagnostics",
@@ -537,7 +537,7 @@ impl AionrsAgentManager {
             call_id,
             value,
             always_allow,
-            "Aionrs confirm"
+            "Super Digital confirm"
         );
 
         if is_cancel {
@@ -580,7 +580,7 @@ impl AionrsAgentManager {
             conversation_id = %self.runtime.conversation_id(),
             from = prev,
             to = mode,
-            "Aionrs session mode switched"
+            "Super Digital session mode switched"
         );
         Ok(())
     }

@@ -940,7 +940,7 @@ mod tests {
             ),
         );
 
-        // Non-ACP (Aionrs) + Finished + old activity → should NOT be collected
+        // Non-ACP (Super Digital) + Finished + old activity → should NOT be collected
         insert(
             "conv-aionrs",
             mock_instance(

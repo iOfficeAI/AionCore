@@ -62,7 +62,7 @@ pub enum SessionEvent {
     /// mislabels as a crash. MUST NOT be lowered as `Detached`.
     Cancel,
 
-    // (No clock/timeout lower: AionCore does NOT auto-time-out a turn. A user may
+    // (No clock/timeout lower: Super Digital does NOT auto-time-out a turn. A user may
     // leave a permission unanswered indefinitely; a genuinely wedged agent is
     // ended by user Cancel, and a dead process by `Detached`. The former deadline
     // janitor + `Timeout` event were removed 2026-06-11, user-decided — no
@@ -257,7 +257,7 @@ pub enum SessionEvent {
         tool_name: Option<String>,
         /// The raised tool's raw `input`, shown on the permission card so the
         /// approver can review WHAT they are approving (a Bash `command`, an
-        /// AskUserQuestion `{questions:[…]}` — AionUi issue #3779: without it the
+        /// AskUserQuestion `{questions:[…]}` — Super Digital issue #3779: without it the
         /// card showed only the tool name and the user approved blind). This is
         /// display-to-the-approver, NOT logging — TIO-13 (never log tool input at
         /// info) still applies to log output. `None` for paths that carry no tool

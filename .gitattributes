@@ -1,2 +1,6 @@
 *.sh text eol=lf
 *.ps1 text eol=crlf
+
+# sqlx hashes raw migration bytes: the official v0.2.2 release was built from a
+# CRLF (Windows) checkout, so keep *.sql CRLF to stay checksum-compatible.
+*.sql text eol=crlf

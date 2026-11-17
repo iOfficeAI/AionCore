@@ -302,7 +302,7 @@ impl AppServices {
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
         } else {
-            // AionPro: never ingest the legacy shared skill directory — its
+            // Super Digital Pro: never ingest the legacy shared skill directory — its
             // files carry no account attribution and would only create rows
             // for the never-logged-in local default user.
             aionui_extension::sync_builtin_skill_catalog_into_repo(skill_paths.as_ref(), skill_repo.as_ref())
@@ -370,7 +370,7 @@ impl AppServices {
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),
             session_spawner,
-            // agy cannot prompt for tool permission in headless mode, so AionUi
+            // agy cannot prompt for tool permission in headless mode, so Super Digital
             // registers itself as its PreToolUse hook; the hook process calls
             // back here to raise the user's permission card.
             antigravity_hook_base_url: Some(runtime_base_url.clone()),

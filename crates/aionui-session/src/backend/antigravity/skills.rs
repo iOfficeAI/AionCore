@@ -6,7 +6,7 @@
 //! files rather than asked for.
 //!
 //! The files are the session's RESOLVED skill directories. This used to scan
-//! `{workspace}/.agents/skills`, which AionUi no longer creates. The resolved
+//! `{workspace}/.agents/skills`, which Super Digital no longer creates. The resolved
 //! dirs are a strictly better source anyway: they are exactly this
 //! conversation's enabled skills, so a stale residue left in the workspace by
 //! an older build can no longer show up in the picker.
@@ -119,7 +119,7 @@ mod tests {
     }
 
     /// The command list must come from the session's resolved skills, NOT from
-    /// the workspace: AionUi no longer writes there, and a residue left by an
+    /// the workspace: Super Digital no longer writes there, and a residue left by an
     /// older build must not reappear in the picker.
     #[test]
     fn a_stale_workspace_residue_is_not_listed() {

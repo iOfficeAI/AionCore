@@ -46,7 +46,7 @@ async fn build_v29_db(path: &Path, seed: &[&str]) {
 
 /// Like [`build_v29_db`] but stops at `through_version` (< 29), leaving BOTH 029
 /// and 030 pending. This is the ELECTRON-31Z one-step upgrade: a DB that never
-/// stopped at v29 (AionCore 0.1.52 stops at 28) jumps straight to a build with
+/// stopped at v29 (Super Digital 0.1.52 stops at 28) jumps straight to a build with
 /// 030. Staged init must run the repair before the migrator applies 029 + 030 in
 /// a single pass — the path the old `== 29` gate skipped entirely.
 async fn build_db_through(path: &Path, through_version: i64, seed: &[&str]) {
@@ -138,7 +138,7 @@ async fn stuck_user_with_orphans_self_heals_and_030_applies() {
 
 #[tokio::test]
 async fn v28_start_point_self_heals_across_029_and_030() {
-    // ELECTRON-31Z root case: a DB stopped at v28 (AionCore 0.1.52) upgrades in
+    // ELECTRON-31Z root case: a DB stopped at v28 (Super Digital 0.1.52) upgrades in
     // one step, so the migrator must apply BOTH 029 and 030. The widened gate
     // runs the pre-migration repair before that pass, so 030's CHECK(ok=1)
     // guards see normalized data. The old `== 29` gate skipped v28 and 030
