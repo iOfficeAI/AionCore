@@ -43,7 +43,7 @@
     },
     "mimo-code": {
       "package": "@mimo-ai/cli",
-      "version": "0.1.9"
+      "version": "0.1.15"
     },
     "minimax-code": {
       "registry_json_id": "minimax-code",
