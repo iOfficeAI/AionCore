@@ -447,20 +447,22 @@ async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<
             warn!("Concurrent migrator detected (UNIQUE conflict on _sqlx_migrations); retrying");
             DB_MIGRATOR.run(&mut *conn).await.map_err(DbError::Migration)
         }
-        Err(sqlx::migrate::MigrateError::VersionMismatch(version))
-            if version == MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION =>
-        {
-            if align_reconciled_mcp_migration_checksum(&mut *conn).await? {
+        Err(sqlx::migrate::MigrateError::VersionMismatch(version)) => {
+            let aligned = align_eol_only_migration_checksums(&mut *conn, version).await?;
+            if aligned > 0 {
                 warn!(
-                    "Aligned checksum for reconciled MCP migration {}; retrying",
-                    MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION
+                    "Aligned {} applied migration checksum(s) differing only by LF/CRLF line endings; retrying",
+                    aligned
                 );
-                DB_MIGRATOR.run(&mut *conn).await.map_err(DbError::Migration)
-            } else {
-                Err(DbError::Migration(sqlx::migrate::MigrateError::VersionMismatch(
-                    version,
-                )))
+                return match DB_MIGRATOR.run(&mut *conn).await {
+                    Ok(()) => Ok(()),
+                    Err(sqlx::migrate::MigrateError::VersionMismatch(v)) => {
+                        retry_after_mcp_reconciliation(&mut *conn, v).await
+                    }
+                    Err(e) => Err(DbError::Migration(e)),
+                };
             }
+            retry_after_mcp_reconciliation(&mut *conn, version).await
         }
         Err(e) => Err(DbError::Migration(e)),
     }
@@ -672,6 +674,102 @@ async fn align_reconciled_mcp_migration_checksum(conn: &mut sqlx::SqliteConnecti
     Ok(updated.rows_affected() > 0)
 }
 
+async fn retry_after_mcp_reconciliation(conn: &mut sqlx::SqliteConnection, version: i64) -> Result<(), DbError> {
+    if version == MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION
+        && align_reconciled_mcp_migration_checksum(&mut *conn).await?
+    {
+        warn!(
+            "Aligned checksum for reconciled MCP migration {}; retrying",
+            MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION
+        );
+        DB_MIGRATOR.run(&mut *conn).await.map_err(DbError::Migration)
+    } else {
+        Err(DbError::Migration(sqlx::migrate::MigrateError::VersionMismatch(
+            version,
+        )))
+    }
+}
+
+fn eol_variant_checksums(migration: &sqlx::migrate::Migration) -> (Vec<u8>, Vec<u8>) {
+    let lf = migration.sql.replace("\r\n", "\n");
+    let crlf = lf.replace('\n', "\r\n");
+    let checksum_for = |sql: String| -> Vec<u8> {
+        sqlx::migrate::Migration::new(
+            migration.version,
+            migration.description.clone(),
+            migration.migration_type,
+            std::borrow::Cow::Owned(sql),
+            migration.no_tx,
+        )
+        .checksum
+        .into_owned()
+    };
+    (checksum_for(lf), checksum_for(crlf))
+}
+
+fn eol_variant_checksum_matches(migration: &sqlx::migrate::Migration, stored: &[u8]) -> bool {
+    let (lf_checksum, crlf_checksum) = eol_variant_checksums(migration);
+    stored == lf_checksum.as_slice() || stored == crlf_checksum.as_slice()
+}
+
+/// Reconcile `_sqlx_migrations` checksums when applied migrations differ from the
+/// embedded migrator only by LF vs. CRLF line endings (e.g., Windows vs. Unix builds).
+///
+/// Only runs if `failing_version` itself matches an LF/CRLF-normalized variant of the
+/// embedded migration SQL; genuine SQL modifications continue returning `VersionMismatch`.
+async fn align_eol_only_migration_checksums(
+    conn: &mut sqlx::SqliteConnection,
+    failing_version: i64,
+) -> Result<usize, DbError> {
+    let Some(failing_migration) = DB_MIGRATOR.iter().find(|m| m.version == failing_version) else {
+        return Ok(0);
+    };
+
+    let stored_failing: Option<Vec<u8>> = sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ?")
+        .bind(failing_version)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(DbError::Query)?;
+
+    let Some(stored_failing) = stored_failing else {
+        return Ok(0);
+    };
+
+    if !eol_variant_checksum_matches(failing_migration, &stored_failing) {
+        return Ok(0);
+    }
+
+    let applied: Vec<(i64, Vec<u8>)> =
+        sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version ASC")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(DbError::Query)?;
+
+    let mut aligned = 0usize;
+    for (version, stored_checksum) in applied {
+        let Some(migration) = DB_MIGRATOR.iter().find(|m| m.version == version) else {
+            continue;
+        };
+        if stored_checksum.as_slice() == &*migration.checksum {
+            continue;
+        }
+        if !eol_variant_checksum_matches(migration, &stored_checksum) {
+            continue;
+        }
+        let updated = sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")
+            .bind(&*migration.checksum)
+            .bind(version)
+            .execute(&mut *conn)
+            .await
+            .map_err(DbError::Query)?;
+        if updated.rows_affected() > 0 {
+            aligned += 1;
+        }
+    }
+
+    Ok(aligned)
+}
+
 /// Ensure the system default user exists.
 ///
 /// Uses INSERT OR IGNORE so it is safe to call on every startup.
@@ -865,5 +963,75 @@ mod tests {
     fn startup_file_retry_rejects_non_transient_errors() {
         let err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing file");
         assert!(!is_retryable_startup_file_error(&err));
+    }
+
+    #[tokio::test]
+    async fn eol_only_migration_checksum_drift_reconciles_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("eol-drift.db");
+
+        let db = init_database(&db_path).await.unwrap();
+        for migration in DB_MIGRATOR.iter() {
+            let (lf_cs, crlf_cs) = eol_variant_checksums(migration);
+            let opposite = if &*migration.checksum == lf_cs.as_slice() {
+                crlf_cs
+            } else {
+                lf_cs
+            };
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")
+                .bind(opposite)
+                .bind(migration.version)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        db.close().await;
+
+        let reopened = init_database(&db_path)
+            .await
+            .expect("LF/CRLF-only migration checksum drift should reconcile cleanly");
+
+        let rows: Vec<(i64, Vec<u8>)> =
+            sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version ASC")
+                .fetch_all(reopened.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), DB_MIGRATOR.iter().count());
+        for (version, checksum) in rows {
+            let expected = DB_MIGRATOR.iter().find(|m| m.version == version).unwrap();
+            assert_eq!(checksum.as_slice(), &*expected.checksum);
+        }
+        reopened.close().await;
+    }
+
+    #[tokio::test]
+    async fn modified_migration_sql_checksum_still_returns_version_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tampered-checksum.db");
+
+        let db = init_database(&db_path).await.unwrap();
+        let m1 = DB_MIGRATOR.iter().find(|m| m.version == 1).unwrap();
+        let tampered = sqlx::migrate::Migration::new(
+            m1.version,
+            m1.description.clone(),
+            m1.migration_type,
+            std::borrow::Cow::Owned(format!("-- tampered\n{}", m1.sql)),
+            m1.no_tx,
+        );
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 1")
+            .bind(&*tampered.checksum)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.close().await;
+
+        let err = init_database(&db_path)
+            .await
+            .err()
+            .expect("tampered migration SQL checksum must still fail");
+        assert!(
+            matches!(err, DbError::Migration(sqlx::migrate::MigrateError::VersionMismatch(1))),
+            "expected VersionMismatch(1), got: {err:?}"
+        );
     }
 }
