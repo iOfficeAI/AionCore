@@ -28,7 +28,7 @@ impl AgentHealthPolicy {
         ) {
             return AgentHealthAction::Keep;
         }
-        if agent_type != AgentType::Acp || !outcome.terminal.is_error() {
+        if !matches!(agent_type, AgentType::Acp | AgentType::Antigravity) || !outcome.terminal.is_error() {
             return AgentHealthAction::Keep;
         }
 
@@ -129,5 +129,17 @@ mod tests {
             AgentHealthPolicy::decide(AgentType::Acp, &outcome, RuntimeLifecycleState::Deleting),
             AgentHealthAction::Keep
         );
+    }
+
+    #[test]
+    fn antigravity_terminal_error_evicts_task() {
+        let outcome = error_outcome(Some(AgentErrorCode::UnknownUpstreamError));
+        assert!(matches!(
+            AgentHealthPolicy::decide(AgentType::Antigravity, &outcome, RuntimeLifecycleState::Active),
+            AgentHealthAction::EvictAcpTask {
+                clear_model_seed: false,
+                ..
+            }
+        ));
     }
 }

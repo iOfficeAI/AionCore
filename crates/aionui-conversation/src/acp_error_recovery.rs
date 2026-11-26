@@ -284,7 +284,7 @@ impl ConversationService {
         outcome: &RelayOutcome,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> bool {
-        if agent_type != AgentType::Acp || !outcome.terminal.is_error() {
+        if !matches!(agent_type, AgentType::Acp | AgentType::Antigravity) || !outcome.terminal.is_error() {
             return false;
         }
 
