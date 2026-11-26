@@ -25,6 +25,14 @@ pub(crate) fn explain_turn_error(raw: &str) -> String {
     raw.to_owned()
 }
 
+/// Whether an `agy` error string matches a known historical stream-interruption
+/// artifact left on disk by `agy -p` after recovering from an interrupted retry
+/// (`antigravity-cli#969`, `#1518`).
+fn is_stale_interrupted_signature(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("the stream was interrupted") || lower.contains("api error (attempt ")
+}
+
 /// Folds the agy stream into `SessionEvent`s, carrying the small amount of
 /// cross-frame state the translation needs.
 #[derive(Debug, Default)]
@@ -45,6 +53,11 @@ pub(crate) struct Translator {
     /// and its closing message claims the work is done. Counting these is the
     /// only way to notice, because the terminal frame carries no trace of them.
     failed_steps: u32,
+    /// Highest `step_index` seen for an `error_message` step in THIS turn.
+    last_error_step_index: Option<u64>,
+    /// Highest `step_index` seen for a completed / delta-bearing `agent_response`
+    /// step in THIS turn.
+    last_completed_response_step_index: Option<u64>,
 }
 
 impl Translator {
@@ -77,23 +90,62 @@ impl Translator {
                 if !r.conversation_id.is_empty() {
                     self.backend_session_id = Some(r.conversation_id);
                 }
-                let is_error = !r.status.eq_ignore_ascii_case("SUCCESS");
-                let outcome = match r.status.to_ascii_uppercase().as_str() {
-                    "SUCCESS" => TurnOutcome::EndTurn,
-                    "INTERRUPTED" => TurnOutcome::Cancelled {
-                        reason: CancelReason::UserCancel,
-                    },
-                    _ => TurnOutcome::Failed,
-                };
-                // On failure agy puts the reason in `error`, not `response`.
-                let result_text = if is_error {
-                    explain_turn_error(&r.error.unwrap_or(r.response))
+                let last_error_step = std::mem::take(&mut self.last_error_step_index);
+                let last_completed_resp = std::mem::take(&mut self.last_completed_response_step_index);
+
+                // Sticky historical-error guard (antigravity-cli#969 / #1518):
+                // `agy -p` leaves historical `ERROR_MESSAGE` steps on disk (e.g. from an
+                // earlier interrupted retry that actually recovered) and keeps echoing
+                // `"status": "ERROR"` with that stale error on every subsequent resumed turn
+                // even though the turn generated a full completed response. Recover ONLY when
+                // ALL FOUR hold so real errors are never swallowed:
+                // 1) terminal status is ERROR
+                // 2) non-empty assistant response was returned
+                // 3) current turn completed an AgentResponse step AFTER any current-turn ErrorMessage
+                // 4) terminal error matches the known stale stream-interruption signature
+                let sticky_recovered = r.status.eq_ignore_ascii_case("ERROR")
+                    && !r.response.trim().is_empty()
+                    && last_completed_resp
+                        .is_some_and(|resp_idx| last_error_step.is_none_or(|err_idx| resp_idx > err_idx))
+                    && r.error.as_deref().is_some_and(is_stale_interrupted_signature);
+
+                let (is_error, outcome, result_text) = if sticky_recovered {
+                    tracing::warn!(
+                        conversation_id = self.backend_session_id.as_deref().unwrap_or(""),
+                        error = r.error.as_deref().unwrap_or(""),
+                        last_completed_resp = ?last_completed_resp,
+                        last_error_step = ?last_error_step,
+                        "antigravity: recovered turn with stale historical stream-interruption error after completed response"
+                    );
+                    (false, TurnOutcome::EndTurn, r.response)
                 } else {
-                    r.response
+                    let is_error = !r.status.eq_ignore_ascii_case("SUCCESS");
+                    let outcome = match r.status.to_ascii_uppercase().as_str() {
+                        "SUCCESS" => TurnOutcome::EndTurn,
+                        "INTERRUPTED" => TurnOutcome::Cancelled {
+                            reason: CancelReason::UserCancel,
+                        },
+                        _ => TurnOutcome::Failed,
+                    };
+                    // On failure agy puts the reason in `error`, not `response`.
+                    let result_text = if is_error {
+                        explain_turn_error(&r.error.unwrap_or(r.response))
+                    } else {
+                        r.response
+                    };
+                    (is_error, outcome, result_text)
                 };
                 let mut out = Vec::with_capacity(3);
                 if let Some(u) = r.usage {
                     out.push(usage_delta(&u));
+                }
+                if sticky_recovered {
+                    out.push(SessionEvent::Notice {
+                        level: NoticeLevel::Info,
+                        message: "Antigravity returned a stale historical stream-interruption error after completing this turn; keeping the completed response.".to_owned(),
+                        localized: None,
+                        supersedes_key: None,
+                    });
                 }
                 // BEFORE the terminal, and it MUST stay there. `StreamRelay`
                 // breaks out of its receive loop the moment it sees the turn's
@@ -199,6 +251,10 @@ impl Translator {
 
         match su.step_type {
             AgyStepType::AgentResponse => {
+                let has_delta = su.text_delta.as_deref().is_some_and(|t| !t.is_empty());
+                if su.state == AgyState::Done || has_delta {
+                    self.last_completed_response_step_index = Some(su.step_index);
+                }
                 if let Some(text) = su.text_delta.filter(|t| !t.is_empty()) {
                     out.push(SessionEvent::MessageDelta { item_id: id, text });
                 }
@@ -287,6 +343,9 @@ impl Translator {
             // put on screen per-step. The count is what makes the turn's
             // closing "success" answerable.
             AgyStepType::ErrorMessage => {
+                if matches!(su.state, AgyState::Done | AgyState::Error) {
+                    self.last_error_step_index = Some(su.step_index);
+                }
                 if su.state == AgyState::Done {
                     self.failed_steps = self.failed_steps.saturating_add(1);
                 }
@@ -810,5 +869,109 @@ mod tests {
             })
             .expect("notice expected");
         assert!(msg.contains('1') && !msg.contains('2'), "counted twice: {msg}");
+    }
+
+    #[test]
+    fn sticky_historical_stream_interrupted_error_recovers_after_completed_response() {
+        let (_, evs) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":200,"state":"DONE","step_type":"agent_response","text_delta":"OK"}}"#,
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"ERROR","response":"OK","error":"Error: The stream was interrupted. Please continue the task you were working on."}}"#,
+        ]);
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            SessionEvent::Notice { level: NoticeLevel::Info, message, .. }
+                if message.contains("stale historical stream-interruption error")
+        )));
+        assert!(matches!(
+            evs.last(),
+            Some(SessionEvent::TurnResult { is_error: false, outcome: TurnOutcome::EndTurn, result_text, .. })
+                if result_text == "OK"
+        ));
+    }
+
+    #[test]
+    fn sticky_error_after_recovered_retry_in_same_turn_keeps_newer_response() {
+        let (_, evs) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":5,"state":"DONE","step_type":"error_message"}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":7,"state":"DONE","step_type":"agent_response","text_delta":"Recovered final answer"}}"#,
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"ERROR","response":"Recovered final answer","error":"API Error (Attempt 2): stream interrupted"}}"#,
+        ]);
+        assert!(matches!(
+            evs.last(),
+            Some(SessionEvent::TurnResult { is_error: false, outcome: TurnOutcome::EndTurn, result_text, .. })
+                if result_text == "Recovered final answer"
+        ));
+    }
+
+    #[test]
+    fn sticky_error_guard_never_swallows_empty_newer_error_non_stale_or_interrupted() {
+        // Negative 1: empty response must fail.
+        let (_, evs1) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"agent_response"}}"#,
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"ERROR","response":"   ","error":"The stream was interrupted"}}"#,
+        ]);
+        assert!(matches!(
+            evs1.last(),
+            Some(SessionEvent::TurnResult {
+                is_error: true,
+                outcome: TurnOutcome::Failed,
+                ..
+            })
+        ));
+
+        // Negative 2: ErrorMessage AFTER completed AgentResponse must fail.
+        let (_, evs2) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":7,"state":"DONE","step_type":"agent_response","text_delta":"partial"}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":9,"state":"DONE","step_type":"error_message"}}"#,
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"ERROR","response":"partial","error":"The stream was interrupted"}}"#,
+        ]);
+        assert!(matches!(
+            evs2.last(),
+            Some(SessionEvent::TurnResult {
+                is_error: true,
+                outcome: TurnOutcome::Failed,
+                ..
+            })
+        ));
+
+        // Negative 3: non-stale real errors (auth / 429 / 500) must fail even with response text.
+        for err in [
+            "authentication failed or timed out",
+            "429 rate limit exceeded",
+            "500 internal server error",
+        ] {
+            let line = format!(
+                r#"{{"event":"result","result":{{"conversation_id":"c1","status":"ERROR","response":"partial","error":"{err}"}}}}"#
+            );
+            let (_, evs3) = tr(&[
+                r#"{"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"partial"}}"#,
+                &line,
+            ]);
+            assert!(
+                matches!(
+                    evs3.last(),
+                    Some(SessionEvent::TurnResult {
+                        is_error: true,
+                        outcome: TurnOutcome::Failed,
+                        ..
+                    })
+                ),
+                "real error {err} must not be swallowed"
+            );
+        }
+
+        // Negative 4: INTERRUPTED stays Cancelled.
+        let (_, evs4) = tr(&[
+            r#"{"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"partial"}}"#,
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"INTERRUPTED","response":"partial","error":"The stream was interrupted"}}"#,
+        ]);
+        assert!(matches!(
+            evs4.last(),
+            Some(SessionEvent::TurnResult {
+                is_error: true,
+                outcome: TurnOutcome::Cancelled { .. },
+                ..
+            })
+        ));
     }
 }
