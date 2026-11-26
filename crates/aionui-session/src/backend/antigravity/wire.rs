@@ -177,6 +177,8 @@ pub(crate) struct AgyResult {
     pub num_turns: u64,
     #[serde(default)]
     pub usage: Option<AgyUsage>,
+    #[serde(default)]
+    pub finished_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
