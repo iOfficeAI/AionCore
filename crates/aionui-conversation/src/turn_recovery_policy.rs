@@ -37,7 +37,7 @@ impl TurnRecoveryPolicy {
         let session_recovery_signal = classify_session_recovery_signal(outcome);
 
         let decision = if lifecycle == RuntimeLifecycleState::Active
-            && agent_type == AgentType::Acp
+            && matches!(agent_type, AgentType::Acp | AgentType::Antigravity)
             && outcome.terminal.is_error()
             && retryable == Some(true)
             && error_code != Some(AgentErrorCode::UserLlmProviderModelNotFound)
@@ -371,5 +371,53 @@ mod tests {
             TurnRecoveryPolicy::decide(AgentType::Aionrs, None, &outcome, RuntimeLifecycleState::Active, false);
 
         assert_eq!(decision, TurnRecoveryDecision::None);
+    }
+
+    #[test]
+    fn antigravity_clean_retryable_error_auto_replays_once_only() {
+        let outcome = retryable_clean_error();
+        let first = TurnRecoveryPolicy::decide(
+            AgentType::Antigravity,
+            Some("antigravity"),
+            &outcome,
+            RuntimeLifecycleState::Active,
+            false,
+        );
+        assert!(matches!(first, TurnRecoveryDecision::AutoReplayOnce { .. }));
+
+        let second = TurnRecoveryPolicy::decide(
+            AgentType::Antigravity,
+            Some("antigravity"),
+            &outcome,
+            RuntimeLifecycleState::Active,
+            true,
+        );
+        assert_eq!(second, TurnRecoveryDecision::None);
+
+        let mut dirty = retryable_clean_error();
+        dirty.attempt.saw_visible_output = true;
+        assert_eq!(
+            TurnRecoveryPolicy::decide(
+                AgentType::Antigravity,
+                Some("antigravity"),
+                &dirty,
+                RuntimeLifecycleState::Active,
+                false,
+            ),
+            TurnRecoveryDecision::None
+        );
+
+        let mut with_side_effect = retryable_clean_error();
+        with_side_effect.attempt.saw_tool_or_side_effect = true;
+        assert_eq!(
+            TurnRecoveryPolicy::decide(
+                AgentType::Antigravity,
+                Some("antigravity"),
+                &with_side_effect,
+                RuntimeLifecycleState::Active,
+                false,
+            ),
+            TurnRecoveryDecision::None
+        );
     }
 }
